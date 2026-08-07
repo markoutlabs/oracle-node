@@ -19,7 +19,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M2 | `oracle-agg` + halt/degrade | **done** |
 | M3 | WS/REST server + client SDK | **done** |
 | M3.5 | `oracle-node` binary wiring the pipeline | **done** |
-| M4 | Remaining venues + USDT/USD conversion | not started |
+| M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | not started |
 | M6 | Hardening | not started |
 
@@ -52,6 +52,12 @@ aggregator never learns anything venue-specific.
 - `MonotonicClock` — forward-only unix nanoseconds. `SystemTime::now()` can step
   backwards under NTP, which makes in-flight observations look like they arrived
   from the future and read as age zero forever.
+
+All five venues from the spec are implemented: Binance (URL-encoded
+subscriptions), plus Bybit, OKX, Coinbase, and Kraken behind a shared
+`VenueAdapter` — those four connect, send a subscribe frame, and need an
+application keepalive, so what actually differs per venue is only its naming and
+its decoder.
 
 Two invariants the code enforces rather than documents:
 
@@ -161,6 +167,23 @@ command-line argument: arguments are visible in `ps` to every user on the box.
 At startup the node checks that the registry actually authorises its own signing
 address, and warns loudly if not — otherwise the first sign that nothing verifies
 comes from a downstream consumer.
+
+#### USDT is not USD
+
+Binance, Bybit, and OKX quote in USDT. Coinbase and Kraken are the only
+native-USD venues in scope, which makes losing both a distinct failure class
+rather than "two of five sources down".
+
+`CRYPTO.USDT/USD` is therefore a feed like any other, priced from the native-USD
+venues, and stablecoin-quoted sources of a `/USD` feed are converted through it.
+The peg's own uncertainty propagates in quadrature, so a wobbling peg widens the
+whole catalogue instead of silently mispricing it. Confirmed live: with the peg
+at 1.0bp and the aggregate floor at 1.0bp, BTC/USD published 1.414bp — exactly
+√2 × 1bp.
+
+If the peg goes away, dependent feeds **halt**. Publishing a USDT-quoted number
+under a `/USD` symbol would be wrong by however far the peg had drifted, and
+nobody would notice.
 
 ### `oracle-wire`
 

@@ -8,7 +8,7 @@ use oracle_types::{
     Venue,
 };
 
-use crate::aggregate::{self, Outcome, Reasons};
+use crate::aggregate::{self, Outcome, Peg, Reasons};
 use crate::config::{ConfigError, FeedConfig};
 use crate::quote::{self, SourceQuote};
 
@@ -85,6 +85,12 @@ struct FeedRuntime {
     config: FeedConfig,
     sources: Vec<SourceSlots>,
     last: Option<Published>,
+    /// The most recent successful aggregation, published or not.
+    ///
+    /// Separate from `last` because a peg must be readable by dependent feeds on
+    /// every tick, not only on the ticks where publication policy happened to
+    /// fire.
+    last_aggregate: Option<Peg>,
     reference: Option<Fixed>,
     reference_at_ns: u64,
     seq: u64,
@@ -101,6 +107,9 @@ pub struct Aggregator {
     feeds: Vec<FeedRuntime>,
     routes: HashMap<InstrumentId, Vec<(usize, usize)>>,
     by_id: HashMap<FeedId, usize>,
+    /// Evaluation order: pegs before the feeds that depend on them, so a
+    /// conversion reads a peg from this tick rather than the previous one.
+    order: Vec<usize>,
 }
 
 impl Aggregator {
@@ -131,17 +140,60 @@ impl Aggregator {
                 sources: vec![SourceSlots::default(); config.sources.len()],
                 config,
                 last: None,
+                last_aggregate: None,
                 reference: None,
                 reference_at_ns: 0,
                 seq: 0,
                 stats: FeedStats::default(),
             });
         }
+        // Every peg must exist and must not itself need conversion.
+        for feed in &feeds {
+            if !feed.config.needs_conversion() {
+                continue;
+            }
+            let Some(conversion) = feed.config.quote_conversion else {
+                continue;
+            };
+            let missing = || ConfigError::PegNotFound {
+                symbol: feed.config.symbol.to_string(),
+                peg: conversion.peg_feed.to_string(),
+            };
+            let peg_index = by_id
+                .get(&conversion.peg_feed)
+                .copied()
+                .ok_or_else(missing)?;
+            let peg = feeds.get(peg_index).ok_or_else(missing)?;
+            if peg.config.needs_conversion() {
+                return Err(ConfigError::ChainedPeg {
+                    symbol: feed.config.symbol.to_string(),
+                    peg: peg.config.symbol.to_string(),
+                });
+            }
+        }
+
+        // Pegs first. With chaining forbidden, one pass is a complete ordering.
+        let mut order: Vec<usize> = (0..feeds.len()).collect();
+        order.sort_by_key(|index| {
+            feeds
+                .get(*index)
+                .is_some_and(|feed| feed.config.needs_conversion())
+        });
+
         Ok(Self {
             feeds,
             routes,
             by_id,
+            order,
         })
+    }
+
+    /// Returns the peg reading a feed needs, if it needs one.
+    fn peg_for(&self, index: usize) -> Option<Peg> {
+        let feed = self.feeds.get(index)?;
+        let conversion = feed.config.quote_conversion?;
+        let peg_index = self.by_id.get(&conversion.peg_feed).copied()?;
+        self.feeds.get(peg_index)?.last_aggregate
     }
 
     /// Returns the number of feeds.
@@ -217,10 +269,11 @@ impl Aggregator {
         let Some(index) = self.by_id.get(&feed_id).copied() else {
             return Ok(None);
         };
+        let peg = self.peg_for(index);
         let Some(feed) = self.feeds.get_mut(index) else {
             return Ok(None);
         };
-        feed.poll(now_ns)
+        feed.poll(now_ns, peg)
     }
 
     /// Evaluates every feed.
@@ -230,8 +283,16 @@ impl Aggregator {
     pub fn poll_all(&mut self, now_ns: u64) -> (Vec<PriceUpdate>, Vec<AggError>) {
         let mut updates = Vec::new();
         let mut errors = Vec::new();
-        for feed in &mut self.feeds {
-            match feed.poll(now_ns) {
+        // Pegs first, so a dependent feed converts against this tick's reading.
+        for position in 0..self.order.len() {
+            let Some(index) = self.order.get(position).copied() else {
+                continue;
+            };
+            let peg = self.peg_for(index);
+            let Some(feed) = self.feeds.get_mut(index) else {
+                continue;
+            };
+            match feed.poll(now_ns, peg) {
                 Ok(Some(update)) => updates.push(update),
                 Ok(None) => {}
                 Err(error) => errors.push(error),
@@ -242,13 +303,14 @@ impl Aggregator {
 }
 
 impl FeedRuntime {
-    fn poll(&mut self, now_ns: u64) -> Result<Option<PriceUpdate>, AggError> {
+    fn poll(&mut self, now_ns: u64, peg: Option<Peg>) -> Result<Option<PriceUpdate>, AggError> {
         let quotes = self.quotes(now_ns);
         let outcome = aggregate::aggregate(
             &self.config,
             quotes,
             self.reference,
             self.last.map(|l| l.price),
+            peg,
         );
 
         let (price, conf, flags, reasons, sources, num_sources, observation_time_ns) = match outcome
@@ -261,6 +323,12 @@ impl FeedRuntime {
                 if aggregation.flags.is_degraded() {
                     self.stats.degraded = self.stats.degraded.saturating_add(1);
                 }
+                // Recorded on every successful aggregation, not only on publish,
+                // so dependent feeds always have a peg to read.
+                self.last_aggregate = Some(Peg {
+                    price: aggregation.price,
+                    conf: aggregation.conf,
+                });
                 (
                     aggregation.price,
                     aggregation.conf,
@@ -273,6 +341,11 @@ impl FeedRuntime {
             }
             Outcome::Halted { reasons, .. } => {
                 self.stats.halted = self.stats.halted.saturating_add(1);
+                // A halted feed has no *current* reading, so it must stop being
+                // usable as a peg. Leaving the last one in place would let a
+                // dead peg silently convert dependent feeds forever, drifting by
+                // however far the real rate had moved — with no signal anywhere.
+                self.last_aggregate = None;
                 // Carry the last good price so consumers have something to render,
                 // flagged so nothing settles against it. With no history at all
                 // there is nothing honest to say, so stay silent.

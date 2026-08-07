@@ -40,6 +40,10 @@ impl Reasons {
     pub const TRADE_FALLBACK: Self = Self(1 << 4);
     /// At least one source was converted through a peg feed.
     pub const SYNTHETIC_QUOTE: Self = Self(1 << 5);
+    /// The peg feed needed for conversion was missing or unusable.
+    pub const PEG_UNAVAILABLE: Self = Self(1 << 6);
+    /// The peg feed is live but its own confidence is too wide to lean on.
+    pub const PEG_UNCERTAIN: Self = Self(1 << 7);
 
     /// Returns the raw bits, for metrics labels.
     #[must_use]
@@ -72,7 +76,9 @@ impl Reasons {
         if self.contains(Self::SYNTHETIC_QUOTE) {
             bits |= Flags::SYNTHETIC_QUOTE.bits();
         }
-        if self.0 & (Self::OUTLIER_PRESSURE.0 | Self::UNCORROBORATED_JUMP.0) != 0 {
+        if self.0 & (Self::OUTLIER_PRESSURE.0 | Self::UNCORROBORATED_JUMP.0 | Self::PEG_UNCERTAIN.0)
+            != 0
+        {
             bits |= Flags::DEGRADED.bits();
         }
         match Flags::from_bits(bits) {
@@ -108,6 +114,8 @@ impl core::fmt::Debug for Reasons {
             (Self::SANITY_BAND, "SANITY_BAND"),
             (Self::TRADE_FALLBACK, "TRADE_FALLBACK"),
             (Self::SYNTHETIC_QUOTE, "SYNTHETIC_QUOTE"),
+            (Self::PEG_UNAVAILABLE, "PEG_UNAVAILABLE"),
+            (Self::PEG_UNCERTAIN, "PEG_UNCERTAIN"),
         ] {
             if self.contains(reason) {
                 set.entry(&name);
@@ -154,6 +162,67 @@ pub enum Outcome {
     },
 }
 
+/// A peg feed's current reading, for converting stablecoin-quoted sources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Peg {
+    /// The peg's price, such as USDT measured in USD.
+    pub price: Fixed,
+    /// The peg's own confidence half-width.
+    pub conf: Fixed,
+}
+
+impl Peg {
+    /// Returns the peg's confidence as a fraction of its price, in basis points.
+    #[must_use]
+    pub fn conf_bps(&self) -> Option<Fixed> {
+        self.conf.to_bps_of(self.price.checked_abs()?)
+    }
+}
+
+/// Converts stablecoin-quoted prices into the feed's quote asset.
+///
+/// Returns `false` if the peg is unusable, in which case the caller must halt
+/// rather than publish unconverted prices under a `/USD` symbol.
+fn apply_peg(quotes: &mut [SourceQuote], peg: Peg) -> bool {
+    if !peg.price.is_positive() {
+        return false;
+    }
+    for quote in quotes {
+        if !quote.converted {
+            continue;
+        }
+        let Some(price) = quote.price.checked_mul(peg.price) else {
+            return false;
+        };
+        quote.price = price;
+        // The spread is quoted in the same asset, so it converts too.
+        quote.half_spread = quote.half_spread.and_then(|s| s.checked_mul(peg.price));
+    }
+    true
+}
+
+/// Widens a confidence to absorb the peg's own uncertainty.
+///
+/// Relative errors add in quadrature: `rel² = rel_price² + rel_peg²`.
+///
+/// Applied to the whole aggregate even when only some sources were converted.
+/// That is deliberately conservative — the alternative is tracking per-source
+/// uncertainty through the median, and erring wide is the right direction for a
+/// number consumers use to decide whether to trust the price.
+fn widen_for_peg(price: Fixed, conf: Fixed, peg: Peg) -> Option<Fixed> {
+    let magnitude = price.checked_abs()?;
+    if !magnitude.is_positive() {
+        return Some(conf);
+    }
+    let rel_price = conf.checked_div(magnitude)?;
+    let rel_peg = peg.conf.checked_div(peg.price.checked_abs()?)?;
+    let sum = rel_price
+        .checked_mul(rel_price)?
+        .checked_add(rel_peg.checked_mul(rel_peg)?)?;
+    let combined = sum.sqrt()?;
+    magnitude.checked_mul(combined)
+}
+
 /// Aggregates one feed's quotes.
 ///
 /// `reference` is the slow EMA used for the sanity band, and `last_price` is this
@@ -165,10 +234,48 @@ pub fn aggregate(
     mut quotes: Vec<SourceQuote>,
     reference: Option<Fixed>,
     last_price: Option<Fixed>,
+    peg: Option<Peg>,
 ) -> Outcome {
     let mut reasons = Reasons::NONE;
     if quotes.iter().any(|quote| !quote.from_book) {
         reasons |= Reasons::TRADE_FALLBACK;
+    }
+
+    // Convert stablecoin-quoted sources before anything else looks at a price.
+    // Outlier rejection and the sanity band must both see the converted values,
+    // or a depeg would read as every USDT venue disagreeing with the USD ones.
+    let mut applied_peg = None;
+    if config.needs_conversion() {
+        let Some(conversion) = config.quote_conversion else {
+            return Outcome::Halted {
+                reasons: reasons | Reasons::PEG_UNAVAILABLE,
+                live: 0,
+            };
+        };
+        let live = u32::try_from(quotes.len()).unwrap_or(u32::MAX);
+        // No peg means no honest way to state these prices in the quote asset.
+        // Publishing them unconverted would be wrong by whatever the peg has
+        // drifted, which is exactly the error nobody would notice.
+        let Some(peg) = peg else {
+            return Outcome::Halted {
+                reasons: reasons | Reasons::PEG_UNAVAILABLE,
+                live,
+            };
+        };
+        if !apply_peg(&mut quotes, peg) {
+            return Outcome::Halted {
+                reasons: reasons | Reasons::PEG_UNAVAILABLE,
+                live,
+            };
+        }
+        reasons |= Reasons::SYNTHETIC_QUOTE;
+        if peg
+            .conf_bps()
+            .is_none_or(|bps| bps > conversion.max_peg_conf_bps)
+        {
+            reasons |= Reasons::PEG_UNCERTAIN;
+        }
+        applied_peg = Some(peg);
     }
 
     let live = u32::try_from(quotes.len()).unwrap_or(u32::MAX);
@@ -217,6 +324,13 @@ pub fn aggregate(
     }
 
     let mut conf = confidence(config, &samples, &quotes, price).unwrap_or(Fixed::ZERO);
+
+    // The peg's uncertainty is part of this price's uncertainty.
+    if let Some(peg) = applied_peg
+        && let Some(widened) = widen_for_peg(price, conf, peg)
+    {
+        conf = conf.max(widened);
+    }
 
     // When rejection was blocked by the quorum, the sample set knowingly still
     // contains an outlier — and the MAD, being robust, ignores it. Widening to
@@ -420,6 +534,7 @@ mod tests {
             weight: Fixed::ONE,
             observation_time_ns: 1_000,
             from_book: true,
+            converted: false,
         }
     }
 
@@ -450,7 +565,7 @@ mod tests {
             quote(Venue::Coinbase, "99.99"),
             quote(Venue::Kraken, "100.00"),
         ];
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert_eq!(result.price, fixed("100"));
         assert_eq!(result.num_sources, 5);
         assert_eq!(result.rejected, 0);
@@ -470,7 +585,7 @@ mod tests {
         for quote in &mut quotes {
             quote.half_spread = Some(fixed("0.5"));
         }
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert_eq!(result.conf, fixed("0.5"));
     }
 
@@ -485,7 +600,7 @@ mod tests {
         for quote in &mut quotes {
             quote.half_spread = None;
         }
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         // 1bp of 100.
         assert_eq!(result.conf, fixed("0.01"));
     }
@@ -502,6 +617,7 @@ mod tests {
             ],
             None,
             None,
+            None,
         ));
         let loose = priced(aggregate(
             &config,
@@ -510,6 +626,7 @@ mod tests {
                 quote(Venue::Bybit, "100.5"),
                 quote(Venue::Okx, "101"),
             ],
+            None,
             None,
             None,
         ));
@@ -532,7 +649,7 @@ mod tests {
             // Ten percent off.
             quote(Venue::Kraken, "110.00"),
         ];
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert_eq!(result.rejected, 1);
         assert_eq!(result.num_sources, 4);
         assert!(!result.sources.contains(Venue::Kraken));
@@ -550,7 +667,7 @@ mod tests {
             quote(Venue::Bybit, "100.01"),
             quote(Venue::Okx, "200"),
         ];
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert_eq!(result.rejected, 0, "nothing may be dropped below quorum");
         assert!(result.reasons.contains(Reasons::OUTLIER_PRESSURE));
         assert!(result.flags.is_degraded());
@@ -567,7 +684,13 @@ mod tests {
     fn too_few_live_sources_halts() {
         let mut config = config(&ALL);
         config.min_sources = 3;
-        let outcome = aggregate(&config, vec![quote(Venue::Binance, "100")], None, None);
+        let outcome = aggregate(
+            &config,
+            vec![quote(Venue::Binance, "100")],
+            None,
+            None,
+            None,
+        );
         match outcome {
             Outcome::Halted { reasons, live } => {
                 assert!(reasons.contains(Reasons::INSUFFICIENT_SOURCES));
@@ -584,7 +707,7 @@ mod tests {
         // Two venues; one runs 10% while the other does not. The median moves 5%,
         // past the 300bp jump threshold, but only one venue actually moved.
         let quotes = vec![quote(Venue::Binance, "110"), quote(Venue::Bybit, "100")];
-        let result = priced(aggregate(&config, quotes, None, Some(fixed("100"))));
+        let result = priced(aggregate(&config, quotes, None, Some(fixed("100")), None));
         assert!(result.reasons.contains(Reasons::UNCORROBORATED_JUMP));
         assert!(result.flags.is_degraded());
         assert!(
@@ -603,7 +726,7 @@ mod tests {
             quote(Venue::Bybit, "105.01"),
             quote(Venue::Okx, "104.99"),
         ];
-        let result = priced(aggregate(&config, quotes, None, Some(fixed("100"))));
+        let result = priced(aggregate(&config, quotes, None, Some(fixed("100")), None));
         assert!(!result.reasons.contains(Reasons::UNCORROBORATED_JUMP));
         assert!(result.flags.is_none());
     }
@@ -617,7 +740,7 @@ mod tests {
             quote(Venue::Okx, "10"),
         ];
         // Every venue agrees, and all of them are wrong: the reference says 100.
-        let outcome = aggregate(&config, quotes, Some(fixed("100")), None);
+        let outcome = aggregate(&config, quotes, Some(fixed("100")), None, None);
         match outcome {
             Outcome::Halted { reasons, .. } => {
                 assert!(reasons.contains(Reasons::SANITY_BAND));
@@ -634,7 +757,7 @@ mod tests {
             quote(Venue::Bybit, "130"),
             quote(Venue::Okx, "130"),
         ];
-        let result = priced(aggregate(&config, quotes, Some(fixed("100")), None));
+        let result = priced(aggregate(&config, quotes, Some(fixed("100")), None, None));
         assert_eq!(result.price, fixed("130"));
     }
 
@@ -650,7 +773,7 @@ mod tests {
             quote.from_book = false;
             quote.half_spread = None;
         }
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert!(result.reasons.contains(Reasons::TRADE_FALLBACK));
         assert!(
             !result.flags.is_degraded(),
@@ -672,7 +795,7 @@ mod tests {
         attacker.weight = fixed("1000000");
         quotes.push(attacker);
 
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         assert!(
             result.price >= fixed("100.00") && result.price <= fixed("100.03"),
             "price {} escaped the honest range",
@@ -696,7 +819,7 @@ mod tests {
         attacker.weight = fixed("1000000");
         quotes.push(attacker);
 
-        let result = priced(aggregate(&config, quotes, None, None));
+        let result = priced(aggregate(&config, quotes, None, None, None));
         // Without the cap the attacker's own quote would be the answer. With it,
         // they buy influence but not the price.
         assert!(

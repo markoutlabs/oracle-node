@@ -639,6 +639,7 @@ name = "oracle-agg"
 version = "0.1.0"
 dependencies = [
  "oracle-types",
+ "oracle-wire",
  "proptest",
  "thiserror",
 ]

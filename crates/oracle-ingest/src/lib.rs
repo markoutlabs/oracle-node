@@ -35,6 +35,7 @@ mod event;
 mod instrument;
 pub mod session;
 pub mod transport;
+pub mod venues;
 
 pub use backoff::{Backoff, BackoffConfig};
 pub use error::{DecodeError, IngestError};

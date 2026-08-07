@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use oracle_agg::FeedConfig;
-use oracle_agg::config::SourceConfig;
+use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
+use oracle_ingest::venues::{VenueSpec, bybit, coinbase, kraken, okx};
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::feed_id;
 use serde::Deserialize;
@@ -121,6 +122,12 @@ pub struct RegistrySettings {
 pub struct FeedSettings {
     /// Canonical symbol.
     pub symbol: String,
+    /// The peg feed converted sources are priced through, such as `CRYPTO.USDT/USD`.
+    #[serde(default)]
+    pub peg: Option<String>,
+    /// Peg confidence above which this feed degrades, in basis points.
+    #[serde(default)]
+    pub max_peg_conf_bps: Option<String>,
     /// Surviving venues required before the feed publishes a usable price.
     #[serde(default)]
     pub min_sources: Option<u32>,
@@ -147,6 +154,14 @@ pub struct SourceSettings {
     /// Static trust weight as a decimal string; `1` by default.
     #[serde(default)]
     pub weight: Option<String>,
+
+    /// This source is quoted in the feed's peg asset and must be converted.
+    ///
+    /// Set on every USDT-quoted source of a `/USD` feed. Publishing those
+    /// unconverted is a lie that costs money the day the peg breaks — and a
+    /// silent one, because on an ordinary day the two agree to a basis point.
+    #[serde(default)]
+    pub converted: bool,
 }
 
 const fn default_tick_ms() -> u64 {
@@ -157,6 +172,24 @@ const fn default_max_pending() -> usize {
     512
 }
 
+/// Peg confidence above which dependent feeds degrade, from SPEC.md §5.3.
+const DEFAULT_MAX_PEG_CONF_BPS: Fixed = Fixed::from_raw(50 * 1_000_000_000_000);
+
+/// Idle timeout for the socket-subscribing venues.
+const VENUE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Session recycle age for the socket-subscribing venues.
+const VENUE_MAX_SESSION: Duration = Duration::from_secs(23 * 3_600);
+/// Subscription arguments per frame.
+const VENUE_CHUNK: usize = 100;
+
+/// One non-Binance venue connection and the instruments it carries.
+pub struct VenueConnection {
+    /// How to connect, subscribe, and keep alive.
+    pub spec: VenueSpec,
+    /// The instruments on that connection.
+    pub instruments: Vec<InstrumentSpec>,
+}
+
 /// Everything the node needs to start, derived from the config.
 pub struct ResolvedConfig {
     /// Aggregation configuration, one entry per feed.
@@ -165,6 +198,8 @@ pub struct ResolvedConfig {
     pub symbols: Vec<Symbol>,
     /// Binance ingest configuration, derived from the feed sources.
     pub binance: BinanceConfig,
+    /// Connections for the venues that subscribe over the socket.
+    pub venues: Vec<(Venue, Vec<VenueConnection>)>,
     /// How often to evaluate feeds.
     pub tick_interval: Duration,
 }
@@ -281,6 +316,9 @@ impl NodeConfig {
 
                 let instrument = InstrumentId::new(venue, market, source.symbol.as_str());
                 let mut config = SourceConfig::new(instrument, kinds);
+                if source.converted {
+                    config = config.converted();
+                }
                 if let Some(weight) = &source.weight {
                     let weight: Fixed = weight.parse().map_err(|e| {
                         ConfigError::Invalid(format!("feed `{}`: bad weight: {e}", feed.symbol))
@@ -307,6 +345,24 @@ impl NodeConfig {
             if let Some(min_sources) = feed.min_sources {
                 config.min_sources = min_sources;
             }
+            if let Some(peg) = &feed.peg {
+                let peg_symbol: Symbol = peg.parse().map_err(|e| {
+                    ConfigError::Invalid(format!("feed `{}`: bad peg symbol: {e}", feed.symbol))
+                })?;
+                let max_peg_conf_bps = match &feed.max_peg_conf_bps {
+                    Some(text) => text.parse::<Fixed>().map_err(|e| {
+                        ConfigError::Invalid(format!(
+                            "feed `{}`: bad max_peg_conf_bps: {e}",
+                            feed.symbol
+                        ))
+                    })?,
+                    None => DEFAULT_MAX_PEG_CONF_BPS,
+                };
+                config = config.with_conversion(QuoteConversion {
+                    peg_feed: feed_id(&peg_symbol),
+                    max_peg_conf_bps,
+                });
+            }
             config
                 .validate()
                 .map_err(|e| ConfigError::Invalid(e.to_string()))?;
@@ -314,24 +370,105 @@ impl NodeConfig {
         }
 
         let mut binance = BinanceConfig::default();
+        let mut by_venue: BTreeMap<(Venue, MarketKind), Vec<InstrumentSpec>> = BTreeMap::new();
         for ((venue, market, _), spec) in instruments {
-            if venue != Venue::Binance {
-                return Err(ConfigError::Invalid(format!(
-                    "venue `{venue}` has no adapter yet; only binance is implemented"
-                )));
+            match venue {
+                Venue::Binance => match market {
+                    MarketKind::Spot => binance.spot.push(spec),
+                    MarketKind::LinearPerp => binance.perp.push(spec),
+                },
+                other => by_venue.entry((other, market)).or_default().push(spec),
             }
-            match market {
-                MarketKind::Spot => binance.spot.push(spec),
-                MarketKind::LinearPerp => binance.perp.push(spec),
-            }
+        }
+
+        let mut venues: BTreeMap<Venue, Vec<VenueConnection>> = BTreeMap::new();
+        for ((venue, market), instruments) in by_venue {
+            let connection = venue_connection(venue, market, &instruments)?;
+            venues.entry(venue).or_default().push(connection);
         }
 
         Ok(ResolvedConfig {
             feeds,
             symbols,
             binance,
+            venues: venues.into_iter().collect(),
             tick_interval: Duration::from_millis(self.tick_interval_ms.max(1)),
         })
+    }
+}
+
+/// Builds one venue connection from its instruments.
+fn venue_connection(
+    venue: Venue,
+    market: MarketKind,
+    instruments: &[InstrumentSpec],
+) -> Result<VenueConnection, ConfigError> {
+    let symbols = || instruments.iter().map(|spec| spec.venue_symbol.as_str());
+
+    let (url, subscribe, keepalive) = match venue {
+        Venue::Bybit => (
+            bybit::url(market).to_owned(),
+            bybit::subscribe_frames(symbols(), market, VENUE_CHUNK),
+            Some((bybit::KEEPALIVE, bybit::KEEPALIVE_PAYLOAD.to_owned())),
+        ),
+        Venue::Okx => (
+            okx::URL.to_owned(),
+            okx::subscribe_frames(symbols(), VENUE_CHUNK),
+            Some((okx::KEEPALIVE, okx::KEEPALIVE_PAYLOAD.to_owned())),
+        ),
+        Venue::Coinbase => (
+            coinbase::URL.to_owned(),
+            vec![coinbase::subscribe_frame(symbols())],
+            None,
+        ),
+        Venue::Kraken => (
+            kraken::URL.to_owned(),
+            vec![kraken::subscribe_frame(symbols())],
+            None,
+        ),
+        Venue::Binance => {
+            return Err(ConfigError::Invalid(
+                "binance is configured through its own adapter".to_owned(),
+            ));
+        }
+        // `Venue` is non-exhaustive so adding one stays additive for consumers.
+        // Here it must be a startup failure: a venue with no adapter would
+        // otherwise be configured, accepted, and silently never stream.
+        other => {
+            return Err(ConfigError::Invalid(format!(
+                "venue `{other}` has no adapter in this build"
+            )));
+        }
+    };
+
+    Ok(VenueConnection {
+        spec: VenueSpec {
+            venue,
+            market,
+            url,
+            subscribe,
+            keepalive,
+            idle_timeout: VENUE_IDLE_TIMEOUT,
+            max_session: VENUE_MAX_SESSION,
+            // Distinct per venue and market, so sibling connections do not draw
+            // the same jitter and re-synchronise after a shared outage.
+            backoff_seed: u64::from(venue.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ u64::from(market == MarketKind::LinearPerp),
+        },
+        instruments: instruments.to_vec(),
+    })
+}
+
+/// Returns the decoder for a venue.
+#[must_use]
+pub fn decoder_for(venue: Venue) -> Option<oracle_ingest::venues::DecodeFn> {
+    match venue {
+        Venue::Bybit => Some(bybit::decode_payload),
+        Venue::Okx => Some(okx::decode_payload),
+        Venue::Coinbase => Some(coinbase::decode_payload),
+        Venue::Kraken => Some(kraken::decode_payload),
+        // Binance subscribes through the URL and has its own adapter.
+        Venue::Binance | _ => None,
     }
 }
 
@@ -478,11 +615,145 @@ sources = [
         assert!(parse(&text).resolve().is_err());
     }
 
+    /// The USDT-to-USD path, end to end through configuration.
     #[test]
-    fn venues_without_an_adapter_are_refused_at_startup() {
+    fn a_usd_feed_can_mix_native_and_converted_sources() {
+        let text = r#"
+node_id = "oracle-eu-1"
+
+[server]
+listen = "127.0.0.1:8080"
+
+[signing]
+key_env = "ORACLE_SIGNING_KEY"
+
+[registry]
+path = "registry.json"
+governance_address = "0x0000000000000000000000000000000000000001"
+
+[[feeds]]
+symbol = "CRYPTO.USDT/USD"
+min_sources = 1
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "USDT-USD" },
+  { venue = "kraken", market = "spot", symbol = "USDTUSD" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USD"
+min_sources = 2
+peg = "CRYPTO.USDT/USD"
+max_peg_conf_bps = "50"
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "BTC-USD" },
+  { venue = "binance", market = "spot", symbol = "BTCUSDT", converted = true },
+  { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
+  { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
+]
+"#;
+        let resolved = parse(text).resolve().expect("resolves");
+        let btc = resolved
+            .feeds
+            .iter()
+            .find(|feed| feed.symbol.to_string() == "CRYPTO.BTC/USD")
+            .expect("btc feed");
+        assert!(btc.needs_conversion());
+        assert_eq!(
+            btc.sources
+                .iter()
+                .filter(|source| source.convert_quote)
+                .count(),
+            3,
+            "the three stablecoin venues convert"
+        );
+        assert_eq!(
+            btc.sources
+                .iter()
+                .filter(|source| !source.convert_quote)
+                .count(),
+            1,
+            "the native-USD venue does not"
+        );
+
+        // And the aggregator accepts the pair, peg included.
+        assert!(oracle_agg::Aggregator::new(resolved.feeds).is_ok());
+    }
+
+    #[test]
+    fn every_configured_venue_gets_a_connection() {
         let text = SAMPLE.replacen(r#"venue = "binance""#, r#"venue = "kraken""#, 1);
-        let error = parse(&text).resolve().err().expect("must refuse");
-        assert!(error.to_string().contains("no adapter"), "got {error}");
+        let resolved = parse(&text).resolve().expect("resolves");
+        assert_eq!(
+            resolved.binance.spot.len(),
+            0,
+            "the spot feed moved to kraken"
+        );
+        let venues: Vec<Venue> = resolved.venues.iter().map(|(venue, _)| *venue).collect();
+        assert_eq!(venues, [Venue::Kraken]);
+        assert!(decoder_for(Venue::Kraken).is_some());
+        assert!(
+            decoder_for(Venue::Binance).is_none(),
+            "binance has its own adapter"
+        );
+    }
+
+    #[test]
+    fn each_venue_connection_carries_its_own_subscribe_and_keepalive() {
+        let text = SAMPLE
+            .replacen(
+                r#"venue = "binance", market = "spot""#,
+                r#"venue = "okx", market = "spot""#,
+                1,
+            )
+            .replacen(r#"symbol = "BTCUSDT" }"#, r#"symbol = "BTC-USDT" }"#, 1);
+        let resolved = parse(&text).resolve().expect("resolves");
+        let (_, connections) = resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Okx)
+            .expect("okx configured");
+        let spec = &connections.first().expect("one connection").spec;
+        assert!(
+            spec.subscribe
+                .first()
+                .is_some_and(|f| f.contains("bbo-tbt"))
+        );
+        // OKX drops a connection idle for 30s and wants a plain-text ping.
+        let (period, payload) = spec.keepalive.clone().expect("okx needs a keepalive");
+        assert_eq!(payload, "ping");
+        assert!(period < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sibling_venue_connections_get_different_jitter_seeds() {
+        let text = r#"
+node_id = "n"
+
+[server]
+listen = "127.0.0.1:8080"
+
+[signing]
+key_env = "K"
+
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000001"
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 1
+sources = [
+  { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
+  { venue = "okx", market = "spot", symbol = "BTC-USDT" },
+]
+"#;
+        let resolved = parse(text).resolve().expect("resolves");
+        let seeds: std::collections::HashSet<u64> = resolved
+            .venues
+            .iter()
+            .flat_map(|(_, connections)| connections.iter().map(|c| c.spec.backoff_seed))
+            .collect();
+        assert_eq!(seeds.len(), 2, "connections must not share a jitter seed");
     }
 
     #[test]

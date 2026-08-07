@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use oracle_ingest::binance::BinanceAdapter;
 use oracle_ingest::transport::WebSocketConnector;
-use oracle_ingest::{ExchangeAdapter as _, IngestEvent};
+use oracle_ingest::venues::VenueAdapter;
+use oracle_ingest::{ExchangeAdapter, IngestEvent};
+use oracle_node::config::decoder_for;
 use oracle_node::{NodeConfig, Pipeline};
 use oracle_server::{ServerState, router};
 use tokio::sync::mpsc;
@@ -78,18 +80,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = CancellationToken::new();
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
 
-    let adapter = Box::new(BinanceAdapter::new(resolved.binance, WebSocketConnector)?);
-    for (session, market, _) in adapter.plan()? {
-        info!(%market, url = %session.url, "ingest endpoint");
+    let mut adapters: Vec<Box<dyn ExchangeAdapter>> = Vec::new();
+    if !resolved.binance.spot.is_empty() || !resolved.binance.perp.is_empty() {
+        let adapter = BinanceAdapter::new(resolved.binance, WebSocketConnector)?;
+        for (session, market, _) in adapter.plan()? {
+            info!(venue = "binance", %market, url = %session.url, "ingest endpoint");
+        }
+        adapters.push(Box::new(adapter));
     }
-    {
+    for (venue, connections) in resolved.venues {
+        let Some(decode) = decoder_for(venue) else {
+            warn!(%venue, "no decoder in this build; skipping");
+            continue;
+        };
+        let specs = connections
+            .into_iter()
+            .map(|connection| {
+                info!(%venue, market = %connection.spec.market, url = %connection.spec.url,
+                      "ingest endpoint");
+                (connection.spec, connection.instruments)
+            })
+            .collect();
+        adapters.push(Box::new(VenueAdapter::new(
+            venue,
+            specs,
+            decode,
+            WebSocketConnector,
+        )?));
+    }
+    if adapters.is_empty() {
+        return Err("no venue adapters configured".into());
+    }
+
+    for adapter in adapters {
         let shutdown = shutdown.clone();
+        let ingest_tx = ingest_tx.clone();
+        let label = adapter.label().to_owned();
         tokio::spawn(async move {
             if let Err(error) = adapter.run(ingest_tx, shutdown).await {
-                error!(%error, "ingest stopped");
+                error!(venue = %label, %error, "ingest stopped");
             }
         });
     }
+    drop(ingest_tx);
 
     // One task owns the pipeline. Events are applied in arrival order, which is
     // what preserves the disconnect-before-reconnect guarantee.

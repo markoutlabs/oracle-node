@@ -19,6 +19,8 @@ pub struct SourceQuote {
     pub observation_time_ns: u64,
     /// `true` if this came from a two-sided book rather than a trade print.
     pub from_book: bool,
+    /// `true` if this price is quoted in the peg asset and needs conversion.
+    pub converted: bool,
 }
 
 /// Derives a quote from the freshest usable observation for one source.
@@ -79,6 +81,7 @@ pub fn derive(
             weight: weight_for(source, config, observation, price, now_ns)?,
             observation_time_ns: observation.local_recv_ns,
             from_book,
+            converted: source.convert_quote,
         });
     }
     None

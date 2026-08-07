@@ -25,6 +25,13 @@ pub struct SourceConfig {
 
     /// Static trust weight for this venue, before liquidity and freshness.
     pub weight: Fixed,
+
+    /// This source is quoted in the feed's peg asset and must be converted.
+    ///
+    /// Binance, Bybit, and OKX quote in USDT. Publishing those as `/USD` without
+    /// conversion is a lie that costs money the day the peg breaks — and it is a
+    /// silent lie, because on any ordinary day the two are indistinguishable.
+    pub convert_quote: bool,
 }
 
 impl SourceConfig {
@@ -35,6 +42,7 @@ impl SourceConfig {
             instrument,
             kinds,
             weight: Fixed::ONE,
+            convert_quote: false,
         }
     }
 
@@ -44,6 +52,30 @@ impl SourceConfig {
         self.weight = weight;
         self
     }
+
+    /// Marks this source as needing conversion through the feed's peg.
+    #[must_use]
+    pub const fn converted(mut self) -> Self {
+        self.convert_quote = true;
+        self
+    }
+}
+
+/// How to convert stablecoin-quoted sources into the feed's quote asset.
+///
+/// The peg is a feed like any other, priced from venues that quote it natively.
+/// Its uncertainty propagates into every price that passes through it, so a
+/// wobbling peg widens the whole catalogue rather than silently mispricing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuoteConversion {
+    /// The peg feed, such as `CRYPTO.USDT/USD`.
+    pub peg_feed: FeedId,
+
+    /// Peg confidence above which dependent feeds degrade, in basis points.
+    ///
+    /// A depeg then shows up as confidence widening across the board — which is
+    /// the honest signal — rather than as a uniform, invisible mispricing.
+    pub max_peg_conf_bps: Fixed,
 }
 
 /// Per-feed aggregation and publication policy.
@@ -57,6 +89,9 @@ pub struct FeedConfig {
     pub expo: i32,
     /// Contributing venues.
     pub sources: Vec<SourceConfig>,
+
+    /// Peg conversion for sources marked [`SourceConfig::convert_quote`].
+    pub quote_conversion: Option<QuoteConversion>,
 
     /// Fewest surviving venues required to publish a usable price.
     ///
@@ -155,6 +190,7 @@ impl FeedConfig {
             symbol,
             feed_id,
             sources,
+            quote_conversion: None,
             min_sources: 2,
             max_age: Duration::from_millis(2_000),
             ema_half_life: Duration::from_secs(300),
@@ -193,6 +229,19 @@ impl FeedConfig {
             sanity_band: (Fixed::ZERO, Fixed::ZERO),
             ..Self::spot(symbol, feed_id, sources)
         }
+    }
+
+    /// Returns `true` if any source needs peg conversion.
+    #[must_use]
+    pub fn needs_conversion(&self) -> bool {
+        self.quote_conversion.is_some() && self.sources.iter().any(|source| source.convert_quote)
+    }
+
+    /// Sets the peg conversion.
+    #[must_use]
+    pub const fn with_conversion(mut self, conversion: QuoteConversion) -> Self {
+        self.quote_conversion = Some(conversion);
+        self
     }
 
     /// Returns `true` if the sanity band is active.
@@ -238,6 +287,22 @@ impl FeedConfig {
             return Err(ConfigError::Invalid {
                 symbol: self.symbol.to_string(),
                 reason: "sanity band low bound is not below the high bound".to_owned(),
+            });
+        }
+        if self.sources.iter().any(|source| source.convert_quote) && self.quote_conversion.is_none()
+        {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: "a source is marked for conversion but no peg feed is configured"
+                    .to_owned(),
+            });
+        }
+        if let Some(conversion) = &self.quote_conversion
+            && conversion.peg_feed == self.feed_id
+        {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: "a feed cannot be its own peg".to_owned(),
             });
         }
         for source in &self.sources {
@@ -299,6 +364,28 @@ pub enum ConfigError {
     DuplicateFeed {
         /// The feed.
         symbol: String,
+    },
+
+    /// A feed names a peg that this node does not price.
+    #[error("feed `{symbol}` needs peg {peg}, which is not a configured feed")]
+    PegNotFound {
+        /// The dependent feed.
+        symbol: String,
+        /// The peg it asked for.
+        peg: String,
+    },
+
+    /// A peg feed itself needs conversion.
+    ///
+    /// Refused rather than resolved: chained pegs would need cycle detection and
+    /// an evaluation order, and every extra hop multiplies another uncertainty
+    /// into every downstream price.
+    #[error("feed `{symbol}` names peg `{peg}`, which itself needs conversion")]
+    ChainedPeg {
+        /// The dependent feed.
+        symbol: String,
+        /// The peg it asked for.
+        peg: String,
     },
 }
 
