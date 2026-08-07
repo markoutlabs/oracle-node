@@ -16,7 +16,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 |---|---|---|
 | M0 | `oracle-types`, `oracle-wire` | **done** |
 | M1 | Binance adapter + normalization | **done** (see caveat below) |
-| M2 | `oracle-agg` + halt/degrade | not started |
+| M2 | `oracle-agg` + halt/degrade | **done** |
 | M3 | WS/REST server + client SDK | not started |
 | M4 | Remaining venues + USDT/USD conversion | not started |
 | M5 | Multi-node deploy + registry rotation | not started |
@@ -61,6 +61,44 @@ Two invariants the code enforces rather than documents:
   `IngestEvent::Disconnected` before any post-reconnect quote, and consumers must
   drop that venue's book rather than carry a pre-gap quote across the hole.
 
+### `oracle-agg`
+
+Aggregation: many venues' observations into one price and confidence.
+
+`Aggregator` holds no clock, opens no socket, spawns nothing. Time arrives as a
+`now_ns` argument and results are returned rather than sent — so a recorded
+observation sequence replays bit-for-bit, months later, on another machine. Every
+production incident becomes a unit test instead of an argument.
+
+```text
+observations ──▶ per-venue quote     (microprice, staleness, crossed books)
+             ──▶ outlier rejection   (MAD, unweighted, never below quorum)
+             ──▶ weight cap          (no source may buy the median)
+             ──▶ weighted median
+             ──▶ confidence          (disagreement ∨ spread ∨ floor)
+             ──▶ circuit breakers    (jump corroboration, sanity band)
+             ──▶ publication policy  (rate cap, then deviation ∨ heartbeat)
+```
+
+**The governing bias: degrade loudly, halt rarely, never silently narrow.** An
+oracle that goes dark breaks its consumers; one that publishes a confident wrong
+number liquidates them. Widening the confidence interval is the pressure-release
+valve. Halting is reserved for the two cases with no honest price to widen
+around: too few live sources, and a price outside the sanity band.
+
+`conf` is the widest of three floors — venue disagreement, actual book spreads,
+and an absolute minimum. It is not decoration; it is how the oracle says "markets
+are dislocated" without either lying or going dark, and it is the number a
+consumer should key off.
+
+**Why the weight cap exists.** A weighted median offers no protection against
+weight itself: a sample holding more than half the total *is* the answer,
+whatever its value. The weight inputs — spread and freshness — are exactly what a
+manipulating venue controls. So outlier rejection runs first and is deliberately
+**unweighted**, and surviving weights are then capped to a multiple of the median
+weight. `stats::a_dominant_weight_captures_the_weighted_median` documents the
+underlying hazard so nobody removes those two defences by accident.
+
 ### `oracle-wire`
 
 Byte layouts and cryptography.
@@ -93,6 +131,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
+
+### Adversarial replay
+
+`crates/oracle-agg/tests/adversarial.rs` drives manipulated venues through the
+full aggregator. Every scenario asserts one contract: the aggregator prices
+honestly, degrades loudly, or halts — but never publishes a confidently wrong
+number. Covered: spoofed prints, frozen feeds, one-sided and crossed books, slow
+drift, implausibly tight books bidding for weight, quorum loss, market-wide
+dislocation, mid-second disconnects, rate-cap behaviour under volatility,
+sequence monotonicity across halt/recover cycles, and replay determinism.
 
 ### Running against live venues
 

@@ -26,6 +26,32 @@ pub enum ObsKind {
 }
 
 impl ObsKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::BookTop,
+        Self::Trade,
+        Self::MarkPrice,
+        Self::IndexPrice,
+        Self::Funding,
+        Self::OpenInterest,
+    ];
+
+    /// Number of kinds. Sizes the per-venue latest-observation slots.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Returns a dense index in `0..COUNT`, for array-backed lookups.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::BookTop => 0,
+            Self::Trade => 1,
+            Self::MarkPrice => 2,
+            Self::IndexPrice => 3,
+            Self::Funding => 4,
+            Self::OpenInterest => 5,
+        }
+    }
+
     /// Returns `true` if this kind carries a two-sided book.
     #[must_use]
     pub const fn has_book(self) -> bool {
@@ -208,6 +234,14 @@ mod tests {
             local_recv_ns: 2_000,
             seq: None,
         }
+    }
+
+    #[test]
+    fn kind_indices_are_dense_and_unique() {
+        for (position, kind) in ObsKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), position);
+        }
+        assert_eq!(ObsKind::COUNT, 6);
     }
 
     #[test]

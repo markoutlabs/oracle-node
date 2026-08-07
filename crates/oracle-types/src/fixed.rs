@@ -331,6 +331,21 @@ impl Fixed {
         Self(self.0.saturating_sub(rhs.0))
     }
 
+    /// Returns the square root, or `None` for negative values.
+    ///
+    /// `sqrt(m / S) = sqrt(m · S) / S`, so the mantissa is scaled up once before
+    /// the integer root. Exact and deterministic — no floating point, and no
+    /// dependence on the host's libm.
+    #[inline]
+    #[must_use]
+    pub fn sqrt(self) -> Option<Self> {
+        if self.0 < 0 {
+            return None;
+        }
+        let radicand = self.0.checked_mul(SCALE)?;
+        Some(Self(radicand.isqrt()))
+    }
+
     /// Returns this value as a fraction of `reference`, in basis points.
     ///
     /// Returns `None` if `reference` is zero or the computation overflows.
@@ -595,6 +610,30 @@ mod tests {
     }
 
     #[test]
+    fn square_roots_are_exact_where_they_can_be() {
+        assert_eq!(
+            Fixed::from_int(4).expect("in range").sqrt(),
+            Fixed::from_int(2).ok()
+        );
+        assert_eq!(
+            Fixed::from_int(9).expect("in range").sqrt(),
+            Fixed::from_int(3).ok()
+        );
+        assert_eq!(Fixed::ZERO.sqrt(), Some(Fixed::ZERO));
+        assert_eq!(Fixed::ONE.sqrt(), Some(Fixed::ONE));
+        // sqrt(2) to twelve places, truncated by the integer root.
+        assert_eq!(
+            Fixed::from_int(2)
+                .expect("in range")
+                .sqrt()
+                .expect("non-negative")
+                .to_string(),
+            "1.414213562373"
+        );
+        assert_eq!(Fixed::from_int(-1).expect("in range").sqrt(), None);
+    }
+
+    #[test]
     fn bps_of_reference() {
         let diff: Fixed = "6.43125".parse().expect("valid");
         let reference: Fixed = "64312.5".parse().expect("valid");
@@ -626,6 +665,18 @@ mod tests {
         fn scaled_round_trip_is_lossless_within_range(mantissa in -1_000_000_000_000_i64..1_000_000_000_000_i64) {
             let value = Fixed::from_scaled(mantissa, -8).expect("in range");
             proptest::prop_assert_eq!(value.to_scaled(-8).expect("in range"), mantissa);
+        }
+
+        #[test]
+        fn sqrt_squared_is_close_to_the_input(raw in 0i128..1_000_000_000_000_000) {
+            let value = Fixed::from_raw(raw);
+            let root = value.sqrt().expect("non-negative");
+            let squared = root.checked_mul(root).expect("in range");
+            // Truncation loses at most one unit in the last place of the root,
+            // so the square is within 2*root+1 raw units below the input.
+            let tolerance = Fixed::from_raw(root.raw().saturating_mul(2).saturating_add(1));
+            proptest::prop_assert!(squared <= value);
+            proptest::prop_assert!(value.checked_sub(squared).expect("in range") <= tolerance);
         }
 
         #[test]

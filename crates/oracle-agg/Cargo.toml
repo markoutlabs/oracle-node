@@ -1,0 +1,19 @@
+[package]
+name = "oracle-agg"
+description = "Deterministic price aggregation: observations in, one price and confidence interval out."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-types.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

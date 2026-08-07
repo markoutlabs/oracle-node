@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/oracle-types", "crates/oracle-wire", "crates/oracle-ingest"]
+members = [
+    "crates/oracle-types",
+    "crates/oracle-wire",
+    "crates/oracle-ingest",
+    "crates/oracle-agg",
+]
 
 [workspace.package]
 version = "0.1.0"
