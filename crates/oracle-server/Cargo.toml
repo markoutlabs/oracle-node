@@ -1,0 +1,30 @@
+[package]
+name = "oracle-server"
+description = "Subscriber-facing WebSocket and REST server for a price oracle node."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-types.workspace = true
+oracle-wire.workspace = true
+
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+oracle-client.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio-tungstenite = { workspace = true, features = ["connect"] }
+
+[lints]
+workspace = true

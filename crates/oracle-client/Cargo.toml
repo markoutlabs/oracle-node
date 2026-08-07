@@ -1,0 +1,27 @@
+[package]
+name = "oracle-client"
+description = "Consumer SDK: verify signed oracle updates from many nodes and resolve one price."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-agg.workspace = true
+oracle-types.workspace = true
+oracle-wire.workspace = true
+
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

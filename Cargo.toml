@@ -5,6 +5,8 @@ members = [
     "crates/oracle-wire",
     "crates/oracle-ingest",
     "crates/oracle-agg",
+    "crates/oracle-client",
+    "crates/oracle-server",
 ]
 
 [workspace.package]
@@ -16,8 +18,14 @@ repository = "https://github.com/example/price-oracle"
 
 [workspace.dependencies]
 oracle-types = { path = "crates/oracle-types", version = "0.1.0" }
+oracle-wire = { path = "crates/oracle-wire", version = "0.1.0" }
+oracle-agg = { path = "crates/oracle-agg", version = "0.1.0" }
+oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
+oracle-client = { path = "crates/oracle-client", version = "0.1.0" }
 
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }

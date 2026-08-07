@@ -17,7 +17,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M0 | `oracle-types`, `oracle-wire` | **done** |
 | M1 | Binance adapter + normalization | **done** (see caveat below) |
 | M2 | `oracle-agg` + halt/degrade | **done** |
-| M3 | WS/REST server + client SDK | not started |
+| M3 | WS/REST server + client SDK | **done** |
 | M4 | Remaining venues + USDT/USD conversion | not started |
 | M5 | Multi-node deploy + registry rotation | not started |
 | M6 | Hardening | not started |
@@ -99,6 +99,46 @@ manipulating venue controls. So outlier rejection runs first and is deliberately
 weight. `stats::a_dominant_weight_captures_the_weighted_median` documents the
 underlying hazard so nobody removes those two defences by accident.
 
+### `oracle-server`
+
+The subscriber-facing node: WebSocket fanout and REST.
+
+Fanout is **conflating** — one slot per feed per subscriber, newer replaces
+pending older. A stale price delivered from behind a backlog is worse than no
+price, because the consumer acts on it as though it were current. Frames are
+signed and encoded once and shared as `Bytes` across every subscriber; the JSON
+view is built lazily, since most subscribers take binary.
+
+The consequence consumers must internalise: **you observe state, not
+transitions.** A sub-second halt can be conflated away. Every frame carries
+complete state and the heartbeat makes any sustained halt unmissable, but code
+that accumulates transitions rather than reading state will eventually be wrong.
+
+`GET /v1/registry` serves this node's registry as a **hint, never a trust root**.
+A consumer that accepted it as authoritative would let the node vouch for itself,
+and therefore add itself.
+
+### `oracle-client`
+
+The consumer SDK, and the answer to "so how do I actually use this safely".
+
+Two pure, synchronous halves with a thin async layer on top:
+
+- `Verifier` — one update at a time: signature, registry membership, certificate
+  validity **at publish time**, sequence monotonicity, staleness, coherence.
+  Replay and staleness are the consumer's job because signatures say nothing
+  about freshness: a relay that withholds new updates and rebroadcasts an old one
+  passes every cryptographic check flawlessly.
+- `FeedView` — the cross-node step: median price, with confidence floored at half
+  the inter-node spread. **That floor is the crux.** A disagreeing node cannot
+  move the median, and its disagreement automatically widens the band — so a
+  consumer keying off `conf` reacts correctly with no extra logic.
+
+`OracleClientBuilder::build` **refuses a quorum below three** unless you call
+`i_understand_this_provides_no_protection_against_a_bad_node()`. Verifying
+signatures from one node confirms who is talking and nothing else, and that is
+the mistake most likely to be made during integration and then never revisited.
+
 ### `oracle-wire`
 
 Byte layouts and cryptography.
@@ -131,6 +171,15 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
+
+### End to end
+
+`crates/oracle-server/tests/end_to_end.rs` runs the real axum server over a real
+TCP listener and drives it with the real SDK — no mocks on either side of the
+wire. The scenarios that matter are the ones where something is wrong: a forged
+frame, a captured frame replayed, a node reporting itself halted, one node lying
+among three, and a node-served registry that still demands the pinned governance
+key.
 
 ### Adversarial replay
 
