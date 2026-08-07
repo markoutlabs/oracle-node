@@ -270,6 +270,22 @@ impl fmt::Display for MarketKind {
     }
 }
 
+impl MarketKind {
+    /// Every market kind.
+    pub const ALL: [Self; 2] = [Self::Spot, Self::LinearPerp];
+}
+
+impl FromStr for MarketKind {
+    type Err = VenueError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|market| market.as_str() == s)
+            .ok_or_else(|| VenueError::Unknown(s.to_owned()))
+    }
+}
+
 /// A specific tradeable instrument on a specific venue.
 ///
 /// The symbol is the venue's own spelling (`BTCUSDT`, `BTC-USD`, `XBT/USD`),
@@ -385,6 +401,17 @@ mod tests {
             .collect();
         assert!(!stablecoin_only.has_native_usd());
         assert!(stablecoin_only.with(Venue::Kraken).has_native_usd());
+    }
+
+    #[test]
+    fn market_name_round_trips() {
+        for market in MarketKind::ALL {
+            assert_eq!(
+                market.as_str().parse::<MarketKind>().expect("known"),
+                market
+            );
+        }
+        assert!("futures".parse::<MarketKind>().is_err());
     }
 
     #[test]

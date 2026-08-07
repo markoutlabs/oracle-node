@@ -1,0 +1,55 @@
+# An oracle node, end to end.
+#
+# Ingest subscriptions are DERIVED from the feed sources below — there is no
+# separate instrument list to keep in sync. Two lists would drift, and the
+# failure mode of that drift is a feed that quietly loses a venue.
+
+node_id = "oracle-eu-1"
+
+# How often to evaluate every feed. Must be at or below the tightest feed's rate
+# cap (50ms by default), or the cap becomes the tick rate and the deviation
+# trigger never fires early.
+tick_interval_ms = 25
+
+[server]
+listen = "0.0.0.0:8080"
+# Distinct feeds a subscriber may have outstanding before it is disconnected as
+# lagged. Fanout conflates per feed, so this is a breadth limit, not a depth one.
+max_pending_feeds = 512
+
+[signing]
+# A file or an environment variable, never a command-line argument: arguments are
+# visible in `ps` to every user on the box.
+key_file = "/etc/oracle/signing.key"
+# key_env = "ORACLE_SIGNING_KEY"
+
+[registry]
+path = "/etc/oracle/registry.json"
+# Pinned here rather than taken from the registry itself, which would let the
+# document vouch for its own author.
+governance_address = "0x0000000000000000000000000000000000000000"
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BTCUSDT" },
+  # Further venues land here as M4 adds their adapters.
+]
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
+]
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.FUNDING_8H"
+# Funding genuinely updates on the order of minutes, so the spot staleness
+# threshold would halt it permanently.
+slow = true
+min_sources = 1
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["funding"] },
+]

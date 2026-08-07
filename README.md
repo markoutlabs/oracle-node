@@ -18,6 +18,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M1 | Binance adapter + normalization | **done** (see caveat below) |
 | M2 | `oracle-agg` + halt/degrade | **done** |
 | M3 | WS/REST server + client SDK | **done** |
+| M3.5 | `oracle-node` binary wiring the pipeline | **done** |
 | M4 | Remaining venues + USDT/USD conversion | not started |
 | M5 | Multi-node deploy + registry rotation | not started |
 | M6 | Hardening | not started |
@@ -139,6 +140,28 @@ Two pure, synchronous halves with a thin async layer on top:
 signatures from one node confirms who is talking and nothing else, and that is
 the mistake most likely to be made during integration and then never revisited.
 
+### `oracle-node`
+
+The binary. One config file describes the whole node; ingest subscriptions are
+**derived** from the feed definitions rather than listed separately, because two
+lists would drift and the failure mode of that drift is a feed that quietly loses
+a venue.
+
+`Pipeline` is synchronous and owned by a single task. That is deliberate: the
+ordering guarantee `oracle-ingest` provides — a disconnect notice reaching the
+aggregator before any post-reconnect quote — only means something if nothing
+downstream reorders it. Fanning events across workers would break it silently.
+
+```sh
+cargo run -p oracle-node -- crates/oracle-node/config/example.toml
+```
+
+The signing key comes from a file or an environment variable, never a
+command-line argument: arguments are visible in `ps` to every user on the box.
+At startup the node checks that the registry actually authorises its own signing
+address, and warns loudly if not — otherwise the first sign that nothing verifies
+comes from a downstream consumer.
+
 ### `oracle-wire`
 
 Byte layouts and cryptography.
@@ -171,6 +194,20 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
+
+### Running a node locally
+
+```sh
+# One-node registry plus keys, generated with the real tooling.
+cargo run -p oracle-node --example gen_local_registry > registry.json
+
+cargo run -p oracle-node -- node.toml            # ingest, sign, serve
+cargo run -p oracle-client --example subscribe \
+  -- registry.json 0x<governance> CRYPTO.BTC/USDT
+```
+
+Confirmed live against Binance: exchange → node → signed frame → WebSocket → SDK
+verification, with prices resolving `Ok` and zero rejected frames.
 
 ### End to end
 

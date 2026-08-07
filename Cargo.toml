@@ -7,6 +7,7 @@ members = [
     "crates/oracle-agg",
     "crates/oracle-client",
     "crates/oracle-server",
+    "crates/oracle-node",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ oracle-wire = { path = "crates/oracle-wire", version = "0.1.0" }
 oracle-agg = { path = "crates/oracle-agg", version = "0.1.0" }
 oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
 oracle-client = { path = "crates/oracle-client", version = "0.1.0" }
+oracle-server = { path = "crates/oracle-server", version = "0.1.0" }
 
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
@@ -37,6 +39,8 @@ tokio = { version = "1", default-features = false }
 tokio-tungstenite = { version = "0.30", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-util = "0.7"
+toml = "0.9"
+tracing-subscriber = "0.3"
 tracing = "0.1"
 
 

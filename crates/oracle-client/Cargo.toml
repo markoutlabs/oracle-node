@@ -21,7 +21,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+oracle-wire.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

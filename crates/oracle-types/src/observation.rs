@@ -78,6 +78,22 @@ impl fmt::Display for ObsKind {
     }
 }
 
+impl core::str::FromStr for ObsKind {
+    type Err = ObsKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == s)
+            .ok_or_else(|| ObsKindError(s.to_owned()))
+    }
+}
+
+/// An unrecognised observation kind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown observation kind `{0}`")]
+pub struct ObsKindError(pub String);
+
 /// One venue's observation of one instrument.
 ///
 /// # Timestamps
@@ -234,6 +250,14 @@ mod tests {
             local_recv_ns: 2_000,
             seq: None,
         }
+    }
+
+    #[test]
+    fn kind_names_round_trip() {
+        for kind in ObsKind::ALL {
+            assert_eq!(kind.as_str().parse::<ObsKind>().expect("known"), kind);
+        }
+        assert!("nonsense".parse::<ObsKind>().is_err());
     }
 
     #[test]

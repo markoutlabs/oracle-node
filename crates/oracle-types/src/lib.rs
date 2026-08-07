@@ -22,7 +22,7 @@ mod venue;
 
 pub use fixed::{Fixed, FixedError};
 pub use flags::Flags;
-pub use observation::{ObsKind, Observation};
+pub use observation::{ObsKind, ObsKindError, Observation};
 pub use symbol::{AssetClass, AssetCode, FeedId, FeedKind, Symbol, SymbolError};
 pub use update::PriceUpdate;
 pub use venue::{InstrumentId, MarketKind, Venue, VenueError, VenueSet};
