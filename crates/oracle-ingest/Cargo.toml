@@ -1,0 +1,34 @@
+[package]
+name = "oracle-ingest"
+description = "Exchange WebSocket ingest: adapters, reconnect sessions, and normalization into observations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-types.workspace = true
+
+async-trait.workspace = true
+futures-util.workspace = true
+serde = { workspace = true }
+rustls.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+oracle-types = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "test-util",
+    "macros",
+    "signal",
+] }
+
+[lints]
+workspace = true

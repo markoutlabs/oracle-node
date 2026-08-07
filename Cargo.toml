@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/oracle-types", "crates/oracle-wire", "crates/oracle-ingest"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/price-oracle"
+
+[workspace.dependencies]
+oracle-types = { path = "crates/oracle-types", version = "0.1.0" }
+
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tiny-keccak = { version = "2", features = ["keccak"] }
+tokio = { version = "1", default-features = false }
+tokio-tungstenite = { version = "0.30", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+
+proptest = "1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unexpected_cfgs = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+
+# Selected pedantic lints. Money- and signature-handling code should not
+# silently truncate, wrap, or panic.
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+indexing_slicing = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = false

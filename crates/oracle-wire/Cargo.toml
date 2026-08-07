@@ -1,0 +1,23 @@
+[package]
+name = "oracle-wire"
+description = "Canonical encoding, signing, and verification for oracle price updates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-types.workspace = true
+
+hex.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tiny-keccak.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
