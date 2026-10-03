@@ -8,6 +8,7 @@ members = [
     "crates/oracle-client",
     "crates/oracle-server",
     "crates/oracle-node",
+    "crates/oracle-registry-canister",
 ]
 
 [workspace.package]
@@ -25,8 +26,19 @@ oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
 oracle-client = { path = "crates/oracle-client", version = "0.1.0" }
 oracle-server = { path = "crates/oracle-server", version = "0.1.0" }
 
+# Internet Computer. Only the registry canister and its test use these.
+candid = "0.10"
+ic-cdk = "0.20"
+ic-cdk-management-canister = "0.2"
+ic-cdk-timers = "1"
+pocket-ic = "9"
+
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
+backon = { version = "1", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+time = { version = "0.3", default-features = false, features = ["parsing", "std"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }

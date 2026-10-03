@@ -3,7 +3,7 @@
 use core::fmt;
 use core::str::FromStr;
 
-use crate::WireError;
+use crate::{Address, WireError, backend};
 
 /// Length of an encoded signature: `r ‖ s ‖ v`.
 pub const SIGNATURE_LEN: usize = 65;
@@ -74,6 +74,40 @@ impl Signature {
                 .ok_or(WireError::RecoveryFailed)?;
         }
         Self::from_bytes(bytes)
+    }
+
+    /// Adapts a plain 64-byte `r ‖ s` signature whose signer is already known.
+    ///
+    /// Threshold signers such as the Internet Computer's `sign_with_ecdsa`
+    /// return no recovery id and do not promise low-`s`. The curve backend
+    /// folds `s` into the low half, and the recovery id is found by recovering
+    /// with both candidates and comparing against `expected`. The result
+    /// verifies like any other [`Signature`] in the protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::ZeroScalar`] for a zero `r` or `s`, and
+    /// [`WireError::RecoveryFailed`] if the scalars are not a signature or
+    /// neither recovery id yields `expected`, which means the signature is not
+    /// over `digest` or not by that key.
+    pub fn from_compact_for(
+        digest: &[u8; 32],
+        compact: &[u8; 64],
+        expected: Address,
+    ) -> Result<Self, WireError> {
+        let (r, s) = compact.split_at(32);
+        if r.iter().all(|&b| b == 0) || s.iter().all(|&b| b == 0) {
+            return Err(WireError::ZeroScalar);
+        }
+        let low = backend::normalize_s(compact)?;
+        for recovery in 0..=1_u8 {
+            if let Ok(public) = backend::recover(digest, &low, recovery)
+                && Address::from_uncompressed(&public) == expected
+            {
+                return Self::from_parts(&low, recovery);
+            }
+        }
+        Err(WireError::RecoveryFailed)
     }
 
     /// Splits into `r ‖ s` and the raw recovery id in `{0, 1}`.
@@ -243,6 +277,48 @@ mod tests {
         assert_eq!(
             Signature::from_parts(&compact, 2),
             Err(WireError::InvalidRecoveryByte(29))
+        );
+    }
+
+    /// A threshold signer returns `r ‖ s` with no recovery id and possibly a
+    /// high `s`. Adapting it must land on exactly the canonical signature the
+    /// in-process signer would have produced.
+    #[test]
+    fn adapts_a_high_s_compact_signature_from_a_known_signer() {
+        let signer = Signer::from_secret_bytes([9_u8; 32]).expect("valid key");
+        let digest = [0x5A_u8; 32];
+        let canonical = signer.sign_digest(&digest);
+        let (low, _) = canonical.parts();
+
+        // The same signature with s' = n - s: the high-s twin that verifies
+        // identically and that `from_bytes` rejects. A fixed vector, so the test
+        // does no curve arithmetic of its own.
+        let mut high = [0_u8; 64];
+        hex::decode_to_slice(
+            "eb512eded9ae28506f5c530c71a932c454a41b39f2982e4d1ceabd29c469af05\
+             a66e7a605d574763ee8334ba5da52d5e8f443b5683529dde3c170f858432ea04",
+            &mut high,
+        )
+        .expect("vector");
+        assert_eq!(high[..32], low[..32], "same r");
+        assert_ne!(high[32..], low[32..], "negated s");
+        assert!(high[32..] > HALF_CURVE_ORDER[..], "the vector is high-s");
+
+        let from_low =
+            Signature::from_compact_for(&digest, &low, signer.address()).expect("adapts");
+        let from_high =
+            Signature::from_compact_for(&digest, &high, signer.address()).expect("adapts");
+        assert_eq!(from_low, canonical);
+        assert_eq!(from_high, canonical);
+
+        let other = Signer::from_secret_bytes([10_u8; 32]).expect("valid key");
+        assert_eq!(
+            Signature::from_compact_for(&digest, &low, other.address()),
+            Err(WireError::RecoveryFailed)
+        );
+        assert_eq!(
+            Signature::from_compact_for(&digest, &[0_u8; 64], signer.address()),
+            Err(WireError::ZeroScalar)
         );
     }
 

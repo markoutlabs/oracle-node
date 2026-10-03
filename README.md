@@ -330,6 +330,37 @@ bytes ──parse──▶ UnverifiedFrame ──verify(&VerifiedRegistry)──
 
 Verification stops at "a registered node really signed this". Sequence monotonicity, staleness, and cross-node quorum are consumer policy and belong to the client SDK (M3). **A signed update is a bearer token that never expires on its own**: a relay that withholds new updates and rebroadcasts an old one passes every check in `oracle-wire`.
 
+### `oracle-registry-canister`
+
+The node registry as an Internet Computer canister (SPEC §3.6). It is the
+trust root for membership: who the nodes are, which signing key each one holds
+right now, and which keys it held before.
+
+- **The canister signs the registry.** Every version is signed with a
+  threshold ECDSA key on secp256k1, so the governance address consumers pin is
+  the address of that key and `Registry::verify` is unchanged. No governance
+  private key exists anywhere. Consumers need no Internet Computer agent; they
+  fetch `/registry.json` and verify the signature they already verify.
+- **One live key per node.** `rotate_key` is an atomic swap. The old key gets a
+  `retired_at` and stays in `get_key_history` for stored-frame verification,
+  but it never verifies a live frame again, and its address can never be listed
+  again by anyone.
+- **Rules are code, not policy.** One rotation fleet-wide per window, never
+  below `min_nodes`, a heartbeat re-sign so a withheld document is detectable
+  by age. Each rule is a unit test in `state.rs`, with no canister runtime.
+- **Governance is the controller set.** A single-controller canister is a
+  single governance key with extra steps; put it under a multisig or an SNS
+  with timelocked upgrades.
+
+`state.rs` is the whole state machine and has no IC dependency. `lib.rs` adds
+the caller, the clock, stable memory, and the signing round. Entries,
+certificates and documents cross the Candid boundary as JSON strings in the
+protocol's own format, so there is one schema rather than a Candid mirror.
+
+`tests/pocket_ic.rs` runs the real wasm on PocketIC with real threshold
+signing. It needs the PocketIC server: set `POCKET_IC_BIN`, or have a `dfx`
+install whose cache bundles it. The test builds the canister wasm itself.
+
 ## Development
 
 ```sh
@@ -340,7 +371,13 @@ cargo fmt --all --check
 # The two secp256k1 backends must agree byte for byte. The golden vectors
 # run under k256 here, and the wasm32 build is what the registry canister needs.
 cargo test -p oracle-wire --features pure-rust
-cargo build -p oracle-wire --no-default-features --target wasm32-unknown-unknown
+cargo clippy --target wasm32-unknown-unknown -p oracle-wire -p oracle-registry-canister \
+  --no-default-features --lib -- -D warnings
+
+# The canister wasm and its Candid interface.
+cargo build -p oracle-registry-canister --target wasm32-unknown-unknown --release
+candid-extractor target/wasm32-unknown-unknown/release/oracle_registry_canister.wasm \
+  > crates/oracle-registry-canister/oracle-registry-canister.did
 ```
 
 ### Running a node locally

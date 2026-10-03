@@ -64,6 +64,12 @@ pub(crate) fn recover(
     Ok(uncompressed(&key))
 }
 
+/// Folds `s` into the low half of the group, leaving low-`s` input unchanged.
+pub(crate) fn normalize_s(compact: &[u8; 64]) -> Result<[u8; 64], WireError> {
+    let sig = Signature::from_slice(compact).map_err(|_| WireError::RecoveryFailed)?;
+    Ok(sig.normalize_s().unwrap_or(sig).to_bytes().into())
+}
+
 /// Decompresses a 33-byte public key.
 pub(crate) fn decompress(compressed: &[u8; 33]) -> Result<[u8; 65], WireError> {
     VerifyingKey::from_sec1_bytes(compressed)

@@ -1,0 +1,30 @@
+[package]
+name = "oracle-registry-canister"
+description = "The node registry as an Internet Computer canister: membership, key rotation, and a threshold-ECDSA-signed registry document."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# No `os-rng`: a canister never generates keys and wasm32 has no entropy
+# source `getrandom` knows about.
+oracle-wire = { path = "../oracle-wire", version = "0.1.0", default-features = false }
+
+candid.workspace = true
+ic-cdk.workspace = true
+ic-cdk-management-canister.workspace = true
+ic-cdk-timers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pocket-ic.workspace = true
+
+[lints]
+workspace = true

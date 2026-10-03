@@ -60,6 +60,14 @@ pub(crate) fn recover(
         .map_err(|_| WireError::RecoveryFailed)
 }
 
+/// Folds `s` into the low half of the group, leaving low-`s` input unchanged.
+pub(crate) fn normalize_s(compact: &[u8; 64]) -> Result<[u8; 64], WireError> {
+    let mut sig = secp256k1::ecdsa::Signature::from_compact(compact)
+        .map_err(|_| WireError::RecoveryFailed)?;
+    sig.normalize_s();
+    Ok(sig.serialize_compact())
+}
+
 /// Decompresses a 33-byte public key.
 pub(crate) fn decompress(compressed: &[u8; 33]) -> Result<[u8; 65], WireError> {
     PublicKey::from_byte_array_compressed(*compressed)
