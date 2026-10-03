@@ -116,7 +116,7 @@ pub struct RegistrySettings {
     #[serde(default)]
     pub path: Option<PathBuf>,
     /// URL of the signed registry JSON, usually the registry canister's
-    /// `/registry.json` on its raw gateway domain (SPEC §3.6).
+    /// `/registry.json` (SPEC §3.6).
     ///
     /// Fetched at startup. The response is not trusted beyond parsing; the
     /// document's governance signature is the check.

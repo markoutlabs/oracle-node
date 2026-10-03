@@ -86,6 +86,8 @@ pub struct HttpResponse {
     pub headers: Vec<(String, String)>,
     /// Response body.
     pub body: Vec<u8>,
+    /// Ask the gateway to repeat the request as an update call.
+    pub upgrade: Option<bool>,
 }
 
 fn now_secs() -> u64 {
@@ -349,20 +351,32 @@ fn get_pending() -> String {
     })
 }
 
-/// Serves the registry document at `/registry.json`.
+/// Answers a gateway request for `/registry.json` by asking for an update call.
 ///
-/// The response is not certified by the subnet. It does not need to be: the
-/// document carries its own governance signature, which is the check every
-/// consumer runs. Fetch it through a raw gateway domain or an agent.
+/// HTTP gateways refuse a query response the canister has not certified. This
+/// canister does not build certification trees; instead it upgrades the request
+/// to an update call, whose result consensus certifies on its own. Fetches are
+/// rare (startup, rotation, once per `refresh_interval`), so the update-call
+/// latency is acceptable, and the document still carries its own governance
+/// signature, which is the check every consumer runs.
 #[ic_cdk::query]
 fn http_request(request: HttpRequest) -> HttpResponse {
-    let path = request.url.split('?').next().unwrap_or_default();
-    if request.method != "GET" || path != "/registry.json" {
-        return HttpResponse {
-            status_code: 404,
-            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
-            body: b"not found".to_vec(),
-        };
+    if !is_registry_request(&request) {
+        return not_found();
+    }
+    HttpResponse {
+        status_code: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+        upgrade: Some(true),
+    }
+}
+
+/// Serves the registry document at `/registry.json`, as an update call.
+#[ic_cdk::update]
+fn http_request_update(request: HttpRequest) -> HttpResponse {
+    if !is_registry_request(&request) {
+        return not_found();
     }
     match get_registry() {
         Some(json) => HttpResponse {
@@ -372,12 +386,28 @@ fn http_request(request: HttpRequest) -> HttpResponse {
                 ("cache-control".to_owned(), "no-cache".to_owned()),
             ],
             body: json.into_bytes(),
+            upgrade: None,
         },
         None => HttpResponse {
             status_code: 503,
             headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
             body: b"no registry version has been published yet".to_vec(),
+            upgrade: None,
         },
+    }
+}
+
+fn is_registry_request(request: &HttpRequest) -> bool {
+    let path = request.url.split('?').next().unwrap_or_default();
+    request.method == "GET" && path == "/registry.json"
+}
+
+fn not_found() -> HttpResponse {
+    HttpResponse {
+        status_code: 404,
+        headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+        body: b"not found".to_vec(),
+        upgrade: None,
     }
 }
 

@@ -1,7 +1,7 @@
 //! Signing-key certificates.
 //!
-//! A node has two keys. The **identity key** is long-lived, belongs in a KMS or
-//! HSM, and signs nothing but certificates. The **signing key** lives in process
+//! A node has two keys. The **identity key** is long-lived, stays encrypted on
+//! the operator's machine, and signs nothing but certificates. The **signing key** lives in process
 //! memory, signs every price update, and is rotated on a schedule. A certificate
 //! is the identity key's statement that a given signing address is authorised
 //! for a given window.

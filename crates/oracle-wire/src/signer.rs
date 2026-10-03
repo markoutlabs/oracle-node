@@ -14,7 +14,7 @@ use crate::{Address, CompressedPublicKey, Signature, WireError, backend, domain}
 /// This is the hot signing key, not the node identity key. It is expected to
 /// live in process memory, be rotated on a schedule, and be authorised by a
 /// [`crate::SigningKeyCert`] issued by the identity key — which should live in a
-/// KMS or HSM and never sign a price.
+/// encrypted file on the operator's machine and never sign a price.
 ///
 /// The [`fmt::Debug`] implementation redacts the secret, and [`Drop`] erases it.
 /// Neither is a substitute for keeping the key out of logs, cores, and swap.

@@ -6,7 +6,7 @@
 //!   registry.json 0x<governance-address> CRYPTO.BTC/USDT
 //! # From the registry canister, refreshing on rotation.
 //! cargo run -p oracle-client --example subscribe -- \
-//!   https://<canister-id>.raw.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT
+//!   https://<canister-id>.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT
 //! ```
 //!
 //! Uses a quorum of one so it can run against a single local node. That is
@@ -15,30 +15,40 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::Parser;
 use oracle_client::{HttpRegistrySource, OracleClient, Status};
+
+/// Subscribe to live nodes and print verified prices.
+#[derive(Parser)]
+struct Args {
+    /// A registry JSON file, or an `http(s)://` URL that serves one.
+    registry: String,
+    /// The pinned governance address, `0x`-hex.
+    governance: oracle_wire::Address,
+    /// Feed symbols, such as `CRYPTO.BTC/USDT`.
+    #[arg(required = true)]
+    symbols: Vec<String>,
+    /// How long to run.
+    #[arg(long, default_value_t = 12)]
+    seconds: u64,
+    /// Print every Nth resolved price.
+    #[arg(long, default_value_t = 20)]
+    every: u32,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let registry_arg = args
-        .next()
-        .ok_or("usage: subscribe <registry.json|https://.../registry.json> <gov> <symbol...>")?;
-    let governance: oracle_wire::Address =
-        args.next().ok_or("missing governance address")?.parse()?;
-    let symbols: Vec<String> = args.collect();
-    if symbols.is_empty() {
-        return Err("give at least one symbol".into());
-    }
+    let args = Args::parse();
 
     // A URL refreshes on its own when a node rotates. A file is pinned until
     // the process restarts.
-    let builder = if registry_arg.starts_with("http://") || registry_arg.starts_with("https://") {
-        let source = Arc::new(HttpRegistrySource::new(registry_arg)?);
-        OracleClient::builder_from_source(source, governance).await?
+    let builder = if args.registry.starts_with("http://") || args.registry.starts_with("https://") {
+        let source = Arc::new(HttpRegistrySource::new(args.registry.clone())?);
+        OracleClient::builder_from_source(source, args.governance).await?
     } else {
         let registry: oracle_wire::Registry =
-            serde_json::from_str(&std::fs::read_to_string(&registry_arg)?)?;
-        OracleClient::builder(registry.verify(governance, 0)?)
+            serde_json::from_str(&std::fs::read_to_string(&args.registry)?)?;
+        OracleClient::builder(registry.verify(args.governance, 0)?)
     };
 
     let mut client = builder
@@ -47,22 +57,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_age(Duration::from_secs(5))
         .build()?;
     println!(
-        "registry v{} verified against {governance}",
-        client.registry_version()
+        "registry v{} verified against {}",
+        client.registry_version(),
+        args.governance
     );
 
-    let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
+    let refs: Vec<&str> = args.symbols.iter().map(String::as_str).collect();
     client.subscribe(&refs).await?;
-    println!("subscribed to {refs:?}\n");
+    println!("subscribed to {refs:?} for {}s\n", args.seconds);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.seconds);
     let mut seen = 0_u32;
+    let mut version = client.registry_version();
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(price)) = tokio::time::timeout_at(deadline, client.next()).await else {
             break;
         };
         seen += 1;
-        if seen % 20 != 1 {
+        if client.registry_version() != version {
+            version = client.registry_version();
+            println!("--- adopted registry v{version} ---");
+        }
+        if seen % args.every != 1 {
             continue;
         }
         let status = match price.status {
@@ -82,7 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats = client.stats();
-    println!("\nverified {} update(s): {stats:?}", stats.accepted);
+    println!(
+        "\nverified {} update(s) on registry v{}: {stats:?}",
+        stats.accepted,
+        client.registry_version()
+    );
     if stats.accepted == 0 {
         return Err("no updates verified".into());
     }

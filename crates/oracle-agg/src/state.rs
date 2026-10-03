@@ -113,6 +113,25 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
+    /// Starts every feed's sequence counter at `floor`.
+    ///
+    /// `seq` must never go backwards for a `(node, feed)`, and consumers refuse
+    /// anything that does as a replay (SPEC §7). A counter that restarts at zero
+    /// with the process therefore blinds every consumer to this node until it
+    /// has published more updates than it ever had before. The node seeds the
+    /// floor from its clock in milliseconds: a restart lands above the previous
+    /// run as long as that run published fewer than one update per millisecond,
+    /// and the rate caps make that certain.
+    ///
+    /// Replay tests leave the floor at zero so recorded sequences reproduce.
+    #[must_use]
+    pub fn with_sequence_floor(mut self, floor: u64) -> Self {
+        for feed in &mut self.feeds {
+            feed.seq = floor;
+        }
+        self
+    }
+
     /// Builds an aggregator.
     ///
     /// # Errors
@@ -805,6 +824,24 @@ mod tests {
             update.flags.is_none(),
             "recovery must be announced, not waited out"
         );
+    }
+
+    /// A restarted node must not reuse sequence numbers, or consumers refuse
+    /// it as a replay until it catches up with its previous life.
+    #[test]
+    fn the_sequence_floor_puts_a_restart_above_the_previous_run() {
+        let mut aggregator = aggregator().with_sequence_floor(1_000_000);
+        feed(
+            &mut aggregator,
+            SECOND,
+            &[(Venue::Binance, "100", "100.02")],
+        );
+        feed(&mut aggregator, SECOND, &[(Venue::Bybit, "100", "100.02")]);
+        let first = aggregator
+            .poll(feed_id(), SECOND)
+            .expect("no error")
+            .expect("published");
+        assert_eq!(first.seq, 1_000_001);
     }
 
     #[test]

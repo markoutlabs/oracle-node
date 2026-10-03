@@ -1655,6 +1655,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "backon",
+ "clap",
  "futures-util",
  "oracle-agg",
  "oracle-types",

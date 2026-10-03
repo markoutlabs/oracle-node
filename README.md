@@ -21,6 +21,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M3.5 | `oracle-node` binary wiring the pipeline | **done** |
 | M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | **done** |
+| M5.5 | Registry canister, one live key per node | **done** |
 | M6 | Hardening | not started |
 
 ## Crates
@@ -207,9 +208,11 @@ broken or newer versions are being withheld. Every feed is then reported
 `Degraded` with `Concern::RegistryStale`. The prices are still verified; the
 membership may not be current.
 
-`HttpRegistrySource::canister(id)` fetches from the canister's raw gateway URL.
-The response is not IC-certified, and does not need to be: the document carries
-its own governance signature, which is the check every consumer runs.
+`HttpRegistrySource::canister(id)` fetches `/registry.json` from the canister.
+The canister answers through an update call, so the gateway's response
+verification passes without the canister building certification trees. The
+document carries its own governance signature either way, which is the check
+every consumer runs.
 
 Stored frames are a separate path. `verify_historical` checks a frame against
 the key that was live at its publish time, using the node's key history from the
@@ -278,7 +281,7 @@ The signing key comes from a file or an environment variable, never a
 command-line argument: arguments are visible in `ps` to every user on the box.
 
 The registry comes from `registry.path`, a file, or `registry.url`, usually the
-registry canister's `/registry.json` on its raw gateway domain. A file is pinned
+registry canister's `/registry.json`. A file is pinned
 until the node restarts. Either way the document is verified against the pinned
 `governance_address` before anything else happens.
 
@@ -426,6 +429,31 @@ cargo run -p oracle-node -- start node1/config.toml
 
 Confirmed live against Binance: exchange → node → signed frame → WebSocket → SDK
 verification, with prices resolving `Ok` and zero rejected frames.
+
+### End to end on a local replica
+
+`scripts/e2e-dfx.sh` is the M5.5 exit criterion as one command. It starts a
+clean local replica, deploys the registry canister, generates a node with
+`init`, submits and approves it through the canister, starts the node against
+the canister URL, and runs the SDK client. Then, with the client still running,
+it rotates the node's key through the canister, restarts the node on the new
+key, and checks the client's counters: exactly one registry refresh, no
+untrusted frames, no replays. It ends by printing the canister's key history.
+
+```sh
+scripts/e2e-dfx.sh                 # about three minutes; stops the replica after
+KEEP_REPLICA=1 scripts/e2e-dfx.sh  # leave the replica and the node running
+```
+
+It uses a throwaway `dfx` identity named `oracle-e2e`, never your default, and
+needs internet access for the venue connections. The first run found a real bug:
+a restarted node began its sequence numbers at zero and was refused as a replay
+for every frame until it caught up, which is why `Aggregator::with_sequence_floor`
+exists.
+
+The local gateway, like the mainnet one, verifies responses. The canister answers
+`/registry.json` through an update call rather than building certification trees,
+so the same URL shape works in both places and no `raw` domain is involved.
 
 ### Rotating a signing key
 

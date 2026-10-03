@@ -70,17 +70,17 @@ impl HttpRegistrySource {
         })
     }
 
-    /// The registry canister's `http_request` endpoint on the Internet Computer.
+    /// The registry canister's `/registry.json` on the Internet Computer.
     ///
-    /// The `raw` gateway serves the canister's response as is. The certifying
-    /// gateway would reject it, because the canister does not certify the
-    /// response: the document's own signature is the check that matters.
+    /// The canister answers through an update call, so the gateway's response
+    /// verification passes and no `raw` domain is needed. The document's own
+    /// governance signature remains the check that matters.
     ///
     /// # Errors
     ///
     /// See [`HttpRegistrySource::new`].
     pub fn canister(canister_id: &str) -> Result<Self, FetchError> {
-        Self::new(format!("https://{canister_id}.raw.icp0.io/registry.json"))
+        Self::new(format!("https://{canister_id}.icp0.io/registry.json"))
     }
 
     /// The URL fetched.
@@ -117,6 +117,6 @@ mod tests {
     #[test]
     fn the_http_client_builds_with_the_workspace_tls_provider() {
         let source = HttpRegistrySource::canister("aaaaa-aa").expect("builds");
-        assert_eq!(source.url(), "https://aaaaa-aa.raw.icp0.io/registry.json");
+        assert_eq!(source.url(), "https://aaaaa-aa.icp0.io/registry.json");
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! identity key ── long-lived. Signs only signing-key certificates, never prices.
-//!      │          Belongs in a KMS/HSM or age-encrypted at rest.
+//!      │          Encrypted at rest on the operator's machine.
 //!      └── signing key ── in process memory, rotated every 30 days.
 //!                         Signs every PriceUpdate.
 //! ```

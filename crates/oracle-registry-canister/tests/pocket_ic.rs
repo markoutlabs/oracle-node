@@ -281,20 +281,33 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
         Err(VerifyError::StaleRegistry { .. })
     ));
 
-    // The HTTP endpoint serves the same bytes.
-    let response: HttpResponse = h.query(
-        "http_request",
-        Encode!(&HttpRequest {
-            method: "GET".to_owned(),
-            url: "/registry.json?x=1".to_owned(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        })
-        .expect("encodes"),
+    // The HTTP endpoint upgrades to an update call, which then serves the
+    // same bytes. The gateway does the second hop; here it is explicit.
+    let request = HttpRequest {
+        method: "GET".to_owned(),
+        url: "/registry.json?x=1".to_owned(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let first: HttpResponse = h.query("http_request", Encode!(&request).expect("encodes"));
+    assert_eq!(first.upgrade, Some(true));
+    let response: HttpResponse = h.update(
+        Principal::anonymous(),
+        "http_request_update",
+        Encode!(&request).expect("encodes"),
     );
     assert_eq!(response.status_code, 200);
     let served: Registry = serde_json::from_slice(&response.body).expect("parses");
     assert_eq!(served, registry);
+    let missing: HttpResponse = h.query(
+        "http_request",
+        Encode!(&HttpRequest {
+            url: "/other".to_owned(),
+            ..request
+        })
+        .expect("encodes"),
+    );
+    assert_eq!(missing.status_code, 404);
 
     // Rotation: atomic swap, one live key, history kept, retired_at set.
     let old_a = a.signing.address();

@@ -171,7 +171,10 @@ async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Erro
     }
     report_cert_expiry(&verified, signer_address);
 
-    let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?;
+    // Sequence numbers must never go backwards for this node, including across
+    // restarts. Milliseconds since the epoch outrun any publish counter.
+    let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?
+        .with_sequence_floor(wall_clock_unix_nanos() / 1_000_000);
     let mut pipeline = Pipeline::new(aggregator, signer);
 
     let state = ServerState::new(
@@ -324,7 +327,7 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("  identity  {}", keys.identity.address());
     println!(
         "            Long-lived. Signs certificates, never prices. Keep it out of\n\
-         \x20           the node — a KMS, an HSM, or age-encrypted at rest."
+         \x20           the node process, encrypted at rest on this machine."
     );
     println!("  signing   {}", keys.signing.address());
     println!(
