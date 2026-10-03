@@ -76,6 +76,14 @@ pub enum WireError {
     #[error("invalid secret key")]
     InvalidSecretKey,
 
+    /// The operating system's entropy source could not be read.
+    ///
+    /// Fatal by design. Falling back to a weaker source would produce a key that
+    /// looks exactly like a good one and is guessable, and nothing downstream
+    /// could ever detect the difference.
+    #[error("cannot read entropy from the operating system: {0}")]
+    EntropyUnavailable(String),
+
     /// A compressed public key did not decode to a curve point.
     #[error("invalid public key")]
     InvalidPublicKey,

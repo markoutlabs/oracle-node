@@ -1,0 +1,200 @@
+# Every feed kind this build can actually serve, across all six venues.
+#
+#   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
+#     > node/registry.json
+#   ORACLE_SIGNING_KEY=4141414141414141414141414141414141414141414141414141414141414141 \
+#     cargo run -p oracle-node -- start node/all-feeds.toml --tail
+#
+# The key and governance address below are the deterministic ones
+# `gen_local_registry --nodes 1` prints. They are derived from small integers and
+# guessable by construction. Never use them anywhere real.
+#
+# Ingest subscriptions are DERIVED from the sources below — there is no separate
+# instrument list to keep in sync.
+
+node_id = "oracle-local-1"
+
+# At or below the tightest feed's rate cap (50ms), or the cap becomes the tick
+# rate and the deviation trigger never fires early. This is noisy under --tail;
+# grep it (`| grep published`) rather than raising it.
+tick_interval_ms = 25
+
+[server]
+listen = "127.0.0.1:8791"
+max_pending_feeds = 512
+
+[signing]
+key_env = "ORACLE_SIGNING_KEY"
+
+[registry]
+path = "node/registry.json"
+governance_address = "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb"
+
+# ---------------------------------------------------------------- the peg
+#
+# Must come from native-USD venues only. Sourcing CRYPTO.USDT/USD from a
+# USDT-quoted venue would be circular: it would report 1.0 by construction on
+# exactly the day it stopped being true. §12.4.
+#
+# Coinbase and Kraken are the only two native-USD venues in scope, which makes
+# losing both a distinct failure class rather than "two of six sources down".
+
+[[feeds]]
+symbol = "CRYPTO.USDT/USD"
+min_sources = 1
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "USDT-USD" },
+  { venue = "kraken", market = "spot", symbol = "USDT/USD" },
+]
+
+# ------------------------------------------------------------ spot, USD
+#
+# Native-USD venues price directly; USDT-quoted venues are converted through the
+# peg above. The peg's own uncertainty propagates in quadrature, so a wobbling
+# peg widens the whole catalogue instead of silently mispricing it.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USD"
+peg = "CRYPTO.USDT/USD"
+min_sources = 2
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "BTC-USD" },
+  { venue = "kraken", market = "spot", symbol = "BTC/USD" },
+  { venue = "binance", market = "spot", symbol = "BTCUSDT", converted = true },
+  { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
+  { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USD"
+peg = "CRYPTO.USDT/USD"
+min_sources = 2
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "ETH-USD" },
+  { venue = "kraken", market = "spot", symbol = "ETH/USD" },
+  { venue = "binance", market = "spot", symbol = "ETHUSDT", converted = true },
+  { venue = "bybit", market = "spot", symbol = "ETHUSDT", converted = true },
+  { venue = "okx", market = "spot", symbol = "ETH-USDT", converted = true },
+]
+
+[[feeds]]
+symbol = "CRYPTO.SOL/USD"
+peg = "CRYPTO.USDT/USD"
+min_sources = 2
+sources = [
+  { venue = "coinbase", market = "spot", symbol = "SOL-USD" },
+  { venue = "kraken", market = "spot", symbol = "SOL/USD" },
+  { venue = "binance", market = "spot", symbol = "SOLUSDT", converted = true },
+  { venue = "bybit", market = "spot", symbol = "SOLUSDT", converted = true },
+  { venue = "okx", market = "spot", symbol = "SOL-USDT", converted = true },
+]
+
+# ----------------------------------------------------------- spot, USDT
+#
+# The same books priced as what they are, with no conversion and no peg risk.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BTCUSDT" },
+  { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
+  { venue = "okx", market = "spot", symbol = "BTC-USDT" },
+]
+
+# --------------------------------------------------- perpetual mark, USD
+#
+# Deribit's BTC-PERPETUAL is inverse (coin-margined) but USD-quoted; Kraken
+# Futures' PF_ contracts are linear. Both price in USD, so neither needs the peg.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USD.PERP_MARK"
+min_sources = 2
+sources = [
+  { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["mark_price"] },
+  { venue = "kraken", market = "linear_perp", symbol = "PF_XBTUSD", kinds = ["mark_price"] },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USD.PERP_MARK"
+min_sources = 2
+sources = [
+  { venue = "deribit", market = "inverse_perp", symbol = "ETH-PERPETUAL", kinds = ["mark_price"] },
+  { venue = "kraken", market = "linear_perp", symbol = "PF_ETHUSD", kinds = ["mark_price"] },
+]
+
+# The venue-computed index, which is what the mark is tethered to. Worth
+# publishing separately: a mark diverging from its own index is the first sign a
+# perp is dislocating from spot.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USD.PERP_INDEX"
+min_sources = 2
+sources = [
+  { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["index_price"] },
+  { venue = "kraken", market = "linear_perp", symbol = "PF_XBTUSD", kinds = ["index_price"] },
+]
+
+# -------------------------------------------------- perpetual mark, USDT
+#
+# Binance, Bybit and OKX perps are USDT-margined, so they belong under a /USDT
+# symbol rather than being converted into the /USD one.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
+  { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"] },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USDT.PERP_MARK"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
+  { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"] },
+]
+
+# --------------------------------------------------------------- funding
+#
+# DELIBERATELY SINGLE-SOURCE. `FUNDING_8H` promises a rate normalised to eight
+# hours, and Deribit is the only venue here that publishes one: its `funding_8h`
+# is a fraction over a fixed 8h window whatever its settlement cadence.
+#
+# Every other venue reports a fraction over ITS OWN interval — hourly on Kraken
+# Futures, 8h or 4h on Binance depending on the contract, and the message does
+# not say which. Adding them would take a median across incomparable numbers and
+# publish a confidently wrong figure without halting or degrading. Run with
+# --tail and compare Deribit's `funding` against Kraken's: same contract, same
+# instant, roughly 25x apart.
+#
+# See SPEC.md §13 open question 3. Do not add sources here until the interval
+# metadata fetch exists.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USD.FUNDING_8H"
+# Funding updates on the order of minutes, so the spot staleness threshold would
+# halt it permanently. `slow` relaxes it to 90s and drops the sanity band.
+slow = true
+min_sources = 1
+sources = [
+  { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["funding"] },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USD.FUNDING_8H"
+slow = true
+min_sources = 1
+sources = [
+  { venue = "deribit", market = "inverse_perp", symbol = "ETH-PERPETUAL", kinds = ["funding"] },
+]
+
+# ------------------------------------------------------------ not served
+#
+# CRYPTO.*.OPEN_INTEREST is a valid symbol and `ObsKind::OpenInterest` exists,
+# but no decoder in this build emits one. A feed configured for it would halt
+# permanently rather than fail loudly, so it is left out until an adapter fills
+# it in.

@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use oracle_agg::stats;
 use oracle_types::{FeedId, Fixed, PriceUpdate};
-use oracle_wire::Address;
+
+use crate::verify::NodeId;
 
 /// Quorum and divergence policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,10 +109,16 @@ impl Resolved {
 }
 
 /// The latest accepted update from each node, for one feed.
+///
+/// Keyed by node rather than by signing key. A node holds two authorised keys
+/// during a rotation overlap, and keying by key would let it occupy two seats in
+/// its own quorum — three "nodes" agreeing could be two machines, one of which is
+/// simply mid-rotation. That defeats the only defence the design has against a
+/// single bad node.
 #[derive(Clone, Debug, Default)]
 pub struct FeedView {
     feed_id: FeedId,
-    per_node: HashMap<Address, PriceUpdate>,
+    per_node: HashMap<NodeId, PriceUpdate>,
 }
 
 impl FeedView {
@@ -128,13 +135,23 @@ impl FeedView {
     ///
     /// Out-of-order arrival across nodes is normal; the verifier guarantees
     /// monotonicity per node, so a lower sequence here is a duplicate.
-    pub fn record(&mut self, signer: Address, update: PriceUpdate) {
-        match self.per_node.get(&signer) {
+    pub fn record(&mut self, node: NodeId, update: PriceUpdate) {
+        match self.per_node.get(&node) {
             Some(existing) if existing.seq >= update.seq => {}
             _ => {
-                self.per_node.insert(signer, update);
+                self.per_node.insert(node, update);
             }
         }
+    }
+
+    /// Drops every node not in `keep`.
+    ///
+    /// Called when a new registry version de-lists a node. Revocation has to take
+    /// effect on the spot: a node left in place would keep counting toward the
+    /// quorum on the strength of updates it sent while still trusted, for as long
+    /// as those updates stayed inside the staleness window.
+    pub fn retain_nodes(&mut self, keep: &dyn Fn(&str) -> bool) {
+        self.per_node.retain(|node, _| keep(node));
     }
 
     /// Returns how many nodes have reported.
@@ -243,8 +260,8 @@ mod tests {
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
 
-    fn address(byte: u8) -> Address {
-        Address::from_bytes([byte; 20])
+    fn node(index: u8) -> NodeId {
+        NodeId::from(format!("oracle-{index}").as_str())
     }
 
     fn update(price: &str, conf: &str, seq: u64, flags: Flags) -> PriceUpdate {
@@ -267,9 +284,9 @@ mod tests {
 
     fn view(nodes: &[(u8, &str, &str, Flags)]) -> FeedView {
         let mut view = FeedView::new(FeedId::from_bytes([7; 32]));
-        for (index, (byte, price, conf, flags)) in nodes.iter().enumerate() {
+        for (index, (id, price, conf, flags)) in nodes.iter().enumerate() {
             view.record(
-                address(*byte),
+                node(*id),
                 update(price, conf, u64::try_from(index).unwrap_or(0) + 1, *flags),
             );
         }
@@ -413,14 +430,14 @@ mod tests {
     #[test]
     fn a_later_update_from_the_same_node_replaces_the_earlier_one() {
         let mut view = FeedView::new(FeedId::from_bytes([7; 32]));
-        view.record(address(1), update("64000", "0.5", 1, Flags::NONE));
-        view.record(address(1), update("64500", "0.5", 2, Flags::NONE));
+        view.record(node(1), update("64000", "0.5", 1, Flags::NONE));
+        view.record(node(1), update("64500", "0.5", 2, Flags::NONE));
         assert_eq!(view.len(), 1);
 
         // An out-of-order duplicate must not overwrite the newer value.
-        view.record(address(1), update("1", "0.5", 1, Flags::NONE));
-        view.record(address(2), update("64500", "0.5", 1, Flags::NONE));
-        view.record(address(3), update("64500", "0.5", 1, Flags::NONE));
+        view.record(node(1), update("1", "0.5", 1, Flags::NONE));
+        view.record(node(2), update("64500", "0.5", 1, Flags::NONE));
+        view.record(node(3), update("64500", "0.5", 1, Flags::NONE));
 
         let resolved = view.resolve(&QuorumConfig::default(), NOW);
         assert_eq!(resolved.price, Some(fixed("64500")));

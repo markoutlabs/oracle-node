@@ -22,6 +22,11 @@ use super::decimal;
 pub const SPOT_URL: &str = "wss://stream.bybit.com/v5/public/spot";
 /// Linear perpetual endpoint.
 pub const LINEAR_URL: &str = "wss://stream.bybit.com/v5/public/linear";
+/// Inverse (coin-margined) perpetual endpoint.
+///
+/// Carries the same `tickers` shape as linear, so the decoder is unchanged; only
+/// the host and the size units differ.
+pub const INVERSE_URL: &str = "wss://stream.bybit.com/v5/public/inverse";
 
 /// Keepalive period. Bybit drops connections idle for 30s.
 pub const KEEPALIVE: Duration = Duration::from_secs(20);
@@ -35,6 +40,7 @@ pub const fn url(market: MarketKind) -> &'static str {
     match market {
         MarketKind::Spot => SPOT_URL,
         MarketKind::LinearPerp => LINEAR_URL,
+        MarketKind::InversePerp => INVERSE_URL,
     }
 }
 
@@ -52,7 +58,9 @@ pub fn subscribe_frames<'a>(
     for symbol in symbols {
         topics.push(format!("orderbook.1.{symbol}"));
         topics.push(format!("publicTrade.{symbol}"));
-        if market == MarketKind::LinearPerp {
+        // `tickers` is where mark, index and funding live, and only perpetuals
+        // have them — on spot it would be a throttled duplicate of the book.
+        if market.is_perp() {
             topics.push(format!("tickers.{symbol}"));
         }
     }

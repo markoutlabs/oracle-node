@@ -124,6 +124,19 @@ fn sample_updates() -> Vec<(&'static str, u8, PriceUpdate)> {
             .expect("valid symbol"),
     );
 
+    /// The five venues these vectors were minted with.
+    ///
+    /// Spelled out rather than taken from `Venue::ALL`, which grows: a vector
+    /// built from a moving constant re-mints itself every time a venue is added
+    /// and proves nothing about the bytes that were actually signed.
+    const V1_VENUES: [Venue; 5] = [
+        Venue::Binance,
+        Venue::Bybit,
+        Venue::Okx,
+        Venue::Coinbase,
+        Venue::Kraken,
+    ];
+
     vec![
         (
             "btc_usd_healthy",
@@ -139,7 +152,7 @@ fn sample_updates() -> Vec<(&'static str, u8, PriceUpdate)> {
                 prev_publish_time_ns: BASE_TIME_NS - NANOS_PER_SEC,
                 seq: 918_273,
                 num_sources: 5,
-                sources: Venue::ALL.into_iter().collect(),
+                sources: V1_VENUES.into_iter().collect(),
             },
         ),
         (
@@ -210,7 +223,7 @@ fn sample_updates() -> Vec<(&'static str, u8, PriceUpdate)> {
                 prev_publish_time_ns: u64::MAX,
                 seq: u64::MAX,
                 num_sources: u32::MAX,
-                sources: Venue::ALL.into_iter().collect(),
+                sources: V1_VENUES.into_iter().collect(),
             },
         ),
     ]

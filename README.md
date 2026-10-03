@@ -20,7 +20,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M3 | WS/REST server + client SDK | **done** |
 | M3.5 | `oracle-node` binary wiring the pipeline | **done** |
 | M4 | Remaining venues + USDT/USD conversion | **done** |
-| M5 | Multi-node deploy + registry rotation | not started |
+| M5 | Multi-node deploy + registry rotation | **done** |
 | M6 | Hardening | not started |
 
 ## Crates
@@ -53,11 +53,45 @@ aggregator never learns anything venue-specific.
   backwards under NTP, which makes in-flight observations look like they arrived
   from the future and read as age zero forever.
 
-All five venues from the spec are implemented: Binance (URL-encoded
-subscriptions), plus Bybit, OKX, Coinbase, and Kraken behind a shared
-`VenueAdapter` — those four connect, send a subscribe frame, and need an
-application keepalive, so what actually differs per venue is only its naming and
-its decoder.
+Binance encodes subscriptions in the URL; every other venue connects, sends a
+subscribe frame, and needs an application keepalive, so they share a
+`VenueAdapter` and supply only their naming and their decoder. The decoder is
+attached **per connection**, not per venue — Kraken spot and Kraken Futures share
+a brand and nothing else.
+
+| Venue | Spot | Mark | Index | Funding |
+|---|:--:|:--:|:--:|:--:|
+| Binance | ✅ | ✅ | ✅ | ✅ (raw interval) |
+| Bybit | ✅ | ✅ | ✅ | ✅ (raw interval) |
+| OKX | ✅ | ✅ | — | ✅ (raw interval) |
+| Coinbase | ✅ | — | — | — |
+| Kraken | ✅ | ✅ | ✅ | ✅ (1h) |
+| Deribit | — | ✅ | ✅ | ✅ (**8h, normalised**) |
+
+Two venues are deliberately absent from that table:
+
+- **Coinbase perpetuals.** They live on Coinbase International, whose market-data
+  socket authenticates every subscription with an API key, passphrase and HMAC
+  signature. This build has no credential path for ingest, so configuring one is
+  a startup error naming the reason rather than a socket that gets dropped three
+  seconds after connecting.
+- **Binance coin-margined futures.** A different host with its own contract
+  catalogue. `base_url` returns `None` for `inverse_perp` rather than falling
+  back to the USD-margined host, which would stream a different contract under a
+  name that looks right.
+
+**Deribit is the only funding source that is currently safe to aggregate.** It
+publishes `funding_8h`, a fraction over a fixed eight-hour window. Every other
+venue publishes a fraction over its own interval — 1h on Kraken Futures, 8h or 4h
+on Binance depending on the contract, and the message does not say which. See
+[the funding caveat](#funding-is-not-normalised).
+
+`MarketKind` now distinguishes `InversePerp` from `LinearPerp`, because the
+distinction is load-bearing: on Deribit's `BTC-PERPETUAL` the order sizes are
+quoted in **USD**, not BTC. They are divided by price on the way in so every
+venue reports base units. Nothing today would notice if that were wrong —
+`microprice` is scale-invariant within one observation and depth weighting is
+inert — which is exactly why it is a distinct market kind rather than a comment.
 
 Two invariants the code enforces rather than documents:
 
@@ -146,6 +180,25 @@ Two pure, synchronous halves with a thin async layer on top:
 signatures from one node confirms who is talking and nothing else, and that is
 the mistake most likely to be made during integration and then never revisited.
 
+#### Quorum counts nodes, not keys
+
+Both halves key their state by `NodeId`, never by signing address. During a key
+rotation a node is authorised under **two** keys at once (§3.5's 24h overlap), so
+a client that counted keys would let one machine hold two seats in its own
+quorum — three agreeing "nodes" could be two boxes, one of them merely
+mid-rotation. That defeats the only defence the design has against a single bad
+node, and it would show up as a perfectly healthy `Ok` with `nodes: 3`.
+
+The same applies to replay: high-water marks follow the node, so an incoming key
+inherits the outgoing key's sequence floor rather than starting fresh.
+
+`OracleClient::refresh_registry` adopts a newer governance-signed registry in
+place — no reconnect, no lost feed state, no consumer release. It is checked
+against the governance key the client was pinned to and against the version
+currently trusted, so neither a forged document nor a replayed older one takes
+effect. Nodes the new version de-lists are dropped from the quorum **on
+adoption**, not once their last update ages out.
+
 ### `oracle-node`
 
 The binary. One config file describes the whole node; ingest subscriptions are
@@ -159,14 +212,80 @@ aggregator before any post-reconnect quote — only means something if nothing
 downstream reorders it. Fanning events across workers would break it silently.
 
 ```sh
-cargo run -p oracle-node -- crates/oracle-node/config/example.toml
+oracle-node init [--out DIR]           # generate this node's keys
+oracle-node start <config.toml>        # ingest, aggregate, sign, serve
+oracle-node start <config.toml> --tail # ...and log the stream as it flows
+```
+
+`--tail` logs every decoded observation going into the aggregator and every
+signed update coming out, under the `tail` target. It is the fastest way to see
+what a venue is actually sending — normalised, but before anything is weighted,
+filtered, or aggregated:
+
+```text
+INFO tail: observation venue=deribit market=inverse_perp symbol=BTC-PERPETUAL
+           kind="book_top" price=64972.25 bid="64972" ask="64972.5"
+           bid_qty="2.292679923659" ask_qty="1.610373619608" lag_ms="49"
+INFO tail: observation venue=kraken market=linear_perp symbol=PF_XBTUSD
+           kind="mark_price" price=64971.86250214206 lag_ms="81"
+INFO tail: published status="ok" price="64971.86250214" conf="6.49718625"
+           seq=1 sources=2 venues={Kraken, Deribit}
+```
+
+That output is also the quickest demonstration of the funding caveat below:
+Deribit reports `funding=0.00000012` and Kraken `funding=0.000002992933` for the
+same contract at the same instant, because one is an 8h rate and the other is
+hourly. `lag_ms` is `local_recv − exchange_time` and is diagnostic only —
+staleness is always measured with our own clock, never the venue's.
+
+`init` generates **both** keys — the two-tier split from §3.5 is the design, not
+a suggestion — issues the signing certificate, and prints the registry entry to
+hand to governance. That entry carries no secret: an identity public key, the
+endpoints, and a certificate anyone can check. Nothing the node publishes
+verifies for anyone until governance signs it into a new registry version.
+
+Secrets go to stdout by default, which puts them in terminal scrollback and shell
+history; `--out DIR` writes them to `0600` files instead, along with a starter
+config. It refuses to overwrite existing keys — silently replacing an identity
+key would orphan every certificate it ever issued.
+
+Keys come from the OS CSPRNG (`Signer::generate`). The seeded keys in the
+examples and test helpers are derived from small integers and guessable by
+construction; they exist so fixtures reproduce.
+
+```sh
+cargo run -p oracle-node -- start crates/oracle-node/config/example.toml
 ```
 
 The signing key comes from a file or an environment variable, never a
 command-line argument: arguments are visible in `ps` to every user on the box.
+
 At startup the node checks that the registry actually authorises its own signing
-address, and warns loudly if not — otherwise the first sign that nothing verifies
-comes from a downstream consumer.
+address, and **refuses to start** if not. This is a hard failure rather than a
+warning because it is otherwise the quietest way for a node to fail: it goes on
+ingesting, aggregating and signing, every node-local metric reads healthy, and
+every subscriber silently discards the output. The certificate expiry countdown
+is logged at startup and re-checked hourly, warning under seven days (§9.3) —
+a 30-day certificate lapses mid-flight long before anything else prompts a
+restart.
+
+#### Funding is not normalised
+
+`FeedKind::Funding8h` claims a rate "normalised to an 8-hour interval".
+`ObsKind::Funding` carries "a fraction over the venue's own interval". Nothing
+converts between them, because the interval is not in the WebSocket message — it
+needs an instrument-metadata fetch (Binance `/fapi/v1/fundingInfo`, Bybit
+`fundingInterval`, OKX `fundingTime` deltas), and that has not been built.
+
+The consequence: a `FUNDING_8H` feed whose sources sit on different intervals
+takes a **median across incomparable numbers**. A 1h rate and an 8h rate are off
+by 8×, and nothing halts or degrades — it publishes a confidently wrong number,
+which is the one failure mode the rest of this codebase works to prevent.
+
+Safe today: Deribit alone, which publishes a genuine `funding_8h`; or a single
+venue; or several venues on a contract you have confirmed shares an interval
+(BTC and ETH majors are 8h on Binance, Bybit and OKX). Treat multi-venue funding
+as unsupported until the metadata fetch lands. SPEC.md §13, open question 3.
 
 #### USDT is not USD
 
@@ -224,13 +343,52 @@ cargo fmt --all --check
 # One-node registry plus keys, generated with the real tooling.
 cargo run -p oracle-node --example gen_local_registry > registry.json
 
-cargo run -p oracle-node -- node.toml            # ingest, sign, serve
+cargo run -p oracle-node -- start node.toml      # ingest, sign, serve
 cargo run -p oracle-client --example subscribe \
   -- registry.json 0x<governance> CRYPTO.BTC/USDT
 ```
 
+To run a node you generated with `init`, governance has to sign its entry in —
+`gen_local_registry` plays that part with `--entry`:
+
+```sh
+cargo run -p oracle-node -- init --out node1
+cargo run -p oracle-node --example gen_local_registry -- \
+  --nodes 0 --entry node1/node-entry.json > node1/registry.json
+# then pin the printed GOVERNANCE address in node1/config.toml
+cargo run -p oracle-node -- start node1/config.toml
+```
+
 Confirmed live against Binance: exchange → node → signed frame → WebSocket → SDK
 verification, with prices resolving `Ok` and zero rejected frames.
+
+### Rotating a signing key
+
+The same generator models a rotation, which is three registry versions rather
+than one edit:
+
+```sh
+# v1 — five nodes, quorum of three (§9.2).
+cargo run -p oracle-node --example gen_local_registry -- --nodes 5 > registry.json
+
+# v2 — oracle-local-1 mid-rotation. Both its keys are listed and both verify, so
+# it can move to the new one with no window in which subscribers refuse it.
+cargo run -p oracle-node --example gen_local_registry -- \
+  --nodes 5 --version 2 --rotate oracle-local-1 > registry.v2.json
+
+# v3 — the overlap closes. Publishing this is what revokes the old key.
+cargo run -p oracle-node --example gen_local_registry -- \
+  --nodes 5 --version 3 --rotate oracle-local-1 --close-overlap > registry.v3.json
+```
+
+Consumers adopt each version with `refresh_registry`, which enforces forward-only
+versions — so v3 is what makes the outgoing key unusable, and replaying v2
+afterwards cannot bring it back.
+
+`crates/oracle-client/tests/rotation.rs` covers the ways "zero consumer impact"
+can be true on paper and false in practice: the rotating node taking two quorum
+seats, the replay floor resetting with the new key, and a de-listed node counting
+until its last update ages out.
 
 ### End to end
 

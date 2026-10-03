@@ -16,7 +16,9 @@
 //! something if nothing downstream reorders it.
 
 pub mod config;
+pub mod init;
 pub mod pipeline;
 
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
+pub use init::{InitError, InitOptions, NodeKeys};
 pub use pipeline::{Pipeline, PipelineStats};

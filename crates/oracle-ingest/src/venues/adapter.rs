@@ -38,6 +38,13 @@ pub struct VenueSpec {
     pub max_session: Duration,
     /// Jitter seed; distinct per connection.
     pub backoff_seed: u64,
+    /// How to decode this connection's payloads.
+    ///
+    /// Per connection rather than per venue: one exchange can speak entirely
+    /// different protocols on different markets. Kraken's v2 spot feed and
+    /// Kraken Futures share a venue and a brand and nothing else — different
+    /// host, different envelope, different field names.
+    pub decode: DecodeFn,
 }
 
 /// Decodes one venue's payloads.
@@ -72,7 +79,6 @@ impl MessageHandler for VenueHandler {
 /// A venue adapter built from a [`VenueSpec`] and a decode function.
 pub struct VenueAdapter<C> {
     specs: Vec<(VenueSpec, InstrumentMap)>,
-    decode: DecodeFn,
     connector: C,
     label: String,
     venue: Venue,
@@ -87,7 +93,6 @@ impl<C: Connector + Clone + 'static> VenueAdapter<C> {
     pub fn new(
         venue: Venue,
         connections: Vec<(VenueSpec, Vec<InstrumentSpec>)>,
-        decode: DecodeFn,
         connector: C,
     ) -> Result<Self, IngestError> {
         if connections
@@ -108,7 +113,6 @@ impl<C: Connector + Clone + 'static> VenueAdapter<C> {
         }
         Ok(Self {
             specs,
-            decode,
             connector,
             label: venue.as_str().to_owned(),
             venue,
@@ -155,7 +159,7 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for VenueAdapter<C> {
             let session = Session::new(
                 session_config(spec, self.venue),
                 self.connector.clone(),
-                VenueHandler::new(map.clone(), self.decode),
+                VenueHandler::new(map.clone(), spec.decode),
                 MonotonicClock::new(),
             );
             sessions.push(session.run(out.clone(), shutdown.clone()));
@@ -210,6 +214,7 @@ mod tests {
             idle_timeout: Duration::from_secs(30),
             max_session: Duration::from_secs(3_600),
             backoff_seed: seed,
+            decode,
         }
     }
 
@@ -231,7 +236,6 @@ mod tests {
         let result = VenueAdapter::new(
             Venue::Bybit,
             vec![(spec(MarketKind::Spot, "wss://x", 1), vec![])],
-            decode,
             NullConnector {
                 opens: Arc::new(AtomicUsize::new(0)),
             },
@@ -253,7 +257,6 @@ mod tests {
                     instruments(MarketKind::LinearPerp),
                 ),
             ],
-            decode,
             NullConnector {
                 opens: Arc::new(AtomicUsize::new(0)),
             },
@@ -285,7 +288,6 @@ mod tests {
                 ),
                 (spec(MarketKind::LinearPerp, "wss://linear", 2), vec![]),
             ],
-            decode,
             NullConnector {
                 opens: Arc::new(AtomicUsize::new(0)),
             },
@@ -310,7 +312,6 @@ mod tests {
                         instruments(MarketKind::LinearPerp),
                     ),
                 ],
-                decode,
                 NullConnector {
                     opens: Arc::clone(&opens),
                 },

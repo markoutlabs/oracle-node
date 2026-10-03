@@ -15,10 +15,18 @@
 //! Skip these and the signatures buy you nothing.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::{Address, UnverifiedFrame, VerifiedRegistry, VerifyError};
+
+/// A node's stable identity across registry versions.
+///
+/// Registry indices are positional and signing addresses are rotated, so neither
+/// survives the events this type exists to be correct across. Reference-counted
+/// because it is cloned once per accepted frame on the hot path.
+pub type NodeId = Arc<str>;
 
 /// Freshness policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,9 +115,17 @@ pub enum RejectReason {
 pub struct Accepted {
     /// The update.
     pub update: PriceUpdate,
-    /// Which node signed it.
+    /// The signing key it recovered to.
+    ///
+    /// Identifies the *key*, not the node: a node holds two of these during a
+    /// rotation overlap. Anything counting nodes must use [`Accepted::node`].
     pub signer: Address,
+    /// Which node signed it.
+    pub node: NodeId,
     /// That node's index in the registry it was verified against.
+    ///
+    /// Positional, and therefore only meaningful against that exact registry
+    /// version. Use [`Accepted::node`] for anything that outlives a refresh.
     pub node_index: usize,
 }
 
@@ -118,10 +134,18 @@ pub struct Accepted {
 /// Holds the per-`(node, feed)` sequence high-water marks, so it must persist
 /// across updates — a verifier rebuilt per message provides no replay protection
 /// at all.
+///
+/// The marks are keyed by **node**, not by signing key. Keying them by key would
+/// hand every rotation a fresh replay floor: an attacker holding a captured frame
+/// signed under the outgoing key could replay it the moment the node moved to the
+/// incoming one, because that key's counter would start from nothing.
 pub struct Verifier {
     registry: VerifiedRegistry,
     config: VerifyConfig,
-    high_water: HashMap<(Address, FeedId), u64>,
+    high_water: HashMap<(NodeId, FeedId), u64>,
+    /// Registry index → node id, so the hot path clones an `Arc` rather than a
+    /// `String` for every accepted frame.
+    node_ids: Vec<NodeId>,
 }
 
 impl Verifier {
@@ -129,6 +153,7 @@ impl Verifier {
     #[must_use]
     pub fn new(registry: VerifiedRegistry, config: VerifyConfig) -> Self {
         Self {
+            node_ids: intern_node_ids(&registry),
             registry,
             config,
             high_water: HashMap::new(),
@@ -144,8 +169,11 @@ impl Verifier {
     /// Replaces the registry, keeping the sequence high-water marks.
     ///
     /// Marks are retained deliberately: a registry rotation must not reopen the
-    /// replay window for keys that remain listed.
+    /// replay window for nodes that remain listed. They survive the swap because
+    /// they are keyed by node id, which is stable across versions, rather than by
+    /// registry index, which is not.
     pub fn set_registry(&mut self, registry: VerifiedRegistry) {
+        self.node_ids = intern_node_ids(&registry);
         self.registry = registry;
     }
 
@@ -160,6 +188,12 @@ impl Verifier {
         let verified = parsed.verify(&self.registry)?;
         let update = *verified.update();
         let signer = verified.signer();
+        let node_index = verified.node_index();
+        let node = self
+            .node_ids
+            .get(node_index)
+            .cloned()
+            .ok_or(VerifyError::UnknownSigner { signer })?;
 
         if update.observation_time_ns > update.publish_time_ns {
             return Err(RejectReason::IncoherentTimestamps { signer });
@@ -189,7 +223,7 @@ impl Verifier {
             }
         }
 
-        let key = (signer, update.feed_id);
+        let key = (Arc::clone(&node), update.feed_id);
         if let Some(last_seq) = self.high_water.get(&key).copied()
             && update.seq <= last_seq
         {
@@ -204,9 +238,19 @@ impl Verifier {
         Ok(Accepted {
             update,
             signer,
-            node_index: verified.node_index(),
+            node,
+            node_index,
         })
     }
+}
+
+/// Interns the registry's node ids, positionally.
+fn intern_node_ids(registry: &VerifiedRegistry) -> Vec<NodeId> {
+    registry
+        .nodes()
+        .iter()
+        .map(|node| NodeId::from(node.node_id.as_str()))
+        .collect()
 }
 
 /// Converts a duration to nanoseconds, saturating.
@@ -378,6 +422,50 @@ mod tests {
             *byte ^= 0x01;
         }
         assert!(verifier.accept(&frame, NOW).is_err());
+    }
+
+    /// Replay state follows the node, not the key. Otherwise a captured frame
+    /// signed under the outgoing key could be replayed the instant the node
+    /// moved to the incoming one, because that key's counter would start empty.
+    #[test]
+    fn rotating_a_signing_key_does_not_reopen_the_replay_window() {
+        let mut node = TestNode::new(1, NODE_ID);
+        node.rotate();
+        let mut verifier = Verifier::new(registry_with(&[&node]), VerifyConfig::default());
+
+        let update = update_at(NOW, 5);
+        assert!(verifier.accept(&node.sign_outgoing(&update), NOW).is_ok());
+
+        // The same sequence number, re-signed under the new key, is still a replay.
+        assert!(
+            matches!(
+                verifier.accept(&node.sign(&update), NOW),
+                Err(RejectReason::Replayed {
+                    seq: 5,
+                    last_seq: 5,
+                    ..
+                })
+            ),
+            "the incoming key must inherit the node's sequence floor"
+        );
+    }
+
+    #[test]
+    fn both_keys_in_an_overlap_resolve_to_the_same_node() {
+        let mut node = TestNode::new(1, NODE_ID);
+        node.rotate();
+        let mut verifier = Verifier::new(registry_with(&[&node]), VerifyConfig::default());
+
+        let old = verifier
+            .accept(&node.sign_outgoing(&update_at(NOW, 1)), NOW)
+            .expect("accepted");
+        let new = verifier
+            .accept(&node.sign(&update_at(NOW, 2)), NOW)
+            .expect("accepted");
+
+        assert_ne!(old.signer, new.signer, "two distinct keys");
+        assert_eq!(old.node, new.node, "but one node");
+        assert_eq!(&*new.node, NODE_ID);
     }
 
     #[test]

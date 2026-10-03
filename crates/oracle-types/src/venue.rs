@@ -36,18 +36,21 @@ pub enum Venue {
     Okx = 2,
     /// Coinbase Advanced Trade (spot, natively USD-quoted).
     Coinbase = 3,
-    /// Kraken v2 (spot, natively USD-quoted).
+    /// Kraken (v2 spot, natively USD-quoted; Kraken Futures perpetuals).
     Kraken = 4,
+    /// Deribit v2 (inverse and linear perpetuals; no spot in scope).
+    Deribit = 5,
 }
 
 impl Venue {
     /// Every venue, in discriminant order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Binance,
         Self::Bybit,
         Self::Okx,
         Self::Coinbase,
         Self::Kraken,
+        Self::Deribit,
     ];
 
     /// Returns the wire-stable index.
@@ -64,6 +67,7 @@ impl Venue {
             Self::Okx => 2,
             Self::Coinbase => 3,
             Self::Kraken => 4,
+            Self::Deribit => 5,
         }
     }
 
@@ -83,6 +87,7 @@ impl Venue {
             2 => Some(Self::Okx),
             3 => Some(Self::Coinbase),
             4 => Some(Self::Kraken),
+            5 => Some(Self::Deribit),
             _ => None,
         }
     }
@@ -96,6 +101,7 @@ impl Venue {
             Self::Okx => "okx",
             Self::Coinbase => "coinbase",
             Self::Kraken => "kraken",
+            Self::Deribit => "deribit",
         }
     }
 
@@ -237,7 +243,7 @@ impl fmt::Debug for VenueSet {
     }
 }
 
-/// Whether an instrument is spot or a linear perpetual.
+/// Whether an instrument is spot, a linear perpetual, or an inverse perpetual.
 ///
 /// Deliberately **not** `#[non_exhaustive]`, unlike [`Venue`]. A new venue is
 /// additive — consumers that match on venue names carry on unaffected. A new
@@ -250,7 +256,19 @@ pub enum MarketKind {
     /// Spot market.
     Spot,
     /// Linear (stablecoin- or USD-margined) perpetual swap.
+    ///
+    /// Order sizes are in the **base** asset, like spot.
     LinearPerp,
+    /// Inverse (coin-margined) perpetual swap, such as Deribit `BTC-PERPETUAL`.
+    ///
+    /// The price is still a quote-currency price per unit of base, so it
+    /// aggregates alongside everything else. Order sizes are **not**: they are
+    /// quoted in the *quote* currency, so a decoder must divide by price to
+    /// report base units like every other market kind. Getting that wrong would
+    /// not move any price today — `microprice` is scale-invariant within one
+    /// observation and depth weighting is inert — which is exactly why it needs
+    /// to be a distinct kind rather than a comment.
+    InversePerp,
 }
 
 impl MarketKind {
@@ -260,7 +278,14 @@ impl MarketKind {
         match self {
             Self::Spot => "spot",
             Self::LinearPerp => "linear_perp",
+            Self::InversePerp => "inverse_perp",
         }
+    }
+
+    /// Returns `true` if this is a perpetual swap of either margining style.
+    #[must_use]
+    pub const fn is_perp(self) -> bool {
+        matches!(self, Self::LinearPerp | Self::InversePerp)
     }
 }
 
@@ -272,7 +297,7 @@ impl fmt::Display for MarketKind {
 
 impl MarketKind {
     /// Every market kind.
-    pub const ALL: [Self; 2] = [Self::Spot, Self::LinearPerp];
+    pub const ALL: [Self; 3] = [Self::Spot, Self::LinearPerp, Self::InversePerp];
 }
 
 impl FromStr for MarketKind {
@@ -363,9 +388,20 @@ mod tests {
         assert_eq!(Venue::Okx.index(), 2);
         assert_eq!(Venue::Coinbase.index(), 3);
         assert_eq!(Venue::Kraken.index(), 4);
+        assert_eq!(Venue::Deribit.index(), 5);
         for venue in Venue::ALL {
             assert_eq!(Venue::from_index(venue.index()), Some(venue));
         }
+    }
+
+    /// Adding a venue must only ever *widen* the set of accepted bitmaps. If a
+    /// bit that used to be assigned stopped being assigned, every historical
+    /// signature carrying it would become unverifiable.
+    #[test]
+    fn previously_assigned_bits_stay_assigned() {
+        // The v1 five, as minted in the golden vectors.
+        assert!(VenueSet::from_bits(0b1_1111).is_ok());
+        assert_eq!(VenueSet::from_bits(0b1_1111).expect("assigned").len(), 5);
     }
 
     #[test]
@@ -386,8 +422,9 @@ mod tests {
     #[test]
     fn venue_set_rejects_unassigned_bits() {
         assert!(VenueSet::from_bits(1 << 31).is_err());
-        assert!(VenueSet::from_bits(0b1_1111).is_ok());
-        assert!(VenueSet::from_bits(0b10_0000).is_err());
+        // Every assigned bit, and the first one past them.
+        assert!(VenueSet::from_bits(0b11_1111).is_ok());
+        assert!(VenueSet::from_bits(0b100_0000).is_err());
     }
 
     #[test]

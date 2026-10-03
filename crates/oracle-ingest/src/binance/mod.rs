@@ -175,6 +175,10 @@ fn seed_for(market: MarketKind, index: usize) -> u64 {
     let market_bits: u64 = match market {
         MarketKind::Spot => 0x5370_7400_0000_0000,
         MarketKind::LinearPerp => 0x5065_7270_0000_0000,
+        // Unreachable through this adapter, which serves only spot and linear
+        // perps, but the seed must stay distinct rather than collide with one
+        // of them if that ever changes.
+        MarketKind::InversePerp => 0x496E_7673_0000_0000,
     };
     let index = u64::try_from(index).unwrap_or(0);
     market_bits ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15)

@@ -13,7 +13,9 @@ use oracle_agg::FeedConfig;
 use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
-use oracle_ingest::venues::{VenueSpec, bybit, coinbase, kraken, okx};
+use oracle_ingest::venues::{
+    DecodeFn, VenueSpec, bybit, coinbase, deribit, kraken, kraken_futures, okx,
+};
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::feed_id;
 use serde::Deserialize;
@@ -376,6 +378,13 @@ impl NodeConfig {
                 Venue::Binance => match market {
                     MarketKind::Spot => binance.spot.push(spec),
                     MarketKind::LinearPerp => binance.perp.push(spec),
+                    MarketKind::InversePerp => {
+                        return Err(ConfigError::Invalid(
+                            "binance coin-margined futures are not served by this build; \
+                             they live on a different host with their own contract catalogue"
+                                .to_owned(),
+                        ));
+                    }
                 },
                 other => by_venue.entry((other, market)).or_default().push(spec),
             }
@@ -405,26 +414,68 @@ fn venue_connection(
 ) -> Result<VenueConnection, ConfigError> {
     let symbols = || instruments.iter().map(|spec| spec.venue_symbol.as_str());
 
-    let (url, subscribe, keepalive) = match venue {
+    // Annotated so each arm's function item coerces to the shared pointer type;
+    // an `as` cast per arm would do the same but reads as a reinterpretation.
+    type Connection = (String, Vec<String>, Option<(Duration, String)>, DecodeFn);
+    let (url, subscribe, keepalive, decode): Connection = match venue {
         Venue::Bybit => (
             bybit::url(market).to_owned(),
             bybit::subscribe_frames(symbols(), market, VENUE_CHUNK),
             Some((bybit::KEEPALIVE, bybit::KEEPALIVE_PAYLOAD.to_owned())),
+            bybit::decode_payload,
         ),
         Venue::Okx => (
             okx::URL.to_owned(),
             okx::subscribe_frames(symbols(), VENUE_CHUNK),
             Some((okx::KEEPALIVE, okx::KEEPALIVE_PAYLOAD.to_owned())),
+            okx::decode_payload,
         ),
+        // Coinbase's public feed is spot only. Its perpetuals live on Coinbase
+        // International, whose market-data socket authenticates every
+        // subscription — a credential path this build does not have.
+        Venue::Coinbase if market.is_perp() => {
+            return Err(ConfigError::Invalid(
+                "coinbase perpetuals are on Coinbase International, whose market-data \
+                 feed requires API credentials this build cannot supply"
+                    .to_owned(),
+            ));
+        }
         Venue::Coinbase => (
             coinbase::URL.to_owned(),
             vec![coinbase::subscribe_frame(symbols())],
             None,
+            coinbase::decode_payload,
+        ),
+        // Kraken spot and Kraken Futures share a brand and nothing else.
+        Venue::Kraken if market.is_perp() => (
+            kraken_futures::URL.to_owned(),
+            vec![kraken_futures::subscribe_frame(symbols())],
+            None,
+            kraken_futures::decode_payload,
         ),
         Venue::Kraken => (
             kraken::URL.to_owned(),
             vec![kraken::subscribe_frame(symbols())],
             None,
+            kraken::decode_payload,
+        ),
+        // Deribit is a derivatives venue; its spot book is not worth pricing from.
+        Venue::Deribit if !market.is_perp() => {
+            return Err(ConfigError::Invalid(
+                "deribit serves perpetuals only; use market = \"linear_perp\" or \
+                 \"inverse_perp\""
+                    .to_owned(),
+            ));
+        }
+        Venue::Deribit => (
+            deribit::URL.to_owned(),
+            deribit::subscribe_frames(symbols(), VENUE_CHUNK),
+            // None: the ticker channel pushes every 100ms whether or not the
+            // market moves, so the socket is never idle and `idle_timeout`
+            // catches a half-open one. Deribit's own heartbeat needs a reply to
+            // each `test_request`, which this transport has no way to send.
+            None,
+            deribit::decode_payload,
         ),
         Venue::Binance => {
             return Err(ConfigError::Invalid(
@@ -453,22 +504,22 @@ fn venue_connection(
             // Distinct per venue and market, so sibling connections do not draw
             // the same jitter and re-synchronise after a shared outage.
             backoff_seed: u64::from(venue.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ u64::from(market == MarketKind::LinearPerp),
+                ^ market_seed(market),
+            decode,
         },
         instruments: instruments.to_vec(),
     })
 }
 
-/// Returns the decoder for a venue.
-#[must_use]
-pub fn decoder_for(venue: Venue) -> Option<oracle_ingest::venues::DecodeFn> {
-    match venue {
-        Venue::Bybit => Some(bybit::decode_payload),
-        Venue::Okx => Some(okx::decode_payload),
-        Venue::Coinbase => Some(coinbase::decode_payload),
-        Venue::Kraken => Some(kraken::decode_payload),
-        // Binance subscribes through the URL and has its own adapter.
-        Venue::Binance | _ => None,
+/// Distinguishes a market within a venue's backoff seed.
+///
+/// Sibling connections must not draw the same jitter, or they re-synchronise
+/// after a shared outage and reconnect in lockstep.
+const fn market_seed(market: MarketKind) -> u64 {
+    match market {
+        MarketKind::Spot => 0,
+        MarketKind::LinearPerp => 1,
+        MarketKind::InversePerp => 2,
     }
 }
 
@@ -690,11 +741,6 @@ sources = [
         );
         let venues: Vec<Venue> = resolved.venues.iter().map(|(venue, _)| *venue).collect();
         assert_eq!(venues, [Venue::Kraken]);
-        assert!(decoder_for(Venue::Kraken).is_some());
-        assert!(
-            decoder_for(Venue::Binance).is_none(),
-            "binance has its own adapter"
-        );
     }
 
     #[test]
@@ -722,6 +768,134 @@ sources = [
         let (period, payload) = spec.keepalive.clone().expect("okx needs a keepalive");
         assert_eq!(payload, "ping");
         assert!(period < Duration::from_secs(30));
+    }
+
+    /// Builds a config with one feed sourced from a single venue and market.
+    fn one_source(venue: &str, market: &str, symbol: &str) -> Result<ResolvedConfig, ConfigError> {
+        let text = format!(
+            r#"
+node_id = "n"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USD.PERP_MARK"
+min_sources = 1
+sources = [
+  {{ venue = "{venue}", market = "{market}", symbol = "{symbol}", kinds = ["mark_price"] }},
+]
+"#
+        );
+        parse(&text).resolve()
+    }
+
+    fn spec_for(resolved: &ResolvedConfig, venue: Venue) -> &VenueSpec {
+        &resolved
+            .venues
+            .iter()
+            .find(|(v, _)| *v == venue)
+            .expect("venue configured")
+            .1
+            .first()
+            .expect("one connection")
+            .spec
+    }
+
+    /// Kraken spot and Kraken Futures are different hosts speaking different
+    /// protocols. Routing a perp to the spot endpoint would connect happily and
+    /// then decode nothing.
+    #[test]
+    fn kraken_perps_route_to_the_futures_endpoint() {
+        let resolved = one_source("kraken", "linear_perp", "PF_XBTUSD").expect("resolves");
+        let spec = spec_for(&resolved, Venue::Kraken);
+        assert!(spec.url.contains("futures.kraken.com"), "{}", spec.url);
+        assert!(
+            spec.subscribe
+                .first()
+                .is_some_and(|f| f.contains(r#""feed":"ticker""#))
+        );
+
+        let spot = one_source("kraken", "spot", "BTC/USD").expect("resolves");
+        let spot_spec = spec_for(&spot, Venue::Kraken);
+        assert!(spot_spec.url.contains("ws.kraken.com"), "{}", spot_spec.url);
+        assert_ne!(spec.url, spot_spec.url);
+    }
+
+    #[test]
+    fn deribit_perps_subscribe_to_the_ticker_channel() {
+        for market in ["linear_perp", "inverse_perp"] {
+            let symbol = if market == "inverse_perp" {
+                "BTC-PERPETUAL"
+            } else {
+                "BTC_USDC-PERPETUAL"
+            };
+            let resolved = one_source("deribit", market, symbol).expect("resolves");
+            let spec = spec_for(&resolved, Venue::Deribit);
+            assert!(spec.url.contains("deribit.com"), "{}", spec.url);
+            assert!(
+                spec.subscribe
+                    .first()
+                    .is_some_and(|f| f.contains("public/subscribe") && f.contains(symbol)),
+                "{:?}",
+                spec.subscribe
+            );
+        }
+    }
+
+    /// Deribit has no spot book worth pricing from, so asking for one is a
+    /// configuration error rather than a connection that streams nothing.
+    #[test]
+    fn deribit_spot_is_refused() {
+        let error = one_source("deribit", "spot", "BTC-PERPETUAL")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("perpetuals only")),
+            "got {error:?}"
+        );
+    }
+
+    /// Coinbase's public feed is spot only; its perps need credentials this
+    /// build has no way to supply. Better to say so at startup than to open a
+    /// socket that is disconnected three seconds later.
+    #[test]
+    fn coinbase_perps_are_refused_with_the_reason() {
+        let error = one_source("coinbase", "linear_perp", "BTC-PERP")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("credentials")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn binance_coin_margined_futures_are_refused() {
+        let error = one_source("binance", "inverse_perp", "BTCUSD_PERP")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("coin-margined")),
+            "got {error:?}"
+        );
+    }
+
+    /// Sibling connections must not draw the same jitter, or they reconnect in
+    /// lockstep after a shared outage.
+    #[test]
+    fn every_market_of_a_venue_gets_a_distinct_backoff_seed() {
+        let seeds: std::collections::HashSet<u64> = MarketKind::ALL
+            .into_iter()
+            .map(|market| {
+                u64::from(Venue::Deribit.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ market_seed(market)
+            })
+            .collect();
+        assert_eq!(seeds.len(), MarketKind::ALL.len());
     }
 
     #[test]

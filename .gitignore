@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+node/registry.json
+node/*.key
+.DS_Store

@@ -46,6 +46,47 @@ impl Signer {
         })
     }
 
+    /// Generates a key from the operating system's CSPRNG.
+    ///
+    /// This is the only key-generation path in the codebase. The seeded keys in
+    /// the examples and test helpers are derived from small integers and are
+    /// guessable by construction — they exist so that fixtures are reproducible,
+    /// and using one for anything real would hand over the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::EntropyUnavailable`] if the OS entropy source cannot
+    /// be read. There is deliberately no fallback: a key drawn from a weaker
+    /// source is indistinguishable from a good one everywhere downstream.
+    pub fn generate() -> Result<Self, WireError> {
+        // A uniformly random 32-byte string lands outside the curve order with
+        // probability around 2^-128. Negligible is not impossible, and the
+        // failure would be silent, so draw again rather than reason about it.
+        for _ in 0..8 {
+            let mut bytes = [0_u8; 32];
+            getrandom::fill(&mut bytes)
+                .map_err(|e| WireError::EntropyUnavailable(e.to_string()))?;
+            let signer = Self::from_secret_bytes(bytes);
+            bytes.fill(0);
+            if let Ok(signer) = signer {
+                return Ok(signer);
+            }
+        }
+        Err(WireError::EntropyUnavailable(
+            "the entropy source repeatedly produced invalid scalars".to_owned(),
+        ))
+    }
+
+    /// Returns the secret key as hex, without a `0x` prefix.
+    ///
+    /// The one deliberate way to get the secret out of this type — [`fmt::Debug`]
+    /// redacts it and [`Drop`] erases it, so anything that exports the key should
+    /// be obvious at the call site rather than incidental.
+    #[must_use]
+    pub fn to_secret_hex(&self) -> String {
+        hex::encode(self.secret.secret_bytes())
+    }
+
     /// Loads a signing key from hex, with or without a `0x` prefix.
     ///
     /// # Errors
@@ -211,6 +252,39 @@ mod tests {
         let from_bytes = Signer::from_secret_bytes(bytes).expect("valid key");
         let from_hex = Signer::from_hex(&format!("0x{}", hex::encode(bytes))).expect("valid key");
         assert_eq!(from_bytes.address(), from_hex.address());
+    }
+
+    #[test]
+    fn generated_keys_are_usable_and_distinct() {
+        let first = Signer::generate().expect("entropy available");
+        let second = Signer::generate().expect("entropy available");
+        assert_ne!(
+            first.address(),
+            second.address(),
+            "two generated keys must not collide"
+        );
+
+        // The generated key round-trips through the same path the node uses to
+        // load it back from a file.
+        let reloaded = Signer::from_hex(&first.to_secret_hex()).expect("valid key");
+        assert_eq!(reloaded.address(), first.address());
+
+        // And it actually signs.
+        let signature = first.sign_payload(b"payload");
+        assert_eq!(
+            recover_payload_signer(b"payload", &signature).expect("recovers"),
+            first.address()
+        );
+    }
+
+    #[test]
+    fn secret_hex_is_32_bytes_without_a_prefix() {
+        let hex = Signer::generate()
+            .expect("entropy available")
+            .to_secret_hex();
+        assert_eq!(hex.len(), 64);
+        assert!(!hex.starts_with("0x"));
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

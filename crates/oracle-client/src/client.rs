@@ -4,7 +4,7 @@
 //! lives in [`crate::verify`] and [`crate::quorum`], which are pure and
 //! synchronous; this layer only moves bytes and calls them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -66,6 +66,10 @@ pub enum ClientError {
         /// Why.
         reason: String,
     },
+
+    /// A replacement registry did not verify against the pinned governance key.
+    #[error("cannot adopt this registry: {0}")]
+    Registry(#[from] oracle_wire::VerifyError),
 }
 
 /// Builds an [`OracleClient`].
@@ -225,6 +229,66 @@ impl OracleClient {
         self.stats
     }
 
+    /// Returns the registry version currently trusted.
+    #[must_use]
+    pub const fn registry_version(&self) -> u64 {
+        self.registry.version()
+    }
+
+    /// Adopts a newer registry version without interrupting the feed.
+    ///
+    /// This is how a node rotates a signing key, or is added or removed, without
+    /// a consumer release. The replacement is checked against the governance key
+    /// this client was pinned to and against the version currently trusted, so
+    /// neither a forged document nor a replayed older one can take effect.
+    ///
+    /// Feed state and replay high-water marks survive the swap. Observations from
+    /// nodes the new version de-lists do not — revocation has to bite immediately,
+    /// not once the revoked node's last update happens to age out.
+    ///
+    /// Returns the newly adopted version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Registry`] if the replacement is not strictly newer
+    /// or is not signed by the pinned governance key, or
+    /// [`ClientError::UnreachableQuorum`] if adopting it would leave fewer nodes
+    /// than the configured quorum. The client keeps its existing registry in
+    /// every failure case.
+    pub fn refresh_registry(
+        &mut self,
+        registry: &oracle_wire::Registry,
+    ) -> Result<u64, ClientError> {
+        let verified = self.registry.accept_successor(registry)?;
+
+        // Checked before anything is swapped in: a registry that shrinks below
+        // the quorum would leave the client permanently halted, and silently
+        // adopting it would turn a governance mistake into an outage with no
+        // obvious cause.
+        let available = verified.nodes().len();
+        if self.quorum_config.quorum > available {
+            return Err(ClientError::UnreachableQuorum {
+                requested: self.quorum_config.quorum,
+                available,
+            });
+        }
+
+        let listed: HashSet<&str> = verified
+            .nodes()
+            .iter()
+            .map(|node| node.node_id.as_str())
+            .collect();
+        for view in self.views.values_mut() {
+            view.retain_nodes(&|node_id| listed.contains(node_id));
+        }
+        drop(listed);
+
+        let version = verified.version();
+        self.verifier.set_registry(verified.clone());
+        self.registry = verified;
+        Ok(version)
+    }
+
     /// Connects to every node in the registry and subscribes to `symbols`.
     ///
     /// # Errors
@@ -287,7 +351,7 @@ impl OracleClient {
             .views
             .entry(feed)
             .or_insert_with(|| FeedView::new(feed));
-        view.record(accepted.signer, accepted.update);
+        view.record(accepted.node, accepted.update);
         Ok(view.resolve(&self.quorum_config, now_ns))
     }
 

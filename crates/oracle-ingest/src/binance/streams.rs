@@ -34,10 +34,15 @@ impl StreamKind {
     /// primary input — it is pushed on every top-of-book change rather than
     /// throttled, so it is both fresher and cheaper than a depth stream.
     #[must_use]
-    pub const fn for_market(market: MarketKind) -> &'static [Self] {
+    pub const fn for_market(market: MarketKind) -> Option<&'static [Self]> {
         match market {
-            MarketKind::Spot => &[Self::BookTicker, Self::AggTrade],
-            MarketKind::LinearPerp => &[Self::BookTicker, Self::AggTrade, Self::MarkPrice],
+            MarketKind::Spot => Some(&[Self::BookTicker, Self::AggTrade]),
+            MarketKind::LinearPerp => Some(&[Self::BookTicker, Self::AggTrade, Self::MarkPrice]),
+            // Binance's coin-margined futures live on a different host with
+            // their own contract catalogue. `None` rather than a silent fall
+            // back to the USD-margined host, which would stream the wrong
+            // contract under the right-looking name.
+            MarketKind::InversePerp => None,
         }
     }
 
@@ -71,10 +76,12 @@ impl StreamKind {
 
 /// Returns the base endpoint for a market.
 #[must_use]
-pub const fn base_url(market: MarketKind) -> &'static str {
+pub const fn base_url(market: MarketKind) -> Option<&'static str> {
     match market {
-        MarketKind::Spot => SPOT_BASE,
-        MarketKind::LinearPerp => FUTURES_BASE,
+        MarketKind::Spot => Some(SPOT_BASE),
+        MarketKind::LinearPerp => Some(FUTURES_BASE),
+        // See `for_market`: coin-margined futures are `dstream`, not this host.
+        MarketKind::InversePerp => None,
     }
 }
 
@@ -84,7 +91,11 @@ pub fn stream_names<'a>(
     venue_symbols: impl Iterator<Item = &'a str>,
     market: MarketKind,
 ) -> Vec<String> {
-    let kinds = StreamKind::for_market(market);
+    // A market this adapter does not serve yields no streams, so it opens no
+    // connection rather than one subscribed to nothing.
+    let Some(kinds) = StreamKind::for_market(market) else {
+        return Vec::new();
+    };
     let mut names = Vec::new();
     for symbol in venue_symbols {
         // Binance names streams in lowercase and stamps payloads in uppercase.
@@ -118,9 +129,26 @@ mod tests {
     fn spot_and_perp_subscribe_to_different_streams() {
         assert_eq!(
             StreamKind::for_market(MarketKind::Spot),
-            [StreamKind::BookTicker, StreamKind::AggTrade]
+            Some([StreamKind::BookTicker, StreamKind::AggTrade].as_slice())
         );
-        assert!(StreamKind::for_market(MarketKind::LinearPerp).contains(&StreamKind::MarkPrice));
+        assert!(
+            StreamKind::for_market(MarketKind::LinearPerp)
+                .expect("linear perps are served")
+                .contains(&StreamKind::MarkPrice)
+        );
+    }
+
+    /// Coin-margined futures live on `dstream`, which this adapter does not
+    /// serve. Falling back to the USD-margined host would stream a different
+    /// contract under a name that looks right.
+    #[test]
+    fn coin_margined_futures_are_refused_rather_than_mis_hosted() {
+        assert_eq!(StreamKind::for_market(MarketKind::InversePerp), None);
+        assert_eq!(base_url(MarketKind::InversePerp), None);
+        assert!(
+            stream_names(["BTCUSD_PERP"].into_iter(), MarketKind::InversePerp).is_empty(),
+            "no streams means no connection, rather than one subscribed to nothing"
+        );
     }
 
     #[test]

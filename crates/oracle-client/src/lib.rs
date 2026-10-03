@@ -29,6 +29,15 @@
 //! Both are pure and synchronous. [`OracleClient`] is the thin async layer that
 //! connects to nodes and drives them.
 //!
+//! # Rotation
+//!
+//! Both halves count **nodes**, keyed by [`NodeId`] — never signing keys. A node
+//! rotating its signing key is authorised under two keys at once during the
+//! overlap window, and a client that counted keys would let that one machine hold
+//! two seats in its own quorum. [`OracleClient::refresh_registry`] adopts a newer
+//! governance-signed registry in place, so a rotation costs the consumer nothing:
+//! no reconnect, no lost feed state, no release.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -61,4 +70,4 @@ pub mod verify;
 
 pub use client::{ClientError, OracleClient, OracleClientBuilder};
 pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
-pub use verify::{Accepted, RejectReason, Verifier, VerifyConfig};
+pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig};

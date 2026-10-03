@@ -95,7 +95,10 @@ fn perp_map() -> InstrumentMap {
 fn config(market: MarketKind) -> SessionConfig {
     let mut config = SessionConfig::new(
         StreamId::new(Venue::Binance, market),
-        format!("{}?streams=btcusdt@bookTicker", streams::base_url(market)),
+        format!(
+            "{}?streams=btcusdt@bookTicker",
+            streams::base_url(market).expect("binance serves this market")
+        ),
     );
     config.idle_timeout = Duration::from_millis(50);
     config.backoff = BackoffConfig {

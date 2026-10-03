@@ -291,6 +291,7 @@ impl Registry {
         Ok(VerifiedRegistry {
             registry: self.clone(),
             by_address,
+            governance,
         })
     }
 }
@@ -303,6 +304,7 @@ impl Registry {
 pub struct VerifiedRegistry {
     registry: Registry,
     by_address: HashMap<Address, usize>,
+    governance: Address,
 }
 
 impl VerifiedRegistry {
@@ -310,6 +312,28 @@ impl VerifiedRegistry {
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.registry.version
+    }
+
+    /// Returns the governance address this registry was verified against.
+    ///
+    /// Carried along so a refresh can re-verify against the same pinned trust
+    /// root. A refresh that took its governance key from anywhere else would let
+    /// whoever supplied the new document also supply the key that vouches for it.
+    #[must_use]
+    pub const fn governance(&self) -> Address {
+        self.governance
+    }
+
+    /// Verifies a replacement registry against this one's governance key and version.
+    ///
+    /// The successor must be **strictly** newer, which is what stops an old
+    /// document from being replayed to reinstate a revoked signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Registry::verify`].
+    pub fn accept_successor(&self, next: &Registry) -> Result<Self, VerifyError> {
+        next.verify(self.governance, self.registry.version)
     }
 
     /// Returns the quorum guidance.
@@ -328,6 +352,47 @@ impl VerifiedRegistry {
     #[must_use]
     pub fn node(&self, index: usize) -> Option<&NodeEntry> {
         self.registry.nodes.get(index)
+    }
+
+    /// Returns a node's identifier by index.
+    ///
+    /// Indices are positional and shift whenever the node list changes, so
+    /// anything that outlives one registry version — replay high-water marks,
+    /// per-node quorum state — must be keyed by this instead.
+    #[must_use]
+    pub fn node_id(&self, index: usize) -> Option<&str> {
+        self.registry
+            .nodes
+            .get(index)
+            .map(|node| node.node_id.as_str())
+    }
+
+    /// Returns `true` if `node_id` is listed.
+    #[must_use]
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        self.registry
+            .nodes
+            .iter()
+            .any(|node| node.node_id == node_id)
+    }
+
+    /// Returns the last second at which `signer` is authorised, across every
+    /// certificate listing it.
+    ///
+    /// This is the expiry countdown from §9.3: a node whose certificate lapses
+    /// keeps signing perfectly valid frames that every consumer then refuses, and
+    /// nothing node-local notices. Returns `None` if the address is unlisted.
+    #[must_use]
+    pub fn authorized_until(&self, signer: Address) -> Option<u64> {
+        let index = *self.by_address.get(&signer)?;
+        self.registry
+            .nodes
+            .get(index)?
+            .signing_keys
+            .iter()
+            .filter(|cert| cert.address == signer)
+            .map(|cert| cert.not_after)
+            .max()
     }
 
     /// Returns the underlying registry.
@@ -621,6 +686,96 @@ mod tests {
             verified.authorize(stranger.address(), 1_000_000 * oracle_types::NANOS_PER_SEC),
             Err(VerifyError::UnknownSigner { .. })
         ));
+    }
+
+    #[test]
+    fn a_successor_is_checked_against_the_pinned_governance_key() {
+        let now = 1_000_000;
+        let (current, _) = registry(now);
+        let (spare, _) = registry(now);
+        let verified = current.verify(governance().address(), 0).expect("verifies");
+        assert_eq!(verified.governance(), governance().address());
+
+        // A newer version signed by the same governance key is accepted.
+        let next = Registry::sign(&governance(), 8, now, spare.nodes.clone(), spare.quorum)
+            .expect("signs");
+        assert_eq!(
+            verified
+                .accept_successor(&next)
+                .expect("accepted")
+                .version(),
+            8
+        );
+
+        // The same version is not "newer", so it cannot be replayed to reinstate
+        // a key the successor revoked.
+        assert!(matches!(
+            verified.accept_successor(&current),
+            Err(VerifyError::StaleRegistry { .. })
+        ));
+
+        // A newer version signed by anyone else is refused, which is the whole
+        // point of carrying the governance key rather than accepting one
+        // alongside the document it is supposed to vouch for.
+        let impostor = Signer::from_secret_bytes([0x99; 32]).expect("valid key");
+        let forged = Registry::sign(&impostor, 9, now, spare.nodes, spare.quorum).expect("signs");
+        assert!(matches!(
+            verified.accept_successor(&forged),
+            Err(VerifyError::UntrustedGovernance { .. })
+        ));
+    }
+
+    #[test]
+    fn reports_when_a_signing_key_stops_being_authorized() {
+        let now = 1_000_000;
+        let (registry, hots) = registry(now);
+        let verified = registry
+            .verify(governance().address(), 0)
+            .expect("verifies");
+        let hot = hots.first().expect("one node");
+        assert_eq!(
+            verified.authorized_until(hot.address()),
+            Some(now + 30 * DAY)
+        );
+
+        let stranger = Signer::from_secret_bytes([0xAA; 32]).expect("valid key");
+        assert_eq!(verified.authorized_until(stranger.address()), None);
+    }
+
+    /// During a rotation overlap a node lists two certificates. The countdown
+    /// must follow the later one, or an operator rotating correctly would be
+    /// paged about an expiry that no longer matters.
+    #[test]
+    fn expiry_follows_the_newest_certificate_for_an_address() {
+        let now = 1_000_000;
+        let identity = Signer::from_secret_bytes([1_u8; 32]).expect("valid key");
+        let hot = Signer::from_secret_bytes([101_u8; 32]).expect("valid key");
+        let node_id = "oracle-1";
+        let nodes = vec![NodeEntry {
+            node_id: node_id.to_owned(),
+            operator: "operator-1".to_owned(),
+            identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+            endpoints: vec!["wss://node1.example/v1/ws".to_owned()],
+            signing_keys: vec![
+                SigningKeyCert::issue(&identity, node_id, hot.address(), now, now + DAY)
+                    .expect("issues"),
+                SigningKeyCert::issue(&identity, node_id, hot.address(), now + DAY, now + 30 * DAY)
+                    .expect("issues"),
+            ],
+            weight: 1,
+        }];
+        let quorum = Quorum {
+            min_nodes: 1,
+            recommended: 1,
+        };
+        let verified = Registry::sign(&governance(), 1, now, nodes, quorum)
+            .expect("signs")
+            .verify(governance().address(), 0)
+            .expect("verifies");
+        assert_eq!(
+            verified.authorized_until(hot.address()),
+            Some(now + 30 * DAY)
+        );
     }
 
     #[test]

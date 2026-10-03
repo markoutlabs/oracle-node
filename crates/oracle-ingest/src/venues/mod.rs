@@ -12,7 +12,9 @@
 pub mod adapter;
 pub mod bybit;
 pub mod coinbase;
+pub mod deribit;
 pub mod kraken;
+pub mod kraken_futures;
 pub mod okx;
 
 pub use adapter::{DecodeFn, VenueAdapter, VenueHandler, VenueSpec};
