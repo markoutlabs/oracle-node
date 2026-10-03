@@ -42,6 +42,10 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+# `rustls-no-provider`, not `rustls`: the workspace already pins rustls to the
+# `ring` provider through tokio-tungstenite, and a second provider makes
+# `ClientConfig::builder()` refuse to pick one at runtime.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 getrandom = "0.3"

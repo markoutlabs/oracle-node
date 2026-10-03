@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 
 use candid::Principal;
 use oracle_wire::{
-    Address, CompressedPublicKey, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODE_ID_LEN, MAX_NODES,
-    MAX_OPERATOR_LEN, NodeEntry, Quorum, Registry, Signature, SigningKeyCert, WireError,
+    Address, CompressedPublicKey, KeyHistoryEntry, MAX_ENDPOINT_LEN, MAX_ENDPOINTS,
+    MAX_NODE_ID_LEN, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry, Quorum, Registry, Signature,
+    SigningKeyCert, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -159,19 +160,6 @@ pub struct PendingEntry {
     pub operator_principal: Principal,
     /// When, unix seconds.
     pub submitted_at: u64,
-}
-
-/// One generation in a node's key history, as served to auditors.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyHistoryEntry {
-    /// Generation number, from 1.
-    pub generation: u32,
-    /// The certificate.
-    pub cert: SigningKeyCert,
-    /// When the key became live.
-    pub added_at: u64,
-    /// When it stopped being live. `None` while live.
-    pub retired_at: Option<u64>,
 }
 
 /// A registry document ready to sign.

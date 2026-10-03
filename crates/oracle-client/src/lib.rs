@@ -31,12 +31,18 @@
 //!
 //! # Rotation
 //!
-//! Both halves count **nodes**, keyed by [`NodeId`] — never signing keys. A node
-//! rotating its signing key is authorised under two keys at once during the
-//! overlap window, and a client that counted keys would let that one machine hold
-//! two seats in its own quorum. [`OracleClient::refresh_registry`] adopts a newer
-//! governance-signed registry in place, so a rotation costs the consumer nothing:
-//! no reconnect, no lost feed state, no release.
+//! A node holds one live signing key at a time (SPEC §3.5). When it rotates, the
+//! registry swaps the key atomically, and this client learns about it the first
+//! time it sees a frame from the new key: an unknown signer triggers one fetch
+//! from the [`RegistrySource`], at most once per `refresh_interval`, and the
+//! frame is retried. [`OracleClient::refresh_registry`] adopts the newer
+//! governance-signed document in place, with no reconnect and no lost feed state.
+//! The old key is reported as [`RejectReason::RetiredKey`] from then on, without
+//! a fetch. Both halves key their state by [`NodeId`], never by signing key, so a
+//! node's quorum seat and its replay floor follow it through the rotation.
+//!
+//! Stored frames are a separate path: [`verify_historical`] checks a frame
+//! against the key that was live at its publish time.
 //!
 //! # Example
 //!
@@ -65,9 +71,11 @@
 
 mod client;
 pub mod quorum;
+pub mod source;
 pub mod testing;
 pub mod verify;
 
-pub use client::{ClientError, OracleClient, OracleClientBuilder};
+pub use client::{ClientError, ClientStats, OracleClient, OracleClientBuilder};
 pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
-pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig};
+pub use source::{FetchError, HttpRegistrySource, RegistrySource};
+pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig, verify_historical};

@@ -44,6 +44,27 @@ pub struct Quorum {
     pub recommended: u16,
 }
 
+/// One generation of a node's signing keys, as the registry canister serves it.
+///
+/// Live frames never consult this. It exists for stored-frame verification
+/// (SPEC §3.5): a frame signed last month must verify against the key that was
+/// live at its `publish_time_ns`, bounded by when that key was retired.
+///
+/// The certificate is signed by the node's identity key and can be checked.
+/// `added_at` and `retired_at` are the canister's word and cannot be; a signed
+/// key history is future work.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyHistoryEntry {
+    /// Generation number, from 1.
+    pub generation: u32,
+    /// The certificate the operator issued with the node's identity key.
+    pub cert: SigningKeyCert,
+    /// When the key became live, unix seconds.
+    pub added_at: u64,
+    /// When it stopped being live, unix seconds. `None` while live.
+    pub retired_at: Option<u64>,
+}
+
 /// One node in the registry.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

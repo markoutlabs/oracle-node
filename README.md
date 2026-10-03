@@ -181,24 +181,39 @@ Two pure, synchronous halves with a thin async layer on top:
 signatures from one node confirms who is talking and nothing else, and that is
 the mistake most likely to be made during integration and then never revisited.
 
-#### Quorum counts nodes, not keys
+#### How a rotation reaches the consumer
 
-Both halves key their state by `NodeId`, never by signing address. During a key
-rotation a node is authorised under **two** keys at once (§3.5's 24h overlap), so
-a client that counted keys would let one machine hold two seats in its own
-quorum — three agreeing "nodes" could be two boxes, one of them merely
-mid-rotation. That defeats the only defence the design has against a single bad
-node, and it would show up as a perfectly healthy `Ok` with `nodes: 3`.
+A node holds one live signing key at a time (SPEC §3.5). When its operator
+rotates it, the registry canister swaps the key atomically, and the consumer
+finds out from the first frame it cannot verify:
 
-The same applies to replay: high-water marks follow the node, so an incoming key
-inherits the outgoing key's sequence floor rather than starting fresh.
+1. An unknown signer triggers one fetch from the `RegistrySource`, at most once
+   per `refresh_interval` (10s by default). Anyone who can inject a frame can
+   trigger the fetch, so the floor is what keeps a hostile relay from turning
+   the client into a load generator against the registry.
+2. `refresh_registry` adopts the document in place if it is strictly newer and
+   signed by the pinned governance address. No reconnect, no lost feed state.
+   Nodes the new version de-lists are dropped from the quorum **on adoption**,
+   not once their last update ages out.
+3. The frame is retried. The node is back with its new key, and it kept its seat
+   and its replay floor, because both are keyed by `NodeId` and not by address.
+4. The old key is now **retired**, not unknown. Frames it signed are refused as
+   `RetiredKey` and never trigger another fetch. A few right after a rotation
+   are frames that were in flight. A steady stream is a stolen key in use.
 
-`OracleClient::refresh_registry` adopts a newer governance-signed registry in
-place — no reconnect, no lost feed state, no consumer release. It is checked
-against the governance key the client was pinned to and against the version
-currently trusted, so neither a forged document nor a replayed older one takes
-effect. Nodes the new version de-lists are dropped from the quorum **on
-adoption**, not once their last update ages out.
+The canister re-signs the document daily even when nothing changed, so a
+registry older than `max_registry_age` (48h by default) means the fetch path is
+broken or newer versions are being withheld. Every feed is then reported
+`Degraded` with `Concern::RegistryStale`. The prices are still verified; the
+membership may not be current.
+
+`HttpRegistrySource::canister(id)` fetches from the canister's raw gateway URL.
+The response is not IC-certified, and does not need to be: the document carries
+its own governance signature, which is the check every consumer runs.
+
+Stored frames are a separate path. `verify_historical` checks a frame against
+the key that was live at its publish time, using the node's key history from the
+canister, bounded by when that key was retired.
 
 ### `oracle-node`
 
@@ -429,10 +444,11 @@ Consumers adopt each version with `refresh_registry`, which enforces forward-onl
 versions — so v3 is what makes the outgoing key unusable, and replaying v2
 afterwards cannot bring it back.
 
-`crates/oracle-client/tests/rotation.rs` covers the ways "zero consumer impact"
-can be true on paper and false in practice: the rotating node taking two quorum
-seats, the replay floor resetting with the new key, and a de-listed node counting
-until its last update ages out.
+`crates/oracle-client/tests/rotation.rs` covers the ways a rotation can go wrong
+from the consumer's side: never learning about the new key, fetching on every
+unknown frame, a retired key that keeps verifying, the replay floor resetting
+with the new key, a de-listed node counting until its last update ages out, and a
+stale document reported as healthy.
 
 ### End to end
 

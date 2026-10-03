@@ -5,28 +5,43 @@
 //! synchronous; this layer only moves bytes and calls them.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_util::{SinkExt as _, StreamExt as _};
-use oracle_types::{FeedId, Symbol};
-use oracle_wire::{VerifiedRegistry, feed_id};
+use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
+use oracle_wire::{Address, VerifiedRegistry, VerifyError, feed_id};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::quorum::{FeedView, QuorumConfig, Resolved};
+use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
+use crate::source::{FetchError, RegistrySource};
 use crate::verify::{RejectReason, Verifier, VerifyConfig};
 
 /// The quorum below which the builder demands an explicit acknowledgement.
 const SAFE_QUORUM: usize = 3;
 
+/// Default floor between two registry fetches triggered by unknown signers.
+///
+/// Anyone who can inject a frame can trigger a fetch, so the floor is what
+/// stops a hostile relay from turning the client into a load generator
+/// against the registry.
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Default registry age above which feeds are reported degraded.
+///
+/// The canister re-signs at least daily (SPEC §3.6). Two missed heartbeats
+/// means the fetch path is broken or newer versions are being withheld.
+const DEFAULT_MAX_REGISTRY_AGE: Duration = Duration::from_secs(48 * 3_600);
+
 /// A client construction or connection failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
-    /// A quorum below [`SAFE_QUORUM`] was requested without acknowledgement.
+    /// A quorum below three was requested without acknowledgement.
     ///
     /// Verifying signatures from one node confirms who is talking and nothing
     /// about whether to believe them: a single compromised node is a single
@@ -70,7 +85,11 @@ pub enum ClientError {
 
     /// A replacement registry did not verify against the pinned governance key.
     #[error("cannot adopt this registry: {0}")]
-    Registry(#[from] oracle_wire::VerifyError),
+    Registry(#[from] VerifyError),
+
+    /// The registry source could not deliver a document.
+    #[error(transparent)]
+    Fetch(#[from] FetchError),
 }
 
 /// Builds an [`OracleClient`].
@@ -81,9 +100,37 @@ pub struct OracleClientBuilder {
     verify: VerifyConfig,
     quorum_config: QuorumConfig,
     channel_capacity: usize,
+    source: Option<Arc<dyn RegistrySource>>,
+    refresh_interval: Duration,
+    max_registry_age: Duration,
 }
 
 impl OracleClientBuilder {
+    /// Sets where newer registry versions are fetched from.
+    ///
+    /// Without a source the client stays on the registry it was built with
+    /// until [`OracleClient::refresh_registry`] is called by hand, and a node
+    /// that rotates its key is lost until then.
+    #[must_use]
+    pub fn registry_source(mut self, source: Arc<dyn RegistrySource>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Sets the floor between two fetches triggered by unknown signers.
+    #[must_use]
+    pub const fn refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = interval;
+        self
+    }
+
+    /// Sets the registry age above which feeds are reported degraded.
+    #[must_use]
+    pub const fn max_registry_age(mut self, age: Duration) -> Self {
+        self.max_registry_age = age;
+        self
+    }
+
     /// Sets the number of distinct nodes required.
     #[must_use]
     pub const fn quorum(mut self, nodes: usize) -> Self {
@@ -163,6 +210,10 @@ impl OracleClientBuilder {
             frames_rx: rx,
             shutdown: CancellationToken::new(),
             stats: ClientStats::default(),
+            source: self.source,
+            refresh_interval: self.refresh_interval,
+            max_registry_age: self.max_registry_age,
+            last_refresh_attempt_ns: None,
         })
     }
 }
@@ -180,12 +231,19 @@ pub struct ClientStats {
     pub out_of_time: u64,
     /// Frames refused for incoherent timestamps.
     pub incoherent: u64,
+    /// Frames refused because their key has been retired.
+    pub retired: u64,
+    /// Registry fetches made.
+    pub refreshes: u64,
+    /// Registry fetches that failed or did not verify.
+    pub refresh_failures: u64,
 }
 
 impl ClientStats {
     fn record(&mut self, reason: &RejectReason) {
         match reason {
             RejectReason::Untrusted(_) => self.untrusted = self.untrusted.saturating_add(1),
+            RejectReason::RetiredKey { .. } => self.retired = self.retired.saturating_add(1),
             RejectReason::Replayed { .. } => self.replayed = self.replayed.saturating_add(1),
             RejectReason::TooOld { .. } | RejectReason::FromTheFuture { .. } => {
                 self.out_of_time = self.out_of_time.saturating_add(1);
@@ -208,6 +266,10 @@ pub struct OracleClient {
     frames_rx: mpsc::Receiver<Vec<u8>>,
     shutdown: CancellationToken,
     stats: ClientStats,
+    source: Option<Arc<dyn RegistrySource>>,
+    refresh_interval: Duration,
+    max_registry_age: Duration,
+    last_refresh_attempt_ns: Option<u64>,
 }
 
 impl OracleClient {
@@ -221,7 +283,29 @@ impl OracleClient {
             verify: VerifyConfig::default(),
             quorum_config: QuorumConfig::default(),
             channel_capacity: 4_096,
+            source: None,
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
         }
+    }
+
+    /// Fetches the registry from `source`, verifies it against `governance`,
+    /// and starts building a client that keeps refreshing from that source.
+    ///
+    /// `governance` is the pinned trust root. It comes from the operator's
+    /// documentation, never from the document being fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Fetch`] if the source fails, or
+    /// [`ClientError::Registry`] if the document is not signed by `governance`.
+    pub async fn builder_from_source(
+        source: Arc<dyn RegistrySource>,
+        governance: Address,
+    ) -> Result<OracleClientBuilder, ClientError> {
+        let registry = source.fetch().await?;
+        let verified = registry.verify(governance, 0)?;
+        Ok(Self::builder(verified).registry_source(source))
     }
 
     /// Returns the counters.
@@ -234,6 +318,52 @@ impl OracleClient {
     #[must_use]
     pub const fn registry_version(&self) -> u64 {
         self.registry.version()
+    }
+
+    /// Returns how long ago the trusted registry was issued.
+    #[must_use]
+    pub fn registry_age(&self, now_ns: u64) -> Duration {
+        let issued_ns = self
+            .registry
+            .as_registry()
+            .effective_from
+            .saturating_mul(NANOS_PER_SEC);
+        Duration::from_nanos(now_ns.saturating_sub(issued_ns))
+    }
+
+    /// Returns `true` if the trusted registry is older than `max_registry_age`.
+    #[must_use]
+    pub fn registry_is_stale(&self, now_ns: u64) -> bool {
+        self.registry_age(now_ns) > self.max_registry_age
+    }
+
+    /// Fetches from the registry source and adopts the document if it is newer.
+    ///
+    /// Returns the adopted version, or `None` if the source served the version
+    /// already trusted. Unlike the automatic path this is not rate-limited.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Fetch`] if the source fails, or the errors of
+    /// [`OracleClient::refresh_registry`] if the document does not verify. With
+    /// no source configured it returns `Ok(None)`.
+    pub async fn refresh_from_source(&mut self) -> Result<Option<u64>, ClientError> {
+        let Some(source) = self.source.clone() else {
+            return Ok(None);
+        };
+        self.stats.refreshes = self.stats.refreshes.saturating_add(1);
+        let outcome = async {
+            let registry = source.fetch().await?;
+            if registry.version <= self.registry.version() {
+                return Ok(None);
+            }
+            self.refresh_registry(&registry).map(Some)
+        }
+        .await;
+        if outcome.is_err() {
+            self.stats.refresh_failures = self.stats.refresh_failures.saturating_add(1);
+        }
+        outcome
     }
 
     /// Adopts a newer registry version without interrupting the feed.
@@ -330,30 +460,89 @@ impl OracleClient {
         Ok(())
     }
 
-    /// Feeds one frame in directly, bypassing the network.
+    /// Feeds one frame in directly, bypassing the network and the registry source.
     ///
-    /// For tests and for consumers running their own transport.
+    /// For tests and for consumers running their own transport. An unknown
+    /// signer is a plain rejection here; [`OracleClient::ingest_with_refresh`]
+    /// is the path that goes looking for a newer registry.
     ///
     /// # Errors
     ///
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
-        let accepted = match self.verifier.accept(frame, now_ns) {
-            Ok(accepted) => accepted,
-            Err(reason) => {
-                self.stats.record(&reason);
-                return Err(reason);
-            }
-        };
-        self.stats.accepted = self.stats.accepted.saturating_add(1);
+        let outcome = self.try_ingest(frame, now_ns);
+        self.record(&outcome);
+        outcome
+    }
 
+    /// Feeds one frame in, refreshing the registry once if the signer is unknown.
+    ///
+    /// This is how a rotation reaches the consumer. The first frame from a node's
+    /// new key is unknown; the client fetches the registry, adopts it if it is
+    /// newer, and retries the frame. The fetch is rate-limited to one per
+    /// `refresh_interval`, because anyone who can inject a frame can trigger it.
+    /// A retired key never triggers a fetch: the registry already knows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`] if the frame still fails after the refresh.
+    pub async fn ingest_with_refresh(
+        &mut self,
+        frame: &[u8],
+        now_ns: u64,
+    ) -> Result<Resolved, RejectReason> {
+        let mut outcome = self.try_ingest(frame, now_ns);
+        if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { signer })) = &outcome
+            && self.refresh_due(now_ns)
+        {
+            self.last_refresh_attempt_ns = Some(now_ns);
+            match self.refresh_from_source().await {
+                Ok(Some(version)) => debug!(%signer, version, "adopted a newer registry"),
+                Ok(None) => debug!(%signer, "registry unchanged; signer stays unknown"),
+                Err(error) => warn!(%signer, %error, "registry refresh failed"),
+            }
+            outcome = self.try_ingest(frame, now_ns);
+        }
+        self.record(&outcome);
+        outcome
+    }
+
+    fn try_ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
+        let accepted = self.verifier.accept(frame, now_ns)?;
         let feed = accepted.update.feed_id;
         let view = self
             .views
             .entry(feed)
             .or_insert_with(|| FeedView::new(feed));
         view.record(accepted.node, accepted.update);
-        Ok(view.resolve(&self.quorum_config, now_ns))
+        let mut resolved = view.resolve(&self.quorum_config, now_ns);
+        self.annotate(&mut resolved, now_ns);
+        Ok(resolved)
+    }
+
+    fn record(&mut self, outcome: &Result<Resolved, RejectReason>) {
+        match outcome {
+            Ok(_) => self.stats.accepted = self.stats.accepted.saturating_add(1),
+            Err(reason) => self.stats.record(reason),
+        }
+    }
+
+    fn refresh_due(&self, now_ns: u64) -> bool {
+        let floor = u64::try_from(self.refresh_interval.as_nanos()).unwrap_or(u64::MAX);
+        self.source.is_some()
+            && self
+                .last_refresh_attempt_ns
+                .is_none_or(|last| now_ns.saturating_sub(last) >= floor)
+    }
+
+    /// Adds the client-level concerns a feed view cannot know about.
+    fn annotate(&self, resolved: &mut Resolved, now_ns: u64) {
+        if self.registry_is_stale(now_ns) {
+            resolved.concerns.push(Concern::RegistryStale);
+            if resolved.status == Status::Ok {
+                resolved.status = Status::Degraded;
+            }
+        }
     }
 
     /// Returns the next resolved price.
@@ -365,7 +554,7 @@ impl OracleClient {
         loop {
             let frame = self.frames_rx.recv().await?;
             let now_ns = now_unix_nanos();
-            match self.ingest(&frame, now_ns) {
+            match self.ingest_with_refresh(&frame, now_ns).await {
                 Ok(resolved) => return Some(resolved),
                 Err(reason) => {
                     debug!(%reason, "rejected an update");
@@ -378,9 +567,11 @@ impl OracleClient {
     #[must_use]
     pub fn resolve(&self, symbol: &Symbol, now_ns: u64) -> Option<Resolved> {
         let id = feed_id(symbol);
-        self.views
-            .get(&id)
-            .map(|view| view.resolve(&self.quorum_config, now_ns))
+        self.views.get(&id).map(|view| {
+            let mut resolved = view.resolve(&self.quorum_config, now_ns);
+            self.annotate(&mut resolved, now_ns);
+            resolved
+        })
     }
 
     /// Stops every node connection.

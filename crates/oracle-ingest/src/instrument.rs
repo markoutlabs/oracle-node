@@ -141,7 +141,7 @@ impl InstrumentMap {
     ///
     /// The uppercase path is exact and allocation-free; anything else is
     /// normalized through a stack buffer. Only symbols longer than
-    /// [`MAX_VENUE_SYMBOL`] miss, and those are rejected at construction.
+    /// `MAX_VENUE_SYMBOL` miss, and those are rejected at construction.
     #[must_use]
     pub fn lookup(&self, venue_symbol: &str) -> Option<&InstrumentEntry> {
         if let Some(entry) = self.by_symbol.get(venue_symbol) {

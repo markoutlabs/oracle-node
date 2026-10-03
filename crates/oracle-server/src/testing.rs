@@ -64,10 +64,15 @@ pub fn test_registry() -> Registry {
         signing_keys: vec![cert],
         weight: 1,
     };
+    // Issued now, not at the epoch: a client treats a registry older than its
+    // `max_registry_age` as stale and degrades every feed.
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     Registry::sign(
         &governance_key(),
         1,
-        0,
+        issued_at,
         vec![node],
         Quorum {
             min_nodes: 1,

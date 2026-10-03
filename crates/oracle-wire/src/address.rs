@@ -132,7 +132,7 @@ impl CompressedPublicKey {
 
     /// Wraps 33 raw bytes without checking that they form a curve point.
     ///
-    /// Use [`CompressedPublicKey::decode`] before relying on the key.
+    /// Use [`CompressedPublicKey::decompress`] before relying on the key.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 33]) -> Self {
         Self(bytes)

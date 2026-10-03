@@ -9,10 +9,17 @@
 //! production** — the secrets are guessable by construction.
 
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, VerifiedRegistry};
+use oracle_wire::{
+    Address, CompressedPublicKey, KeyHistoryEntry, NodeEntry, Quorum, Registry, Signer,
+    SigningKeyCert, VerifiedRegistry,
+};
 
 /// A conventional node id for single-node tests.
 pub const NODE_ID: &str = "oracle-test-1";
+
+/// Issue time of test registries, unix seconds. Matches the `NOW` the tests
+/// use, so a freshly built registry is never reported stale.
+pub const REGISTRY_ISSUED_AT: u64 = 1_754_582_400;
 
 /// Seed for the governance key that signs test registries.
 const GOVERNANCE_SEED: u8 = 0xC0;
@@ -71,16 +78,20 @@ impl TestNode {
         &self.node_id
     }
 
-    /// Rotates to a fresh signing key, keeping the outgoing one authorised.
-    ///
-    /// This is the overlap window from SPEC §3.5: for a period both keys are
-    /// listed and both verify, so the node can move to the new one without a gap
-    /// in which subscribers reject everything it publishes.
+    /// Returns the identity key, which issues this node's certificates.
+    #[must_use]
+    pub fn identity_key(&self) -> CompressedPublicKey {
+        self.identity.public_key()
+    }
+
+    /// Rotates to a fresh signing key. The old one is remembered for
+    /// [`TestNode::sign_outgoing`], so tests can produce frames a retired key
+    /// signed, but [`TestNode::entry`] lists only the live key (SPEC §3.5).
     ///
     /// # Panics
     ///
-    /// Panics if called more than twice on one node, which would need a third
-    /// key this helper does not derive.
+    /// Panics if called twice on one node, which would need a third key this
+    /// helper does not derive.
     pub fn rotate(&mut self) {
         assert!(
             self.outgoing.is_none(),
@@ -120,41 +131,50 @@ impl TestNode {
             .to_vec()
     }
 
-    /// Builds this node's registry entry, listing every authorised key.
+    /// Builds this node's registry entry: one live key.
     ///
     /// # Panics
     ///
     /// Cannot panic: the node id is short enough for the certificate encoding.
     #[must_use]
     pub fn entry(&self) -> NodeEntry {
-        let mut signing_keys = vec![self.cert(self.signing.address())];
-        if let Some(outgoing) = &self.outgoing {
-            signing_keys.push(self.cert(outgoing.address()));
-        }
         NodeEntry {
             node_id: self.node_id.clone(),
             operator: "test".to_owned(),
             identity_pubkey: self.identity.public_key(),
             endpoints: vec![format!("wss://{}.test/v1/ws", self.node_id)],
-            signing_keys,
+            signing_keys: vec![self.cert(self.signing.address())],
             weight: 1,
         }
     }
 
-    /// Builds this node's entry with only the current key listed.
+    /// Builds this node's key history as the registry canister would serve it.
     ///
-    /// Models the registry version published once the overlap closes, which is
-    /// what actually revokes the outgoing key.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic: the node id is short enough for the certificate encoding.
+    /// `rotated_at` is when the outgoing key was retired, unix seconds. Ignored
+    /// if the node has not rotated.
     #[must_use]
-    pub fn entry_without_outgoing(&self) -> NodeEntry {
-        NodeEntry {
-            signing_keys: vec![self.cert(self.signing.address())],
-            ..self.entry()
+    pub fn history(&self, rotated_at: u64) -> Vec<KeyHistoryEntry> {
+        let mut history = Vec::with_capacity(2);
+        if let Some(outgoing) = &self.outgoing {
+            history.push(KeyHistoryEntry {
+                generation: 1,
+                cert: self.cert(outgoing.address()),
+                added_at: CERT_NOT_BEFORE,
+                retired_at: Some(rotated_at),
+            });
         }
+        let generation = u32::try_from(history.len()).unwrap_or(0).saturating_add(1);
+        history.push(KeyHistoryEntry {
+            generation,
+            cert: self.cert(self.signing.address()),
+            added_at: if generation == 1 {
+                CERT_NOT_BEFORE
+            } else {
+                rotated_at
+            },
+            retired_at: None,
+        });
+        history
     }
 
     fn cert(&self, address: Address) -> SigningKeyCert {
@@ -194,11 +214,22 @@ pub fn registry_with(nodes: &[&TestNode]) -> VerifiedRegistry {
 /// Panics if the entries cannot form a valid registry.
 #[must_use]
 pub fn signed_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
+    signed_registry_at(version, REGISTRY_ISSUED_AT, entries)
+}
+
+/// Builds a signed registry issued at an explicit time, for staleness tests.
+///
+/// # Panics
+///
+/// Panics if the entries cannot form a valid registry.
+#[must_use]
+pub fn signed_registry_at(version: u64, issued_at: u64, entries: Vec<NodeEntry>) -> Registry {
     let quorum = Quorum {
         min_nodes: u16::try_from(entries.len()).unwrap_or(u16::MAX),
         recommended: u16::try_from(entries.len()).unwrap_or(u16::MAX),
     };
-    Registry::sign(&governance(), version, 0, entries, quorum).expect("test registry encodes")
+    Registry::sign(&governance(), version, issued_at, entries, quorum)
+        .expect("test registry encodes")
 }
 
 /// Signs a registry with a key that is not the pinned governance key.
@@ -213,7 +244,8 @@ pub fn forged_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
         min_nodes: u16::try_from(entries.len()).unwrap_or(u16::MAX),
         recommended: u16::try_from(entries.len()).unwrap_or(u16::MAX),
     };
-    Registry::sign(&impostor, version, 0, entries, quorum).expect("test registry encodes")
+    Registry::sign(&impostor, version, REGISTRY_ISSUED_AT, entries, quorum)
+        .expect("test registry encodes")
 }
 
 /// Builds a plain healthy price update.

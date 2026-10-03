@@ -1,26 +1,65 @@
-//! M5: five nodes, a quorum of three, and a signing-key rotation the consumer
-//! never notices.
+//! M5.5: five nodes, a quorum of three, and a signing-key rotation under the
+//! one-live-key model (SPEC §3.5).
 //!
-//! The milestone's exit criterion is "rotation with zero consumer impact", and
-//! the interesting failures are all ways that phrase can be satisfied on paper
-//! while being false in practice:
+//! A rotation is an atomic swap in the registry. The consumer learns about it
+//! from the first frame it cannot verify, fetches the registry once, and carries
+//! on. The ways that can go wrong, each a test here:
 //!
-//! - The rotating node keeps publishing, but occupies *two* quorum seats while
-//!   both its keys are valid — so three agreeing "nodes" are really two machines.
-//! - The rotation lands, but the consumer's replay floor resets with the new key.
-//! - The new registry is adopted, but a de-listed node keeps counting until its
-//!   last update ages out.
-//!
-//! Each of those is a test here.
+//! - The consumer never learns about the new key, or fetches on every unknown
+//!   frame and becomes a load generator against the registry.
+//! - The retired key keeps verifying, or triggers fetches forever.
+//! - The replay floor resets with the new key.
+//! - A de-listed node keeps counting until its last update ages out.
+//! - A document that stops being refreshed is reported as healthy.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use oracle_client::source::RegistryFuture;
 use oracle_client::testing::{
-    TestNode, forged_registry, registry_with, signed_registry, update_at,
+    REGISTRY_ISSUED_AT, TestNode, forged_registry, governance, registry_with, signed_registry,
+    signed_registry_at, update_at,
 };
-use oracle_client::{ClientError, OracleClient, Status};
+use oracle_client::{ClientError, Concern, OracleClient, RegistrySource, RejectReason, Status};
 use oracle_types::NANOS_PER_SEC;
-use oracle_wire::NodeEntry;
+use oracle_wire::{NodeEntry, Registry, VerifyError};
 
-const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
+const NOW: u64 = REGISTRY_ISSUED_AT * NANOS_PER_SEC;
+
+/// A registry source that serves whatever the test put in it, and counts.
+#[derive(Default)]
+struct MockSource {
+    document: Mutex<Option<Registry>>,
+    fetches: AtomicUsize,
+}
+
+impl MockSource {
+    fn serving(registry: Registry) -> Arc<Self> {
+        Arc::new(Self {
+            document: Mutex::new(Some(registry)),
+            fetches: AtomicUsize::new(0),
+        })
+    }
+
+    fn serve(&self, registry: Registry) {
+        *self.document.lock().expect("not poisoned") = Some(registry);
+    }
+
+    fn fetches(&self) -> usize {
+        self.fetches.load(Ordering::SeqCst)
+    }
+}
+
+impl RegistrySource for MockSource {
+    fn fetch(&self) -> RegistryFuture<'_> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        let document = self.document.lock().expect("not poisoned").clone();
+        Box::pin(async move {
+            document
+                .ok_or_else(|| oracle_client::FetchError::Transport("nothing to serve".to_owned()))
+        })
+    }
+}
 
 /// The deployment §9.2 calls for: five nodes, quorum of three.
 fn fleet() -> Vec<TestNode> {
@@ -37,6 +76,15 @@ fn client(nodes: &[TestNode]) -> OracleClient {
     let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
     OracleClient::builder(registry)
         .quorum(3)
+        .build()
+        .expect("five nodes satisfy a quorum of three")
+}
+
+fn client_with_source(nodes: &[TestNode], source: Arc<MockSource>) -> OracleClient {
+    let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+    OracleClient::builder(registry)
+        .quorum(3)
+        .registry_source(source)
         .build()
         .expect("five nodes satisfy a quorum of three")
 }
@@ -59,108 +107,97 @@ fn five_nodes_resolve_at_a_quorum_of_three() {
     assert_eq!(resolved.nodes, 5);
 }
 
-/// The core rotation hazard. A node mid-overlap holds two authorised keys; if
-/// the client counted keys it would seat that one machine twice, and a quorum of
-/// three could be satisfied by two nodes — one of them simply rotating.
-#[test]
-fn a_rotating_node_does_not_occupy_two_quorum_seats() {
+/// The whole rotation story from the consumer's side: one unknown frame, one
+/// fetch, and the node is back with its new key. The old key is retired, not
+/// unknown, so it never costs another fetch.
+#[tokio::test]
+async fn a_rotation_costs_the_consumer_one_fetch() {
     let mut nodes = fleet();
-    nodes.truncate(3);
-    if let Some(node) = nodes.first_mut() {
-        node.rotate();
-    }
-    let mut client = client(&nodes);
+    let source = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let mut client = client_with_source(&nodes, Arc::clone(&source));
 
-    // Three nodes are registered; only two of them will publish. The third stays
-    // silent, so the quorum has to come from the two that speak — or not at all.
-    let [rotating, other, _silent] = nodes.as_slice() else {
-        panic!("three nodes")
-    };
-
-    // Three accepted frames, two of them from the same machine under different
-    // keys. That must not be a quorum.
-    client
-        .ingest(&rotating.sign_outgoing(&update_at(NOW, 1)), NOW)
-        .expect("accepted");
-    client
-        .ingest(&rotating.sign(&update_at(NOW, 2)), NOW)
-        .expect("accepted");
-    let resolved = client
-        .ingest(&other.sign(&update_at(NOW, 1)), NOW)
-        .expect("accepted");
-
-    assert_eq!(client.stats().accepted, 3, "three frames really did verify");
-    assert_eq!(resolved.nodes, 2, "but they came from two nodes");
-    assert_eq!(resolved.status, Status::Halted);
-}
-
-/// The milestone criterion. A node rotates its key mid-stream while the registry
-/// is refreshed underneath a running consumer; the feed must stay `Ok` the whole
-/// way through, with no reconnect and no lost state.
-#[test]
-fn rotation_never_drops_the_consumer_below_quorum() {
-    let mut nodes = fleet();
-    let mut client = client(&nodes);
-
-    // Before: everyone on their original key.
-    let mut seq = 1;
     for node in &nodes {
         client
-            .ingest(&node.sign(&update_at(NOW, seq)), NOW)
+            .ingest_with_refresh(&node.sign(&update_at(NOW, 1)), NOW)
+            .await
             .expect("accepted");
     }
-    // Governance publishes v2, listing node 1's incoming key alongside its
-    // outgoing one. The consumer adopts it in place.
-    if let Some(node) = nodes.first_mut() {
-        node.rotate();
-    }
-    let overlap = signed_registry(2, entries(&nodes));
-    assert_eq!(client.refresh_registry(&overlap).expect("adopted"), 2);
+    assert_eq!(source.fetches(), 0, "known signers never fetch");
 
-    // Node 1 moves to the new key; everyone else is unchanged. The feed must not
-    // so much as flicker.
-    seq += 1;
-    let mut last = None;
-    for node in &nodes {
-        last = Some(
-            client
-                .ingest(&node.sign(&update_at(NOW, seq)), NOW)
-                .expect("accepted"),
-        );
-    }
-    let resolved = last.expect("resolved");
+    // The operator rotates node 1. The canister publishes v2 with only the new
+    // key. The consumer has no idea yet.
+    nodes.first_mut().expect("a node").rotate();
+    source.serve(signed_registry(2, entries(&nodes)));
+
+    let rotated = nodes.first().expect("a node");
+    let resolved = client
+        .ingest_with_refresh(&rotated.sign(&update_at(NOW, 2)), NOW)
+        .await
+        .expect("the new key is accepted after one refresh");
+    assert_eq!(source.fetches(), 1);
+    assert_eq!(client.registry_version(), 2);
+    assert_eq!(resolved.nodes, 5, "the node kept its seat through the swap");
     assert_eq!(resolved.status, Status::Ok);
-    assert_eq!(resolved.nodes, 5, "still five nodes, not six");
 
-    // The overlap closes: v3 drops the outgoing key.
-    let closed: Vec<NodeEntry> = nodes.iter().map(TestNode::entry_without_outgoing).collect();
-    let final_registry = signed_registry(3, closed);
-    assert_eq!(
-        client.refresh_registry(&final_registry).expect("adopted"),
-        3
-    );
-
-    seq += 1;
-    let mut last = None;
-    for node in &nodes {
-        last = Some(
-            client
-                .ingest(&node.sign(&update_at(NOW, seq)), NOW)
-                .expect("accepted"),
-        );
-    }
-    let resolved = last.expect("resolved");
-    assert_eq!(resolved.status, Status::Ok);
-    assert_eq!(resolved.nodes, 5);
-
-    // And the revoked key is now genuinely revoked.
-    let rotating = nodes.first().expect("a node");
+    // A frame that was in flight under the old key: refused, and no fetch.
+    let old_key = client
+        .ingest_with_refresh(&rotated.sign_outgoing(&update_at(NOW, 3)), NOW)
+        .await
+        .expect_err("the retired key must not verify");
     assert!(
-        client
-            .ingest(&rotating.sign_outgoing(&update_at(NOW, seq + 1)), NOW)
-            .is_err(),
-        "the outgoing key must stop verifying once it is de-listed"
+        matches!(old_key, RejectReason::RetiredKey { .. }),
+        "{old_key:?}"
     );
+    assert_eq!(
+        source.fetches(),
+        1,
+        "a retired key is not a reason to fetch"
+    );
+    assert_eq!(client.stats().retired, 1);
+
+    // Everyone publishes again. Still five nodes, not six and not four.
+    let mut last = None;
+    for node in &nodes {
+        last = Some(
+            client
+                .ingest_with_refresh(&node.sign(&update_at(NOW, 4)), NOW)
+                .await
+                .expect("accepted"),
+        );
+    }
+    assert_eq!(last.expect("resolved").nodes, 5);
+}
+
+/// Anyone who can inject a frame can make the signer unknown. The fetch is
+/// rate-limited so that costs the registry one request per interval, not one
+/// per frame.
+#[tokio::test]
+async fn unknown_signers_fetch_at_most_once_per_interval() {
+    let nodes = fleet();
+    let source = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let mut client = client_with_source(&nodes, Arc::clone(&source));
+    let impostor = TestNode::new(200, "impostor");
+
+    for seq in 1..=5 {
+        let error = client
+            .ingest_with_refresh(&impostor.sign(&update_at(NOW, seq)), NOW + seq)
+            .await
+            .expect_err("an impostor stays unknown");
+        assert!(matches!(
+            error,
+            RejectReason::Untrusted(VerifyError::UnknownSigner { .. })
+        ));
+    }
+    assert_eq!(source.fetches(), 1, "five unknown frames, one fetch");
+    assert_eq!(client.stats().untrusted, 5);
+
+    // Once the interval has passed, one more.
+    let later = NOW + 11 * NANOS_PER_SEC;
+    let _ = client
+        .ingest_with_refresh(&impostor.sign(&update_at(later, 9)), later)
+        .await;
+    assert_eq!(source.fetches(), 2);
+    assert_eq!(client.stats().refreshes, 2);
 }
 
 /// Revocation has to take effect on adoption, not once the revoked node's last
@@ -191,6 +228,13 @@ fn a_de_listed_node_stops_counting_immediately() {
         resolved.nodes, 3,
         "the two de-listed nodes must be gone from the view at once"
     );
+
+    // And their keys are retired, not unknown.
+    let removed = nodes.last().expect("a node");
+    assert!(matches!(
+        client.ingest(&removed.sign(&update_at(NOW, 2)), NOW),
+        Err(RejectReason::RetiredKey { .. })
+    ));
 }
 
 #[test]
@@ -251,6 +295,34 @@ fn a_registry_signed_by_anyone_else_is_refused() {
     assert_eq!(client.registry_version(), 1);
 }
 
+/// The same anchor applies when the client is built from a source.
+#[tokio::test]
+async fn building_from_a_source_verifies_against_the_pinned_governance_key() {
+    let nodes = fleet();
+    let good = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let client = OracleClient::builder_from_source(good, governance().address())
+        .await
+        .expect("fetched and verified")
+        .quorum(3)
+        .build()
+        .expect("builds");
+    assert_eq!(client.registry_version(), 1);
+
+    let forged = MockSource::serving(forged_registry(1, entries(&nodes)));
+    let error = OracleClient::builder_from_source(forged, governance().address())
+        .await
+        .err()
+        .expect("must refuse");
+    assert!(matches!(error, ClientError::Registry(_)), "got {error:?}");
+
+    let empty = Arc::new(MockSource::default());
+    let error = OracleClient::builder_from_source(empty, governance().address())
+        .await
+        .err()
+        .expect("must fail");
+    assert!(matches!(error, ClientError::Fetch(_)), "got {error:?}");
+}
+
 /// A registry swap is exactly the moment an attacker would hope the replay
 /// window reopened.
 #[test]
@@ -271,4 +343,37 @@ fn a_refresh_does_not_reopen_the_replay_window() {
         "the sequence floor must survive the swap"
     );
     assert_eq!(client.stats().replayed, 1);
+}
+
+/// The canister re-signs daily even with no change. A document two days old
+/// means the consumer is cut off from membership changes, and that must show.
+#[test]
+fn a_stale_registry_degrades_every_feed() {
+    let nodes = fleet();
+    let mut client = client(&nodes);
+
+    for node in &nodes {
+        client
+            .ingest(&node.sign(&update_at(NOW, 1)), NOW)
+            .expect("accepted");
+    }
+    let three_days = 3 * 86_400;
+    client
+        .refresh_registry(&signed_registry_at(
+            2,
+            REGISTRY_ISSUED_AT - three_days,
+            entries(&nodes),
+        ))
+        .expect("adopted");
+    assert!(client.registry_is_stale(NOW));
+
+    let resolved = client
+        .ingest(
+            &nodes.first().expect("a node").sign(&update_at(NOW, 2)),
+            NOW,
+        )
+        .expect("accepted");
+    assert_eq!(resolved.status, Status::Degraded);
+    assert!(resolved.concerns.contains(&Concern::RegistryStale));
+    assert_eq!(resolved.nodes, 5, "the prices themselves are fine");
 }

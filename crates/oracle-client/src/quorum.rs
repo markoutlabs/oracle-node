@@ -77,6 +77,12 @@ pub enum Concern {
     NodeReportedDegraded,
     /// At least one node reported its own feed halted, and was excluded.
     NodeReportedHalted,
+    /// The registry document is older than the configured maximum.
+    ///
+    /// The canister re-signs on a heartbeat even with no change (SPEC §3.6), so
+    /// an old document means the fetch path is broken or something is
+    /// withholding newer versions. Membership changes may be missing.
+    RegistryStale,
 }
 
 /// A resolved price for one feed.
@@ -110,11 +116,9 @@ impl Resolved {
 
 /// The latest accepted update from each node, for one feed.
 ///
-/// Keyed by node rather than by signing key. A node holds two authorised keys
-/// during a rotation overlap, and keying by key would let it occupy two seats in
-/// its own quorum — three "nodes" agreeing could be two machines, one of which is
-/// simply mid-rotation. That defeats the only defence the design has against a
-/// single bad node.
+/// Keyed by node rather than by signing key. Keys rotate and registry indices
+/// shift on every refresh; the node id is the one key that survives both, so a
+/// node's seat and its last update follow it through a rotation.
 #[derive(Clone, Debug, Default)]
 pub struct FeedView {
     feed_id: FeedId,

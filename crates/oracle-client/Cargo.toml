@@ -14,6 +14,8 @@ oracle-wire.workspace = true
 
 backon.workspace = true
 futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
@@ -22,8 +24,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 oracle-wire.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 
 [lints]
 workspace = true

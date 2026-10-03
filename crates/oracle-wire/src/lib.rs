@@ -95,8 +95,8 @@ pub use payload::{
     decode_price_update, encode_price_update, feed_id,
 };
 pub use registry::{
-    MAX_CERTS_PER_NODE, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry,
-    Quorum, Registry, VerifiedRegistry,
+    KeyHistoryEntry, MAX_CERTS_PER_NODE, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES,
+    MAX_OPERATOR_LEN, NodeEntry, Quorum, Registry, VerifiedRegistry,
 };
 pub use signature::{SIGNATURE_LEN, Signature};
 pub use signer::{Signer, recover_address, recover_payload_signer};

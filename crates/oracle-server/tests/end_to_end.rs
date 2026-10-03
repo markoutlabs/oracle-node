@@ -93,7 +93,7 @@ async fn start_node() -> Node {
     let registry = Registry::sign(
         &governance,
         1,
-        0,
+        now_ns() / NANOS_PER_SEC,
         vec![entry],
         oracle_wire::Quorum {
             min_nodes: 1,
