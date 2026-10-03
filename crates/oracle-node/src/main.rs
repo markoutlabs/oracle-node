@@ -10,7 +10,10 @@ use oracle_ingest::clock::wall_clock_unix_nanos;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::VenueAdapter;
 use oracle_ingest::{ExchangeAdapter, IngestEvent};
-use oracle_node::{InitOptions, NodeConfig, NodeKeys, Pipeline, Rotation, candid_call};
+use oracle_node::keyfile;
+use oracle_node::{
+    InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, candid_call,
+};
 use oracle_server::{ServerState, router};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -94,9 +97,13 @@ struct InitArgs {
     #[arg(long, default_value_t = InitOptions::default().validity_days)]
     validity_days: u64,
     /// Write the keys, registry entry, and a starter config to DIR instead of
-    /// printing the secrets to the terminal.
+    /// printing the secrets to the terminal. The keys are encrypted at rest.
     #[arg(long, value_name = "DIR")]
     out: Option<PathBuf>,
+    /// A 0600 file holding the passphrase that encrypts the keys. Without it,
+    /// `--out` prompts at the terminal. Recorded in the starter config.
+    #[arg(long, value_name = "FILE", requires = "out")]
+    passphrase_file: Option<PathBuf>,
     /// The registry canister id. Prints the `dfx` call that submits the entry.
     #[arg(long, value_name = "CANISTER_ID")]
     canister: Option<String>,
@@ -113,6 +120,11 @@ struct RotateArgs {
     /// Signing certificate lifetime, in days.
     #[arg(long, default_value_t = InitOptions::default().validity_days)]
     validity_days: u64,
+    /// A 0600 file holding the passphrase that opens the identity key and
+    /// encrypts the new signing key. Defaults to the config's
+    /// `signing.passphrase_file`, then to a prompt.
+    #[arg(long, value_name = "FILE")]
+    passphrase_file: Option<PathBuf>,
 }
 
 async fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,19 +358,30 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match &out {
         Some(dir) => {
-            let (identity_path, signing_path) = keys.write_keys(dir)?;
+            // Asked for before anything is written, so a refused prompt leaves
+            // no half-initialised directory behind.
+            let passphrase = PassphraseSource::from_file(args.passphrase_file.clone())
+                .read("the new key files", true)?;
+            let (identity_path, signing_path) = keys.write_keys(dir, &passphrase)?;
             let entry_path = dir.join("node-entry.json");
             let config_path = dir.join("config.toml");
             let registry_path = dir.join("registry.json");
             std::fs::write(&entry_path, format!("{entry}\n"))?;
             std::fs::write(
                 &config_path,
-                keys.config_template(&signing_path, &registry_path),
+                keys.config_template(
+                    &signing_path,
+                    &registry_path,
+                    args.passphrase_file.as_deref(),
+                ),
             )?;
 
             println!("\nWritten");
-            println!("  {}  (0600 — keep offline)", identity_path.display());
-            println!("  {}  (0600 — the node reads this)", signing_path.display());
+            println!("  {}  (age, 0600 — keep offline)", identity_path.display());
+            println!(
+                "  {}  (age, 0600 — the node reads this)",
+                signing_path.display()
+            );
             println!("  {}  (send to governance)", entry_path.display());
             println!("  {}  (starter config)", config_path.display());
         }
@@ -483,13 +506,19 @@ fn log_update(update: &oracle_wire::SignedUpdate) {
 /// node keeps signing with its old key until the registry lists the new one.
 fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig::load(&args.dir.join("config.toml"))?;
-    let identity_hex =
-        zeroize::Zeroizing::new(std::fs::read_to_string(args.dir.join("identity.key"))?);
-    let identity = oracle_wire::Signer::from_hex(identity_hex.trim())?;
+    // One passphrase opens the identity key and seals the new signing key, so
+    // the node's `signing.passphrase_file` keeps working after the swap.
+    let passphrase = PassphraseSource::from_file(
+        args.passphrase_file
+            .clone()
+            .or_else(|| config.signing.passphrase_file.clone()),
+    )
+    .read("identity.key", false)?;
+    let identity = keyfile::load_signer(&args.dir.join("identity.key"), Some(&passphrase))?;
 
     let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
     let rotation = Rotation::generate(&identity, &config.node_id, args.validity_days, now)?;
-    let (key_path, cert_path) = rotation.write(&args.dir)?;
+    let (key_path, cert_path) = rotation.write(&args.dir, &passphrase)?;
 
     println!("Generated a new signing key for `{}`.\n", config.node_id);
     println!("  new signing  {}", rotation.signing.address());
@@ -498,7 +527,7 @@ fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
         rotation.cert.not_before, rotation.cert.not_after, args.validity_days
     );
     println!("\nWritten");
-    println!("  {}  (0600 — not loaded yet)", key_path.display());
+    println!("  {}  (age, 0600 — not loaded yet)", key_path.display());
     println!("  {}  (send to the registry)", cert_path.display());
 
     let call = args.canister.as_deref().map_or_else(

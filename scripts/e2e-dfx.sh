@@ -58,8 +58,12 @@ echo "governance $GOV"
 
 say "node identity, submitted and approved"
 rm -rf "$DIR" && mkdir -p "$DIR"
+# The keys are encrypted at rest; the node opens them with this passphrase file.
+python3 -c 'import secrets; print(secrets.token_hex(16))' > "$DIR/passphrase"
+chmod 600 "$DIR/passphrase"
 $NODE init --out "$DIR/node1" --node-id "$NODE_ID" --operator e2e \
-  --endpoint ws://127.0.0.1:8791/v1/ws --canister "$CANISTER" > "$DIR/init.out"
+  --endpoint ws://127.0.0.1:8791/v1/ws --canister "$CANISTER" \
+  --passphrase-file "$DIR/passphrase" > "$DIR/init.out"
 eval "$(grep '^dfx canister call' "$DIR/init.out") --identity $IDENTITY" >/dev/null
 dfx canister call oracle_registry approve_entry "(\"$NODE_ID\")" --identity "$IDENTITY" >/dev/null
 python3 - "$DIR/node1/config.toml" "$URL" "$GOV" <<'PY'

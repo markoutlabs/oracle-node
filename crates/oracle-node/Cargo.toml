@@ -15,6 +15,7 @@ oracle-server.workspace = true
 oracle-types.workspace = true
 oracle-wire.workspace = true
 
+age.workspace = true
 axum.workspace = true
 clap.workspace = true
 serde = { workspace = true }
@@ -24,6 +25,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
+rpassword.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zeroize.workspace = true
 

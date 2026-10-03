@@ -97,10 +97,19 @@ pub struct ServerSettings {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigningSettings {
-    /// File containing the key as hex. Read once at startup.
+    /// File containing the key: an `age` file as written by `init`, or plaintext
+    /// hex for a local playground. Read once at startup.
     #[serde(default)]
     pub key_file: Option<PathBuf>,
-    /// Environment variable holding the key as hex.
+    /// File containing the passphrase that opens an encrypted `key_file`,
+    /// readable only by the operator. Without it the node prompts at startup,
+    /// and refuses to start when there is no terminal.
+    #[serde(default)]
+    pub passphrase_file: Option<PathBuf>,
+    /// Environment variable holding the key as plaintext hex.
+    ///
+    /// For local playgrounds with seeded keys only. A real key never goes in an
+    /// environment variable (SPEC §9.2).
     #[serde(default)]
     pub key_env: Option<String>,
 }
@@ -241,20 +250,38 @@ impl NodeConfig {
     /// Returns [`ConfigError::SigningKey`] if no source is configured, the source
     /// cannot be read, or the value is not a valid key.
     pub fn load_signing_key(&self) -> Result<oracle_wire::Signer, ConfigError> {
-        // Wiped on drop. The hex string is the key.
-        let hex = zeroize::Zeroizing::new(match (&self.signing.key_file, &self.signing.key_env) {
-            (Some(path), _) => std::fs::read_to_string(path)
-                .map_err(|e| ConfigError::SigningKey(format!("{}: {e}", path.display())))?,
-            (None, Some(var)) => std::env::var(var)
-                .map_err(|_| ConfigError::SigningKey(format!("${var} is not set")))?,
-            (None, None) => {
-                return Err(ConfigError::SigningKey(
-                    "set either signing.key_file or signing.key_env".to_owned(),
-                ));
+        let failed = |e: &dyn std::fmt::Display| ConfigError::SigningKey(e.to_string());
+        match (&self.signing.key_file, &self.signing.key_env) {
+            (Some(path), _) => {
+                // The passphrase is read only for an encrypted file, so a
+                // plaintext playground key never prompts.
+                let passphrase =
+                    if crate::keyfile::file_is_encrypted(path).map_err(|e| failed(&e))? {
+                        let source = crate::keyfile::PassphraseSource::from_file(
+                            self.signing.passphrase_file.clone(),
+                        );
+                        Some(
+                            source
+                                .read(&path.display().to_string(), false)
+                                .map_err(|e| failed(&e))?,
+                        )
+                    } else {
+                        None
+                    };
+                crate::keyfile::load_signer(path, passphrase.as_ref()).map_err(|e| failed(&e))
             }
-        });
-        oracle_wire::Signer::from_hex(hex.trim())
-            .map_err(|e| ConfigError::SigningKey(e.to_string()))
+            (None, Some(var)) => {
+                // Wiped on drop. The hex string is the key.
+                let hex = zeroize::Zeroizing::new(
+                    std::env::var(var)
+                        .map_err(|_| ConfigError::SigningKey(format!("${var} is not set")))?,
+                );
+                oracle_wire::Signer::from_hex(hex.trim()).map_err(|e| failed(&e))
+            }
+            (None, None) => Err(ConfigError::SigningKey(
+                "set either signing.key_file or signing.key_env".to_owned(),
+            )),
+        }
     }
 
     /// Fetches the registry from its configured source and verifies it against

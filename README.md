@@ -280,6 +280,15 @@ cargo run -p oracle-node -- start crates/oracle-node/config/example.toml
 The signing key comes from a file or an environment variable, never a
 command-line argument: arguments are visible in `ps` to every user on the box.
 
+**Keys are encrypted at rest.** `init --out` and `rotate` write `age` files,
+encrypted with a passphrase from `--passphrase-file` or a terminal prompt, and
+record the passphrase file in the starter config as `signing.passphrase_file`.
+At startup the node opens the key with that file, or prompts when the line is
+absent, and refuses to start when it has neither and no terminal. Plaintext hex
+is still accepted in a key file or `key_env` so the local playground can hand a
+seeded key to the node; a real key never goes there. There is no KMS and no HSM
+by design (SPEC §9.2): a cloud key service is a third party in the signing path.
+
 The registry comes from `registry.path`, a file, or `registry.url`, usually the
 registry canister's `/registry.json`. A file is pinned
 until the node restarts. Either way the document is verified against the pinned

@@ -17,7 +17,10 @@
 
 use std::path::{Path, PathBuf};
 
+use age::secrecy::SecretString;
 use oracle_wire::{NodeEntry, Signer, SigningKeyCert};
+
+use crate::keyfile;
 
 /// Default certificate validity, in days (SPEC §3.5).
 pub const DEFAULT_VALIDITY_DAYS: u64 = 30;
@@ -141,15 +144,20 @@ impl NodeKeys {
         }
     }
 
-    /// Writes both keys to `dir`, readable only by the current user.
+    /// Writes both keys to `dir` as `age` files encrypted with `passphrase`,
+    /// readable only by the current user.
     ///
     /// Returns the paths written, identity first.
     ///
     /// # Errors
     ///
-    /// Returns [`InitError::Write`] if the directory cannot be created or either
-    /// file cannot be written.
-    pub fn write_keys(&self, dir: &Path) -> Result<(PathBuf, PathBuf), InitError> {
+    /// Returns [`InitError::Write`] if the directory cannot be created, either
+    /// file exists or cannot be written, or encryption fails.
+    pub fn write_keys(
+        &self,
+        dir: &Path,
+        passphrase: &SecretString,
+    ) -> Result<(PathBuf, PathBuf), InitError> {
         std::fs::create_dir_all(dir).map_err(|e| InitError::Write {
             path: dir.to_path_buf(),
             reason: e.to_string(),
@@ -157,17 +165,24 @@ impl NodeKeys {
 
         let identity_path = dir.join("identity.key");
         let signing_path = dir.join("signing.key");
-        write_secret(&identity_path, &self.identity.to_secret_hex())?;
-        write_secret(&signing_path, &self.signing.to_secret_hex())?;
+        write_encrypted(&identity_path, &self.identity.to_secret_hex(), passphrase)?;
+        write_encrypted(&signing_path, &self.signing.to_secret_hex(), passphrase)?;
         Ok((identity_path, signing_path))
     }
 
     /// Renders a starter config file.
     ///
-    /// `signing_key_file` is where the node will read its signing key from, and
-    /// `registry_path` where it will read the governance-signed registry.
+    /// `signing_key_file` is where the node will read its signing key from,
+    /// `registry_path` where it will read the governance-signed registry, and
+    /// `passphrase_file`, if given, where it will read the passphrase that opens
+    /// the key. Without one the node prompts at startup.
     #[must_use]
-    pub fn config_template(&self, signing_key_file: &Path, registry_path: &Path) -> String {
+    pub fn config_template(
+        &self,
+        signing_key_file: &Path,
+        registry_path: &Path,
+        passphrase_file: Option<&Path>,
+    ) -> String {
         let listen = self
             .options
             .endpoint
@@ -181,6 +196,10 @@ impl NodeKeys {
         // Quoted by the TOML serializer, so a quote or a backslash in a node id
         // or a path cannot produce a file the node then refuses to load.
         let quoted = |text: String| toml::Value::String(text).to_string();
+        let passphrase_line = passphrase_file.map_or_else(
+            || "# passphrase_file = \"/etc/oracle/passphrase\"".to_owned(),
+            |path| format!("passphrase_file = {}", quoted(path.display().to_string())),
+        );
 
         format!(
             r#"node_id = {node_id}
@@ -195,8 +214,11 @@ max_pending_feeds = 512
 
 [signing]
 # A file or an environment variable, never a command-line argument: arguments
-# are visible in `ps` to every user on the box.
+# are visible in `ps` to every user on the box. The key file is an `age` file;
+# the passphrase that opens it comes from a 0600 file, or from a prompt at
+# startup when this line is absent.
 key_file = {signing_key_file}
+{passphrase_line}
 
 [registry]
 path = {registry_path}
@@ -217,6 +239,7 @@ sources = [
             node_id = quoted(self.options.node_id.clone()),
             listen = quoted(listen),
             signing_key_file = quoted(signing_key_file.display().to_string()),
+            passphrase_line = passphrase_line,
             registry_path = quoted(registry_path.display().to_string()),
         )
     }
@@ -262,8 +285,9 @@ impl Rotation {
         Ok(Self { signing, cert })
     }
 
-    /// Writes the new key to `dir/signing.key.next`, readable only by the
-    /// current user, and the certificate to `dir/rotation-cert.json`.
+    /// Writes the new key to `dir/signing.key.next` as an `age` file encrypted
+    /// with `passphrase`, readable only by the current user, and the
+    /// certificate to `dir/rotation-cert.json`.
     ///
     /// Returns the two paths, key first.
     ///
@@ -272,10 +296,14 @@ impl Rotation {
     /// Returns [`InitError::Write`] if either file exists or cannot be written.
     /// An existing `signing.key.next` is a rotation that was never completed,
     /// and overwriting it would lose a key the canister may already list.
-    pub fn write(&self, dir: &Path) -> Result<(PathBuf, PathBuf), InitError> {
+    pub fn write(
+        &self,
+        dir: &Path,
+        passphrase: &SecretString,
+    ) -> Result<(PathBuf, PathBuf), InitError> {
         let key_path = dir.join("signing.key.next");
         let cert_path = dir.join("rotation-cert.json");
-        write_secret(&key_path, &self.signing.to_secret_hex())?;
+        write_encrypted(&key_path, &self.signing.to_secret_hex(), passphrase)?;
         let cert = serde_json::to_string_pretty(&self.cert).map_err(|e| InitError::Write {
             path: cert_path.clone(),
             reason: e.to_string(),
@@ -329,6 +357,15 @@ pub fn candid_call(canister: &str, method: &str, args: &[&str]) -> String {
         "dfx canister call {canister} {method} '({})'",
         quoted.join(", ")
     )
+}
+
+/// Encrypts a secret and writes it to a file only the current user can read.
+fn write_encrypted(path: &Path, secret: &str, passphrase: &SecretString) -> Result<(), InitError> {
+    let armored = keyfile::encrypt(secret, passphrase).map_err(|e| InitError::Write {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    write_secret(path, &armored)
 }
 
 /// Writes a secret to a file only the current user can read.
@@ -496,21 +533,29 @@ mod tests {
         }
     }
 
+    fn passphrase() -> SecretString {
+        SecretString::from("correct horse battery staple".to_owned())
+    }
+
     #[test]
-    fn written_keys_reload_and_are_not_world_readable() {
+    fn written_keys_are_encrypted_reload_and_are_not_world_readable() {
         let dir = std::env::temp_dir().join(format!("oracle-init-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let keys = NodeKeys::generate(options(), NOW).expect("generates");
-        let (identity_path, signing_path) = keys.write_keys(&dir).expect("writes");
+        let (identity_path, signing_path) = keys.write_keys(&dir, &passphrase()).expect("writes");
+
+        // At rest the file is an age file; the hex never touches the disk.
+        let on_disk = std::fs::read_to_string(&signing_path).expect("readable");
+        assert!(keyfile::is_encrypted(&on_disk), "{on_disk}");
+        assert!(!on_disk.contains(&*keys.signing.to_secret_hex()));
 
         // The node loads its key with exactly this call.
-        let reloaded = Signer::from_hex(
-            std::fs::read_to_string(&signing_path)
-                .expect("readable")
-                .trim(),
-        )
-        .expect("valid key");
+        let reloaded = keyfile::load_signer(&signing_path, Some(&passphrase())).expect("valid key");
         assert_eq!(reloaded.address(), keys.signing.address());
+        assert!(
+            keyfile::load_signer(&signing_path, None).is_err(),
+            "an encrypted key must not open without the passphrase"
+        );
 
         #[cfg(unix)]
         {
@@ -527,7 +572,7 @@ mod tests {
         // Refusing to clobber matters: silently overwriting an identity key would
         // orphan every certificate it ever issued.
         assert!(
-            keys.write_keys(&dir).is_err(),
+            keys.write_keys(&dir, &passphrase()).is_err(),
             "writing over existing keys must fail"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -539,11 +584,25 @@ mod tests {
         let config = keys.config_template(
             Path::new("/etc/oracle/signing.key"),
             Path::new("/etc/oracle/registry.json"),
+            Some(Path::new("/etc/oracle/passphrase")),
         );
         let parsed: crate::NodeConfig =
             toml::from_str(&config).expect("init must emit a valid config");
         assert_eq!(parsed.node_id, "oracle-eu-1");
+        assert_eq!(
+            parsed.signing.passphrase_file.as_deref(),
+            Some(Path::new("/etc/oracle/passphrase"))
+        );
         parsed.resolve().expect("the emitted feeds must resolve");
+
+        // Without a passphrase file the line is a comment, and the node prompts.
+        let prompting = keys.config_template(
+            Path::new("/etc/oracle/signing.key"),
+            Path::new("/etc/oracle/registry.json"),
+            None,
+        );
+        let parsed: crate::NodeConfig = toml::from_str(&prompting).expect("valid config");
+        assert!(parsed.signing.passphrase_file.is_none());
     }
 
     /// A quote in the node id or a backslash in a path used to produce a file
@@ -558,6 +617,7 @@ mod tests {
         let config = keys.config_template(
             Path::new(r"C:\keys\signing.key"),
             Path::new(r"C:\keys\registry.json"),
+            None,
         );
         let parsed: crate::NodeConfig = toml::from_str(&config).expect("valid TOML");
         assert_eq!(parsed.node_id, r#"oracle "eu" \ 1"#);
@@ -575,7 +635,8 @@ mod tests {
             ..options()
         };
         let keys = NodeKeys::generate(options, NOW).expect("generates");
-        let config = keys.config_template(Path::new("signing.key"), Path::new("registry.json"));
+        let config =
+            keys.config_template(Path::new("signing.key"), Path::new("registry.json"), None);
         assert!(config.contains("listen = \"0.0.0.0:9001\""), "{config}");
     }
 
@@ -586,7 +647,8 @@ mod tests {
             ..options()
         };
         let keys = NodeKeys::generate(options, NOW).expect("generates");
-        let config = keys.config_template(Path::new("signing.key"), Path::new("registry.json"));
+        let config =
+            keys.config_template(Path::new("signing.key"), Path::new("registry.json"), None);
         assert!(config.contains("listen = \"0.0.0.0:9001\""), "{config}");
     }
 }

@@ -26,6 +26,24 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+const PASSPHRASE: &str = "correct horse battery staple";
+
+/// Writes a passphrase file next to, not inside, the directory under test, so
+/// `init --out` still sees an empty target.
+fn passphrase_file(dir: &Path) -> String {
+    let path = dir.with_extension("passphrase");
+    std::fs::write(&path, format!("{PASSPHRASE}\n")).expect("writes");
+    path.to_str().expect("utf-8").to_owned()
+}
+
+fn passphrase() -> age::secrecy::SecretString {
+    age::secrecy::SecretString::from(PASSPHRASE.to_owned())
+}
+
+fn load_key(path: &Path) -> oracle_wire::Signer {
+    oracle_node::keyfile::load_signer(path, Some(&passphrase())).expect("a valid encrypted key")
+}
+
 /// Counts 64-character hex runs, which is what a leaked secret key looks like.
 fn secret_like_strings(text: &str) -> usize {
     text.split(|c: char| !c.is_ascii_hexdigit())
@@ -92,8 +110,19 @@ fn init_generates_a_different_identity_every_time() {
 #[test]
 fn init_with_out_writes_files_and_prints_no_secrets() {
     let dir = scratch("out");
-    let output = run(&["init", "--out", dir.to_str().expect("utf-8")]);
-    assert!(output.status.success());
+    let pass = passphrase_file(&dir);
+    let output = run(&[
+        "init",
+        "--out",
+        dir.to_str().expect("utf-8"),
+        "--passphrase-file",
+        &pass,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = stdout(&output);
 
     assert_eq!(
@@ -111,9 +140,21 @@ fn init_with_out_writes_files_and_prints_no_secrets() {
         assert!(dir.join(name).is_file(), "{name} was not written");
     }
 
+    // At rest both keys are age files. The hex never touches the disk.
+    for name in ["identity.key", "signing.key"] {
+        let on_disk = std::fs::read_to_string(dir.join(name)).expect("readable");
+        assert!(
+            oracle_node::keyfile::is_encrypted(&on_disk),
+            "{name} is not encrypted"
+        );
+        assert_eq!(
+            secret_like_strings(&on_disk),
+            0,
+            "{name} holds plaintext hex"
+        );
+    }
     // The written signing key is the one the node will load.
-    let signing = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
-    let signer = oracle_wire::Signer::from_hex(signing.trim()).expect("a valid key");
+    let signer = load_key(&dir.join("signing.key"));
     let entry: oracle_wire::NodeEntry = serde_json::from_str(
         &std::fs::read_to_string(dir.join("node-entry.json")).expect("readable"),
     )
@@ -143,9 +184,15 @@ fn init_with_out_writes_files_and_prints_no_secrets() {
 fn rotate_writes_the_next_key_beside_the_live_one() {
     let dir = scratch("rotate");
     let path = dir.to_str().expect("utf-8");
-    assert!(run(&["init", "--out", path]).status.success());
+    let pass = passphrase_file(&dir);
+    assert!(
+        run(&["init", "--out", path, "--passphrase-file", &pass])
+            .status
+            .success()
+    );
     let live_before = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
 
+    // No --passphrase-file: rotate falls back to the config's passphrase_file.
     let output = run(&["rotate", "--dir", path, "--canister", "aaaaa-aa"]);
     assert!(
         output.status.success(),
@@ -168,15 +215,18 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
         live_before, live_after,
         "the live key must not change until the canister has"
     );
-    let next = std::fs::read_to_string(dir.join("signing.key.next")).expect("written");
-    let next = oracle_wire::Signer::from_hex(next.trim()).expect("a valid key");
+    let on_disk = std::fs::read_to_string(dir.join("signing.key.next")).expect("written");
+    assert!(
+        oracle_node::keyfile::is_encrypted(&on_disk),
+        "the next key must be encrypted"
+    );
+    let next = load_key(&dir.join("signing.key.next"));
     let cert: oracle_wire::SigningKeyCert = serde_json::from_str(
         &std::fs::read_to_string(dir.join("rotation-cert.json")).expect("written"),
     )
     .expect("a certificate");
     assert_eq!(cert.address, next.address());
-    let identity = std::fs::read_to_string(dir.join("identity.key")).expect("readable");
-    let identity = oracle_wire::Signer::from_hex(identity.trim()).expect("a valid key");
+    let identity = load_key(&dir.join("identity.key"));
     assert_eq!(cert.recover_issuer().expect("recovers"), identity.address());
 
     // A second rotation before the first completed must not clobber the key.
@@ -192,9 +242,14 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
 fn init_refuses_to_overwrite_existing_keys() {
     let dir = scratch("clobber");
     let path = dir.to_str().expect("utf-8");
-    assert!(run(&["init", "--out", path]).status.success());
+    let pass = passphrase_file(&dir);
+    assert!(
+        run(&["init", "--out", path, "--passphrase-file", &pass])
+            .status
+            .success()
+    );
 
-    let second = run(&["init", "--out", path]);
+    let second = run(&["init", "--out", path, "--passphrase-file", &pass]);
     assert!(!second.status.success(), "the second init must fail");
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("identity.key"),
@@ -206,10 +261,17 @@ fn init_refuses_to_overwrite_existing_keys() {
 #[test]
 fn the_emitted_config_is_loadable() {
     let dir = scratch("config");
+    let pass = passphrase_file(&dir);
     assert!(
-        run(&["init", "--out", dir.to_str().expect("utf-8")])
-            .status
-            .success()
+        run(&[
+            "init",
+            "--out",
+            dir.to_str().expect("utf-8"),
+            "--passphrase-file",
+            &pass
+        ])
+        .status
+        .success()
     );
     // The same call `start` makes. An init that emitted an unloadable config
     // would only fail once someone tried to run the node.
@@ -220,6 +282,34 @@ fn the_emitted_config_is_loadable() {
         Some(Path::new(&dir.join("signing.key"))),
         "the config must point at the key that was just written"
     );
+    // And `start` opens it non-interactively through the recorded passphrase file.
+    assert_eq!(
+        config.signing.passphrase_file.as_deref(),
+        Some(Path::new(&pass))
+    );
+    let signer = config
+        .load_signing_key()
+        .expect("the node can open its own key");
+    assert_eq!(
+        signer.address(),
+        load_key(&dir.join("signing.key")).address()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cargo test` has no terminal. An init that cannot ask for a passphrase must
+/// refuse rather than write plaintext keys or hang.
+#[test]
+fn init_with_out_needs_a_passphrase_source_when_there_is_no_terminal() {
+    let dir = scratch("nopass");
+    let output = run(&["init", "--out", dir.to_str().expect("utf-8")]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("passphrase"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.join("identity.key").exists(), "nothing may be written");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

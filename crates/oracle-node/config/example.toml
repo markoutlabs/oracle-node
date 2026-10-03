@@ -19,8 +19,11 @@ max_pending_feeds = 512
 
 [signing]
 # A file or an environment variable, never a command-line argument: arguments are
-# visible in `ps` to every user on the box.
+# visible in `ps` to every user on the box. The key file is an `age` file written
+# by `oracle-node init`; the passphrase that opens it comes from a 0600 file, or
+# from a prompt at startup when `passphrase_file` is absent.
 key_file = "/etc/oracle/signing.key"
+# passphrase_file = "/etc/oracle/passphrase"
 # key_env = "ORACLE_SIGNING_KEY"
 
 [registry]

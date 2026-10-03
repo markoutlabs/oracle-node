@@ -33,6 +33,7 @@ ic-cdk-management-canister = "0.2"
 ic-cdk-timers = "1"
 pocket-ic = "9"
 
+age = { version = "0.11", features = ["armor"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 backon = { version = "1", default-features = false, features = ["std"] }
@@ -46,6 +47,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # `ring` provider through tokio-tungstenite, and a second provider makes
 # `ClientConfig::builder()` refuse to pick one at runtime.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rpassword = "7"
 secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 getrandom = "0.3"
