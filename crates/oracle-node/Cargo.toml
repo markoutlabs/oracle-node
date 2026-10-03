@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 oracle-agg.workspace = true
+oracle-client.workspace = true
 oracle-ingest.workspace = true
 oracle-server.workspace = true
 oracle-types.workspace = true

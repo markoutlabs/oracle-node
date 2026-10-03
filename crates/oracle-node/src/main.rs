@@ -10,7 +10,7 @@ use oracle_ingest::clock::wall_clock_unix_nanos;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::VenueAdapter;
 use oracle_ingest::{ExchangeAdapter, IngestEvent};
-use oracle_node::{InitOptions, NodeConfig, NodeKeys, Pipeline};
+use oracle_node::{InitOptions, NodeConfig, NodeKeys, Pipeline, Rotation, candid_call};
 use oracle_server::{ServerState, router};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -65,6 +65,9 @@ struct Cli {
 enum Command {
     /// Generate this node's keys and print what to do with them.
     Init(InitArgs),
+    /// Generate a new signing key for an existing node and print the registry
+    /// call that swaps it in.
+    Rotate(RotateArgs),
     /// Run the node: ingest, aggregate, sign, serve.
     Start {
         /// The node config file.
@@ -94,6 +97,22 @@ struct InitArgs {
     /// printing the secrets to the terminal.
     #[arg(long, value_name = "DIR")]
     out: Option<PathBuf>,
+    /// The registry canister id. Prints the `dfx` call that submits the entry.
+    #[arg(long, value_name = "CANISTER_ID")]
+    canister: Option<String>,
+}
+
+#[derive(Args)]
+struct RotateArgs {
+    /// The directory `init --out` wrote: identity.key, signing.key, config.toml.
+    #[arg(long, value_name = "DIR")]
+    dir: PathBuf,
+    /// The registry canister id. Prints the `dfx` call that swaps the key.
+    #[arg(long, value_name = "CANISTER_ID")]
+    canister: Option<String>,
+    /// Signing certificate lifetime, in days.
+    #[arg(long, default_value_t = InitOptions::default().validity_days)]
+    validity_days: u64,
 }
 
 async fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,6 +129,7 @@ async fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
     }
     match Cli::parse().command {
         Command::Init(args) => init_command(args),
+        Command::Rotate(args) => rotate_command(args),
         Command::Start { config, tail } => start(config, tail).await,
     }
 }
@@ -126,7 +146,7 @@ async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Erro
     // Both fail loudly at startup rather than at the first publish.
     let signer = config.load_signing_key()?;
     let signer_address = signer.address();
-    let registry = config.load_registry()?;
+    let registry = config.fetch_registry().await?;
 
     info!(
         node_id = %config.node_id,
@@ -295,6 +315,10 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
     let keys = NodeKeys::generate(options, now)?;
     let entry = serde_json::to_string_pretty(&keys.registry_entry())?;
+    let submit_call = args.canister.as_deref().map(|canister| {
+        let compact = serde_json::to_string(&keys.registry_entry()).expect("entry serialises");
+        candid_call(canister, "submit_entry", &[&compact])
+    });
 
     println!("Generated a new identity for `{}`.\n", keys.options.node_id);
     println!("  identity  {}", keys.identity.address());
@@ -345,6 +369,12 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("\nSend to governance\n\n{entry}");
         }
+    }
+    if let Some(call) = submit_call {
+        println!(
+            "\nSubmit the entry to the registry canister as this node's operator, then \
+             ask governance to approve it:\n\n{call}"
+        );
     }
 
     println!("\nNext");
@@ -442,6 +472,49 @@ fn log_update(update: &oracle_wire::SignedUpdate) {
         venues = ?payload.sources,
         "published"
     );
+}
+
+/// Generates a new signing key for an existing node.
+///
+/// Nothing on the node changes yet. The canister swaps keys atomically, so the
+/// node keeps signing with its old key until the registry lists the new one.
+fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = NodeConfig::load(&args.dir.join("config.toml"))?;
+    let identity_hex =
+        zeroize::Zeroizing::new(std::fs::read_to_string(args.dir.join("identity.key"))?);
+    let identity = oracle_wire::Signer::from_hex(identity_hex.trim())?;
+
+    let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
+    let rotation = Rotation::generate(&identity, &config.node_id, args.validity_days, now)?;
+    let (key_path, cert_path) = rotation.write(&args.dir)?;
+
+    println!("Generated a new signing key for `{}`.\n", config.node_id);
+    println!("  new signing  {}", rotation.signing.address());
+    println!(
+        "  valid        unix {} .. {} ({} days)",
+        rotation.cert.not_before, rotation.cert.not_after, args.validity_days
+    );
+    println!("\nWritten");
+    println!("  {}  (0600 — not loaded yet)", key_path.display());
+    println!("  {}  (send to the registry)", cert_path.display());
+
+    let call = args.canister.as_deref().map_or_else(
+        || {
+            "dfx canister call <CANISTER_ID> rotate_key '(<node-id>, <rotation-cert.json>)'"
+                .to_owned()
+        },
+        |canister| rotation.canister_call(canister),
+    );
+    println!(
+        "\nNext\n\n  1. Submit the rotation as this node's operator:\n\n     {call}\n\n  \
+         2. Once the call succeeds the registry lists only the new key. Move it into \
+         place and restart:\n\n     mv {key} {live}\n\n  \
+         3. Consumers pick the new key up from the first frame it signs. The old key \
+         is retired on the canister and can never be listed again.",
+        key = key_path.display(),
+        live = args.dir.join("signing.key").display(),
+    );
+    Ok(())
 }
 
 /// Logs how long this node's signing certificate remains valid.

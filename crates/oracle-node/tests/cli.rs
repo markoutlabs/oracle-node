@@ -137,6 +137,55 @@ fn init_with_out_writes_files_and_prints_no_secrets() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A rotation produces a new key beside the live one, never over it, and the
+/// printed canister call carries a certificate the identity key issued.
+#[test]
+fn rotate_writes_the_next_key_beside_the_live_one() {
+    let dir = scratch("rotate");
+    let path = dir.to_str().expect("utf-8");
+    assert!(run(&["init", "--out", path]).status.success());
+    let live_before = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
+
+    let output = run(&["rotate", "--dir", path, "--canister", "aaaaa-aa"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = stdout(&output);
+    assert_eq!(
+        secret_like_strings(&text),
+        0,
+        "rotate must keep secrets off stdout:\n{text}"
+    );
+    assert!(
+        text.contains("dfx canister call aaaaa-aa rotate_key"),
+        "{text}"
+    );
+
+    let live_after = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
+    assert_eq!(
+        live_before, live_after,
+        "the live key must not change until the canister has"
+    );
+    let next = std::fs::read_to_string(dir.join("signing.key.next")).expect("written");
+    let next = oracle_wire::Signer::from_hex(next.trim()).expect("a valid key");
+    let cert: oracle_wire::SigningKeyCert = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("rotation-cert.json")).expect("written"),
+    )
+    .expect("a certificate");
+    assert_eq!(cert.address, next.address());
+    let identity = std::fs::read_to_string(dir.join("identity.key")).expect("readable");
+    let identity = oracle_wire::Signer::from_hex(identity.trim()).expect("a valid key");
+    assert_eq!(cert.recover_issuer().expect("recovers"), identity.address());
+
+    // A second rotation before the first completed must not clobber the key.
+    let second = run(&["rotate", "--dir", path]);
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("signing.key.next"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Overwriting an identity key would orphan every certificate it ever issued,
 /// and the node would keep running until the registry stopped matching.
 #[test]

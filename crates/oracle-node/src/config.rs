@@ -105,12 +105,23 @@ pub struct SigningSettings {
     pub key_env: Option<String>,
 }
 
-/// Where the registry comes from.
+/// Where the registry comes from. Exactly one of `path` and `url`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrySettings {
-    /// Path to the signed registry JSON.
-    pub path: PathBuf,
+    /// Path to a signed registry JSON file.
+    ///
+    /// A file is pinned until the node restarts. Fine for a local run; a
+    /// deployed node should fetch from the registry canister instead.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// URL of the signed registry JSON, usually the registry canister's
+    /// `/registry.json` on its raw gateway domain (SPEC §3.6).
+    ///
+    /// Fetched at startup. The response is not trusted beyond parsing; the
+    /// document's governance signature is the check.
+    #[serde(default)]
+    pub url: Option<String>,
     /// Governance address to verify it against, `0x`-hex.
     ///
     /// Pinned here rather than taken from the registry itself, which would let
@@ -246,18 +257,41 @@ impl NodeConfig {
             .map_err(|e| ConfigError::SigningKey(e.to_string()))
     }
 
-    /// Loads and verifies the registry against the pinned governance address.
+    /// Fetches the registry from its configured source and verifies it against
+    /// the pinned governance address.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Registry`] if the file is unreadable, malformed, or
-    /// not signed by the pinned key.
-    pub fn load_registry(&self) -> Result<oracle_wire::Registry, ConfigError> {
-        let path = &self.registry.path;
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?;
-        let registry: oracle_wire::Registry = serde_json::from_str(&text)
-            .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?;
+    /// Returns [`ConfigError::Registry`] if neither or both of `registry.path`
+    /// and `registry.url` are set, if the document cannot be read or fetched, or
+    /// if it is not signed by the pinned key.
+    pub async fn fetch_registry(&self) -> Result<oracle_wire::Registry, ConfigError> {
+        let registry: oracle_wire::Registry = match (&self.registry.path, &self.registry.url) {
+            (Some(path), None) => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?;
+                serde_json::from_str(&text)
+                    .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?
+            }
+            (None, Some(url)) => {
+                use oracle_client::RegistrySource as _;
+                oracle_client::HttpRegistrySource::new(url.clone())
+                    .map_err(|e| ConfigError::Registry(e.to_string()))?
+                    .fetch()
+                    .await
+                    .map_err(|e| ConfigError::Registry(format!("{url}: {e}")))?
+            }
+            (None, None) => {
+                return Err(ConfigError::Registry(
+                    "set registry.path or registry.url".to_owned(),
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Registry(
+                    "set only one of registry.path and registry.url".to_owned(),
+                ));
+            }
+        };
 
         let governance: oracle_wire::Address = self
             .registry
@@ -866,6 +900,72 @@ sources = [
         assert!(
             matches!(&error, ConfigError::Invalid(m) if m.contains("coin-margined")),
             "got {error:?}"
+        );
+    }
+
+    fn registry_section(body: &str) -> NodeConfig {
+        let text = SAMPLE.replace(
+            "[registry]\npath = \"registry.json\"\n\
+             governance_address = \"0x0000000000000000000000000000000000000001\"",
+            &format!("[registry]\n{body}"),
+        );
+        assert_ne!(text, SAMPLE, "the sample registry section must be replaced");
+        parse(&text)
+    }
+
+    #[tokio::test]
+    async fn the_registry_source_is_exactly_one_of_path_and_url() {
+        let neither =
+            registry_section("governance_address = \"0x0000000000000000000000000000000000000001\"");
+        let error = neither.fetch_registry().await.expect_err("must refuse");
+        assert!(
+            error.to_string().contains("registry.path or registry.url"),
+            "{error}"
+        );
+
+        let both = registry_section(
+            "path = \"r.json\"\nurl = \"http://127.0.0.1:1/registry.json\"\n\
+             governance_address = \"0x0000000000000000000000000000000000000001\"",
+        );
+        let error = both.fetch_registry().await.expect_err("must refuse");
+        assert!(error.to_string().contains("only one"), "{error}");
+    }
+
+    /// The deployed shape: the registry comes from a URL and is verified against
+    /// the pinned governance address, not trusted because it was served.
+    #[tokio::test]
+    async fn the_registry_is_fetched_from_a_url_and_verified() {
+        use oracle_client::testing::{TestNode, governance, signed_registry};
+
+        let node = TestNode::new(1, "oracle-1");
+        let registry = signed_registry(3, vec![node.entry()]);
+        let json = serde_json::to_string(&registry).expect("serialises");
+        let app = axum::Router::new().route(
+            "/registry.json",
+            axum::routing::get(move || std::future::ready(json.clone())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serves");
+        });
+
+        let pinned = registry_section(&format!(
+            "url = \"http://{address}/registry.json\"\ngovernance_address = \"{}\"",
+            governance().address()
+        ));
+        let fetched = pinned.fetch_registry().await.expect("fetched and verified");
+        assert_eq!(fetched.version, 3);
+
+        let wrong_key = registry_section(&format!(
+            "url = \"http://{address}/registry.json\"\n\
+             governance_address = \"0x0000000000000000000000000000000000000001\""
+        ));
+        assert!(
+            wrong_key.fetch_registry().await.is_err(),
+            "a served document must not be trusted on arrival"
         );
     }
 

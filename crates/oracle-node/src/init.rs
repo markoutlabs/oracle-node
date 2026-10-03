@@ -222,6 +222,115 @@ sources = [
     }
 }
 
+/// A new signing key for an existing node, ready for the registry canister.
+///
+/// The swap is atomic on the canister (SPEC §3.5), so the node must keep
+/// signing with its old key until `rotate_key` has been accepted. That is why
+/// the new key goes to `signing.key.next` rather than over `signing.key`: the
+/// operator moves it into place and restarts the node once the canister has
+/// published the new version.
+pub struct Rotation {
+    /// The new hot signing key.
+    pub signing: Signer,
+    /// The identity key's authorisation of it.
+    pub cert: SigningKeyCert,
+}
+
+impl Rotation {
+    /// Generates a new signing key and issues its certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError::NodeId`] if the node id is too long for the
+    /// certificate encoding, or [`InitError::Key`] if the OS entropy source
+    /// cannot be read.
+    pub fn generate(
+        identity: &Signer,
+        node_id: &str,
+        validity_days: u64,
+        now: u64,
+    ) -> Result<Self, InitError> {
+        let signing = Signer::generate()?;
+        let not_after = now.saturating_add(validity_days.saturating_mul(86_400));
+        let cert = SigningKeyCert::issue(identity, node_id, signing.address(), now, not_after)
+            .map_err(|error| match error {
+                oracle_wire::WireError::FieldTooLong { .. } => {
+                    InitError::NodeId(format!("`{node_id}` is too long for a certificate"))
+                }
+                other => InitError::Key(other),
+            })?;
+        Ok(Self { signing, cert })
+    }
+
+    /// Writes the new key to `dir/signing.key.next`, readable only by the
+    /// current user, and the certificate to `dir/rotation-cert.json`.
+    ///
+    /// Returns the two paths, key first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError::Write`] if either file exists or cannot be written.
+    /// An existing `signing.key.next` is a rotation that was never completed,
+    /// and overwriting it would lose a key the canister may already list.
+    pub fn write(&self, dir: &Path) -> Result<(PathBuf, PathBuf), InitError> {
+        let key_path = dir.join("signing.key.next");
+        let cert_path = dir.join("rotation-cert.json");
+        write_secret(&key_path, &self.signing.to_secret_hex())?;
+        let cert = serde_json::to_string_pretty(&self.cert).map_err(|e| InitError::Write {
+            path: cert_path.clone(),
+            reason: e.to_string(),
+        })?;
+        std::fs::write(&cert_path, format!("{cert}\n")).map_err(|e| InitError::Write {
+            path: cert_path.clone(),
+            reason: e.to_string(),
+        })?;
+        Ok((key_path, cert_path))
+    }
+
+    /// The `dfx canister call` that submits this rotation to the registry.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic: a certificate always serialises.
+    #[must_use]
+    pub fn canister_call(&self, canister: &str) -> String {
+        let cert = serde_json::to_string(&self.cert).expect("certificate serialises");
+        candid_call(canister, "rotate_key", &[&self.cert.node_id, &cert])
+    }
+}
+
+/// Renders a `dfx canister call` with Candid text arguments.
+///
+/// The arguments are JSON documents the canister parses, so they are full of
+/// quotes. Candid text literals escape `\\` and `\"` the same way JSON does,
+/// plus `\n`, `\r` and `\t`; everything else passes through.
+#[must_use]
+pub fn candid_call(canister: &str, method: &str, args: &[&str]) -> String {
+    let quoted: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            let mut out = String::with_capacity(arg.len() + 2);
+            out.push('"');
+            for ch in arg.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    other => out.push(other),
+                }
+            }
+            out.push('"');
+            out
+        })
+        .collect();
+    format!(
+        "dfx canister call {canister} {method} '({})'",
+        quoted.join(", ")
+    )
+}
+
 /// Writes a secret to a file only the current user can read.
 fn write_secret(path: &Path, contents: &str) -> Result<(), InitError> {
     let failed = |reason: String| InitError::Write {
@@ -333,6 +442,40 @@ mod tests {
                 .authorize(keys.signing.address(), NOW * oracle_types::NANOS_PER_SEC)
                 .expect("the signing key must be authorised"),
             0
+        );
+    }
+
+    /// A rotation is a new hot key under the same identity, so its certificate
+    /// must recover to that identity and name a different signing address.
+    #[test]
+    fn a_rotation_keeps_the_identity_and_changes_the_signing_key() {
+        let keys = NodeKeys::generate(options(), NOW).expect("generates");
+        let rotation =
+            Rotation::generate(&keys.identity, "oracle-eu-1", 30, NOW + 10).expect("rotates");
+        assert_ne!(rotation.signing.address(), keys.signing.address());
+        assert_eq!(
+            rotation.cert.recover_issuer().expect("recovers"),
+            keys.identity.address()
+        );
+        assert_eq!(rotation.cert.address, rotation.signing.address());
+        assert_eq!(rotation.cert.not_before, NOW + 10);
+        assert_eq!(rotation.cert.not_after, NOW + 10 + 30 * 86_400);
+
+        // The printed call carries the certificate the canister will parse.
+        let call = rotation.canister_call("aaaaa-aa");
+        assert!(
+            call.starts_with("dfx canister call aaaaa-aa rotate_key '("),
+            "{call}"
+        );
+        assert!(call.contains(r#"\"node_id\":\"oracle-eu-1\""#), "{call}");
+    }
+
+    #[test]
+    fn candid_calls_escape_json_arguments() {
+        let call = candid_call("c", "m", &["plain", r#"{"a":"b\\c"}"#, "line\nbreak"]);
+        assert_eq!(
+            call,
+            r#"dfx canister call c m '("plain", "{\"a\":\"b\\\\c\"}", "line\nbreak")'"#
         );
     }
 

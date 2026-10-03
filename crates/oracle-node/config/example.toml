@@ -24,7 +24,10 @@ key_file = "/etc/oracle/signing.key"
 # key_env = "ORACLE_SIGNING_KEY"
 
 [registry]
+# Exactly one of `path` and `url`. A file is pinned until the node restarts; a
+# deployed node fetches from the registry canister's raw gateway URL instead.
 path = "/etc/oracle/registry.json"
+# url = "https://<canister-id>.raw.icp0.io/registry.json"
 # Pinned here rather than taken from the registry itself, which would let the
 # document vouch for its own author.
 governance_address = "0x0000000000000000000000000000000000000000"

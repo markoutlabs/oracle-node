@@ -20,5 +20,5 @@ pub mod init;
 pub mod pipeline;
 
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
-pub use init::{InitError, InitOptions, NodeKeys};
+pub use init::{InitError, InitOptions, NodeKeys, Rotation, candid_call};
 pub use pipeline::{Pipeline, PipelineStats};

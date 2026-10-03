@@ -228,9 +228,10 @@ aggregator before any post-reconnect quote — only means something if nothing
 downstream reorders it. Fanning events across workers would break it silently.
 
 ```sh
-oracle-node init [--out DIR]           # generate this node's keys
-oracle-node start <config.toml>        # ingest, aggregate, sign, serve
-oracle-node start <config.toml> --tail # ...and log the stream as it flows
+oracle-node init [--out DIR] [--canister ID]   # generate this node's keys
+oracle-node rotate --dir DIR [--canister ID]   # generate the next signing key
+oracle-node start <config.toml>                # ingest, aggregate, sign, serve
+oracle-node start <config.toml> --tail         # ...and log the stream as it flows
 ```
 
 `--tail` logs every decoded observation going into the aggregator and every
@@ -275,6 +276,11 @@ cargo run -p oracle-node -- start crates/oracle-node/config/example.toml
 
 The signing key comes from a file or an environment variable, never a
 command-line argument: arguments are visible in `ps` to every user on the box.
+
+The registry comes from `registry.path`, a file, or `registry.url`, usually the
+registry canister's `/registry.json` on its raw gateway domain. A file is pinned
+until the node restarts. Either way the document is verified against the pinned
+`governance_address` before anything else happens.
 
 At startup the node checks that the registry actually authorises its own signing
 address, and **refuses to start** if not. This is a hard failure rather than a
@@ -423,26 +429,31 @@ verification, with prices resolving `Ok` and zero rejected frames.
 
 ### Rotating a signing key
 
-The same generator models a rotation, which is three registry versions rather
-than one edit:
+A rotation is one canister call, not a registry edit. The node generates the
+key, the operator submits it, the canister swaps it atomically (SPEC §3.5):
 
 ```sh
-# v1 — five nodes, quorum of three (§9.2).
-cargo run -p oracle-node --example gen_local_registry -- --nodes 5 > registry.json
+# 1. A new key beside the live one. Nothing on the node changes yet.
+oracle-node rotate --dir node1 --canister <CANISTER_ID>
+#    writes node1/signing.key.next and node1/rotation-cert.json, and prints:
+#    dfx canister call <CANISTER_ID> rotate_key '("oracle-eu-1", "{...cert...}")'
 
-# v2 — oracle-local-1 mid-rotation. Both its keys are listed and both verify, so
-# it can move to the new one with no window in which subscribers refuse it.
-cargo run -p oracle-node --example gen_local_registry -- \
-  --nodes 5 --version 2 --rotate oracle-local-1 > registry.v2.json
+# 2. Run that call as the node's operator principal. The canister checks the
+#    certificate against the node's identity key, refuses an address it has ever
+#    seen, and refuses a second rotation inside the fleet-wide window.
 
-# v3 — the overlap closes. Publishing this is what revokes the old key.
-cargo run -p oracle-node --example gen_local_registry -- \
-  --nodes 5 --version 3 --rotate oracle-local-1 --close-overlap > registry.v3.json
+# 3. The registry now lists only the new key. Move it into place and restart.
+mv node1/signing.key.next node1/signing.key
+oracle-node start node1/config.toml
 ```
 
-Consumers adopt each version with `refresh_registry`, which enforces forward-only
-versions — so v3 is what makes the outgoing key unusable, and replaying v2
-afterwards cannot bring it back.
+The node is out of each consumer's quorum from step 2 until its first frame
+under the new key triggers that consumer's one registry fetch. The other nodes
+carry the feed through it, exactly as through a restart. The old key is retired
+on the canister and can never be listed again, by anyone.
+
+The local generator does not model rotation. It stands in for the canister only
+to sign a document; the rules a rotation needs live in the canister.
 
 `crates/oracle-client/tests/rotation.rs` covers the ways a rotation can go wrong
 from the consumer's side: never learning about the new key, fetching on every
