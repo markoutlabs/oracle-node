@@ -105,7 +105,7 @@ fn config(market: MarketKind) -> SessionConfig {
         initial: Duration::from_millis(1),
         max: Duration::from_millis(5),
         multiplier: 2,
-        jitter_percent: 0,
+        jitter: false,
         reset_after_stable: Duration::from_secs(60),
     };
     config

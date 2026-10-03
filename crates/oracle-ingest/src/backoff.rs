@@ -1,15 +1,21 @@
 //! Reconnect backoff.
 //!
-//! Pure and deterministic given a seed, so the schedule is asserted in tests
-//! rather than observed in production.
+//! The exponential ladder and the jitter come from `backon`. This module adds
+//! the one rule `backon` does not have: the ladder resets after a connection
+//! proved stable, so a flapping endpoint keeps backing off while a healthy one
+//! that drops once starts again from the bottom.
 //!
 //! Jitter is not decoration. Five nodes and several venue connections all
 //! reconnecting on the same exponential ladder will synchronise after a shared
 //! outage and hammer the venue in lockstep at exactly the moment it is least able
 //! to cope — and a venue that rate-limits in response turns a transient blip into
-//! a long one.
+//! a long one. Jitter is seeded from OS entropy per [`Backoff`], so sibling
+//! connections and sibling nodes never share a sequence. Tests pass a seed to
+//! assert exact delays.
 
 use std::time::Duration;
+
+use backon::{BackoffBuilder, ExponentialBuilder};
 
 /// Backoff parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,9 +25,9 @@ pub struct BackoffConfig {
     /// Ceiling on the delay.
     pub max: Duration,
     /// Multiplier applied per consecutive failure.
-    pub multiplier: u32,
-    /// Jitter as a percentage of the computed delay, applied symmetrically.
-    pub jitter_percent: u32,
+    pub multiplier: u16,
+    /// Add a random amount in `[0, delay)` to every delay.
+    pub jitter: bool,
     /// Consecutive-failure count is reset after a connection stays up this long.
     ///
     /// Without this, a connection that flaps every few seconds would keep
@@ -30,80 +36,59 @@ pub struct BackoffConfig {
 }
 
 impl Default for BackoffConfig {
-    /// 100ms to 30s, doubling, ±25% jitter, reset after 60s of stability.
+    /// 100ms to 30s, doubling, jittered, reset after 60s of stability.
     fn default() -> Self {
         Self {
             initial: Duration::from_millis(100),
             max: Duration::from_secs(30),
             multiplier: 2,
-            jitter_percent: 25,
+            jitter: true,
             reset_after_stable: Duration::from_secs(60),
         }
     }
 }
 
-/// An exponential backoff with jitter.
-#[derive(Clone, Debug)]
+/// An exponential backoff with jitter and a stability reset.
 pub struct Backoff {
     config: BackoffConfig,
+    seed: Option<u64>,
     failures: u32,
-    rng: Xorshift64,
+    ladder: backon::ExponentialBackoff,
 }
 
 impl Backoff {
-    /// Builds a backoff with an explicit jitter seed.
-    ///
-    /// Seed each connection differently — from the venue and market, say — so
-    /// that connections sharing a process do not draw the same jitter sequence
-    /// and re-synchronise anyway.
+    /// Builds a backoff whose jitter is seeded from OS entropy.
     #[must_use]
-    pub const fn with_seed(config: BackoffConfig, seed: u64) -> Self {
+    pub fn new(config: BackoffConfig) -> Self {
+        Self::build(config, None)
+    }
+
+    /// Builds a backoff with a fixed jitter seed, for tests that assert delays.
+    #[must_use]
+    pub fn with_seed(config: BackoffConfig, seed: u64) -> Self {
+        Self::build(config, Some(seed))
+    }
+
+    fn build(config: BackoffConfig, seed: Option<u64>) -> Self {
         Self {
+            ladder: ladder(config, seed),
             config,
+            seed,
             failures: 0,
-            rng: Xorshift64::new(seed),
         }
     }
 
     /// Returns the delay to wait before the next attempt, and advances the ladder.
+    ///
+    /// Whole milliseconds. `backon` scales with `f32`, which leaves
+    /// sub-millisecond noise on the ladder; nothing here needs finer than that.
     pub fn next_delay(&mut self) -> Duration {
-        let step = self.failures;
         self.failures = self.failures.saturating_add(1);
-
-        let base_ms = u64::try_from(self.config.initial.as_millis()).unwrap_or(u64::MAX);
-        let max_ms = u64::try_from(self.config.max.as_millis()).unwrap_or(u64::MAX);
-        let multiplier = u64::from(self.config.multiplier.max(1));
-
-        // Saturating exponentiation: the ladder clamps at `max` rather than
-        // wrapping to a tiny delay after enough failures.
-        let mut delay_ms = base_ms;
-        for _ in 0..step {
-            delay_ms = delay_ms.saturating_mul(multiplier);
-            if delay_ms >= max_ms {
-                delay_ms = max_ms;
-                break;
-            }
-        }
-        delay_ms = delay_ms.min(max_ms);
-
-        Duration::from_millis(self.apply_jitter(delay_ms))
-    }
-
-    /// Applies symmetric jitter of ±`jitter_percent`.
-    fn apply_jitter(&mut self, delay_ms: u64) -> u64 {
-        let percent = u64::from(self.config.jitter_percent);
-        if percent == 0 || delay_ms == 0 {
-            return delay_ms;
-        }
-        let span = delay_ms.saturating_mul(percent) / 100;
-        if span == 0 {
-            return delay_ms;
-        }
-        // Uniform over [-span, +span].
-        let offset = self
-            .rng
-            .next_below(span.saturating_mul(2).saturating_add(1));
-        delay_ms.saturating_add(offset).saturating_sub(span)
+        // The ladder has no attempt limit, so `None` cannot happen. The ceiling
+        // is the safe answer if it ever did.
+        let delay = self.ladder.next().unwrap_or(self.config.max);
+        let millis = delay.as_nanos().saturating_add(500_000) / 1_000_000;
+        Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
     }
 
     /// Resets the ladder after a connection proved stable.
@@ -112,13 +97,17 @@ impl Backoff {
     /// connections do not reset, so a flapping endpoint still backs off.
     pub fn record_disconnect(&mut self, uptime: Duration) {
         if uptime >= self.config.reset_after_stable {
-            self.failures = 0;
+            self.reset();
         }
     }
 
     /// Resets the ladder unconditionally.
-    pub const fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.failures = 0;
+        // A fixed seed moves on, so a reset does not replay the same first
+        // jitter. Two backoffs built from one seed still stay in step.
+        self.seed = self.seed.map(|seed| seed.wrapping_add(1));
+        self.ladder = ladder(self.config, self.seed);
     }
 
     /// Returns the number of consecutive failures recorded.
@@ -128,35 +117,19 @@ impl Backoff {
     }
 }
 
-/// A tiny xorshift PRNG.
-///
-/// Jitter needs to be spread out, not unpredictable, so a 5-line generator with
-/// no dependency and a reproducible sequence is a better fit than a real CSPRNG.
-#[derive(Clone, Debug)]
-struct Xorshift64(u64);
-
-impl Xorshift64 {
-    const fn new(seed: u64) -> Self {
-        // Zero is a fixed point for xorshift; substitute a non-zero constant.
-        Self(if seed == 0 {
-            0x9E37_79B9_7F4A_7C15
-        } else {
-            seed
-        })
+fn ladder(config: BackoffConfig, seed: Option<u64>) -> backon::ExponentialBackoff {
+    let mut builder = ExponentialBuilder::default()
+        .with_min_delay(config.initial)
+        .with_max_delay(config.max)
+        .with_factor(f32::from(config.multiplier.max(1)))
+        .without_max_times();
+    if config.jitter {
+        builder = builder.with_jitter();
     }
-
-    const fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
+    if let Some(seed) = seed {
+        builder = builder.with_jitter_seed(seed);
     }
-
-    const fn next_below(&mut self, bound: u64) -> u64 {
-        if bound == 0 { 0 } else { self.next() % bound }
-    }
+    builder.build()
 }
 
 #[cfg(test)]
@@ -168,14 +141,21 @@ mod tests {
             initial: Duration::from_millis(100),
             max: Duration::from_secs(30),
             multiplier: 2,
-            jitter_percent: 0,
+            jitter: false,
             reset_after_stable: Duration::from_secs(60),
+        }
+    }
+
+    fn jittered() -> BackoffConfig {
+        BackoffConfig {
+            jitter: true,
+            ..config()
         }
     }
 
     #[test]
     fn ladder_doubles_then_clamps() {
-        let mut backoff = Backoff::with_seed(config(), 1);
+        let mut backoff = Backoff::new(config());
         let expected_ms = [
             100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 25_600, 30_000, 30_000,
         ];
@@ -186,7 +166,7 @@ mod tests {
 
     #[test]
     fn ladder_never_wraps_after_many_failures() {
-        let mut backoff = Backoff::with_seed(config(), 1);
+        let mut backoff = Backoff::new(config());
         for _ in 0..1_000 {
             let delay = backoff.next_delay();
             assert!(
@@ -200,17 +180,14 @@ mod tests {
 
     #[test]
     fn jitter_stays_within_bounds_and_varies() {
-        let mut config = config();
-        config.jitter_percent = 25;
-        let mut backoff = Backoff::with_seed(config, 42);
-
+        let mut backoff = Backoff::with_seed(jittered(), 42);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
             backoff.reset();
             let delay = backoff.next_delay();
-            // Base 100ms, ±25%.
+            // Base 100ms plus [0, 100ms).
             assert!(
-                delay >= Duration::from_millis(75) && delay <= Duration::from_millis(125),
+                delay >= Duration::from_millis(100) && delay <= Duration::from_millis(200),
                 "jitter escaped its band: {delay:?}"
             );
             seen.insert(delay);
@@ -225,10 +202,20 @@ mod tests {
     #[test]
     fn different_seeds_desynchronise() {
         // The whole point of jitter: two connections must not draw the same ladder.
-        let mut config = config();
-        config.jitter_percent = 25;
-        let mut a = Backoff::with_seed(config, 1);
-        let mut b = Backoff::with_seed(config, 2);
+        let mut a = Backoff::with_seed(jittered(), 1);
+        let mut b = Backoff::with_seed(jittered(), 2);
+        let series_a: Vec<_> = (0..8).map(|_| a.next_delay()).collect();
+        let series_b: Vec<_> = (0..8).map(|_| b.next_delay()).collect();
+        assert_ne!(series_a, series_b);
+    }
+
+    /// Two unseeded backoffs, as production builds them, must not share a
+    /// sequence either. Identical config across a fleet used to mean identical
+    /// jitter, which is the lockstep the module exists to prevent.
+    #[test]
+    fn unseeded_backoffs_draw_from_entropy() {
+        let mut a = Backoff::new(jittered());
+        let mut b = Backoff::new(jittered());
         let series_a: Vec<_> = (0..8).map(|_| a.next_delay()).collect();
         let series_b: Vec<_> = (0..8).map(|_| b.next_delay()).collect();
         assert_ne!(series_a, series_b);
@@ -236,10 +223,8 @@ mod tests {
 
     #[test]
     fn same_seed_is_reproducible() {
-        let mut config = config();
-        config.jitter_percent = 25;
-        let mut a = Backoff::with_seed(config, 7);
-        let mut b = Backoff::with_seed(config, 7);
+        let mut a = Backoff::with_seed(jittered(), 7);
+        let mut b = Backoff::with_seed(jittered(), 7);
         for _ in 0..16 {
             assert_eq!(a.next_delay(), b.next_delay());
         }
@@ -247,7 +232,7 @@ mod tests {
 
     #[test]
     fn stable_connections_reset_the_ladder_and_flapping_ones_do_not() {
-        let mut backoff = Backoff::with_seed(config(), 1);
+        let mut backoff = Backoff::new(config());
         for _ in 0..5 {
             let _ = backoff.next_delay();
         }

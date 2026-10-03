@@ -171,32 +171,35 @@ impl NodeKeys {
         let listen = self
             .options
             .endpoint
-            .rsplit_once(':')
-            .and_then(|(_, tail)| tail.split('/').next())
-            .and_then(|port| port.parse::<u16>().ok())
+            .parse::<axum::http::Uri>()
+            .ok()
+            .and_then(|uri| uri.port_u16())
             .map_or_else(
                 || "0.0.0.0:8791".to_owned(),
                 |port| format!("0.0.0.0:{port}"),
             );
+        // Quoted by the TOML serializer, so a quote or a backslash in a node id
+        // or a path cannot produce a file the node then refuses to load.
+        let quoted = |text: String| toml::Value::String(text).to_string();
 
         format!(
-            r#"node_id = "{node_id}"
+            r#"node_id = {node_id}
 
 # Must be at or below the tightest feed's rate cap, or the cap becomes the tick
 # rate and the deviation trigger never fires early.
 tick_interval_ms = 25
 
 [server]
-listen = "{listen}"
+listen = {listen}
 max_pending_feeds = 512
 
 [signing]
 # A file or an environment variable, never a command-line argument: arguments
 # are visible in `ps` to every user on the box.
-key_file = "{signing_key_file}"
+key_file = {signing_key_file}
 
 [registry]
-path = "{registry_path}"
+path = {registry_path}
 # Pinned here rather than taken from the registry itself, which would let the
 # document vouch for its own author. Ask governance for this address; do not
 # copy it out of a registry file you were sent.
@@ -211,10 +214,10 @@ sources = [
   {{ venue = "okx", market = "spot", symbol = "BTC-USDT" }},
 ]
 "#,
-            node_id = self.options.node_id,
-            listen = listen,
-            signing_key_file = signing_key_file.display(),
-            registry_path = registry_path.display(),
+            node_id = quoted(self.options.node_id.clone()),
+            listen = quoted(listen),
+            signing_key_file = quoted(signing_key_file.display().to_string()),
+            registry_path = quoted(registry_path.display().to_string()),
         )
     }
 }
@@ -398,6 +401,39 @@ mod tests {
             toml::from_str(&config).expect("init must emit a valid config");
         assert_eq!(parsed.node_id, "oracle-eu-1");
         parsed.resolve().expect("the emitted feeds must resolve");
+    }
+
+    /// A quote in the node id or a backslash in a path used to produce a file
+    /// the node then refused to load.
+    #[test]
+    fn the_config_template_quotes_awkward_values() {
+        let options = InitOptions {
+            node_id: r#"oracle "eu" \ 1"#.to_owned(),
+            ..options()
+        };
+        let keys = NodeKeys::generate(options, NOW).expect("generates");
+        let config = keys.config_template(
+            Path::new(r"C:\keys\signing.key"),
+            Path::new(r"C:\keys\registry.json"),
+        );
+        let parsed: crate::NodeConfig = toml::from_str(&config).expect("valid TOML");
+        assert_eq!(parsed.node_id, r#"oracle "eu" \ 1"#);
+        assert_eq!(
+            parsed.signing.key_file.as_deref(),
+            Some(Path::new(r"C:\keys\signing.key"))
+        );
+    }
+
+    /// A colon later in the URL must not be mistaken for the port.
+    #[test]
+    fn the_config_listen_port_ignores_colons_in_the_path() {
+        let options = InitOptions {
+            endpoint: "ws://127.0.0.1:9001/v1/ws?x=a:1".to_owned(),
+            ..options()
+        };
+        let keys = NodeKeys::generate(options, NOW).expect("generates");
+        let config = keys.config_template(Path::new("signing.key"), Path::new("registry.json"));
+        assert!(config.contains("listen = \"0.0.0.0:9001\""), "{config}");
     }
 
     #[test]

@@ -11,11 +11,13 @@ repository.workspace = true
 oracle-types.workspace = true
 
 async-trait.workspace = true
+backon.workspace = true
 futures-util.workspace = true
 serde = { workspace = true }
 rustls.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util.workspace = true

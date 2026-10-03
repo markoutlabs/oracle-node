@@ -87,6 +87,11 @@ impl fmt::Debug for Address {
 impl FromStr for Address {
     type Err = WireError;
 
+    /// Parses `0x`-prefixed or bare hex.
+    ///
+    /// Mixed-case input is taken as an EIP-55 checksum and must match. That is
+    /// the whole point of the checksum: a typo in a pinned governance address is
+    /// otherwise undetectable until signatures start failing in production.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let body = s.strip_prefix("0x").unwrap_or(s);
         let mut bytes = [0_u8; 20];
@@ -94,7 +99,13 @@ impl FromStr for Address {
             field: "address",
             expected: Self::LEN,
         })?;
-        Ok(Self(bytes))
+        let address = Self(bytes);
+        if body.bytes().any(|b| b.is_ascii_uppercase())
+            && address.to_checksummed() != format!("0x{body}")
+        {
+            return Err(WireError::AddressChecksum(s.to_owned()));
+        }
+        Ok(address)
     }
 }
 
@@ -235,6 +246,28 @@ mod tests {
         );
         assert!("0x1234".parse::<Address>().is_err());
         assert!("not-hex".parse::<Address>().is_err());
+    }
+
+    /// Lowercase carries no checksum. Mixed case does, and a wrong one is a typo.
+    #[test]
+    fn mixed_case_input_must_pass_the_checksum() {
+        let checksummed = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf";
+        let parsed: Address = checksummed.parse().expect("valid checksum");
+        assert_eq!(parsed.to_checksummed(), checksummed);
+        assert_eq!(
+            checksummed
+                .to_lowercase()
+                .parse::<Address>()
+                .expect("lowercase"),
+            parsed
+        );
+
+        // One letter with the wrong case.
+        let typo = "0x7e5F4552091A69125d5DfCb7b8C2659029395Bdf";
+        assert!(matches!(
+            typo.parse::<Address>(),
+            Err(WireError::AddressChecksum(text)) if text == typo
+        ));
     }
 
     #[test]

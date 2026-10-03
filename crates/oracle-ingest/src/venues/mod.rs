@@ -47,62 +47,17 @@ pub(crate) fn decimal_literal(
 
 /// Converts an RFC 3339 timestamp to unix nanoseconds.
 ///
-/// Coinbase stamps `2026-08-07T16:00:00.123456Z`. Implemented here rather than
-/// pulling in a date library, because the only consumer is a diagnostic field:
-/// staleness is measured with our own clock, never the venue's.
+/// Coinbase stamps `2026-08-07T16:00:00.123456Z`. The only consumer is a
+/// diagnostic field: staleness is measured with our own clock, never the
+/// venue's.
 ///
-/// Returns `None` for anything it does not fully understand, which is the right
-/// outcome — a wrong timestamp in a lag metric is worse than a missing one.
+/// Returns `None` for anything that is not RFC 3339 or is before the epoch,
+/// which is the right outcome — a wrong timestamp in a lag metric is worse than
+/// a missing one.
 pub(crate) fn rfc3339_to_unix_nanos(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 20 || bytes.get(4) != Some(&b'-') || bytes.get(10) != Some(&b'T') {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse().ok() };
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    let hour = number(11..13)?;
-    let minute = number(14..16)?;
-    let second = number(17..19)?;
-
-    // Fractional seconds, if present, to nanosecond resolution.
-    let mut nanos = 0_u64;
-    if bytes.get(19) == Some(&b'.') {
-        let digits: String = text
-            .get(20..)?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .take(9)
-            .collect();
-        let scale = 9_u32.checked_sub(u32::try_from(digits.len()).ok()?)?;
-        nanos = digits.parse::<u64>().ok()?.checked_mul(10_u64.pow(scale))?;
-    }
-
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days
-        .checked_mul(86_400)?
-        .checked_add(hour.checked_mul(3_600)?)?
-        .checked_add(minute.checked_mul(60)?)?
-        .checked_add(second)?;
-    u64::try_from(seconds)
-        .ok()?
-        .checked_mul(1_000_000_000)?
-        .checked_add(nanos)
-}
-
-/// Days since the unix epoch, by Howard Hinnant's `days_from_civil`.
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month_shift = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month_shift + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
+    let parsed =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
+    u64::try_from(parsed.unix_timestamp_nanos()).ok()
 }
 
 #[cfg(test)]
@@ -153,9 +108,26 @@ mod tests {
             "2026/08/07T00:00:00Z",
             "2026-13-01T00:00:00Z",
             "2026-08-00T00:00:00Z",
+            "2026-02-31T00:00:00Z",
+            "2026-08-07T25:00:00Z",
+            "2026-08-07T00:00:00Zjunk",
+            "1969-12-31T23:59:59Z",
         ] {
             assert_eq!(rfc3339_to_unix_nanos(bad), None, "should refuse {bad:?}");
         }
+    }
+
+    #[test]
+    fn rfc3339_applies_utc_offsets() {
+        let utc = rfc3339_to_unix_nanos("2026-08-07T00:00:00Z").expect("valid");
+        assert_eq!(
+            rfc3339_to_unix_nanos("2026-08-07T02:00:00+02:00"),
+            Some(utc)
+        );
+        assert_eq!(
+            rfc3339_to_unix_nanos("2026-08-06T19:30:00-04:30"),
+            Some(utc)
+        );
     }
 
     #[test]

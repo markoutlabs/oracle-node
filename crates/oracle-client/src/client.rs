@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_types::{FeedId, Symbol};
 use oracle_wire::{VerifiedRegistry, feed_id};
@@ -400,6 +401,23 @@ fn subscribe_frame(symbols: &[Symbol]) -> String {
     serde_json::json!({ "op": "subscribe", "feeds": feeds, "encoding": "binary" }).to_string()
 }
 
+/// Ceiling on the reconnect delay.
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// A fresh reconnect ladder: 100ms to 30s, doubling, jittered.
+///
+/// Jittered so every subscriber of a node that just restarted does not come
+/// back at the same instant.
+fn reconnect_ladder() -> backon::ExponentialBackoff {
+    ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(RECONNECT_MAX)
+        .with_factor(2.0)
+        .with_jitter()
+        .without_max_times()
+        .build()
+}
+
 /// Connects to one node and forwards its binary frames, reconnecting on failure.
 async fn node_loop(
     endpoint: String,
@@ -407,10 +425,10 @@ async fn node_loop(
     tx: mpsc::Sender<Vec<u8>>,
     shutdown: CancellationToken,
 ) {
-    let mut backoff = Duration::from_millis(100);
+    let mut backoff = reconnect_ladder();
     while !shutdown.is_cancelled() {
         match connect_and_pump(&endpoint, &request, &tx, &shutdown).await {
-            Ok(()) => backoff = Duration::from_millis(100),
+            Ok(()) => backoff = reconnect_ladder(),
             Err(reason) => {
                 warn!(%endpoint, %reason, "node connection failed");
             }
@@ -418,12 +436,12 @@ async fn node_loop(
         if shutdown.is_cancelled() {
             break;
         }
+        let delay = backoff.next().unwrap_or(RECONNECT_MAX);
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(delay) => {}
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 

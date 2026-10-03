@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use oracle_ingest::binance::BinanceAdapter;
+use oracle_ingest::clock::wall_clock_unix_nanos;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::VenueAdapter;
 use oracle_ingest::{ExchangeAdapter, IngestEvent};
@@ -45,42 +47,70 @@ async fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "\
-usage: oracle-node <command>
+/// Price oracle node: ingest, aggregate, sign, serve.
+#[derive(Parser)]
+#[command(
+    name = "oracle-node",
+    version,
+    after_help = "`oracle-node start <CONFIG> --tail` logs every decoded observation going into \
+                  the aggregator and every signed update coming out, which is how you see what \
+                  a venue is actually sending."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-  init [options]           generate this node's keys and print what to do with them
-  start <config> [--tail]  run the node: ingest, aggregate, sign, serve
+#[derive(Subcommand)]
+enum Command {
+    /// Generate this node's keys and print what to do with them.
+    Init(InitArgs),
+    /// Run the node: ingest, aggregate, sign, serve.
+    Start {
+        /// The node config file.
+        config: PathBuf,
+        /// Log every decoded observation going into the aggregator and every
+        /// signed update coming out. The fastest way to see what a venue sends.
+        #[arg(long)]
+        tail: bool,
+    },
+}
 
-`--tail` logs every decoded observation going into the aggregator and every
-signed update coming out, which is how you see what a venue is actually sending.
-
-`oracle-node init --help` lists the init options.";
+#[derive(Args)]
+struct InitArgs {
+    /// This node's identifier.
+    #[arg(long, default_value_t = InitOptions::default().node_id)]
+    node_id: String,
+    /// Who runs it. Operator diversity is what makes the median mean anything.
+    #[arg(long, default_value_t = InitOptions::default().operator)]
+    operator: String,
+    /// The WebSocket endpoint subscribers will connect to.
+    #[arg(long, default_value_t = InitOptions::default().endpoint)]
+    endpoint: String,
+    /// Signing certificate lifetime, in days.
+    #[arg(long, default_value_t = InitOptions::default().validity_days)]
+    validity_days: u64,
+    /// Write the keys, registry entry, and a starter config to DIR instead of
+    /// printing the secrets to the terminal.
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+}
 
 async fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("init") => init_command(&args.collect::<Vec<_>>()),
-        Some("start") => {
-            let rest: Vec<String> = args.collect();
-            let tail = rest.iter().any(|a| a == "--tail");
-            let path: PathBuf = rest
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .ok_or("usage: oracle-node start <config.toml> [--tail]")?
-                .into();
-            start(path, tail).await
-        }
-        Some("help" | "--help" | "-h") => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        // The bare-path form this binary used to take. Say so, rather than
-        // failing with "unknown command" at someone following an older README.
-        Some(other) if other.ends_with(".toml") => {
-            Err(format!("did you mean `oracle-node start {other}`?\n\n{USAGE}").into())
-        }
-        Some(other) => Err(format!("unknown command `{other}`\n\n{USAGE}").into()),
-        None => Err(USAGE.into()),
+    // The bare-path form this binary used to take. Say so, rather than failing
+    // with "unrecognized subcommand" at someone following an older README.
+    if let Some(first) = std::env::args().nth(1)
+        && first.ends_with(".toml")
+    {
+        return Err(format!(
+            "did you mean `oracle-node start {first}`?\n\n{}",
+            Cli::command().render_usage()
+        )
+        .into());
+    }
+    match Cli::parse().command {
+        Command::Init(args) => init_command(args),
+        Command::Start { config, tail } => start(config, tail).await,
     }
 }
 
@@ -111,7 +141,7 @@ async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Erro
     // aggregating and signing perfectly well — every node-local metric reads
     // healthy — while every subscriber discards the output. Refusing to start is
     // the only version of that failure anyone notices.
-    if let Err(error) = verified.authorize(signer_address, now_ns()) {
+    if let Err(error) = verified.authorize(signer_address, wall_clock_unix_nanos()) {
         return Err(format!(
             "signing key {signer_address} is not authorised by registry v{}: {error}. \
              Nothing this node publishes would be accepted.",
@@ -252,45 +282,17 @@ async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-const INIT_USAGE: &str = "\
-usage: oracle-node init [options]
-
-  --node-id ID        this node's identifier (default: oracle-1)
-  --operator NAME     who runs it; operator diversity is what makes the median
-                      mean anything (default: unset)
-  --endpoint URL      the WebSocket endpoint subscribers will connect to
-                      (default: ws://127.0.0.1:8791/v1/ws)
-  --validity-days N   signing certificate lifetime (default: 30)
-  --out DIR           write the keys, registry entry, and a starter config to
-                      DIR instead of printing the secrets to the terminal";
-
 /// Generates a node identity and prints everything needed to run it.
-fn init_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut options = InitOptions::default();
-    let mut out: Option<PathBuf> = None;
+fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let options = InitOptions {
+        node_id: args.node_id,
+        operator: args.operator,
+        endpoint: args.endpoint,
+        validity_days: args.validity_days,
+    };
+    let out = args.out;
 
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        let mut value = |flag: &str| -> Result<String, String> {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("{flag} needs a value"))
-        };
-        match arg.as_str() {
-            "--node-id" => options.node_id = value("--node-id")?,
-            "--operator" => options.operator = value("--operator")?,
-            "--endpoint" => options.endpoint = value("--endpoint")?,
-            "--validity-days" => options.validity_days = value("--validity-days")?.parse()?,
-            "--out" => out = Some(value("--out")?.into()),
-            "--help" | "-h" => {
-                println!("{INIT_USAGE}");
-                return Ok(());
-            }
-            other => return Err(format!("unknown option `{other}`\n\n{INIT_USAGE}").into()),
-        }
-    }
-
-    let now = now_ns() / oracle_types::NANOS_PER_SEC;
+    let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
     let keys = NodeKeys::generate(options, now)?;
     let entry = serde_json::to_string_pretty(&keys.registry_entry())?;
 
@@ -335,8 +337,8 @@ fn init_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => {
             println!("\nSecret keys");
-            println!("  identity  {}", keys.identity.to_secret_hex());
-            println!("  signing   {}", keys.signing.to_secret_hex());
+            println!("  identity  {}", &*keys.identity.to_secret_hex());
+            println!("  signing   {}", &*keys.signing.to_secret_hex());
             println!(
                 "\n  These are now in your terminal scrollback and shell history. Re-run\n  \
                  with `--out DIR` to write them to 0600 files instead."
@@ -442,12 +444,6 @@ fn log_update(update: &oracle_wire::SignedUpdate) {
     );
 }
 
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-}
-
 /// Logs how long this node's signing certificate remains valid.
 ///
 /// SPEC §9.3 alerts on an expiry under seven days, because a lapsed certificate
@@ -457,7 +453,7 @@ fn report_cert_expiry(registry: &oracle_wire::VerifiedRegistry, signer: oracle_w
     let Some(not_after) = registry.authorized_until(signer) else {
         return;
     };
-    let remaining = not_after.saturating_sub(now_ns() / oracle_types::NANOS_PER_SEC);
+    let remaining = not_after.saturating_sub(wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC);
     if remaining <= CERT_EXPIRY_WARNING.as_secs() {
         warn!(
             %signer,

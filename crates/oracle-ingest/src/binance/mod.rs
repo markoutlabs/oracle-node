@@ -156,32 +156,15 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
             let map = InstrumentMap::new(Venue::Binance, market, specs)?;
             let names = stream_names(map.venue_symbols(), market);
             let urls = combined_urls(base, &names, self.config.streams_per_connection);
-            for (index, url) in urls.into_iter().enumerate() {
+            for url in urls {
                 let mut session = SessionConfig::new(StreamId::new(Venue::Binance, market), url);
                 session.idle_timeout = self.config.idle_timeout;
                 session.max_session = self.config.max_session;
-                // Distinct seeds so sibling connections do not draw the same
-                // jitter and re-synchronise after a shared outage.
-                session.backoff_seed = seed_for(market, index);
                 plan.push((session, market, map.clone()));
             }
         }
         Ok(plan)
     }
-}
-
-/// Derives a jitter seed from a connection's identity.
-fn seed_for(market: MarketKind, index: usize) -> u64 {
-    let market_bits: u64 = match market {
-        MarketKind::Spot => 0x5370_7400_0000_0000,
-        MarketKind::LinearPerp => 0x5065_7270_0000_0000,
-        // Unreachable through this adapter, which serves only spot and linear
-        // perps, but the seed must stay distinct rather than collide with one
-        // of them if that ever changes.
-        MarketKind::InversePerp => 0x496E_7673_0000_0000,
-    };
-    let index = u64::try_from(index).unwrap_or(0);
-    market_bits ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 #[async_trait::async_trait]
@@ -335,25 +318,6 @@ mod tests {
             .expect("perp");
         assert!(perp.0.url.starts_with(streams::FUTURES_BASE));
         assert!(perp.0.url.contains("btcusdt@markPrice@1s"));
-    }
-
-    #[test]
-    fn sibling_connections_get_different_jitter_seeds() {
-        let mut config = config();
-        config.streams_per_connection = 1;
-        let adapter = BinanceAdapter::new(config, NullConnector).expect("valid");
-        let plan = adapter.plan().expect("plans");
-        assert!(plan.len() > 2);
-
-        let seeds: std::collections::HashSet<u64> = plan
-            .iter()
-            .map(|(session, _, _)| session.backoff_seed)
-            .collect();
-        assert_eq!(
-            seeds.len(),
-            plan.len(),
-            "connections must not share a jitter seed"
-        );
     }
 
     #[test]

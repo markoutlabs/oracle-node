@@ -46,9 +46,10 @@ aggregator never learns anything venue-specific.
 - `Session` — the connect/decode/reconnect loop, generic over `Connector` so
   reconnect behaviour is tested with a mock in microseconds. Reconnect logic only
   exercised against a live venue is logic only exercised during an outage.
-- `Backoff` — exponential with seeded jitter. Deterministic, so the schedule is
-  asserted rather than observed. Sibling connections get different seeds so they
-  do not re-synchronise after a shared outage.
+- `Backoff` — `backon`'s exponential ladder with jitter, plus a reset once a
+  connection proved stable. Jitter is seeded from OS entropy per connection, so
+  sibling connections and sibling nodes never re-synchronise after a shared
+  outage. Tests pass a seed and assert the exact schedule.
 - `MonotonicClock` — forward-only unix nanoseconds. `SystemTime::now()` can step
   backwards under NTP, which makes in-flight observations look like they arrived
   from the future and read as age zero forever.

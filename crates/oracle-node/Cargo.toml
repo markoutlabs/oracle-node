@@ -15,6 +15,7 @@ oracle-types.workspace = true
 oracle-wire.workspace = true
 
 axum.workspace = true
+clap.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,6 +24,7 @@ tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zeroize.workspace = true
 
 [lints]
 workspace = true

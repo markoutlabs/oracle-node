@@ -36,35 +36,43 @@ const OVERLAP: u64 = 24 * 3_600;
 /// Governance key seed. Signs the registry; pinned by every consumer.
 const GOVERNANCE_SEED: u8 = 0x33;
 
+/// Generates a governance-signed local registry with deterministic keys.
+///
+/// `--entry` signs in an entry produced by `oracle-node init`, which generates
+/// real keys but has no governance key of its own.
+#[derive(clap::Parser)]
 struct Options {
+    /// Number of generated nodes, 0 to 32.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=32))]
     nodes: u8,
+    /// Registry version.
+    #[arg(long, default_value_t = 1)]
     version: u64,
+    /// Port of the first node; each further node takes the next one.
+    #[arg(long, default_value_t = 8791)]
     base_port: u16,
+    /// Put this node mid-rotation: both its keys listed.
+    #[arg(long, value_name = "NODE_ID")]
     rotate: Option<String>,
+    /// Close the overlap: list only the incoming key of the rotated node.
+    #[arg(long, requires = "rotate")]
     close_overlap: bool,
+    /// A node entry from `oracle-node init` to sign in. Repeatable.
+    #[arg(long = "entry", value_name = "node-entry.json")]
     entries: Vec<PathBuf>,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            nodes: 1,
-            version: 1,
-            base_port: 8791,
-            rotate: None,
-            close_overlap: false,
-            entries: Vec::new(),
-        }
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let options = parse_args()?;
-    if options.nodes > 32 {
-        return Err("--nodes must be 32 or fewer".into());
-    }
+    let options = <Options as clap::Parser>::parse();
     if options.nodes == 0 && options.entries.is_empty() {
         return Err("--nodes 0 needs at least one --entry".into());
+    }
+    if options
+        .base_port
+        .checked_add(u16::from(options.nodes))
+        .is_none()
+    {
+        return Err("--base-port is too high for that many nodes".into());
     }
     if let Some(target) = &options.rotate
         && !(1..=options.nodes).any(|index| node_id(index) == *target)
@@ -194,41 +202,4 @@ const fn incoming_seed(index: u8) -> u8 {
 
 fn hex32(seed: u8) -> String {
     format!("{seed:02x}").repeat(32)
-}
-
-fn parse_args() -> Result<Options, Box<dyn std::error::Error>> {
-    let mut options = Options::default();
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--nodes" => options.nodes = next(&mut args, "--nodes")?.parse()?,
-            "--version" => options.version = next(&mut args, "--version")?.parse()?,
-            "--base-port" => options.base_port = next(&mut args, "--base-port")?.parse()?,
-            "--rotate" => options.rotate = Some(next(&mut args, "--rotate")?),
-            "--close-overlap" => options.close_overlap = true,
-            "--entry" => options.entries.push(next(&mut args, "--entry")?.into()),
-            "--help" | "-h" => {
-                eprintln!(
-                    "usage: gen_local_registry [--nodes N] [--version V] [--base-port P] \
-                     [--rotate NODE_ID [--close-overlap]] [--entry node-entry.json]...\n\n\
-                     --entry signs in an entry produced by `oracle-node init`, which \
-                     generates real keys but has no governance key of its own."
-                );
-                std::process::exit(0);
-            }
-            other => return Err(format!("unrecognised argument `{other}`").into()),
-        }
-    }
-    if options.close_overlap && options.rotate.is_none() {
-        return Err("--close-overlap only means anything alongside --rotate".into());
-    }
-    Ok(options)
-}
-
-fn next(
-    args: &mut impl Iterator<Item = String>,
-    flag: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    args.next()
-        .ok_or_else(|| format!("{flag} needs a value").into())
 }

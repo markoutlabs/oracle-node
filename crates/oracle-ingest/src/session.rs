@@ -60,8 +60,6 @@ pub struct SessionConfig {
     pub max_session: Duration,
     /// Reconnect backoff.
     pub backoff: BackoffConfig,
-    /// Jitter seed. Give every connection a different one.
-    pub backoff_seed: u64,
 }
 
 impl SessionConfig {
@@ -76,7 +74,6 @@ impl SessionConfig {
             idle_timeout: Duration::from_secs(60),
             max_session: Duration::from_secs(23 * 3_600),
             backoff: BackoffConfig::default(),
-            backoff_seed: 0,
         }
     }
 }
@@ -136,7 +133,7 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
         out: mpsc::Sender<IngestEvent>,
         shutdown: CancellationToken,
     ) -> Result<SessionStats, IngestError> {
-        let mut backoff = Backoff::with_seed(self.config.backoff, self.config.backoff_seed);
+        let mut backoff = Backoff::new(self.config.backoff);
         let stream = self.config.stream;
 
         while !shutdown.is_cancelled() {
@@ -414,7 +411,7 @@ mod tests {
             initial: Duration::from_millis(10),
             max: Duration::from_millis(100),
             multiplier: 2,
-            jitter_percent: 0,
+            jitter: false,
             reset_after_stable: Duration::from_secs(60),
         };
         config

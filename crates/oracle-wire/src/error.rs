@@ -88,6 +88,13 @@ pub enum WireError {
     #[error("invalid public key")]
     InvalidPublicKey,
 
+    /// A mixed-case address failed its EIP-55 checksum.
+    ///
+    /// Lowercase carries no checksum and is accepted as is. Mixed case is a
+    /// claim, and a claim that does not check out is a typo in a pinned address.
+    #[error("address {0} is mixed-case but fails its EIP-55 checksum")]
+    AddressChecksum(String),
+
     /// A hex-encoded field was malformed or the wrong length.
     #[error("invalid hex for {field}: expected {expected} bytes")]
     InvalidHex {

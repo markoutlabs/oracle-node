@@ -196,7 +196,10 @@ fn usage_errors_exit_non_zero_without_a_log_prefix() {
         let output = run(&args);
         assert!(!output.status.success(), "{args:?} should fail");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("usage"), "{args:?}: {stderr}");
+        assert!(
+            stderr.to_lowercase().contains("usage"),
+            "{args:?}: {stderr}"
+        );
         assert!(
             !stderr.contains("ERROR"),
             "{args:?}: usage text should read as an instruction, not a crash: {stderr}"
@@ -229,14 +232,14 @@ fn start_finds_the_config_path_around_flags() {
             "{args:?} should have tried to load the config: {stderr}"
         );
         assert!(
-            !stderr.contains("usage"),
+            !stderr.to_lowercase().contains("usage"),
             "{args:?} parsed as a usage error: {stderr}"
         );
     }
 
     // ...but a flag on its own is still missing a config.
     let stderr = String::from_utf8_lossy(&run(&["start", "--tail"]).stderr).into_owned();
-    assert!(stderr.contains("usage"), "{stderr}");
+    assert!(stderr.to_lowercase().contains("usage"), "{stderr}");
 }
 
 #[test]

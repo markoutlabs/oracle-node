@@ -12,6 +12,7 @@ oracle-agg.workspace = true
 oracle-types.workspace = true
 oracle-wire.workspace = true
 
+backon.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

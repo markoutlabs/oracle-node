@@ -36,8 +36,6 @@ pub struct VenueSpec {
     pub idle_timeout: Duration,
     /// Recycle the connection at this age.
     pub max_session: Duration,
-    /// Jitter seed; distinct per connection.
-    pub backoff_seed: u64,
     /// How to decode this connection's payloads.
     ///
     /// Per connection rather than per venue: one exchange can speak entirely
@@ -135,7 +133,6 @@ fn session_config(spec: &VenueSpec, venue: Venue) -> SessionConfig {
     config.keepalive = spec.keepalive.clone();
     config.idle_timeout = spec.idle_timeout;
     config.max_session = spec.max_session;
-    config.backoff_seed = spec.backoff_seed;
     config
 }
 
@@ -204,7 +201,7 @@ mod tests {
         }
     }
 
-    fn spec(market: MarketKind, url: &str, seed: u64) -> VenueSpec {
+    fn spec(market: MarketKind, url: &str) -> VenueSpec {
         VenueSpec {
             venue: Venue::Bybit,
             market,
@@ -213,7 +210,6 @@ mod tests {
             keepalive: Some((Duration::from_secs(20), r#"{"op":"ping"}"#.to_owned())),
             idle_timeout: Duration::from_secs(30),
             max_session: Duration::from_secs(3_600),
-            backoff_seed: seed,
             decode,
         }
     }
@@ -235,7 +231,7 @@ mod tests {
     fn an_empty_configuration_is_refused() {
         let result = VenueAdapter::new(
             Venue::Bybit,
-            vec![(spec(MarketKind::Spot, "wss://x", 1), vec![])],
+            vec![(spec(MarketKind::Spot, "wss://x"), vec![])],
             NullConnector {
                 opens: Arc::new(AtomicUsize::new(0)),
             },
@@ -249,11 +245,11 @@ mod tests {
             Venue::Bybit,
             vec![
                 (
-                    spec(MarketKind::Spot, "wss://spot", 1),
+                    spec(MarketKind::Spot, "wss://spot"),
                     instruments(MarketKind::Spot),
                 ),
                 (
-                    spec(MarketKind::LinearPerp, "wss://linear", 2),
+                    spec(MarketKind::LinearPerp, "wss://linear"),
                     instruments(MarketKind::LinearPerp),
                 ),
             ],
@@ -266,10 +262,6 @@ mod tests {
         let plan = adapter.plan();
         let urls: Vec<&str> = plan.iter().map(|config| config.url.as_str()).collect();
         assert_eq!(urls, ["wss://spot", "wss://linear"]);
-        // Sibling connections must not draw the same jitter.
-        let seeds: std::collections::HashSet<u64> =
-            plan.iter().map(|config| config.backoff_seed).collect();
-        assert_eq!(seeds.len(), 2);
         assert!(
             plan.first()
                 .is_some_and(|config| config.keepalive.is_some()),
@@ -283,10 +275,10 @@ mod tests {
             Venue::Bybit,
             vec![
                 (
-                    spec(MarketKind::Spot, "wss://spot", 1),
+                    spec(MarketKind::Spot, "wss://spot"),
                     instruments(MarketKind::Spot),
                 ),
-                (spec(MarketKind::LinearPerp, "wss://linear", 2), vec![]),
+                (spec(MarketKind::LinearPerp, "wss://linear"), vec![]),
             ],
             NullConnector {
                 opens: Arc::new(AtomicUsize::new(0)),
@@ -304,11 +296,11 @@ mod tests {
                 Venue::Bybit,
                 vec![
                     (
-                        spec(MarketKind::Spot, "wss://spot", 1),
+                        spec(MarketKind::Spot, "wss://spot"),
                         instruments(MarketKind::Spot),
                     ),
                     (
-                        spec(MarketKind::LinearPerp, "wss://linear", 2),
+                        spec(MarketKind::LinearPerp, "wss://linear"),
                         instruments(MarketKind::LinearPerp),
                     ),
                 ],

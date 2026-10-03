@@ -2,6 +2,8 @@
 
 use core::fmt;
 
+use zeroize::Zeroizing;
+
 use crate::backend::SecretKey;
 use crate::{Address, CompressedPublicKey, Signature, WireError, backend, domain};
 
@@ -61,12 +63,12 @@ impl Signer {
         // probability around 2^-128. Negligible is not impossible, and the
         // failure would be silent, so draw again rather than reason about it.
         for _ in 0..8 {
-            let mut bytes = [0_u8; 32];
-            getrandom::fill(&mut bytes)
+            // Wiped on drop, not by hand: a manual overwrite of a dead buffer is
+            // a store the optimiser may remove.
+            let mut bytes = Zeroizing::new([0_u8; 32]);
+            getrandom::fill(&mut *bytes)
                 .map_err(|e| WireError::EntropyUnavailable(e.to_string()))?;
-            let signer = Self::from_secret_bytes(bytes);
-            bytes.fill(0);
-            if let Ok(signer) = signer {
+            if let Ok(signer) = Self::from_secret_bytes(*bytes) {
                 return Ok(signer);
             }
         }
@@ -79,10 +81,12 @@ impl Signer {
     ///
     /// The one deliberate way to get the secret out of this type — [`fmt::Debug`]
     /// redacts it and [`Drop`] erases it, so anything that exports the key should
-    /// be obvious at the call site rather than incidental.
+    /// be obvious at the call site rather than incidental. The returned string is
+    /// wiped when dropped.
     #[must_use]
-    pub fn to_secret_hex(&self) -> String {
-        hex::encode(self.secret.to_bytes())
+    pub fn to_secret_hex(&self) -> Zeroizing<String> {
+        let bytes = Zeroizing::new(self.secret.to_bytes());
+        Zeroizing::new(hex::encode(*bytes))
     }
 
     /// Loads a signing key from hex, with or without a `0x` prefix.
@@ -93,14 +97,12 @@ impl Signer {
     /// or [`WireError::InvalidSecretKey`] if it is not a valid scalar.
     pub fn from_hex(hex_str: &str) -> Result<Self, WireError> {
         let body = hex_str.trim().strip_prefix("0x").unwrap_or(hex_str.trim());
-        let mut bytes = [0_u8; 32];
-        hex::decode_to_slice(body, &mut bytes).map_err(|_| WireError::InvalidHex {
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        hex::decode_to_slice(body, &mut *bytes).map_err(|_| WireError::InvalidHex {
             field: "secret_key",
             expected: 32,
         })?;
-        let signer = Self::from_secret_bytes(bytes);
-        bytes.fill(0);
-        signer
+        Self::from_secret_bytes(*bytes)
     }
 
     /// Returns the address this key signs under.

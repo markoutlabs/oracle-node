@@ -230,7 +230,8 @@ impl NodeConfig {
     /// Returns [`ConfigError::SigningKey`] if no source is configured, the source
     /// cannot be read, or the value is not a valid key.
     pub fn load_signing_key(&self) -> Result<oracle_wire::Signer, ConfigError> {
-        let hex = match (&self.signing.key_file, &self.signing.key_env) {
+        // Wiped on drop. The hex string is the key.
+        let hex = zeroize::Zeroizing::new(match (&self.signing.key_file, &self.signing.key_env) {
             (Some(path), _) => std::fs::read_to_string(path)
                 .map_err(|e| ConfigError::SigningKey(format!("{}: {e}", path.display())))?,
             (None, Some(var)) => std::env::var(var)
@@ -240,7 +241,7 @@ impl NodeConfig {
                     "set either signing.key_file or signing.key_env".to_owned(),
                 ));
             }
-        };
+        });
         oracle_wire::Signer::from_hex(hex.trim())
             .map_err(|e| ConfigError::SigningKey(e.to_string()))
     }
@@ -501,26 +502,10 @@ fn venue_connection(
             keepalive,
             idle_timeout: VENUE_IDLE_TIMEOUT,
             max_session: VENUE_MAX_SESSION,
-            // Distinct per venue and market, so sibling connections do not draw
-            // the same jitter and re-synchronise after a shared outage.
-            backoff_seed: u64::from(venue.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ market_seed(market),
             decode,
         },
         instruments: instruments.to_vec(),
     })
-}
-
-/// Distinguishes a market within a venue's backoff seed.
-///
-/// Sibling connections must not draw the same jitter, or they re-synchronise
-/// after a shared outage and reconnect in lockstep.
-const fn market_seed(market: MarketKind) -> u64 {
-    match market {
-        MarketKind::Spot => 0,
-        MarketKind::LinearPerp => 1,
-        MarketKind::InversePerp => 2,
-    }
 }
 
 #[cfg(test)]
@@ -882,52 +867,6 @@ sources = [
             matches!(&error, ConfigError::Invalid(m) if m.contains("coin-margined")),
             "got {error:?}"
         );
-    }
-
-    /// Sibling connections must not draw the same jitter, or they reconnect in
-    /// lockstep after a shared outage.
-    #[test]
-    fn every_market_of_a_venue_gets_a_distinct_backoff_seed() {
-        let seeds: std::collections::HashSet<u64> = MarketKind::ALL
-            .into_iter()
-            .map(|market| {
-                u64::from(Venue::Deribit.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ market_seed(market)
-            })
-            .collect();
-        assert_eq!(seeds.len(), MarketKind::ALL.len());
-    }
-
-    #[test]
-    fn sibling_venue_connections_get_different_jitter_seeds() {
-        let text = r#"
-node_id = "n"
-
-[server]
-listen = "127.0.0.1:8080"
-
-[signing]
-key_env = "K"
-
-[registry]
-path = "r.json"
-governance_address = "0x0000000000000000000000000000000000000001"
-
-[[feeds]]
-symbol = "CRYPTO.BTC/USDT"
-min_sources = 1
-sources = [
-  { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
-  { venue = "okx", market = "spot", symbol = "BTC-USDT" },
-]
-"#;
-        let resolved = parse(text).resolve().expect("resolves");
-        let seeds: std::collections::HashSet<u64> = resolved
-            .venues
-            .iter()
-            .flat_map(|(_, connections)| connections.iter().map(|c| c.spec.backoff_seed))
-            .collect();
-        assert_eq!(seeds.len(), 2, "connections must not share a jitter seed");
     }
 
     #[test]
