@@ -22,7 +22,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | **done** |
 | M5.5 | Registry canister, one live key per node | **done** |
-| M6 | Hardening | in progress: keys encrypted at rest, replay harness |
+| M6 | Hardening | in progress: keys encrypted at rest, replay harness, adversarial suite |
 
 ## Crates
 
@@ -466,6 +466,29 @@ dislocation instead of a guess.
 The replay binary is single-threaded on purpose: the driven clock is only
 coherent when nothing runs between a transport returning a frame and the session
 stamping it.
+
+#### The adversarial suite
+
+`oracle_replay::adversarial` turns a clean recording into an attack by rewriting
+one venue's frames: `scale_prices` for a jump or a spoof window, `drift_prices`
+for a slow pull, `cross_book`, `silence`, and `freeze`. Prices are rewritten
+inside each venue's own JSON, in fixed point, so a transform is exact.
+`crates/oracle-replay/tests/adversarial.rs` replays each attack against the
+clean recording and compares the published prices tick by tick:
+
+| Attack on one of three venues | What must hold |
+|---|---|
+| 10% jump, held | price within 20 bps of clean, outliers rejected, no halt |
+| 50% spoof for one second | same |
+| drift of 25 bps per second | price within 15 bps, the venue is shed once outside the band |
+| crossed book | price within 20 bps, no halt |
+| silence on an open connection | shed by staleness, feed carries on with two sources |
+| frozen quote in a quiet market | within the band, and nothing flags it: a documented limitation |
+| the whole market jumps 150% | the sanity band halts, and anything published at the new level carries the halt flag |
+
+The fixture is a committed twelve-second recording of Binance, Bybit, and OKX
+spot BTC/USDT, with the config it was recorded under beside it. The Binance URL
+embeds the subscribed streams, so a fixture is only valid with its own config.
 
 ### End to end on a local replica
 

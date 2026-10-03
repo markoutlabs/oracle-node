@@ -14,8 +14,9 @@
 //! order on one task. Anything that fans events across workers would break the
 //! guarantee silently: a book carried across a gap looks live and is not.
 
-use oracle_agg::{AggError, Aggregator};
+use oracle_agg::{AggError, Aggregator, FeedStats};
 use oracle_ingest::IngestEvent;
+use oracle_types::FeedId;
 use oracle_wire::{SignedUpdate, Signer};
 
 /// Counters describing what the pipeline has done.
@@ -55,6 +56,15 @@ impl Pipeline {
     #[must_use]
     pub const fn stats(&self) -> PipelineStats {
         self.stats
+    }
+
+    /// Returns every feed's aggregation counters.
+    #[must_use]
+    pub fn feed_stats(&self) -> Vec<(FeedId, FeedStats)> {
+        self.aggregator
+            .feed_ids()
+            .map(|id| (id, self.aggregator.stats(id).unwrap_or_default()))
+            .collect()
     }
 
     /// Applies one ingest event.

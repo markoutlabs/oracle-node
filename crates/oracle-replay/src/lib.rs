@@ -27,11 +27,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use oracle_agg::{AggError, Aggregator};
+pub mod adversarial;
+
+use oracle_agg::{AggError, Aggregator, FeedStats};
 use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::{Connector, Frame, IngestEvent, Record, Transport, TransportError};
 use oracle_node::{Pipeline, PipelineStats, ResolvedConfig, build_adapters};
-use oracle_types::PriceUpdate;
+use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::{Signer, encode_price_update, keccak256};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -59,6 +61,8 @@ pub struct Outcome {
     pub updates: Vec<PriceUpdate>,
     /// Pipeline counters.
     pub stats: PipelineStats,
+    /// Per-feed aggregation counters: outliers rejected, halts, degradations.
+    pub feeds: Vec<(FeedId, FeedStats)>,
     /// Keccak-256 over the canonical bytes of every update, in order.
     ///
     /// Two nodes fed the same recording must produce the same digest.
@@ -224,6 +228,7 @@ pub async fn run(
     let mut outcome = Outcome {
         updates: Vec::new(),
         stats: PipelineStats::default(),
+        feeds: Vec::new(),
         digest: [0; 32],
         errors: Vec::new(),
     };
@@ -264,6 +269,7 @@ pub async fn run(
     }
 
     outcome.stats = pipeline.stats();
+    outcome.feeds = pipeline.feed_stats();
     let mut bytes = Vec::with_capacity(outcome.updates.len() * 128);
     for update in &outcome.updates {
         bytes.extend_from_slice(&encode_price_update(update));

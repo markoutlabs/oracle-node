@@ -1,0 +1,29 @@
+# The config the adversarial fixture was recorded with. One feed, three
+# USDT-quoted spot venues, so one manipulated venue is one of three.
+#
+# The Binance URL embeds the subscribed streams, so a replay must use exactly
+# this feed list or the recording's connections will not match.
+node_id = "adversarial-fixture"
+tick_interval_ms = 25
+
+[server]
+listen = "127.0.0.1:8793"
+max_pending_feeds = 64
+
+[signing]
+# The local playground key. Replay never signs anything anyone verifies.
+key_env = "ORACLE_SIGNING_KEY"
+
+[registry]
+# Only consulted when recording; replay never loads it.
+path = "node/registry.json"
+governance_address = "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb"
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BTCUSDT" },
+  { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
+  { venue = "okx", market = "spot", symbol = "BTC-USDT" },
+]
