@@ -75,7 +75,7 @@ pub mod source;
 pub mod testing;
 pub mod verify;
 
-pub use client::{ClientError, ClientStats, OracleClient, OracleClientBuilder};
+pub use client::{ClientError, ClientStats, OracleClient, OracleClientBuilder, now_unix_nanos};
 pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 pub use source::{FetchError, HttpRegistrySource, RegistrySource};
 pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig, verify_historical};

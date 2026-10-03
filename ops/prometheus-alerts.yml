@@ -1,0 +1,95 @@
+# Prometheus alerting rules for SPEC §9.3.
+#
+# Node metrics come from each node's `/metrics`. Monitor metrics come from
+# `oracle-monitor`, the internal consumer that subscribes to every node. The
+# cross-node rules live there because no node can see its own divergence.
+groups:
+  - name: oracle-node
+    rules:
+      - alert: OracleFeedHalted
+        expr: oracle_feed_status == 2
+        for: 30s
+        labels: { severity: page }
+        annotations:
+          summary: "feed {{ $labels.feed }} halted on {{ $labels.instance }} for 30s"
+
+      - alert: OracleFeedWideConfidence
+        expr: oracle_feed_conf_bps > 50
+        for: 60s
+        labels: { severity: warn }
+        annotations:
+          summary: "feed {{ $labels.feed }} conf above 50 bps for 60s on {{ $labels.instance }}"
+
+      - alert: OracleCertExpiringSoon
+        expr: oracle_cert_expiry_seconds < 7 * 86400
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "signing certificate on {{ $labels.instance }} expires in under seven days; rotate now"
+
+      - alert: OracleRegistryStale
+        expr: oracle_registry_age_seconds > 48 * 3600
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.instance }} started on a registry older than 48h"
+
+      - alert: OracleVenueDown
+        expr: oracle_ingest_connected == 0
+        for: 2m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.stream }} disconnected on {{ $labels.instance }} for 2m"
+
+      # Both native-USD venues down is a distinct failure class (SPEC §4.2):
+      # every USD feed then rests on the USDT peg with no anchor.
+      - alert: OracleUsdAnchorsDown
+        expr: >
+          sum(oracle_ingest_connected{stream=~"coinbase:spot|kraken:spot"}) by (instance) == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "both USD-native venues down on {{ $labels.instance }}"
+
+      - alert: OracleDecodeErrors
+        expr: rate(oracle_ingest_decode_errors_total[5m]) > 1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.stream }} on {{ $labels.instance }} failing to decode; a venue changed its format"
+
+      - alert: OracleSubscribersLagging
+        expr: rate(oracle_server_lagged_disconnects_total[5m]) > 0.1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "subscribers of {{ $labels.instance }} are being dropped for lagging"
+
+  - name: oracle-monitor
+    rules:
+      - alert: OracleNodeDiverging
+        expr: abs(oracle_monitor_node_deviation_bps) > 25
+        for: 30s
+        labels: { severity: page }
+        annotations:
+          summary: "node {{ $labels.node }} is {{ $value }} bps from the cross-node median on {{ $labels.feed }}"
+
+      - alert: OracleConsumerHalted
+        expr: oracle_monitor_status == 2
+        for: 30s
+        labels: { severity: page }
+        annotations:
+          summary: "the consumer view of {{ $labels.feed }} has been halted for 30s"
+
+      - alert: OracleRegistryRefreshStorm
+        expr: rate(oracle_monitor_registry_refreshes[5m]) > 0.05
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "the monitor is refreshing the registry more than a few times a minute; someone is injecting frames"
+
+      - alert: OracleRegistryRefreshFailing
+        expr: increase(oracle_monitor_registry_refresh_failures[15m]) > 0
+        labels: { severity: warn }
+        annotations:
+          summary: "registry refreshes are failing; a rotation would not reach this consumer"

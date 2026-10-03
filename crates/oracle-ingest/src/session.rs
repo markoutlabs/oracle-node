@@ -135,6 +135,7 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
     ) -> Result<SessionStats, IngestError> {
         let mut backoff = Backoff::new(self.config.backoff);
         let stream = self.config.stream;
+        let label = stream.to_string();
 
         while !shutdown.is_cancelled() {
             let connected = tokio::select! {
@@ -147,6 +148,8 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                 Ok(conn) => conn,
                 Err(err) => {
                     self.stats.connect_failures = self.stats.connect_failures.saturating_add(1);
+                    metrics::counter!("oracle_ingest_connect_failures_total", "stream" => label.clone())
+                        .increment(1);
                     warn!(%stream, error = %err, "connect failed");
                     let delay = backoff.next_delay();
                     tokio::select! {
@@ -158,6 +161,9 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             };
 
             self.stats.connects = self.stats.connects.saturating_add(1);
+            metrics::counter!("oracle_ingest_connects_total", "stream" => label.clone())
+                .increment(1);
+            metrics::gauge!("oracle_ingest_connected", "stream" => label.clone()).set(1.0);
             info!(%stream, url = %self.config.url, "connected");
             send(&out, IngestEvent::Connected { stream }).await?;
 
@@ -169,6 +175,9 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             let uptime = started.elapsed();
 
             self.stats.disconnects = self.stats.disconnects.saturating_add(1);
+            metrics::counter!("oracle_ingest_disconnects_total", "stream" => label.clone())
+                .increment(1);
+            metrics::gauge!("oracle_ingest_connected", "stream" => label.clone()).set(0.0);
             info!(%stream, ?uptime, %reason, "disconnected");
             // Downstream must invalidate this venue's state before anything new
             // arrives, so the notice is in-band and ordered with the data.
@@ -207,6 +216,7 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
         shutdown: &CancellationToken,
     ) -> Result<String, IngestError> {
         let stream = self.config.stream;
+        let label = stream.to_string();
         let recycle_at = Instant::now() + self.config.max_session;
         let mut keepalive = self
             .config
@@ -256,7 +266,9 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                 .on_payload(payload, local_recv_ns, &mut observations)
             {
                 Ok(()) => {
-                    self.stats.messages_decoded = self.stats.messages_decoded.saturating_add(1)
+                    self.stats.messages_decoded = self.stats.messages_decoded.saturating_add(1);
+                    metrics::counter!("oracle_ingest_messages_total", "stream" => label.clone())
+                        .increment(1);
                 }
                 Err(err) if err.is_benign() => {
                     self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
@@ -264,6 +276,8 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                 }
                 Err(err) => {
                     self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
+                    metrics::counter!("oracle_ingest_decode_errors_total", "stream" => label.clone())
+                        .increment(1);
                     debug!(%stream, error = %err, "decode failed");
                     continue;
                 }
@@ -271,6 +285,16 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
 
             for observation in observations.drain(..) {
                 self.stats.observations = self.stats.observations.saturating_add(1);
+                metrics::counter!("oracle_ingest_observations_total", "stream" => label.clone())
+                    .increment(1);
+                // Diagnostic only: staleness is measured with our own clock.
+                if let Some(venue_ns) = observation.exchange_time_ns {
+                    let lag_ms =
+                        (i128::from(observation.local_recv_ns) - i128::from(venue_ns)) / 1_000_000;
+                    let clamped = i32::try_from(lag_ms).unwrap_or(i32::MAX);
+                    metrics::gauge!("oracle_ingest_lag_ms", "stream" => label.clone())
+                        .set(f64::from(clamped));
+                }
                 // Awaiting a full channel is deliberate backpressure: if the
                 // aggregator cannot keep up, stop reading the socket rather than
                 // buffer without bound.

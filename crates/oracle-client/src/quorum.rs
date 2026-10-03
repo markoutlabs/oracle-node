@@ -104,6 +104,11 @@ pub struct Resolved {
     pub concerns: Vec<Concern>,
     /// The freshest contributing publish time.
     pub publish_time_ns: u64,
+    /// Inter-node spread as basis points of the median, when there is a price.
+    ///
+    /// The number [`Concern::NodeDivergence`] is judged on, reported whether or
+    /// not it crossed the line. A monitor watches it move; an alert fires on it.
+    pub spread_bps: Option<Fixed>,
 }
 
 impl Resolved {
@@ -164,6 +169,11 @@ impl FeedView {
         self.per_node.len()
     }
 
+    /// Every node's latest accepted update, in no particular order.
+    pub fn latest(&self) -> impl Iterator<Item = (&NodeId, &PriceUpdate)> {
+        self.per_node.iter()
+    }
+
     /// Returns `true` if no node has reported.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -207,6 +217,7 @@ impl FeedView {
                 halted_nodes,
                 concerns,
                 publish_time_ns: 0,
+                spread_bps: None,
             };
         }
 
@@ -228,12 +239,13 @@ impl FeedView {
         };
         let conf = conf.max(spread_half);
 
-        if let (Some(price), Some(low), Some(high)) = (price, prices.first(), prices.last())
-            && price.is_positive()
-            && let Some(spread) = high.checked_sub(*low)
-            && let Some(spread_bps) = spread.to_bps_of(price)
-            && spread_bps > config.max_divergence_bps
-        {
+        let spread_bps = match (price, prices.first(), prices.last()) {
+            (Some(price), Some(low), Some(high)) if price.is_positive() => high
+                .checked_sub(*low)
+                .and_then(|spread| spread.to_bps_of(price)),
+            _ => None,
+        };
+        if spread_bps.is_some_and(|bps| bps > config.max_divergence_bps) {
             concerns.push(Concern::NodeDivergence);
         }
 
@@ -253,6 +265,7 @@ impl FeedView {
             halted_nodes,
             concerns,
             publish_time_ns,
+            spread_bps,
         }
     }
 }

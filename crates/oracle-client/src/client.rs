@@ -563,6 +563,12 @@ impl OracleClient {
         }
     }
 
+    /// The per-node view behind a feed, for monitoring which node says what.
+    #[must_use]
+    pub fn view(&self, symbol: &Symbol) -> Option<&FeedView> {
+        self.views.get(&feed_id(symbol))
+    }
+
     /// Resolves a feed's current state without waiting for a new frame.
     #[must_use]
     pub fn resolve(&self, symbol: &Symbol, now_ns: u64) -> Option<Resolved> {
@@ -673,7 +679,11 @@ async fn connect_and_pump(
 }
 
 /// Reads the wall clock in unix nanoseconds.
-fn now_unix_nanos() -> u64 {
+///
+/// What [`OracleClient::next`] stamps frames with. Public so a monitor can ask
+/// the same clock for the registry age.
+#[must_use]
+pub fn now_unix_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))

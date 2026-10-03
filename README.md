@@ -22,7 +22,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | **done** |
 | M5.5 | Registry canister, one live key per node | **done** |
-| M6 | Hardening | in progress: keys encrypted at rest, replay harness, adversarial suite |
+| M6 | Hardening | in progress: keys encrypted at rest, replay harness, adversarial suite, metrics and alerts |
 
 ## Crates
 
@@ -489,6 +489,39 @@ clean recording and compares the published prices tick by tick:
 The fixture is a committed twelve-second recording of Binance, Bybit, and OKX
 spot BTC/USDT, with the config it was recorded under beside it. The Binance URL
 embeds the subscribed streams, so a fixture is only valid with its own config.
+
+### Metrics and alerts
+
+Every node serves Prometheus text at `/metrics` (SPEC §9.3). The node installs
+the exporter; `oracle-server` only renders what it is handed, so a server built
+without one answers 404 rather than inventing an exporter.
+
+| Family | What |
+|---|---|
+| `oracle_ingest_*` | per stream: connected, connects, disconnects, connect failures, messages, decode errors, observations, lag |
+| `oracle_feed_*` | per feed: status (0 ok, 1 degraded, 2 halted), sources, conf in bps, signed updates, outliers rejected, halted and degraded polls, invalidations |
+| `oracle_pipeline_tick_seconds` | how long one aggregate-and-sign pass takes |
+| `oracle_server_*` | subscribers, updates published, lagged disconnects |
+| `oracle_cert_expiry_seconds`, `oracle_registry_version`, `oracle_registry_age_seconds` | the node's own key and registry |
+
+No node can see its own divergence. `oracle-monitor` is the internal consumer
+the spec asks for: it subscribes to every node exactly as the SDK does, resolves
+every feed, and exports per feed the status, node count, inter-node spread and
+confidence, and per node its signed distance from the resolved price in basis
+points. That last gauge is the highest-signal metric in the system. It catches a
+subtly wrong node that every node-local metric reports as perfectly healthy.
+
+```sh
+oracle-monitor https://<canister>.icp0.io/registry.json 0x<governance> \
+  CRYPTO.BTC/USD CRYPTO.ETH/USD --listen 127.0.0.1:9108
+```
+
+`ops/prometheus-alerts.yml` holds the spec's alert list as Prometheus rules:
+feed halted over thirty seconds, confidence over fifty basis points for a
+minute, a node over twenty-five basis points from the median for thirty seconds,
+certificate expiry under seven days, registry older than two days, both
+USD-native venues down, decode errors, lagging subscribers, and a registry
+refresh storm on the consumer side.
 
 ### End to end on a local replica
 

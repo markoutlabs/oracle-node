@@ -33,6 +33,12 @@ pub struct FeedEntry {
     pub expo: i32,
 }
 
+/// Renders the process's metrics in Prometheus text format.
+///
+/// A closure rather than an exporter handle, so this crate does not choose the
+/// exporter: the node installs one and hands over its `render`.
+pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
+
 /// Shared server state.
 pub struct ServerState {
     hub: Arc<Hub>,
@@ -40,16 +46,29 @@ pub struct ServerState {
     by_symbol: HashMap<String, FeedId>,
     registry: Registry,
     node_id: String,
+    metrics: Option<MetricsRender>,
 }
 
 impl ServerState {
-    /// Builds server state for a fixed feed catalogue.
+    /// Builds server state for a fixed feed catalogue, with no `/metrics`.
     #[must_use]
     pub fn new(
         node_id: impl Into<String>,
         feeds: &[Symbol],
         registry: Registry,
         max_pending: usize,
+    ) -> Arc<Self> {
+        Self::with_metrics(node_id, feeds, registry, max_pending, None)
+    }
+
+    /// Builds server state that serves `/metrics` from `metrics`, if given.
+    #[must_use]
+    pub fn with_metrics(
+        node_id: impl Into<String>,
+        feeds: &[Symbol],
+        registry: Registry,
+        max_pending: usize,
+        metrics: Option<MetricsRender>,
     ) -> Arc<Self> {
         let mut catalog = HashMap::with_capacity(feeds.len());
         let mut by_symbol = HashMap::with_capacity(feeds.len());
@@ -64,6 +83,7 @@ impl ServerState {
             by_symbol,
             registry,
             node_id: node_id.into(),
+            metrics,
         })
     }
 
@@ -115,6 +135,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/price/latest", get(latest_batch))
         .route("/v1/registry", get(registry))
         .route("/v1/health", get(health))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -195,6 +216,22 @@ async fn health(State(state): State<Arc<ServerState>>) -> Response {
     .into_response()
 }
 
+/// Prometheus text format, or 404 when the node installed no exporter.
+async fn metrics(State(state): State<Arc<ServerState>>) -> Response {
+    match &state.metrics {
+        Some(render) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            render(),
+        )
+            .into_response(),
+        None => not_found(
+            "metrics_disabled",
+            "no metrics exporter installed".to_owned(),
+        ),
+    }
+}
+
 fn not_found(code: &str, message: String) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -231,6 +268,8 @@ async fn serve_socket(socket: WebSocket, state: Arc<ServerState>) {
                     batch = subscriber.drain() => {
                         if batch.is_empty() {
                             if subscriber.is_lagged() {
+                                metrics::counter!("oracle_server_lagged_disconnects_total")
+                                    .increment(1);
                                 // Tell them why. A consumer that silently misses
                                 // updates cannot know its prices went stale.
                                 let notice = ServerMessage::Lagged {

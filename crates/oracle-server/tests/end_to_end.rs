@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use oracle_client::{OracleClient, Status, testing as client_testing};
 use oracle_server::testing::{NODE_ID, sample_update, signing_key};
-use oracle_server::{ServerState, router};
+use oracle_server::{MetricsRender, ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
 use oracle_wire::{Registry, Signer, VerifiedRegistry, feed_id};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -67,6 +67,10 @@ struct Node {
 
 /// Starts a server on an ephemeral port with a registry naming its own address.
 async fn start_node() -> Node {
+    start_node_with(None).await
+}
+
+async fn start_node_with(metrics: Option<MetricsRender>) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("has an address");
 
@@ -103,7 +107,7 @@ async fn start_node() -> Node {
     .expect("signs");
     let verified = registry.verify(governance.address(), 0).expect("verifies");
 
-    let state = ServerState::new(NODE_ID, &[symbol()], registry, 64);
+    let state = ServerState::with_metrics(NODE_ID, &[symbol()], registry, 64, metrics);
     let app = router(Arc::clone(&state));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -366,4 +370,19 @@ async fn a_node_served_registry_still_requires_the_pinned_governance_key() {
             .is_ok(),
         "and must verify against the right one"
     );
+}
+
+/// `/metrics` is Prometheus text when the node installed an exporter, and a
+/// plain 404 when it did not. The route never invents an exporter of its own.
+#[tokio::test]
+async fn the_metrics_route_serves_the_installed_exporter_or_nothing() {
+    let bare = start_node().await;
+    let (status, _) = get(&bare.addr, "/metrics").await;
+    assert_eq!(status, 404);
+
+    let render: MetricsRender = Arc::new(|| "# TYPE oracle_test gauge\noracle_test 1\n".to_owned());
+    let node = start_node_with(Some(render)).await;
+    let (status, body) = get(&node.addr, "/metrics").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("oracle_test 1"), "{body}");
 }

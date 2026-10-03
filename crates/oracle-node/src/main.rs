@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{IngestEvent, Recorder, RecordingConnector};
@@ -13,7 +16,8 @@ use oracle_node::{
     InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, build_adapters,
     candid_call,
 };
-use oracle_server::{ServerState, router};
+use oracle_server::{MetricsRender, ServerState, router};
+use oracle_types::FeedId;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -164,12 +168,24 @@ async fn start(
         )
         .init();
 
+    // Installed before anything emits, so no sample is lost. Served by the
+    // subscriber server at `/metrics` (SPEC §9.3).
+    let prometheus = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|error| format!("cannot install the metrics recorder: {error}"))?;
+    let render: MetricsRender = Arc::new(move || prometheus.render());
+
     let config = NodeConfig::load(&path)?;
     let resolved = config.resolve()?;
     // Both fail loudly at startup rather than at the first publish.
     let signer = config.load_signing_key()?;
     let signer_address = signer.address();
     let registry = config.fetch_registry().await?;
+    metrics::gauge!("oracle_registry_version").set(gauge(registry.version));
+    metrics::gauge!("oracle_registry_age_seconds").set(gauge(
+        (wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC)
+            .saturating_sub(registry.effective_from),
+    ));
 
     info!(
         node_id = %config.node_id,
@@ -200,12 +216,18 @@ async fn start(
         .with_sequence_floor(wall_clock_unix_nanos() / 1_000_000);
     let mut pipeline = Pipeline::new(aggregator, signer);
 
-    let state = ServerState::new(
+    let state = ServerState::with_metrics(
         &config.node_id,
         &resolved.symbols,
         registry,
         config.server.max_pending_feeds,
+        Some(render),
     );
+    let feed_names: HashMap<FeedId, String> = resolved
+        .symbols
+        .iter()
+        .map(|symbol| (oracle_wire::feed_id(symbol), symbol.to_string()))
+        .collect();
     let shutdown = CancellationToken::new();
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
 
@@ -251,6 +273,7 @@ async fn start(
             let clock = oracle_ingest::clock::MonotonicClock::new();
             let mut ticker = tokio::time::interval(tick);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut feed_metrics = FeedMetrics::new(feed_names);
             loop {
                 tokio::select! {
                     biased;
@@ -263,7 +286,10 @@ async fn start(
                         pipeline.observe(&event);
                     }
                     _ = ticker.tick() => {
+                        let started = std::time::Instant::now();
                         let (signed, errors) = pipeline.tick(clock.now_ns());
+                        metrics::histogram!("oracle_pipeline_tick_seconds")
+                            .record(started.elapsed().as_secs_f64());
                         for error in errors {
                             warn!(%error, "feed could not be encoded");
                         }
@@ -271,8 +297,10 @@ async fn start(
                             if tail {
                                 log_update(&update);
                             }
+                            feed_metrics.update(update.update());
                             let _ = state.publish(update);
                         }
+                        feed_metrics.poll(&pipeline);
                     }
                 }
             }
@@ -550,6 +578,97 @@ fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A `u64` as a gauge value. Saturates far beyond any real count.
+fn gauge(value: u64) -> f64 {
+    u32::try_from(value).map_or(f64::MAX, f64::from)
+}
+
+/// A fixed-point value as a gauge value, through its decimal text.
+fn gauge_fixed(value: oracle_types::Fixed) -> f64 {
+    value.to_string().parse().unwrap_or(f64::NAN)
+}
+
+/// Per-feed metrics (SPEC §9.3), derived from what the pipeline publishes and
+/// from the aggregator's own counters.
+struct FeedMetrics {
+    names: HashMap<FeedId, String>,
+    last: HashMap<FeedId, oracle_agg::FeedStats>,
+    ticks: u32,
+}
+
+impl FeedMetrics {
+    fn new(names: HashMap<FeedId, String>) -> Self {
+        Self {
+            names,
+            last: HashMap::new(),
+            ticks: 0,
+        }
+    }
+
+    fn name(&self, feed_id: FeedId) -> String {
+        self.names
+            .get(&feed_id)
+            .cloned()
+            .unwrap_or_else(|| feed_id.to_string())
+    }
+
+    /// Gauges from one published update.
+    fn update(&self, update: &oracle_types::PriceUpdate) {
+        let feed = self.name(update.feed_id);
+        metrics::counter!("oracle_updates_signed_total", "feed" => feed.clone()).increment(1);
+        metrics::gauge!("oracle_feed_sources", "feed" => feed.clone())
+            .set(f64::from(update.num_sources));
+        let status = if update.flags.is_halted() {
+            2.0
+        } else if update.flags.is_degraded() {
+            1.0
+        } else {
+            0.0
+        };
+        metrics::gauge!("oracle_feed_status", "feed" => feed.clone()).set(status);
+        if let (Ok(price), Ok(conf)) = (update.price_fixed(), update.conf_fixed())
+            && price.is_positive()
+            && let Some(bps) = conf.to_bps_of(price)
+        {
+            metrics::gauge!("oracle_feed_conf_bps", "feed" => feed).set(gauge_fixed(bps));
+        }
+    }
+
+    /// Counters from the aggregator's cumulative stats, once a second.
+    fn poll(&mut self, pipeline: &Pipeline) {
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % 40 != 0 {
+            return;
+        }
+        for (feed_id, stats) in pipeline.feed_stats() {
+            let feed = self.name(feed_id);
+            let last = self.last.insert(feed_id, stats).unwrap_or_default();
+            let bump = |name: &'static str, now: u64, before: u64| {
+                let delta = now.saturating_sub(before);
+                if delta > 0 {
+                    metrics::counter!(name, "feed" => feed.clone()).increment(delta);
+                }
+            };
+            bump(
+                "oracle_feed_outliers_rejected_total",
+                stats.outliers_rejected,
+                last.outliers_rejected,
+            );
+            bump("oracle_feed_halted_polls_total", stats.halted, last.halted);
+            bump(
+                "oracle_feed_degraded_polls_total",
+                stats.degraded,
+                last.degraded,
+            );
+            bump(
+                "oracle_feed_invalidations_total",
+                stats.invalidations,
+                last.invalidations,
+            );
+        }
+    }
+}
+
 /// Logs how long this node's signing certificate remains valid.
 ///
 /// SPEC §9.3 alerts on an expiry under seven days, because a lapsed certificate
@@ -560,6 +679,7 @@ fn report_cert_expiry(registry: &oracle_wire::VerifiedRegistry, signer: oracle_w
         return;
     };
     let remaining = not_after.saturating_sub(wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC);
+    metrics::gauge!("oracle_cert_expiry_seconds").set(gauge(remaining));
     if remaining <= CERT_EXPIRY_WARNING.as_secs() {
         warn!(
             %signer,

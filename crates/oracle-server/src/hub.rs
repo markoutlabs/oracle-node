@@ -294,6 +294,7 @@ impl Hub {
         });
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.insert(subscriber.id, Arc::clone(&subscriber));
+            metrics::gauge!("oracle_server_subscribers").set(count_as_f64(subscribers.len()));
         }
         subscriber
     }
@@ -304,6 +305,7 @@ impl Hub {
             && let Some(subscriber) = subscribers.remove(&id)
         {
             subscriber.close();
+            metrics::gauge!("oracle_server_subscribers").set(count_as_f64(subscribers.len()));
         }
     }
 
@@ -318,6 +320,7 @@ impl Hub {
     /// Publishes an update to every interested subscriber.
     pub fn publish(&self, symbol: Symbol, signed: SignedUpdate) -> Arc<PreparedUpdate> {
         let prepared = Arc::new(PreparedUpdate::new(symbol, signed));
+        metrics::counter!("oracle_server_updates_published_total").increment(1);
         if let Ok(mut latest) = self.latest.lock() {
             latest.insert(prepared.feed_id, Arc::clone(&prepared));
         }
@@ -344,6 +347,11 @@ impl Hub {
             .lock()
             .map_or_else(|_| Vec::new(), |latest| latest.values().cloned().collect())
     }
+}
+
+/// A collection size as a gauge value. Saturates far beyond any real count.
+fn count_as_f64(count: usize) -> f64 {
+    u32::try_from(count).map_or(f64::MAX, f64::from)
 }
 
 #[cfg(test)]
