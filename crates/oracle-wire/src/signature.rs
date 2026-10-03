@@ -3,8 +3,6 @@
 use core::fmt;
 use core::str::FromStr;
 
-use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
-
 use crate::WireError;
 
 /// Length of an encoded signature: `r ‖ s ‖ v`.
@@ -60,19 +58,16 @@ impl Signature {
         Ok(sig)
     }
 
-    /// Builds a signature from a `libsecp256k1` recoverable signature.
+    /// Builds a signature from `r ‖ s` and a raw recovery id in `{0, 1}`.
     ///
     /// # Errors
     ///
-    /// Returns [`WireError`] if the produced signature is not canonical, which
-    /// would indicate a broken signing backend rather than bad input.
-    pub fn from_recoverable(sig: &RecoverableSignature) -> Result<Self, WireError> {
-        let (recovery_id, compact) = sig.serialize_compact();
-        let recovery = i32::from(recovery_id);
-        let recovery = u8::try_from(recovery).map_err(|_| WireError::RecoveryFailed)?;
+    /// Returns [`WireError`] if the result is not canonical. From a signing
+    /// backend that would indicate a broken library rather than bad input.
+    pub fn from_parts(compact: &[u8; 64], recovery: u8) -> Result<Self, WireError> {
         let mut bytes = [0_u8; SIGNATURE_LEN];
         let (head, tail) = bytes.split_at_mut(64);
-        head.copy_from_slice(&compact);
+        head.copy_from_slice(compact);
         if let Some(slot) = tail.first_mut() {
             *slot = recovery
                 .checked_add(RECOVERY_OFFSET)
@@ -81,22 +76,18 @@ impl Signature {
         Self::from_bytes(bytes)
     }
 
-    /// Converts to a `libsecp256k1` recoverable signature for key recovery.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WireError::RecoveryFailed`] if the scalars do not form a
-    /// signature the backend accepts.
-    pub fn to_recoverable(self) -> Result<RecoverableSignature, WireError> {
-        let recovery = self
-            .recovery_byte()
-            .checked_sub(RECOVERY_OFFSET)
-            .ok_or(WireError::InvalidRecoveryByte(self.recovery_byte()))?;
-        let recovery_id = RecoveryId::try_from(i32::from(recovery))
-            .map_err(|_| WireError::InvalidRecoveryByte(self.recovery_byte()))?;
-        let compact = self.0.get(..64).ok_or(WireError::RecoveryFailed)?;
-        RecoverableSignature::from_compact(compact, recovery_id)
-            .map_err(|_| WireError::RecoveryFailed)
+    /// Splits into `r ‖ s` and the raw recovery id in `{0, 1}`.
+    #[must_use]
+    pub fn parts(&self) -> ([u8; 64], u8) {
+        let mut compact = [0_u8; 64];
+        if let Some(head) = self.0.get(..64) {
+            compact.copy_from_slice(head);
+        }
+        // `from_bytes` guarantees the byte is 27 or 28.
+        (
+            compact,
+            self.recovery_byte().saturating_sub(RECOVERY_OFFSET),
+        )
     }
 
     /// Returns the raw 65 bytes.
@@ -241,12 +232,17 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_round_trip() {
+    fn parts_round_trip() {
         let sig = valid_signature();
-        let recoverable = sig.to_recoverable().expect("canonical");
+        let (compact, recovery) = sig.parts();
+        assert!(recovery <= 1);
         assert_eq!(
-            Signature::from_recoverable(&recoverable).expect("canonical"),
+            Signature::from_parts(&compact, recovery).expect("canonical"),
             sig
+        );
+        assert_eq!(
+            Signature::from_parts(&compact, 2),
+            Err(WireError::InvalidRecoveryByte(29))
         );
     }
 

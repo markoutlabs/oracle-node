@@ -9,10 +9,7 @@
 //! production** — the secrets are guessable by construction.
 
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{
-    Address, CompressedPublicKey, NodeEntry, Quorum, Registry, Signer, SigningKeyCert,
-    VerifiedRegistry,
-};
+use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, VerifiedRegistry};
 
 /// A conventional node id for single-node tests.
 pub const NODE_ID: &str = "oracle-test-1";
@@ -137,7 +134,7 @@ impl TestNode {
         NodeEntry {
             node_id: self.node_id.clone(),
             operator: "test".to_owned(),
-            identity_pubkey: CompressedPublicKey::from_public_key(&self.identity.public_key()),
+            identity_pubkey: self.identity.public_key(),
             endpoints: vec![format!("wss://{}.test/v1/ws", self.node_id)],
             signing_keys,
             weight: 1,

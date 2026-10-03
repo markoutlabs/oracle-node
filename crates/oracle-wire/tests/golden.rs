@@ -32,8 +32,8 @@ use std::path::PathBuf;
 
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol, Venue};
 use oracle_wire::{
-    CompressedPublicKey, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, UnverifiedFrame,
-    domain, encode_price_update, feed_id,
+    NodeEntry, Quorum, Registry, Signer, SigningKeyCert, UnverifiedFrame, domain,
+    encode_price_update, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -298,7 +298,7 @@ fn build() -> GoldenFile {
         vec![NodeEntry {
             node_id: "oracle-eu-1".to_owned(),
             operator: "acme".to_owned(),
-            identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+            identity_pubkey: identity.public_key(),
             endpoints: vec!["wss://eu1.oracle.example/v1/ws".to_owned()],
             signing_keys: vec![cert],
             weight: 1,

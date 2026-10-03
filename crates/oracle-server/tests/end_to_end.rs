@@ -85,7 +85,7 @@ async fn start_node() -> Node {
     let entry = oracle_wire::NodeEntry {
         node_id: NODE_ID.to_owned(),
         operator: "test".to_owned(),
-        identity_pubkey: oracle_wire::CompressedPublicKey::from_public_key(&identity.public_key()),
+        identity_pubkey: identity.public_key(),
         endpoints: vec![format!("ws://{addr}/v1/ws")],
         signing_keys: vec![cert],
         weight: 1,

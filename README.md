@@ -310,6 +310,7 @@ Byte layouts and cryptography.
 
 - Canonical 96-byte price update payload — this layout *is* the protocol.
 - secp256k1 recoverable ECDSA over a keccak256 digest, EIP-712-shaped domain separation. `v` is offset by 27, so the bytes are Ethereum's exactly and an on-chain verifier is a port rather than a redesign.
+- Two curve backends behind one private module: `libsecp256k1` on native targets, `k256` on wasm32 (or anywhere with `--features pure-rust`). Nothing outside the module names a backend type. The split exists so the registry canister can reuse the exact encoding and verification code instead of a port. `k256` recovers about five times slower, which is why it is not the default.
 - `SigningKeyCert` — identity key authorises a hot signing key for a window.
 - `Registry` / `VerifiedRegistry` — the trust root.
 - `UnverifiedFrame` → `VerifiedUpdate` typestate.
@@ -335,6 +336,11 @@ Verification stops at "a registered node really signed this". Sequence monotonic
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
+
+# The two secp256k1 backends must agree byte for byte. The golden vectors
+# run under k256 here, and the wasm32 build is what the registry canister needs.
+cargo test -p oracle-wire --features pure-rust
+cargo build -p oracle-wire --no-default-features --target wasm32-unknown-unknown
 ```
 
 ### Running a node locally

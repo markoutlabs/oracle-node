@@ -1,15 +1,9 @@
 //! Signing keys and public-key recovery.
 
 use core::fmt;
-use std::sync::LazyLock;
 
-use secp256k1::{All, Message, PublicKey, Secp256k1, SecretKey};
-
-use crate::{Address, Signature, WireError, domain};
-
-/// One shared curve context. Building a `Secp256k1` context costs milliseconds,
-/// so it must not happen per signature.
-static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
+use crate::backend::SecretKey;
+use crate::{Address, CompressedPublicKey, Signature, WireError, backend, domain};
 
 /// A secp256k1 signing key.
 ///
@@ -24,7 +18,7 @@ static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
 /// Neither is a substitute for keeping the key out of logs, cores, and swap.
 pub struct Signer {
     secret: SecretKey,
-    public: PublicKey,
+    public: CompressedPublicKey,
     address: Address,
 }
 
@@ -36,9 +30,9 @@ impl Signer {
     /// Returns [`WireError::InvalidSecretKey`] if the bytes are not a valid
     /// scalar for the curve (zero, or at or above the group order).
     pub fn from_secret_bytes(bytes: [u8; 32]) -> Result<Self, WireError> {
-        let secret = SecretKey::from_byte_array(bytes).map_err(|_| WireError::InvalidSecretKey)?;
-        let public = secret.public_key(&SECP);
-        let address = Address::from_public_key(&public);
+        let secret = SecretKey::from_bytes(bytes)?;
+        let public = CompressedPublicKey::from_bytes(secret.public_compressed());
+        let address = public.address()?;
         Ok(Self {
             secret,
             public,
@@ -53,11 +47,15 @@ impl Signer {
     /// guessable by construction — they exist so that fixtures are reproducible,
     /// and using one for anything real would hand over the node.
     ///
+    /// Needs the `os-rng` feature, which is on by default. A wasm32 canister
+    /// has no OS entropy source and never generates keys, so it builds without.
+    ///
     /// # Errors
     ///
     /// Returns [`WireError::EntropyUnavailable`] if the OS entropy source cannot
     /// be read. There is deliberately no fallback: a key drawn from a weaker
     /// source is indistinguishable from a good one everywhere downstream.
+    #[cfg(feature = "os-rng")]
     pub fn generate() -> Result<Self, WireError> {
         // A uniformly random 32-byte string lands outside the curve order with
         // probability around 2^-128. Negligible is not impossible, and the
@@ -84,7 +82,7 @@ impl Signer {
     /// be obvious at the call site rather than incidental.
     #[must_use]
     pub fn to_secret_hex(&self) -> String {
-        hex::encode(self.secret.secret_bytes())
+        hex::encode(self.secret.to_bytes())
     }
 
     /// Loads a signing key from hex, with or without a `0x` prefix.
@@ -111,9 +109,9 @@ impl Signer {
         self.address
     }
 
-    /// Returns the public key.
+    /// Returns the compressed public key.
     #[must_use]
-    pub const fn public_key(&self) -> PublicKey {
+    pub const fn public_key(&self) -> CompressedPublicKey {
         self.public
     }
 
@@ -122,16 +120,15 @@ impl Signer {
     /// # Panics
     ///
     /// Panics if the curve backend returns a non-canonical signature. That
-    /// cannot happen for any input — `libsecp256k1` always emits low-`s` — so it
-    /// would mean the linked library is broken. Crashing is the correct response:
-    /// a node that has lost confidence in its signing backend must stop signing,
+    /// cannot happen for any input — both backends emit low-`s` — so it would
+    /// mean the linked library is broken. Crashing is the correct response: a
+    /// node that has lost confidence in its signing backend must stop signing,
     /// not emit signatures nobody can verify.
     #[must_use]
     pub fn sign_digest(&self, digest: &[u8; 32]) -> Signature {
-        let message = Message::from_digest(*digest);
-        let recoverable = SECP.sign_ecdsa_recoverable(message, &self.secret);
-        Signature::from_recoverable(&recoverable)
-            .expect("libsecp256k1 always produces canonical low-s signatures")
+        let (compact, recovery) = self.secret.sign_digest(digest);
+        Signature::from_parts(&compact, recovery)
+            .expect("the curve backend always produces canonical low-s signatures")
     }
 
     /// Signs a canonical payload under the protocol domain.
@@ -147,7 +144,7 @@ impl Signer {
 
 impl Drop for Signer {
     fn drop(&mut self) {
-        self.secret.non_secure_erase();
+        self.secret.erase();
     }
 }
 
@@ -177,12 +174,9 @@ impl fmt::Debug for Signer {
 /// Returns [`WireError::RecoveryFailed`] if no public key corresponds to the
 /// signature and digest.
 pub fn recover_address(digest: &[u8; 32], signature: &Signature) -> Result<Address, WireError> {
-    let recoverable = signature.to_recoverable()?;
-    let message = Message::from_digest(*digest);
-    let public = SECP
-        .recover_ecdsa(message, &recoverable)
-        .map_err(|_| WireError::RecoveryFailed)?;
-    Ok(Address::from_public_key(&public))
+    let (compact, recovery) = signature.parts();
+    let public = backend::recover(digest, &compact, recovery)?;
+    Ok(Address::from_uncompressed(&public))
 }
 
 /// Recovers the address that signed a canonical payload under the protocol domain.

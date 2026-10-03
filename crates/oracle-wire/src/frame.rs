@@ -304,8 +304,8 @@ impl VerifiedUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SigningKeyCert;
     use crate::registry::{NodeEntry, Quorum, Registry};
-    use crate::{CompressedPublicKey, SigningKeyCert};
     use oracle_types::{FeedId, Flags, NANOS_PER_SEC, Venue};
 
     const NOW_SECS: u64 = 1_754_582_400;
@@ -335,7 +335,7 @@ mod tests {
         let node = NodeEntry {
             node_id: "oracle-eu-1".to_owned(),
             operator: "acme".to_owned(),
-            identity_pubkey: CompressedPublicKey::from_public_key(&identity().public_key()),
+            identity_pubkey: identity().public_key(),
             endpoints: vec!["wss://eu1.example/v1/ws".to_owned()],
             signing_keys: vec![cert],
             weight: 1,

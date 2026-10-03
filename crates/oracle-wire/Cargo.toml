@@ -7,15 +7,30 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["os-rng"]
+# Key generation from the OS CSPRNG. Off for wasm32 canisters, which never
+# generate keys and have no entropy source `getrandom` knows about.
+os-rng = ["dep:getrandom"]
+# Use the pure-Rust `k256` backend on native targets. wasm32 always uses it.
+# CI runs the golden vectors under this feature to prove the backends agree.
+pure-rust = ["dep:k256"]
+
 [dependencies]
 oracle-types.workspace = true
 
 hex.workspace = true
-secp256k1.workspace = true
-getrandom.workspace = true
+getrandom = { workspace = true, optional = true }
+k256 = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 tiny-keccak.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+secp256k1.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+k256.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

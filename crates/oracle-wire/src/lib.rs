@@ -70,6 +70,7 @@
 //! ```
 
 mod address;
+mod backend;
 mod cert;
 mod codec;
 pub mod domain;
@@ -82,6 +83,7 @@ mod signature;
 mod signer;
 
 pub use address::{Address, CompressedPublicKey};
+pub use backend::name as backend_name;
 pub use cert::{MAX_NODE_ID_LEN, SigningKeyCert};
 pub use error::{VerifyError, WireError};
 pub use frame::{

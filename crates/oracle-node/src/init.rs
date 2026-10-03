@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oracle_wire::{CompressedPublicKey, NodeEntry, Signer, SigningKeyCert};
+use oracle_wire::{NodeEntry, Signer, SigningKeyCert};
 
 /// Default certificate validity, in days (SPEC §3.5).
 pub const DEFAULT_VALIDITY_DAYS: u64 = 30;
@@ -134,7 +134,7 @@ impl NodeKeys {
         NodeEntry {
             node_id: self.options.node_id.clone(),
             operator: self.options.operator.clone(),
-            identity_pubkey: CompressedPublicKey::from_public_key(&self.identity.public_key()),
+            identity_pubkey: self.identity.public_key(),
             endpoints: vec![self.options.endpoint.clone()],
             signing_keys: vec![self.cert.clone()],
             weight: 1,

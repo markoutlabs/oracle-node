@@ -3,10 +3,8 @@
 use core::fmt;
 use core::str::FromStr;
 
-use secp256k1::PublicKey;
-
-use crate::WireError;
 use crate::keccak::keccak256;
+use crate::{WireError, backend};
 
 /// A 20-byte signer identity: the last 20 bytes of the Keccak-256 hash of the
 /// uncompressed public key, matching Ethereum's address derivation.
@@ -35,12 +33,11 @@ impl Address {
         &self.0
     }
 
-    /// Derives the address of a public key.
+    /// Derives the address of a 65-byte uncompressed public key.
     ///
     /// `keccak256(uncompressed_pubkey_without_prefix)[12..32]`.
     #[must_use]
-    pub fn from_public_key(key: &PublicKey) -> Self {
-        let uncompressed = key.serialize_uncompressed();
+    pub fn from_uncompressed(uncompressed: &[u8; 65]) -> Self {
         // Byte 0 is the 0x04 uncompressed marker and is not hashed.
         let body = uncompressed.get(1..).unwrap_or(&[]);
         let hash = keccak256(body);
@@ -101,12 +98,6 @@ impl FromStr for Address {
     }
 }
 
-impl From<&PublicKey> for Address {
-    fn from(key: &PublicKey) -> Self {
-        Self::from_public_key(key)
-    }
-}
-
 impl serde::Serialize for Address {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
@@ -142,20 +133,14 @@ impl CompressedPublicKey {
         &self.0
     }
 
-    /// Serializes a public key into compressed form.
-    #[must_use]
-    pub fn from_public_key(key: &PublicKey) -> Self {
-        Self(key.serialize())
-    }
-
-    /// Decodes to a curve point.
+    /// Decodes to a 65-byte uncompressed point.
     ///
     /// # Errors
     ///
     /// Returns [`WireError::InvalidPublicKey`] if the bytes are not a valid
     /// compressed point.
-    pub fn decode(&self) -> Result<PublicKey, WireError> {
-        PublicKey::from_byte_array_compressed(self.0).map_err(|_| WireError::InvalidPublicKey)
+    pub fn decompress(&self) -> Result<[u8; 65], WireError> {
+        backend::decompress(&self.0)
     }
 
     /// Returns the address this key signs under.
@@ -165,7 +150,7 @@ impl CompressedPublicKey {
     /// Returns [`WireError::InvalidPublicKey`] if the bytes are not a valid
     /// compressed point.
     pub fn address(&self) -> Result<Address, WireError> {
-        Ok(Address::from_public_key(&self.decode()?))
+        Ok(Address::from_uncompressed(&self.decompress()?))
     }
 }
 
@@ -255,11 +240,10 @@ mod tests {
     #[test]
     fn compressed_key_round_trips_through_the_curve() {
         let signer = Signer::from_secret_bytes([7_u8; 32]).expect("valid key");
-        let compressed = CompressedPublicKey::from_public_key(&signer.public_key());
-        assert_eq!(
-            compressed.decode().expect("valid point"),
-            signer.public_key()
-        );
+        let compressed = signer.public_key();
+        let uncompressed = compressed.decompress().expect("valid point");
+        assert_eq!(uncompressed.first(), Some(&0x04));
+        assert_eq!(Address::from_uncompressed(&uncompressed), signer.address());
         assert_eq!(compressed.address().expect("valid point"), signer.address());
         assert_eq!(
             compressed
@@ -273,6 +257,7 @@ mod tests {
     #[test]
     fn invalid_compressed_keys_are_rejected() {
         let bogus = CompressedPublicKey::from_bytes([0xFF; 33]);
-        assert_eq!(bogus.decode(), Err(WireError::InvalidPublicKey));
+        assert_eq!(bogus.decompress(), Err(WireError::InvalidPublicKey));
+        assert_eq!(bogus.address(), Err(WireError::InvalidPublicKey));
     }
 }

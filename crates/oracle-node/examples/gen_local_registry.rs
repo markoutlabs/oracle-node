@@ -25,9 +25,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oracle_wire::{
-    CompressedPublicKey, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, WireError,
-};
+use oracle_wire::{NodeEntry, Quorum, Registry, Signer, SigningKeyCert, WireError};
 
 /// Far-future expiry for keys that are not being rotated.
 const FOREVER: u64 = 4_102_444_800;
@@ -168,7 +166,7 @@ fn entry(index: u8, options: &Options, now: u64) -> Result<NodeEntry, WireError>
         // one node wearing a costume (SPEC §9.2). Local runs cannot make that
         // true, but they should not encode the opposite either.
         operator: format!("local-{index}"),
-        identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+        identity_pubkey: identity.public_key(),
         endpoints: vec![format!(
             "ws://127.0.0.1:{}/v1/ws",
             options.base_port + u16::from(index) - 1

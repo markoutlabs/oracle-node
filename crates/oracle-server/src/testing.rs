@@ -5,7 +5,7 @@
 //! integers — never use them in production.**
 
 use oracle_types::{FeedId, Flags, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, Registry, Signer, SigningKeyCert};
+use oracle_wire::{NodeEntry, Quorum, Registry, Signer, SigningKeyCert};
 
 /// The node id used by [`test_registry`].
 pub const NODE_ID: &str = "oracle-test-1";
@@ -59,7 +59,7 @@ pub fn test_registry() -> Registry {
     let node = NodeEntry {
         node_id: NODE_ID.to_owned(),
         operator: "test".to_owned(),
-        identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+        identity_pubkey: identity.public_key(),
         endpoints: vec!["ws://127.0.0.1:0/v1/ws".to_owned()],
         signing_keys: vec![cert],
         weight: 1,

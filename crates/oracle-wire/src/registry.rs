@@ -474,7 +474,7 @@ mod tests {
             NodeEntry {
                 node_id,
                 operator: format!("operator-{index}"),
-                identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+                identity_pubkey: identity.public_key(),
                 endpoints: vec![format!("wss://node{index}.example/v1/ws")],
                 signing_keys: vec![cert],
                 weight: 1,
@@ -754,7 +754,7 @@ mod tests {
         let nodes = vec![NodeEntry {
             node_id: node_id.to_owned(),
             operator: "operator-1".to_owned(),
-            identity_pubkey: CompressedPublicKey::from_public_key(&identity.public_key()),
+            identity_pubkey: identity.public_key(),
             endpoints: vec!["wss://node1.example/v1/ws".to_owned()],
             signing_keys: vec![
                 SigningKeyCert::issue(&identity, node_id, hot.address(), now, now + DAY)
