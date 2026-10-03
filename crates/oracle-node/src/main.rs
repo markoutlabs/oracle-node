@@ -5,14 +5,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
-use oracle_ingest::binance::BinanceAdapter;
-use oracle_ingest::clock::wall_clock_unix_nanos;
+use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
-use oracle_ingest::venues::VenueAdapter;
-use oracle_ingest::{ExchangeAdapter, IngestEvent};
+use oracle_ingest::{IngestEvent, Recorder, RecordingConnector};
 use oracle_node::keyfile;
 use oracle_node::{
-    InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, candid_call,
+    InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, build_adapters,
+    candid_call,
 };
 use oracle_server::{ServerState, router};
 use tokio::sync::mpsc;
@@ -79,6 +78,10 @@ enum Command {
         /// signed update coming out. The fastest way to see what a venue sends.
         #[arg(long)]
         tail: bool,
+        /// Record every raw venue frame, with its receipt time, to this file as
+        /// JSON lines. `oracle-replay` plays it back through the same pipeline.
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
     },
 }
 
@@ -142,11 +145,19 @@ async fn dispatch() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Init(args) => init_command(args),
         Command::Rotate(args) => rotate_command(args),
-        Command::Start { config, tail } => start(config, tail).await,
+        Command::Start {
+            config,
+            tail,
+            record,
+        } => start(config, tail, record).await,
     }
 }
 
-async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn start(
+    path: PathBuf,
+    tail: bool,
+    record: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -198,35 +209,25 @@ async fn start(path: PathBuf, tail: bool) -> Result<(), Box<dyn std::error::Erro
     let shutdown = CancellationToken::new();
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
 
-    let mut adapters: Vec<Box<dyn ExchangeAdapter>> = Vec::new();
-    if !resolved.binance.spot.is_empty() || !resolved.binance.perp.is_empty() {
-        let adapter = BinanceAdapter::new(resolved.binance, WebSocketConnector)?;
-        for (session, market, _) in adapter.plan()? {
-            info!(venue = "binance", %market, url = %session.url, "ingest endpoint");
+    // The same adapters either way; `--record` only wraps the transport.
+    let adapters = match &record {
+        Some(path) => {
+            info!(path = %path.display(), "recording raw venue frames");
+            let connector = RecordingConnector::new(WebSocketConnector, Recorder::to_file(path)?);
+            build_adapters(
+                resolved.binance,
+                resolved.venues,
+                connector,
+                MonotonicClock::new(),
+            )?
         }
-        adapters.push(Box::new(adapter));
-    }
-    for (venue, connections) in resolved.venues {
-        // Each connection carries its own decoder: a venue can speak different
-        // protocols on different markets, and config resolution has already
-        // refused any market this build cannot serve.
-        let specs = connections
-            .into_iter()
-            .map(|connection| {
-                info!(%venue, market = %connection.spec.market, url = %connection.spec.url,
-                      "ingest endpoint");
-                (connection.spec, connection.instruments)
-            })
-            .collect();
-        adapters.push(Box::new(VenueAdapter::new(
-            venue,
-            specs,
+        None => build_adapters(
+            resolved.binance,
+            resolved.venues,
             WebSocketConnector,
-        )?));
-    }
-    if adapters.is_empty() {
-        return Err("no venue adapters configured".into());
-    }
+            MonotonicClock::new(),
+        )?,
+    };
 
     for adapter in adapters {
         let shutdown = shutdown.clone();

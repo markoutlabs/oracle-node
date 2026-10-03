@@ -1,0 +1,33 @@
+[package]
+name = "oracle-replay"
+description = "Replays recorded venue frames through the real ingest and aggregation pipeline, deterministically."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oracle-replay"
+path = "src/main.rs"
+
+[dependencies]
+oracle-agg.workspace = true
+oracle-ingest.workspace = true
+oracle-node.workspace = true
+oracle-types = { workspace = true, features = ["serde"] }
+oracle-wire.workspace = true
+
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

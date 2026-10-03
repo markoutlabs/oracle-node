@@ -33,6 +33,7 @@ pub mod clock;
 mod error;
 mod event;
 mod instrument;
+pub mod record;
 pub mod session;
 pub mod transport;
 pub mod venues;
@@ -41,6 +42,7 @@ pub use backoff::{Backoff, BackoffConfig};
 pub use error::{DecodeError, IngestError};
 pub use event::{IngestEvent, StreamId};
 pub use instrument::{InstrumentMap, InstrumentSpec};
+pub use record::{Record, RecordError, Recorder, RecordingConnector};
 pub use session::{Session, SessionConfig};
 pub use transport::{Connector, Frame, Transport, TransportError};
 

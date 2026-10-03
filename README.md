@@ -22,7 +22,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | **done** |
 | M5.5 | Registry canister, one live key per node | **done** |
-| M6 | Hardening | not started |
+| M6 | Hardening | in progress: keys encrypted at rest, replay harness |
 
 ## Crates
 
@@ -438,6 +438,34 @@ cargo run -p oracle-node -- start node1/config.toml
 
 Confirmed live against Binance: exchange → node → signed frame → WebSocket → SDK
 verification, with prices resolving `Ok` and zero rejected frames.
+
+### Recording and replay
+
+`oracle-node start --record FILE` writes every raw venue frame, with the time it
+arrived, as JSON lines. The recorder sits at the transport, under every decoder,
+so what it keeps is what the venue sent. `oracle-replay` plays a recording back
+through the same adapters, decoders, session loop and aggregator the node runs:
+
+```sh
+oracle-node start node.toml --record capture.jsonl      # on the node
+oracle-replay node.toml capture.jsonl                    # anywhere, later
+oracle-replay node.toml capture.jsonl --json > updates.jsonl
+oracle-replay node.toml capture.jsonl --realtime         # sleep the recorded gaps
+```
+
+Two substitutions make it deterministic. The transport reads the recording
+instead of a socket, releasing frames in recorded order across every connection.
+The session clock reads the recording instead of the wall, so each observation
+carries the receipt time it really had, and the pipeline ticks at recorded-time
+boundaries. The last line `oracle-replay` prints is a digest over every published
+update. Two replays of one recording print the same digest, on any machine. That
+is SPEC §10's cross-node conformance check, and it is also how an incident gets
+reproduced months later and how an aggregation constant gets tuned against a real
+dislocation instead of a guess.
+
+The replay binary is single-threaded on purpose: the driven clock is only
+coherent when nothing runs between a transport returning a frame and the session
+stamping it.
 
 ### End to end on a local replica
 

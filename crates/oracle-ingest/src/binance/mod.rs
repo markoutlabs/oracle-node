@@ -101,6 +101,7 @@ pub struct BinanceAdapter<C> {
     config: BinanceConfig,
     connector: C,
     label: String,
+    clock: MonotonicClock,
 }
 
 impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
@@ -124,8 +125,18 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
         Ok(Self {
             config,
             connector,
+            clock: MonotonicClock::new(),
             label: "binance".to_owned(),
         })
+    }
+
+    /// Stamps observations with `clock` instead of real time.
+    ///
+    /// For replay, where receipt times come from the recording.
+    #[must_use]
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Builds the session configs this adapter will run.
@@ -190,7 +201,7 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for BinanceAdapter<C> {
                 config,
                 self.connector.clone(),
                 BinanceHandler::new(map),
-                MonotonicClock::new(),
+                self.clock.clone(),
             );
             sessions.push(session.run(out.clone(), shutdown.clone()));
         }

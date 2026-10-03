@@ -15,11 +15,13 @@
 //! reaching the aggregator before any post-reconnect quote — only means
 //! something if nothing downstream reorders it.
 
+pub mod adapters;
 pub mod config;
 pub mod init;
 pub mod keyfile;
 pub mod pipeline;
 
+pub use adapters::build_adapters;
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
 pub use init::{InitError, InitOptions, NodeKeys, Rotation, candid_call};
 pub use keyfile::{KeyFileError, PassphraseSource};

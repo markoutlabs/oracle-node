@@ -9,6 +9,7 @@ members = [
     "crates/oracle-server",
     "crates/oracle-node",
     "crates/oracle-registry-canister",
+    "crates/oracle-replay",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ oracle-agg = { path = "crates/oracle-agg", version = "0.1.0" }
 oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
 oracle-client = { path = "crates/oracle-client", version = "0.1.0" }
 oracle-server = { path = "crates/oracle-server", version = "0.1.0" }
+oracle-node = { path = "crates/oracle-node", version = "0.1.0" }
 
 # Internet Computer. Only the registry canister and its test use these.
 candid = "0.10"

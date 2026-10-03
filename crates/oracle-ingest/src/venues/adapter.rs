@@ -80,6 +80,7 @@ pub struct VenueAdapter<C> {
     connector: C,
     label: String,
     venue: Venue,
+    clock: MonotonicClock,
 }
 
 impl<C: Connector + Clone + 'static> VenueAdapter<C> {
@@ -110,11 +111,21 @@ impl<C: Connector + Clone + 'static> VenueAdapter<C> {
             specs.push((spec, map));
         }
         Ok(Self {
+            clock: MonotonicClock::new(),
             specs,
             connector,
             label: venue.as_str().to_owned(),
             venue,
         })
+    }
+
+    /// Stamps observations with `clock` instead of real time.
+    ///
+    /// For replay, where receipt times come from the recording.
+    #[must_use]
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Returns the session configuration this adapter will run.
@@ -157,7 +168,7 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for VenueAdapter<C> {
                 session_config(spec, self.venue),
                 self.connector.clone(),
                 VenueHandler::new(map.clone(), spec.decode),
-                MonotonicClock::new(),
+                self.clock.clone(),
             );
             sessions.push(session.run(out.clone(), shutdown.clone()));
         }

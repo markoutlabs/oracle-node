@@ -17,6 +17,8 @@
 //! matters for `publish_time_ns`, which a consumer compares against *its* clock,
 //! so the node re-anchors on a schedule and only ever forward.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use oracle_types::NANOS_PER_SEC;
@@ -24,35 +26,66 @@ use oracle_types::NANOS_PER_SEC;
 /// A forward-only unix-nanosecond clock.
 #[derive(Debug, Clone)]
 pub struct MonotonicClock {
-    anchor_instant: Instant,
-    anchor_unix_ns: u64,
+    source: Source,
+}
+
+#[derive(Debug, Clone)]
+enum Source {
+    /// Real time, anchored once and derived from the monotonic clock after.
+    Anchored {
+        anchor_instant: Instant,
+        anchor_unix_ns: u64,
+    },
+    /// Whatever a replay driver last stored. Never advances on its own.
+    Driven(Arc<AtomicU64>),
 }
 
 impl MonotonicClock {
     /// Anchors a new clock to the current wall time.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            anchor_instant: Instant::now(),
-            anchor_unix_ns: wall_clock_unix_nanos(),
-        }
+        Self::anchored_at(wall_clock_unix_nanos())
     }
 
     /// Anchors a clock to an explicit unix time, for tests.
     #[must_use]
     pub fn anchored_at(anchor_unix_ns: u64) -> Self {
         Self {
-            anchor_instant: Instant::now(),
-            anchor_unix_ns,
+            source: Source::Anchored {
+                anchor_instant: Instant::now(),
+                anchor_unix_ns,
+            },
+        }
+    }
+
+    /// A clock that reads whatever `source` holds, for replay.
+    ///
+    /// A replaying transport stores each frame's recorded receipt time just
+    /// before it hands the frame over, so the session stamps the observation
+    /// with the time it was really received. Clones share the source. This only
+    /// stays coherent on a single-threaded runtime, where nothing runs between
+    /// the transport returning and the session reading the clock.
+    #[must_use]
+    pub fn driven(source: Arc<AtomicU64>) -> Self {
+        Self {
+            source: Source::Driven(source),
         }
     }
 
     /// Returns the current time in unix nanoseconds.
     #[must_use]
     pub fn now_ns(&self) -> u64 {
-        let elapsed = self.anchor_instant.elapsed();
-        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.anchor_unix_ns.saturating_add(elapsed_ns)
+        match &self.source {
+            Source::Anchored {
+                anchor_instant,
+                anchor_unix_ns,
+            } => {
+                let elapsed = anchor_instant.elapsed();
+                let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+                anchor_unix_ns.saturating_add(elapsed_ns)
+            }
+            Source::Driven(source) => source.load(Ordering::Acquire),
+        }
     }
 
     /// Re-anchors to wall time, but only forwards.
@@ -68,9 +101,18 @@ impl MonotonicClock {
         if correction == 0 {
             return Some(0);
         }
-        self.anchor_instant = Instant::now();
-        self.anchor_unix_ns = wall;
-        Some(correction)
+        match &mut self.source {
+            Source::Anchored {
+                anchor_instant,
+                anchor_unix_ns,
+            } => {
+                *anchor_instant = Instant::now();
+                *anchor_unix_ns = wall;
+                Some(correction)
+            }
+            // A driven clock belongs to a replay. Wall time means nothing to it.
+            Source::Driven(_) => Some(0),
+        }
     }
 }
 
@@ -122,6 +164,15 @@ mod tests {
             now - 1_754_582_400_000_000_000 < NANOS_PER_SEC,
             "drifted by {now}"
         );
+    }
+
+    #[test]
+    fn a_driven_clock_reads_what_the_driver_stored() {
+        let source = Arc::new(AtomicU64::new(5));
+        let clock = MonotonicClock::driven(Arc::clone(&source));
+        assert_eq!(clock.now_ns(), 5);
+        source.store(9, Ordering::Release);
+        assert_eq!(clock.clone().now_ns(), 9, "clones share the source");
     }
 
     #[test]
