@@ -356,11 +356,14 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
         h.verify_http(REGISTRY, tampered).is_err(),
         "a changed body must fail"
     );
-    let missing: HttpResponse = h.query(
-        "http_request",
-        Encode!(&HttpRequest::get("/other").build()).expect("encodes"),
-    );
-    assert_eq!(missing.status_code(), StatusCode::NOT_FOUND);
+    // Every other path gets a 404 that is certified too, or a gateway would
+    // answer with a verification error instead.
+    for other in ["/other", "/", "/registry.json/x"] {
+        let missing = h.get_json(other);
+        assert_eq!(missing.status_code(), StatusCode::NOT_FOUND, "{other}");
+        h.verify_http(other, missing)
+            .unwrap_or_else(|error| panic!("{other}: the 404 is certified: {error}"));
+    }
 
     // Rotation: atomic swap, one live key, history kept, retired_at set.
     let old_a = a.signing.address();
@@ -630,6 +633,15 @@ fn the_sdk_checks_the_certificate_through_the_http_gateway() {
         )
         .expect("certified client list");
     assert_eq!(clients.version, 1);
+    let missing = runtime.block_on(
+        HttpDocumentSource::new(&url("/other"), h.certification())
+            .expect("builds")
+            .fetch::<serde_json::Value>(),
+    );
+    assert!(
+        matches!(&missing, Err(FetchError::Transport(error)) if error.contains("404")),
+        "the gateway passes a certified 404 through: {missing:?}"
+    );
 
     let root_key = hex::encode(h.pic.root_key().expect("root key"));
     for (label, wrong) in [

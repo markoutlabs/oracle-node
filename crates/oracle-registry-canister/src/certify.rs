@@ -1,5 +1,5 @@
-//! HTTP certification of `/registry.json` and `/clients.json`. The certificate
-//! is what proves a fetched document is current.
+//! HTTP certification of `/registry.json`, `/clients.json` and a 404 for every
+//! other path. The certificate is what proves a fetched document is current.
 
 use std::cell::RefCell;
 
@@ -21,17 +21,28 @@ thread_local! {
 
 pub(crate) struct Certified {
     pub(crate) tree: HttpCertificationTree,
-    pub(crate) documents: Vec<CertifiedDocument>,
+    documents: Vec<CertifiedResponse>,
+    not_found: CertifiedResponse,
 }
 
-pub(crate) struct CertifiedDocument {
-    pub(crate) path: &'static str,
+pub(crate) struct CertifiedResponse {
+    pub(crate) path: HttpCertificationPath<'static>,
     pub(crate) entry: HttpCertificationTreeEntry<'static>,
     pub(crate) response: HttpResponse<'static>,
 }
 
-/// Certifies the current `/registry.json` and `/clients.json` responses in one
-/// tree, so the query path can serve either.
+impl Certified {
+    /// The response for `request_path`: its document, or the 404.
+    pub(crate) fn lookup(&self, request_path: &str) -> &CertifiedResponse {
+        self.documents
+            .iter()
+            .find(|document| document.path == HttpCertificationPath::exact(request_path))
+            .unwrap_or(&self.not_found)
+    }
+}
+
+/// Certifies the current `/registry.json` and `/clients.json` responses, and a
+/// 404 for every other path, in one tree.
 pub(crate) fn certify_documents() {
     // An allow-list, not exclusions: gateways add their own headers, and a
     // client that checks the certificate itself must still match.
@@ -40,55 +51,67 @@ pub(crate) fn certify_documents() {
             vec!["content-type", "cache-control"],
         ))
         .build();
-    let headers = |content_type: &str| {
-        vec![
-            ("content-type".to_owned(), content_type.to_owned()),
-            ("cache-control".to_owned(), "no-cache".to_owned()),
-            (
-                CERTIFICATE_EXPRESSION_HEADER_NAME.to_owned(),
-                cel.to_string(),
-            ),
-        ]
+    let build = |status: StatusCode, content_type: &str, body: Vec<u8>| {
+        HttpResponse::builder()
+            .with_status_code(status)
+            .with_headers(vec![
+                ("content-type".to_owned(), content_type.to_owned()),
+                ("cache-control".to_owned(), "no-cache".to_owned()),
+                (
+                    CERTIFICATE_EXPRESSION_HEADER_NAME.to_owned(),
+                    cel.to_string(),
+                ),
+            ])
+            .with_body(body)
+            .build()
     };
-    let response = |json: Option<String>, missing: &'static [u8]| match json {
-        Some(json) => HttpResponse::ok(json.into_bytes(), headers("application/json")).build(),
-        None => HttpResponse::builder()
-            .with_status_code(StatusCode::SERVICE_UNAVAILABLE)
-            .with_headers(headers("text/plain"))
-            .with_body(missing.to_vec())
-            .build(),
+    let document = |json: Option<String>, missing: &[u8]| match json {
+        Some(json) => build(StatusCode::OK, "application/json", json.into_bytes()),
+        None => build(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            missing.to_vec(),
+        ),
     };
     let mut tree = HttpCertificationTree::default();
-    let documents: Vec<CertifiedDocument> = [
-        (
-            REGISTRY_PATH,
-            response(
-                get_registry(),
-                b"no registry version has been published yet",
-            ),
-        ),
-        (
-            CLIENTS_PATH,
-            response(
-                get_clients(),
-                b"no client list version has been published yet",
-            ),
-        ),
-    ]
-    .into_iter()
-    .map(|(path, response)| {
+    let mut certify = |path: HttpCertificationPath<'static>, response: HttpResponse<'static>| {
         let certification = HttpCertification::response_only(&cel, &response, None)
             .expect("the response carries its own CEL expression");
-        let entry =
-            HttpCertificationTreeEntry::new(HttpCertificationPath::exact(path), certification);
+        let entry = HttpCertificationTreeEntry::new(path.clone(), certification);
         tree.insert(&entry);
-        CertifiedDocument {
+        CertifiedResponse {
             path,
             entry,
             response,
         }
-    })
-    .collect();
+    };
+    let documents = vec![
+        certify(
+            HttpCertificationPath::exact(REGISTRY_PATH),
+            document(
+                get_registry(),
+                b"no registry version has been published yet",
+            ),
+        ),
+        certify(
+            HttpCertificationPath::exact(CLIENTS_PATH),
+            document(
+                get_clients(),
+                b"no client list version has been published yet",
+            ),
+        ),
+    ];
+    // A gateway rejects an uncertified response, a 404 included.
+    let not_found = certify(
+        HttpCertificationPath::wildcard("/"),
+        build(StatusCode::NOT_FOUND, "text/plain", b"not found".to_vec()),
+    );
     ic_cdk::api::certified_data_set(tree.root_hash());
-    CERTIFIED.with(|cell| *cell.borrow_mut() = Some(Certified { tree, documents }));
+    CERTIFIED.with(|cell| {
+        *cell.borrow_mut() = Some(Certified {
+            tree,
+            documents,
+            not_found,
+        });
+    });
 }

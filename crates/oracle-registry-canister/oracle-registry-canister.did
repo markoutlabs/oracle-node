@@ -144,7 +144,8 @@ service : (InitArgs) -> {
   get_registry : () -> (opt text) query;
   // The version of the last published document. Zero before the first.
   get_version : () -> (nat64) query;
-  // Serves `/registry.json` and `/clients.json` as certified query responses.
+  // Serves `/registry.json`, `/clients.json`, and a 404 for every other path,
+  // as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.

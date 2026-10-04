@@ -35,7 +35,6 @@ pub mod state;
 
 use candid::CandidType;
 use ic_http_certification::utils::add_v2_certificate_header;
-use ic_http_certification::{HttpCertificationPath, Method};
 pub use ic_http_certification::{HttpRequest, HttpResponse};
 use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, SigningKeyCert};
 use serde::Deserialize;
@@ -236,38 +235,29 @@ fn get_key_history(node_id: String) -> Option<String> {
     })
 }
 
-/// Serves `/registry.json` and `/clients.json` as certified query responses.
+/// Serves `/registry.json`, `/clients.json`, and a 404 for every other path,
+/// as certified query responses.
 #[ic_cdk::query]
 fn http_request(request: HttpRequest<'static>) -> HttpResponse<'static> {
-    let path = request.get_path().ok();
+    let path = request.get_path().unwrap_or_else(|_| "/".to_owned());
     CERTIFIED.with(|cell| {
         let cell = cell.borrow();
         let certified = cell
             .as_ref()
             .expect("certified in init, post_upgrade, and every publish");
-        let document = certified
-            .documents
-            .iter()
-            .find(|doc| request.method() == Method::GET && path.as_deref() == Some(doc.path));
-        let Some(document) = document else {
-            return HttpResponse::not_found(
-                b"not found".to_vec(),
-                vec![("content-type".to_owned(), "text/plain".to_owned())],
-            )
-            .build();
-        };
-        let mut response = document.response.clone();
+        let served = certified.lookup(&path);
+        let mut response = served.response.clone();
         // `None` in a replicated call, where consensus certifies the reply.
         if let Some(certificate) = ic_cdk::api::data_certificate() {
             let witness = certified
                 .tree
-                .witness(&document.entry, document.path)
-                .expect("the entry is in the tree");
+                .witness(&served.entry, &path)
+                .expect("the entry covers the path");
             add_v2_certificate_header(
                 &certificate,
                 &mut response,
                 &witness,
-                &HttpCertificationPath::exact(document.path).to_expr_path(),
+                &served.path.to_expr_path(),
             );
         }
         response
