@@ -324,66 +324,22 @@ impl NodeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Registry`] if neither or both of `registry.path`
-    /// and `registry.url` are set, if the document cannot be read or fetched, or
+    /// Returns [`ConfigError::Registry`] if not exactly one of `registry.path`
+    /// and `registry.url` is set, if the document cannot be read or fetched, or
     /// if it is not signed by the pinned key.
     pub async fn fetch_registry(&self) -> Result<oracle_wire::Registry, ConfigError> {
-        let registry: oracle_wire::Registry = match (&self.registry.path, &self.registry.url) {
-            (Some(path), None) => {
-                let text = std::fs::read_to_string(path)
-                    .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?;
-                serde_json::from_str(&text)
-                    .map_err(|e| ConfigError::Registry(format!("{}: {e}", path.display())))?
-            }
-            (None, Some(url)) => {
-                use oracle_client::RegistrySource as _;
-                oracle_client::HttpRegistrySource::new(url, self.certification()?)
-                    .map_err(|e| ConfigError::Registry(e.to_string()))?
-                    .fetch()
-                    .await
-                    .map_err(|e| ConfigError::Registry(format!("{url}: {e}")))?
-            }
-            (None, None) => {
-                return Err(ConfigError::Registry(
-                    "set registry.path or registry.url".to_owned(),
-                ));
-            }
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::Registry(
-                    "set only one of registry.path and registry.url".to_owned(),
-                ));
-            }
-        };
-
-        let governance: oracle_wire::Address = self
-            .registry
-            .governance_address
-            .parse()
-            .map_err(|e| ConfigError::Registry(format!("bad governance address: {e}")))?;
+        let registry: oracle_wire::Registry = self
+            .load_document(
+                "registry",
+                self.registry.path.as_deref(),
+                self.registry.url.as_deref(),
+            )
+            .await
+            .map_err(ConfigError::Registry)?;
         registry
-            .verify(governance, 0)
+            .verify(self.governance()?, 0)
             .map_err(|e| ConfigError::Registry(e.to_string()))?;
         Ok(registry)
-    }
-
-    /// Returns the certificate check for documents fetched from the canister.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::Registry`] without `registry.canister_id`, or for
-    /// an id or root key that does not parse.
-    pub fn certification(&self) -> Result<oracle_client::Certification, ConfigError> {
-        let canister_id = self.registry.canister_id.as_deref().ok_or_else(|| {
-            ConfigError::Registry(
-                "set registry.canister_id: a fetched document must carry its certificate"
-                    .to_owned(),
-            )
-        })?;
-        match &self.registry.root_key {
-            Some(root_key) => oracle_client::Certification::new(canister_id, root_key),
-            None => oracle_client::Certification::mainnet(canister_id),
-        }
-        .map_err(|e| ConfigError::Registry(e.to_string()))
     }
 
     /// Returns the pinned governance address.
@@ -403,31 +359,51 @@ impl NodeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Clients`] if neither or both of `path` and `url`
-    /// are set, or the document cannot be read or fetched.
+    /// Returns [`ConfigError::Clients`] if not exactly one of `path` and `url`
+    /// is set, or the document cannot be read or fetched.
     pub async fn fetch_client_list(&self) -> Result<Option<oracle_wire::ClientList>, ConfigError> {
         let Some(clients) = &self.clients else {
             return Ok(None);
         };
-        let list = match (&clients.path, &clients.url) {
+        self.load_document("clients", clients.path.as_deref(), clients.url.as_deref())
+            .await
+            .map(Some)
+            .map_err(ConfigError::Clients)
+    }
+
+    /// Reads a signed document from a file, or fetches it from the canister
+    /// with its certificate checked. The governance signature is unchecked.
+    async fn load_document<T: serde::de::DeserializeOwned>(
+        &self,
+        section: &str,
+        path: Option<&std::path::Path>,
+        url: Option<&str>,
+    ) -> Result<T, String> {
+        match (path, url) {
             (Some(path), None) => {
                 let text = std::fs::read_to_string(path)
-                    .map_err(|e| ConfigError::Clients(format!("{}: {e}", path.display())))?;
-                serde_json::from_str(&text)
-                    .map_err(|e| ConfigError::Clients(format!("{}: {e}", path.display())))?
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
             }
-            (None, Some(url)) => oracle_client::HttpDocumentSource::new(url, self.certification()?)
-                .map_err(|e| ConfigError::Clients(e.to_string()))?
-                .fetch()
-                .await
-                .map_err(|e| ConfigError::Clients(format!("{url}: {e}")))?,
-            _ => {
-                return Err(ConfigError::Clients(
-                    "set exactly one of clients.path and clients.url".to_owned(),
-                ));
+            (None, Some(url)) => {
+                let canister_id = self.registry.canister_id.as_deref().ok_or(
+                    "set registry.canister_id: a fetched document must carry its certificate",
+                )?;
+                let certification = match &self.registry.root_key {
+                    Some(root_key) => oracle_client::Certification::new(canister_id, root_key),
+                    None => oracle_client::Certification::mainnet(canister_id),
+                }
+                .map_err(|e| e.to_string())?;
+                oracle_client::HttpDocumentSource::new(url, certification)
+                    .map_err(|e| e.to_string())?
+                    .fetch()
+                    .await
+                    .map_err(|e| format!("{url}: {e}"))
             }
-        };
-        Ok(Some(list))
+            _ => Err(format!(
+                "set exactly one of {section}.path and {section}.url"
+            )),
+        }
     }
 
     /// Resolves the config into everything the node needs to run.
@@ -1067,17 +1043,14 @@ sources = [
         let neither =
             registry_section("governance_address = \"0x0000000000000000000000000000000000000001\"");
         let error = neither.fetch_registry().await.expect_err("must refuse");
-        assert!(
-            error.to_string().contains("registry.path or registry.url"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("exactly one"), "{error}");
 
         let both = registry_section(
             "path = \"r.json\"\nurl = \"http://127.0.0.1:1/registry.json\"\n\
              governance_address = \"0x0000000000000000000000000000000000000001\"",
         );
         let error = both.fetch_registry().await.expect_err("must refuse");
-        assert!(error.to_string().contains("only one"), "{error}");
+        assert!(error.to_string().contains("exactly one"), "{error}");
     }
 
     /// A validly signed registry from a plain server is refused: only the

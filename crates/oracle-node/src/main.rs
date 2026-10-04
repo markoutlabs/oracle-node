@@ -355,19 +355,14 @@ fn spawn_transport_tasks(
                 _ = ticker.tick() => {}
             }
             match config.fetch_client_list().await {
-                Ok(Some(list)) if list.version > transport.clients_version() => {
-                    match transport.replace_clients(&list, unix_now()) {
-                        Ok(revoked) => {
-                            info!(version = list.version, revoked, "adopted client list")
-                        }
-                        Err(error) => warn!(%error, "client list refused"),
+                Ok(Some(list)) => match transport.offer_clients(&list, unix_now()) {
+                    Ok(Some(revoked)) => {
+                        info!(version = list.version, revoked, "adopted client list");
                     }
-                }
-                // The certificate proves the canister still serves this version.
-                Ok(Some(list)) if list.version == transport.clients_version() => {
-                    transport.confirm_clients(unix_now());
-                }
-                Ok(_) => {}
+                    Ok(None) => {}
+                    Err(error) => warn!(%error, "client list refused"),
+                },
+                Ok(None) => {}
                 Err(error) => warn!(%error, "client list fetch failed"),
             }
         }

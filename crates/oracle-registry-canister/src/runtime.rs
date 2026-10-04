@@ -28,3 +28,12 @@ pub(crate) fn read_state<R>(f: impl FnOnce(&State) -> R) -> R {
 pub(crate) fn is_governance() -> bool {
     ic_cdk::api::is_controller(&ic_cdk::api::msg_caller())
 }
+
+/// The guard on every update method. The anonymous principal is never a controller.
+pub(crate) fn governance_only() -> Result<(), String> {
+    if is_governance() {
+        Ok(())
+    } else {
+        Err("only governance (a canister controller) may do this".to_owned())
+    }
+}

@@ -42,9 +42,9 @@ use serde::Deserialize;
 
 use crate::certify::{CERTIFIED, certify_documents};
 use crate::publish::{Document, mutate_and_publish};
-use crate::runtime::{STATE, is_governance, now_secs, read_state};
+use crate::runtime::{STATE, governance_only, is_governance, now_secs, read_state};
 use crate::signing::ensure_governance_key;
-use crate::state::{Config, DEFAULT_EPOCH_SECS, State, StateError};
+use crate::state::{Config, DEFAULT_EPOCH_SECS, State};
 
 /// Install arguments.
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -96,7 +96,8 @@ fn post_upgrade() {
 
 /// Only controllers get past this, so spam costs the canister nothing.
 ///
-/// One replica runs this check, so every update method checks again.
+/// One replica runs this check, so every update method has the
+/// `governance_only` guard too.
 #[ic_cdk::inspect_message]
 fn inspect_message() {
     if is_governance() {
@@ -106,114 +107,84 @@ fn inspect_message() {
 
 /// Governance lists a node. `entry_json` is the operator's `NodeEntry`, with
 /// exactly one certificate. Returns the new version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn add_node(entry_json: String) -> Result<u64, String> {
     let entry: NodeEntry = serde_json::from_str(&entry_json)
         .map_err(|error| format!("entry is not valid JSON: {error}"))?;
-    let governance = is_governance();
-    mutate_and_publish(Document::Registry, move |s| {
-        s.add_node(governance, entry, now_secs())
-    })
-    .await
+    mutate_and_publish(Document::Registry, |s| s.add_node(entry, now_secs())).await
 }
 
 /// Governance swaps a node's signing key. `cert_json` is a `SigningKeyCert`
 /// the node's identity key issued. Returns the new version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn rotate_key(node_id: String, cert_json: String) -> Result<u64, String> {
     let cert: SigningKeyCert = serde_json::from_str(&cert_json)
         .map_err(|error| format!("certificate is not valid JSON: {error}"))?;
-    let governance = is_governance();
-    mutate_and_publish(Document::Registry, move |s| {
-        s.rotate_key(governance, &node_id, cert, now_secs())
+    mutate_and_publish(Document::Registry, |s| {
+        s.rotate_key(&node_id, cert, now_secs())
     })
     .await
 }
 
 /// Governance de-lists a node. Returns the new version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn remove_node(node_id: String) -> Result<u64, String> {
-    let governance = is_governance();
-    mutate_and_publish(Document::Registry, move |s| {
-        s.remove_node(governance, &node_id, now_secs())
-    })
-    .await
+    mutate_and_publish(Document::Registry, |s| s.remove_node(&node_id, now_secs())).await
 }
 
 /// Governance changes the quorum guidance. Returns the new version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn set_quorum(min_nodes: u16, recommended: u16) -> Result<u64, String> {
-    let governance = is_governance();
-    mutate_and_publish(Document::Registry, move |s| {
-        s.set_quorum(
-            governance,
-            Quorum {
-                min_nodes,
-                recommended,
-            },
-        )
-    })
-    .await
+    let quorum = Quorum {
+        min_nodes,
+        recommended,
+    };
+    mutate_and_publish(Document::Registry, |s| s.set_quorum(quorum)).await
 }
 
 /// Governance re-signs the registry with no change. Returns the new version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn republish() -> Result<u64, String> {
-    if !is_governance() {
-        return Err(StateError::NotGovernance.to_string());
-    }
     mutate_and_publish(Document::Registry, |_| Ok(())).await
 }
 
 /// Governance re-signs the client list with no change, for example to publish
 /// an empty list before the first client. Returns the new client-list version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn republish_clients() -> Result<u64, String> {
-    if !is_governance() {
-        return Err(StateError::NotGovernance.to_string());
-    }
     mutate_and_publish(Document::Clients, |_| Ok(())).await
 }
 
 /// Governance authorises a client. `pubkey` is its 33-byte compressed
 /// secp256k1 API key in hex. Returns the new client-list version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn add_client(client_id: String, pubkey: String, expires_at: u64) -> Result<u64, String> {
     let pubkey: CompressedPublicKey = pubkey.parse().map_err(|error| format!("pubkey: {error}"))?;
-    let governance = is_governance();
-    mutate_and_publish(Document::Clients, move |s| {
-        s.add_client(governance, client_id, pubkey, expires_at, now_secs())
+    mutate_and_publish(Document::Clients, |s| {
+        s.add_client(client_id, pubkey, expires_at, now_secs())
     })
     .await
 }
 
 /// Governance moves a client's expiry. Returns the new client-list version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn set_client_expiry(client_id: String, expires_at: u64) -> Result<u64, String> {
-    let governance = is_governance();
-    mutate_and_publish(Document::Clients, move |s| {
-        s.set_client_expiry(governance, &client_id, expires_at)
+    mutate_and_publish(Document::Clients, |s| {
+        s.set_client_expiry(&client_id, expires_at)
     })
     .await
 }
 
 /// Governance removes a client. Returns the new client-list version.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn remove_client(client_id: String) -> Result<u64, String> {
-    let governance = is_governance();
-    mutate_and_publish(Document::Clients, move |s| {
-        s.remove_client(governance, &client_id)
-    })
-    .await
+    mutate_and_publish(Document::Clients, |s| s.remove_client(&client_id)).await
 }
 
 /// Fetches the threshold public key if it is not cached. Returns the
 /// governance address consumers pin.
-#[ic_cdk::update]
+#[ic_cdk::update(guard = "governance_only")]
 async fn refresh_governance_key() -> Result<String, String> {
-    if !is_governance() {
-        return Err(StateError::NotGovernance.to_string());
-    }
     let key = ensure_governance_key().await?;
     key.address()
         .map(|address| address.to_checksummed())
@@ -309,4 +280,22 @@ fn http_request(request: HttpRequest<'static>) -> HttpResponse<'static> {
 mod candid_export {
     use super::*;
     ic_cdk::export_candid!();
+}
+
+#[cfg(test)]
+mod tests {
+    /// SPEC §3.6: governance is the only caller of update methods. The guard
+    /// is an attribute, so a new method could ship without it.
+    #[test]
+    fn every_update_method_is_governance_only() {
+        let source = include_str!("lib.rs");
+        let updates: Vec<&str> = source
+            .lines()
+            .filter(|line| line.starts_with("#[ic_cdk::update"))
+            .collect();
+        assert_eq!(updates.len(), 10);
+        for line in updates {
+            assert_eq!(line, "#[ic_cdk::update(guard = \"governance_only\")]");
+        }
+    }
 }

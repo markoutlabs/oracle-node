@@ -293,8 +293,31 @@ impl NodeTransport {
         });
     }
 
-    /// Records that a fetch proved the current client list is still the latest.
-    pub fn confirm_clients(&self, now: u64) {
+    /// Takes a client list a certified fetch returned. The version in use
+    /// counts as a confirmation and returns `None`; a newer one is adopted and
+    /// returns the number of sessions it revoked.
+    ///
+    /// Adoption closes sessions whose client was removed, rekeyed or cut
+    /// short; if any were, the keys rotate off the grid so what those clients
+    /// hold stops working. Extensions are pushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the verification error if `next` is neither the list in use nor
+    /// a valid successor.
+    pub fn offer_clients(
+        &self,
+        next: &oracle_wire::ClientList,
+        now: u64,
+    ) -> Result<Option<usize>, oracle_wire::VerifyError> {
+        if next.version == self.clients_version() {
+            self.confirm_clients(now);
+            return Ok(None);
+        }
+        self.replace_clients(next, now).map(Some)
+    }
+
+    fn confirm_clients(&self, now: u64) {
         self.confirmed_at.fetch_max(now, Ordering::Relaxed);
     }
 
@@ -302,14 +325,7 @@ impl NodeTransport {
         now.saturating_sub(self.confirmed_at.load(Ordering::Relaxed))
     }
 
-    /// Adopts a newer client list. Sessions whose client was removed, rekeyed
-    /// or cut short are closed; if any were, the keys rotate off the grid so
-    /// what those clients hold stops working. Extensions are pushed.
-    ///
-    /// # Errors
-    ///
-    /// Returns the verification error if `next` is not a valid successor.
-    pub fn replace_clients(
+    fn replace_clients(
         &self,
         next: &oracle_wire::ClientList,
         now: u64,

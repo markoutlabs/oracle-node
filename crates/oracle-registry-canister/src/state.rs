@@ -17,9 +17,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
-    /// Only a canister controller may do this.
-    #[error("only governance (a canister controller) may do this")]
-    NotGovernance,
     /// No listed node has this id.
     #[error("unknown node `{0}`")]
     UnknownNode(String),
@@ -263,17 +260,9 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance, the id is listed, the
-    /// registry is full, or the entry or its certificate fails a check.
-    pub fn add_node(
-        &mut self,
-        is_governance: bool,
-        entry: NodeEntry,
-        now: u64,
-    ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
+    /// Returns an error if the id is listed, the registry is full, or the entry
+    /// or its certificate fails a check.
+    pub fn add_node(&mut self, entry: NodeEntry, now: u64) -> Result<(), StateError> {
         if self.nodes.contains_key(&entry.node_id) {
             return Err(StateError::AlreadyListed(entry.node_id));
         }
@@ -331,19 +320,14 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance, the node is unknown,
-    /// the certificate fails a check, or another rotation happened inside the
-    /// rotation window.
+    /// Returns an error if the node is unknown, the certificate fails a check,
+    /// or another rotation happened inside the rotation window.
     pub fn rotate_key(
         &mut self,
-        is_governance: bool,
         node_id: &str,
         cert: SigningKeyCert,
         now: u64,
     ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
         let node = self
             .nodes
             .get(node_id)
@@ -379,17 +363,9 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance, the node is unknown,
-    /// or the remaining count would fall below `quorum.min_nodes`.
-    pub fn remove_node(
-        &mut self,
-        is_governance: bool,
-        node_id: &str,
-        now: u64,
-    ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
+    /// Returns an error if the node is unknown, or the remaining count would
+    /// fall below `quorum.min_nodes`.
+    pub fn remove_node(&mut self, node_id: &str, now: u64) -> Result<(), StateError> {
         if !self.nodes.contains_key(node_id) {
             return Err(StateError::UnknownNode(node_id.to_owned()));
         }
@@ -412,12 +388,8 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance or the values are
-    /// inconsistent.
-    pub fn set_quorum(&mut self, is_governance: bool, quorum: Quorum) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
+    /// Returns [`StateError::InvalidQuorum`] if the values are inconsistent.
+    pub fn set_quorum(&mut self, quorum: Quorum) -> Result<(), StateError> {
         check_quorum(quorum)?;
         self.quorum = quorum;
         Ok(())
@@ -480,20 +452,16 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance, the id is taken or
-    /// invalid, the key is not a curve point or belongs to another client, the
-    /// list is full, or `expires_at` is not in the future.
+    /// Returns an error if the id is taken or invalid, the key is not a curve
+    /// point or belongs to another client, the list is full, or `expires_at`
+    /// is not in the future.
     pub fn add_client(
         &mut self,
-        is_governance: bool,
         client_id: String,
         pubkey: CompressedPublicKey,
         expires_at: u64,
         now: u64,
     ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
         let trimmed = client_id.trim();
         if trimmed.is_empty() || trimmed != client_id || client_id.len() > MAX_CLIENT_ID_LEN {
             return Err(StateError::InvalidClient(format!(
@@ -538,16 +506,12 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance or the client is unknown.
+    /// Returns [`StateError::UnknownClient`] if the client is unknown.
     pub fn set_client_expiry(
         &mut self,
-        is_governance: bool,
         client_id: &str,
         expires_at: u64,
     ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
         let record = self
             .clients
             .get_mut(client_id)
@@ -560,15 +524,8 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance or the client is unknown.
-    pub fn remove_client(
-        &mut self,
-        is_governance: bool,
-        client_id: &str,
-    ) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
+    /// Returns [`StateError::UnknownClient`] if the client is unknown.
+    pub fn remove_client(&mut self, client_id: &str) -> Result<(), StateError> {
         self.clients
             .remove(client_id)
             .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
@@ -862,7 +819,7 @@ mod tests {
     fn listed(ops: &[Operator], min_nodes: u16) -> State {
         let mut state = State::new(config(), quorum(min_nodes)).expect("valid");
         for op in ops {
-            state.add_node(true, op.entry(NOW), NOW).expect("adds");
+            state.add_node(op.entry(NOW), NOW).expect("adds");
         }
         publish(&mut state, NOW);
         state
@@ -877,15 +834,11 @@ mod tests {
         ];
         let mut state = State::new(config(), quorum(3)).expect("valid");
         let first = ops.first().expect("three operators");
-        assert_eq!(
-            state.add_node(false, first.entry(NOW), NOW),
-            Err(StateError::NotGovernance)
-        );
         for op in &ops {
-            state.add_node(true, op.entry(NOW), NOW).expect("adds");
+            state.add_node(op.entry(NOW), NOW).expect("adds");
         }
         assert_eq!(
-            state.add_node(true, first.entry(NOW), NOW),
+            state.add_node(first.entry(NOW), NOW),
             Err(StateError::AlreadyListed("a".to_owned()))
         );
 
@@ -912,7 +865,7 @@ mod tests {
         let a_signing = Signer::from_secret_bytes([101; 32]).expect("valid key");
         entry.signing_keys = vec![b.cert_for(&a_signing, NOW)];
         assert_eq!(
-            state.add_node(true, entry, NOW),
+            state.add_node(entry, NOW),
             Err(StateError::AddressInUse(a_signing.address()))
         );
     }
@@ -925,12 +878,8 @@ mod tests {
         let old_address = a.signing.address();
 
         let cert = a.rotate(50, NOW + 10);
-        assert_eq!(
-            state.rotate_key(false, "a", cert.clone(), NOW + 10),
-            Err(StateError::NotGovernance)
-        );
         state
-            .rotate_key(true, "a", cert.clone(), NOW + 10)
+            .rotate_key("a", cert.clone(), NOW + 10)
             .expect("rotates");
 
         let registry = publish(&mut state, NOW + 10);
@@ -957,7 +906,7 @@ mod tests {
             NOW + 20,
         );
         assert_eq!(
-            state.rotate_key(true, "a", revived, NOW + WINDOW + 20),
+            state.rotate_key("a", revived, NOW + WINDOW + 20),
             Err(StateError::AddressInUse(old_address))
         );
     }
@@ -969,18 +918,18 @@ mod tests {
         let mut state = listed(&[Operator::new(1, "a"), Operator::new(2, "b")], 2);
 
         state
-            .rotate_key(true, "a", a.rotate(50, NOW), NOW)
+            .rotate_key("a", a.rotate(50, NOW), NOW)
             .expect("rotates");
         let cert_b = b.rotate(51, NOW + 1);
         assert_eq!(
-            state.rotate_key(true, "b", cert_b.clone(), NOW + 1),
+            state.rotate_key("b", cert_b.clone(), NOW + 1),
             Err(StateError::RotationTooSoon {
                 last: NOW,
                 next_allowed: NOW + WINDOW,
             })
         );
         state
-            .rotate_key(true, "b", cert_b, NOW + WINDOW)
+            .rotate_key("b", cert_b, NOW + WINDOW)
             .expect("rotates once the window has passed");
     }
 
@@ -994,14 +943,14 @@ mod tests {
         let mut state = listed(&ops, 3);
 
         assert_eq!(
-            state.remove_node(true, "c", NOW + 1),
+            state.remove_node("c", NOW + 1),
             Err(StateError::BelowQuorum {
                 remaining: 2,
                 min_nodes: 3,
             })
         );
-        state.set_quorum(true, quorum(2)).expect("sets");
-        state.remove_node(true, "c", NOW + 1).expect("removes");
+        state.set_quorum(quorum(2)).expect("sets");
+        state.remove_node("c", NOW + 1).expect("removes");
         let registry = publish(&mut state, NOW + 1);
         assert_eq!(registry.nodes.len(), 2);
         assert_eq!(registry.quorum.min_nodes, 2);
@@ -1013,7 +962,7 @@ mod tests {
         let mut c = Operator::new(3, "c");
         let mut entry = c.entry(NOW + 2);
         entry.signing_keys = vec![c.rotate(60, NOW + 2)];
-        state.add_node(true, entry, NOW + 2).expect("re-adds");
+        state.add_node(entry, NOW + 2).expect("re-adds");
         let history = state.key_history("c").expect("known");
         assert_eq!(history.len(), 2);
         assert_eq!(history.get(1).map(|k| k.generation), Some(2));
@@ -1027,7 +976,7 @@ mod tests {
         let mut stale = a.entry(NOW);
         stale.signing_keys = vec![a.cert_for(&a.signing, NOW - 365 * 86_400)];
         assert!(matches!(
-            state.add_node(true, stale, NOW),
+            state.add_node(stale, NOW),
             Err(StateError::InvalidCert(_))
         ));
 
@@ -1035,7 +984,7 @@ mod tests {
         let mut forged = a.entry(NOW);
         forged.signing_keys = vec![impostor.cert_for(&a.signing, NOW)];
         assert!(matches!(
-            state.add_node(true, forged, NOW),
+            state.add_node(forged, NOW),
             Err(StateError::InvalidCert(_))
         ));
 
@@ -1044,12 +993,12 @@ mod tests {
             .signing_keys
             .push(a.cert_for(&impostor.signing, NOW));
         assert!(matches!(
-            state.add_node(true, two_keys, NOW),
+            state.add_node(two_keys, NOW),
             Err(StateError::InvalidEntry(_))
         ));
 
         state
-            .add_node(true, a.entry(NOW), NOW)
+            .add_node(a.entry(NOW), NOW)
             .expect("a well-formed entry is accepted");
     }
 
@@ -1108,25 +1057,21 @@ mod tests {
     #[test]
     fn client_changes_follow_the_rules() {
         let mut state = State::new(config(), quorum(1)).expect("valid");
-        let add = |state: &mut State, governance: bool, id: &str, seed: u8, expires_at: u64| {
-            state.add_client(governance, id.to_owned(), client_key(seed), expires_at, NOW)
+        let add = |state: &mut State, id: &str, seed: u8, expires_at: u64| {
+            state.add_client(id.to_owned(), client_key(seed), expires_at, NOW)
         };
+        add(&mut state, "c-1", 1, NOW + 60).expect("adds");
         assert_eq!(
-            add(&mut state, false, "c-1", 1, NOW + 60),
-            Err(StateError::NotGovernance)
-        );
-        add(&mut state, true, "c-1", 1, NOW + 60).expect("adds");
-        assert_eq!(
-            add(&mut state, true, "c-1", 2, NOW + 60),
+            add(&mut state, "c-1", 2, NOW + 60),
             Err(StateError::ClientExists("c-1".to_owned()))
         );
         assert_eq!(
-            add(&mut state, true, "c-2", 1, NOW + 60),
+            add(&mut state, "c-2", 1, NOW + 60),
             Err(StateError::ClientKeyInUse("c-1".to_owned()))
         );
         for (id, expires_at) in [(" c-3", NOW + 60), ("", NOW + 60), ("c-3", NOW)] {
             assert!(matches!(
-                add(&mut state, true, id, 3, expires_at),
+                add(&mut state, id, 3, expires_at),
                 Err(StateError::InvalidClient(_))
             ));
         }
@@ -1134,7 +1079,6 @@ mod tests {
         bad_key[0] = 0x05;
         assert!(matches!(
             state.add_client(
-                true,
                 "c-4".to_owned(),
                 CompressedPublicKey::from_bytes(bad_key),
                 NOW + 60,
@@ -1143,22 +1087,16 @@ mod tests {
             Err(StateError::InvalidClient(_))
         ));
 
-        assert_eq!(
-            state.set_client_expiry(false, "c-1", NOW),
-            Err(StateError::NotGovernance)
-        );
-        state
-            .set_client_expiry(true, "c-1", NOW + 120)
-            .expect("extends");
+        state.set_client_expiry("c-1", NOW + 120).expect("extends");
         assert_eq!(
             state.clients.get("c-1").map(|c| c.expires_at),
             Some(NOW + 120)
         );
         assert_eq!(
-            state.remove_client(true, "c-9"),
+            state.remove_client("c-9"),
             Err(StateError::UnknownClient("c-9".to_owned()))
         );
-        state.remove_client(true, "c-1").expect("removes");
+        state.remove_client("c-1").expect("removes");
         assert!(state.clients.is_empty());
     }
 
@@ -1167,7 +1105,7 @@ mod tests {
         let mut state = listed(&[Operator::new(1, "a")], 1);
         let registry_version = state.version;
         state
-            .add_client(true, "c-1".to_owned(), client_key(1), NOW + 600, NOW)
+            .add_client("c-1".to_owned(), client_key(1), NOW + 600, NOW)
             .expect("adds");
 
         let list = state.unsigned_client_list(NOW).expect("encodes");

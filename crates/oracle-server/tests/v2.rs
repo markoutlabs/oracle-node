@@ -322,9 +322,9 @@ async fn a_revoked_client_is_closed_and_cannot_open_the_next_frames() {
 
     let revoked = node
         .transport
-        .replace_clients(&client_list(2, 60, &[("a", 1, expires)]), unix_now())
+        .offer_clients(&client_list(2, 60, &[("a", 1, expires)]), unix_now())
         .expect("adopts");
-    assert_eq!(revoked, 1);
+    assert_eq!(revoked, Some(1));
     assert_ne!(node.transport.current_key().key_id(), before.key_id());
 
     assert!(matches!(
@@ -470,7 +470,8 @@ async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
     ));
 
     // A fetch of the same version is a confirmation and keeps sessions open.
-    node.transport.confirm_clients(unix_now() + 900);
+    let offered = node.transport.offer_clients(&list, unix_now() + 900);
+    assert_eq!(offered.expect("the list in use"), None);
     node.transport.tick(unix_now() + 1_100);
     assert_eq!(node.transport.session_count(), 1);
 
