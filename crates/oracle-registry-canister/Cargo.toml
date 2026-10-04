@@ -18,15 +18,17 @@ oracle-wire = { path = "../oracle-wire", version = "0.1.0", default-features = f
 candid.workspace = true
 ic-cdk.workspace = true
 ic-cdk-management-canister.workspace = true
-ic-cdk-timers.workspace = true
 ic-http-certification.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 ic-response-verification.workspace = true
+oracle-client.workspace = true
 pocket-ic.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time"] }
 
 [lints]
 workspace = true

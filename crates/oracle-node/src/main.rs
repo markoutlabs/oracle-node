@@ -363,6 +363,10 @@ fn spawn_transport_tasks(
                         Err(error) => warn!(%error, "client list refused"),
                     }
                 }
+                // The certificate proves the canister still serves this version.
+                Ok(Some(list)) if list.version == transport.clients_version() => {
+                    transport.confirm_clients(unix_now());
+                }
                 Ok(_) => {}
                 Err(error) => warn!(%error, "client list fetch failed"),
             }
@@ -451,7 +455,7 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "  2. Point `registry.url` and `clients.url` in the config at the canister's\n     \
-         /registry.json and /clients.json."
+         /registry.json and /clients.json, and set `registry.canister_id`."
     );
     println!(
         "  3. Set `governance_address` in the config. Ask governance for it —\n     \

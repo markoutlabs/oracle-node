@@ -118,16 +118,12 @@ type InitArgs = record {
   rotation_window_secs : nat64;
   // Recommended quorum.
   recommended : nat16;
-  // Seconds between heartbeat re-signs.
-  heartbeat_secs : nat64;
   // Broadcast-key epoch for the client list. Default 60.
   epoch_secs : opt nat64;
   // Threshold ECDSA key name: `dfx_test_key` locally, `key_1` on mainnet.
   key_name : text;
   // Fewest nodes a consumer should require.
   min_nodes : nat16;
-  // Seconds between client-list re-signs. Default 3600.
-  clients_heartbeat_secs : opt nat64;
 };
 type Result = variant { Ok : nat64; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
@@ -157,8 +153,11 @@ service : (InitArgs) -> {
   remove_client : (text) -> (Result);
   // Governance de-lists a node. Returns the new version.
   remove_node : (text) -> (Result);
-  // Governance forces a signing round. Returns the new version.
+  // Governance re-signs the registry with no change. Returns the new version.
   republish : () -> (Result);
+  // Governance re-signs the client list with no change, for example to publish
+  // an empty list before the first client. Returns the new client-list version.
+  republish_clients : () -> (Result);
   // Governance swaps a node's signing key. `cert_json` is a `SigningKeyCert`
   // the node's identity key issued. Returns the new version.
   rotate_key : (text, text) -> (Result);

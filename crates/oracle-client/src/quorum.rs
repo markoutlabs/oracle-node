@@ -77,11 +77,10 @@ pub enum Concern {
     NodeReportedDegraded,
     /// At least one node reported its own feed halted, and was excluded.
     NodeReportedHalted,
-    /// The registry document is older than the configured maximum.
+    /// No certified fetch has confirmed the registry within the configured maximum.
     ///
-    /// The canister re-signs on a heartbeat even with no change (SPEC §3.6), so
-    /// an old document means the fetch path is broken or something is
-    /// withholding newer versions. Membership changes may be missing.
+    /// The fetch path is broken or something is withholding newer versions
+    /// (SPEC §3.6). Membership changes may be missing.
     RegistryStale,
 }
 

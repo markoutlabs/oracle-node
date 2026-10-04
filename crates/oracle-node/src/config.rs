@@ -123,7 +123,8 @@ pub struct SigningSettings {
 }
 
 /// Where the client list comes from. Exactly one of `path` and `url`. It is
-/// verified against `registry.governance_address`.
+/// verified against `registry.governance_address`, and a `url` response
+/// against the certificate of `registry.canister_id`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsSettings {
@@ -152,13 +153,19 @@ pub struct RegistrySettings {
     /// deployed node should fetch from the registry canister instead.
     #[serde(default)]
     pub path: Option<PathBuf>,
-    /// URL of the signed registry JSON, usually the registry canister's
-    /// `/registry.json` (SPEC §3.6).
+    /// URL of the registry canister's `/registry.json` (SPEC §3.6). Fetched
+    /// at startup.
     ///
-    /// Fetched at startup. The response is not trusted beyond parsing; the
-    /// document's governance signature is the check.
+    /// The response must carry the canister's certificate, and the document
+    /// must carry the governance signature.
     #[serde(default)]
     pub url: Option<String>,
+    /// The registry canister, whose certificate every fetched document must carry.
+    #[serde(default)]
+    pub canister_id: Option<String>,
+    /// The root key of the canister's network, DER in hex. Mainnet if not set.
+    #[serde(default)]
+    pub root_key: Option<String>,
     /// Governance address to verify it against, `0x`-hex.
     ///
     /// Pinned here rather than taken from the registry itself, which would let
@@ -330,7 +337,7 @@ impl NodeConfig {
             }
             (None, Some(url)) => {
                 use oracle_client::RegistrySource as _;
-                oracle_client::HttpRegistrySource::new(url.clone())
+                oracle_client::HttpRegistrySource::new(url, self.certification()?)
                     .map_err(|e| ConfigError::Registry(e.to_string()))?
                     .fetch()
                     .await
@@ -357,6 +364,26 @@ impl NodeConfig {
             .verify(governance, 0)
             .map_err(|e| ConfigError::Registry(e.to_string()))?;
         Ok(registry)
+    }
+
+    /// Returns the certificate check for documents fetched from the canister.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Registry`] without `registry.canister_id`, or for
+    /// an id or root key that does not parse.
+    pub fn certification(&self) -> Result<oracle_client::Certification, ConfigError> {
+        let canister_id = self.registry.canister_id.as_deref().ok_or_else(|| {
+            ConfigError::Registry(
+                "set registry.canister_id: a fetched document must carry its certificate"
+                    .to_owned(),
+            )
+        })?;
+        match &self.registry.root_key {
+            Some(root_key) => oracle_client::Certification::new(canister_id, root_key),
+            None => oracle_client::Certification::mainnet(canister_id),
+        }
+        .map_err(|e| ConfigError::Registry(e.to_string()))
     }
 
     /// Returns the pinned governance address.
@@ -389,7 +416,7 @@ impl NodeConfig {
                 serde_json::from_str(&text)
                     .map_err(|e| ConfigError::Clients(format!("{}: {e}", path.display())))?
             }
-            (None, Some(url)) => oracle_client::HttpDocumentSource::new(url.clone())
+            (None, Some(url)) => oracle_client::HttpDocumentSource::new(url, self.certification()?)
                 .map_err(|e| ConfigError::Clients(e.to_string()))?
                 .fetch()
                 .await
@@ -1053,14 +1080,13 @@ sources = [
         assert!(error.to_string().contains("only one"), "{error}");
     }
 
-    /// The deployed shape: the registry comes from a URL and is verified against
-    /// the pinned governance address, not trusted because it was served.
+    /// A validly signed registry from a plain server is refused: only the
+    /// canister's certificate proves that it is the latest version.
     #[tokio::test]
-    async fn the_registry_is_fetched_from_a_url_and_verified() {
-        use oracle_client::testing::{TestNode, governance, signed_registry};
+    async fn a_registry_url_needs_the_canister_certificate() {
+        use oracle_client::testing::{governance, signed_registry};
 
-        let node = TestNode::new(1, "oracle-1");
-        let registry = signed_registry(3, vec![node.entry()]);
+        let registry = signed_registry(3, Vec::new());
         let json = serde_json::to_string(&registry).expect("serialises");
         let app = axum::Router::new().route(
             "/registry.json",
@@ -1074,21 +1100,19 @@ sources = [
             axum::serve(listener, app).await.expect("serves");
         });
 
-        let pinned = registry_section(&format!(
-            "url = \"http://{address}/registry.json\"\ngovernance_address = \"{}\"",
-            governance().address()
-        ));
-        let fetched = pinned.fetch_registry().await.expect("fetched and verified");
-        assert_eq!(fetched.version, 3);
-
-        let wrong_key = registry_section(&format!(
-            "url = \"http://{address}/registry.json\"\n\
-             governance_address = \"0x0000000000000000000000000000000000000001\""
-        ));
-        assert!(
-            wrong_key.fetch_registry().await.is_err(),
-            "a served document must not be trusted on arrival"
-        );
+        let section = |extra: &str| {
+            registry_section(&format!(
+                "url = \"http://{address}/registry.json\"\n{extra}governance_address = \"{}\"",
+                governance().address()
+            ))
+        };
+        let error = section("").fetch_registry().await.expect_err("no canister");
+        assert!(error.to_string().contains("canister_id"), "{error}");
+        let error = section("canister_id = \"aaaaa-aa\"\n")
+            .fetch_registry()
+            .await
+            .expect_err("uncertified");
+        assert!(error.to_string().contains("not certified"), "{error}");
     }
 
     #[test]

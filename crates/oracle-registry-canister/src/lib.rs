@@ -22,61 +22,29 @@
 //!
 //! # Signing rounds
 //!
-//! A mutation applies to the state, then one signing round produces the next
-//! version of the document it changed. Mutations are refused while a round is in flight, so a document
-//! never describes a state that no longer exists. If the round fails, the
-//! mutation stands and the heartbeat timer retries the publish.
+//! Publication is on demand: each change signs the next version of the
+//! document it changed, and nothing re-signs on a timer. Consumers judge
+//! freshness by the IC certificate on the HTTP response, not by
+//! `effective_from`. A round that fails changes nothing.
 
+mod certify;
+mod publish;
+mod runtime;
+mod signing;
 pub mod state;
 
-use std::cell::{Cell, RefCell};
-use std::time::Duration;
-
 use candid::CandidType;
-use ic_cdk_management_canister::{
-    EcdsaCurve, EcdsaKeyId, EcdsaPublicKeyArgs, SignWithEcdsaArgs, ecdsa_public_key,
-    sign_with_ecdsa,
-};
 use ic_http_certification::utils::add_v2_certificate_header;
-use ic_http_certification::{
-    CERTIFICATE_EXPRESSION_HEADER_NAME, DefaultCelBuilder, DefaultResponseCertification,
-    HttpCertification, HttpCertificationPath, HttpCertificationTree, HttpCertificationTreeEntry,
-    Method, StatusCode,
-};
+use ic_http_certification::{HttpCertificationPath, Method};
 pub use ic_http_certification::{HttpRequest, HttpResponse};
-use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, Signature, SigningKeyCert};
+use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, SigningKeyCert};
 use serde::Deserialize;
 
-use crate::state::{Config, DEFAULT_CLIENTS_HEARTBEAT_SECS, DEFAULT_EPOCH_SECS, State, StateError};
-
-const REGISTRY_PATH: &str = "/registry.json";
-const CLIENTS_PATH: &str = "/clients.json";
-
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-    /// A signing round is in flight.
-    static BUSY: Cell<bool> = const { Cell::new(false) };
-    // Not in stable memory: rebuilt from `STATE` in `post_upgrade`.
-    static CERTIFIED: RefCell<Option<Certified>> = const { RefCell::new(None) };
-}
-
-struct Certified {
-    tree: HttpCertificationTree,
-    documents: Vec<CertifiedDocument>,
-}
-
-struct CertifiedDocument {
-    path: &'static str,
-    entry: HttpCertificationTreeEntry<'static>,
-    response: HttpResponse<'static>,
-}
-
-/// The two signed documents the canister publishes.
-#[derive(Clone, Copy, Debug)]
-enum Document {
-    Registry,
-    Clients,
-}
+use crate::certify::{CERTIFIED, certify_documents};
+use crate::publish::{Document, mutate_and_publish};
+use crate::runtime::{STATE, is_governance, now_secs, read_state};
+use crate::signing::ensure_governance_key;
+use crate::state::{Config, DEFAULT_EPOCH_SECS, State, StateError};
 
 /// Install arguments.
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -85,68 +53,12 @@ pub struct InitArgs {
     pub key_name: String,
     /// Minimum seconds between two rotations fleet-wide.
     pub rotation_window_secs: u64,
-    /// Seconds between heartbeat re-signs.
-    pub heartbeat_secs: u64,
     /// Fewest nodes a consumer should require.
     pub min_nodes: u16,
     /// Recommended quorum.
     pub recommended: u16,
     /// Broadcast-key epoch for the client list. Default 60.
     pub epoch_secs: Option<u64>,
-    /// Seconds between client-list re-signs. Default 3600.
-    pub clients_heartbeat_secs: Option<u64>,
-}
-
-fn now_secs() -> u64 {
-    ic_cdk::api::time() / 1_000_000_000
-}
-
-fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
-    STATE.with(|cell| {
-        f(cell
-            .borrow_mut()
-            .as_mut()
-            .expect("the canister is initialised"))
-    })
-}
-
-fn read_state<R>(f: impl FnOnce(&State) -> R) -> R {
-    STATE.with(|cell| f(cell.borrow().as_ref().expect("the canister is initialised")))
-}
-
-fn is_governance() -> bool {
-    ic_cdk::api::is_controller(&ic_cdk::api::msg_caller())
-}
-
-fn key_id() -> EcdsaKeyId {
-    EcdsaKeyId {
-        curve: EcdsaCurve::Secp256k1,
-        name: read_state(|s| s.config.key_name.clone()),
-    }
-}
-
-fn schedule_heartbeat() {
-    let interval = read_state(|s| {
-        Duration::from_secs(
-            s.config
-                .heartbeat_secs
-                .min(s.config.clients_heartbeat_secs)
-                .max(1),
-        )
-    });
-    ic_cdk_timers::set_timer_interval(interval, || async {
-        // The timer can fire again while a round awaits its signature.
-        if BUSY.get() {
-            return;
-        }
-        let now = now_secs();
-        let (registry, clients) = read_state(|s| (s.registry_due(now), s.clients_due(now)));
-        for (due, document) in [(registry, Document::Registry), (clients, Document::Clients)] {
-            if due && let Err(error) = publish(document).await {
-                ic_cdk::api::debug_print(format!("heartbeat publish failed: {error}"));
-            }
-        }
-    });
 }
 
 #[ic_cdk::init]
@@ -155,12 +67,7 @@ fn init(args: InitArgs) {
         Config {
             key_name: args.key_name,
             rotation_window_secs: args.rotation_window_secs,
-            heartbeat_secs: args.heartbeat_secs,
             epoch_secs: args.epoch_secs.unwrap_or(DEFAULT_EPOCH_SECS).max(1),
-            clients_heartbeat_secs: args
-                .clients_heartbeat_secs
-                .unwrap_or(DEFAULT_CLIENTS_HEARTBEAT_SECS)
-                .max(1),
         },
         Quorum {
             min_nodes: args.min_nodes,
@@ -170,7 +77,6 @@ fn init(args: InitArgs) {
     .unwrap_or_else(|error| ic_cdk::trap(error.to_string()));
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
     certify_documents();
-    schedule_heartbeat();
 }
 
 #[ic_cdk::pre_upgrade]
@@ -186,158 +92,6 @@ fn post_upgrade() {
     let state: State = serde_json::from_slice(&bytes).expect("state deserialises");
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
     certify_documents();
-    schedule_heartbeat();
-}
-
-/// Runs a mutation, then one signing round for `document`. Returns its new version.
-async fn mutate_and_publish(
-    document: Document,
-    mutation: impl FnOnce(&mut State) -> Result<(), StateError>,
-) -> Result<u64, String> {
-    if BUSY.get() {
-        return Err("a signing round is in flight; retry shortly".to_owned());
-    }
-    with_state(mutation).map_err(|error| error.to_string())?;
-    publish(document).await
-}
-
-/// One signing round for one document.
-async fn publish(document: Document) -> Result<u64, String> {
-    if BUSY.get() {
-        return Err("a signing round is in flight; retry shortly".to_owned());
-    }
-    BUSY.set(true);
-    let result = publish_inner(document).await;
-    BUSY.set(false);
-    result
-}
-
-async fn publish_inner(document: Document) -> Result<u64, String> {
-    let now = now_secs();
-    let version = match document {
-        Document::Registry => {
-            let unsigned =
-                with_state(|s| s.unsigned_document(now)).map_err(|error| error.to_string())?;
-            let signature = sign(&unsigned.signing_bytes).await?;
-            with_state(|s| s.publish(unsigned, signature)).map_err(|error| error.to_string())?
-        }
-        Document::Clients => {
-            let unsigned =
-                with_state(|s| s.unsigned_client_list(now)).map_err(|error| error.to_string())?;
-            let signature = sign(&unsigned.signing_bytes).await?;
-            with_state(|s| s.publish_clients(unsigned, signature))
-                .map_err(|error| error.to_string())?
-        }
-    };
-    certify_documents();
-    Ok(version)
-}
-
-/// Signs canonical document bytes with the threshold key.
-async fn sign(signing_bytes: &[u8]) -> Result<Signature, String> {
-    let governance = ensure_governance_key().await?;
-    let expected = governance.address().map_err(|error| error.to_string())?;
-    let digest = oracle_wire::domain::digest(signing_bytes);
-    let signed = sign_with_ecdsa(&SignWithEcdsaArgs {
-        message_hash: digest.to_vec(),
-        derivation_path: Vec::new(),
-        key_id: key_id(),
-    })
-    .await
-    .map_err(|error| format!("sign_with_ecdsa failed: {error}"))?;
-    let compact: [u8; 64] = signed.signature.as_slice().try_into().map_err(|_| {
-        format!(
-            "sign_with_ecdsa returned {} bytes, expected 64",
-            signed.signature.len()
-        )
-    })?;
-    Signature::from_compact_for(&digest, &compact, expected)
-        .map_err(|error| format!("cannot adapt the threshold signature: {error}"))
-}
-
-/// Certifies the current `/registry.json` and `/clients.json` responses in one
-/// tree, so the query path can serve either.
-fn certify_documents() {
-    let cel = DefaultCelBuilder::response_only_certification()
-        .with_response_certification(DefaultResponseCertification::response_header_exclusions(
-            vec![],
-        ))
-        .build();
-    let headers = |content_type: &str| {
-        vec![
-            ("content-type".to_owned(), content_type.to_owned()),
-            ("cache-control".to_owned(), "no-cache".to_owned()),
-            (
-                CERTIFICATE_EXPRESSION_HEADER_NAME.to_owned(),
-                cel.to_string(),
-            ),
-        ]
-    };
-    let response = |json: Option<String>, missing: &'static [u8]| match json {
-        Some(json) => HttpResponse::ok(json.into_bytes(), headers("application/json")).build(),
-        None => HttpResponse::builder()
-            .with_status_code(StatusCode::SERVICE_UNAVAILABLE)
-            .with_headers(headers("text/plain"))
-            .with_body(missing.to_vec())
-            .build(),
-    };
-    let mut tree = HttpCertificationTree::default();
-    let documents: Vec<CertifiedDocument> = [
-        (
-            REGISTRY_PATH,
-            response(
-                get_registry(),
-                b"no registry version has been published yet",
-            ),
-        ),
-        (
-            CLIENTS_PATH,
-            response(
-                get_clients(),
-                b"no client list version has been published yet",
-            ),
-        ),
-    ]
-    .into_iter()
-    .map(|(path, response)| {
-        let certification = HttpCertification::response_only(&cel, &response, None)
-            .expect("the response carries its own CEL expression");
-        let entry =
-            HttpCertificationTreeEntry::new(HttpCertificationPath::exact(path), certification);
-        tree.insert(&entry);
-        CertifiedDocument {
-            path,
-            entry,
-            response,
-        }
-    })
-    .collect();
-    ic_cdk::api::certified_data_set(tree.root_hash());
-    CERTIFIED.with(|cell| *cell.borrow_mut() = Some(Certified { tree, documents }));
-}
-
-async fn ensure_governance_key() -> Result<CompressedPublicKey, String> {
-    if let Some(key) = read_state(|s| s.governance_key) {
-        return Ok(key);
-    }
-    let result = ecdsa_public_key(&EcdsaPublicKeyArgs {
-        canister_id: None,
-        derivation_path: Vec::new(),
-        key_id: key_id(),
-    })
-    .await
-    .map_err(|error| format!("ecdsa_public_key failed: {error}"))?;
-    let bytes: [u8; 33] = result.public_key.as_slice().try_into().map_err(|_| {
-        format!(
-            "ecdsa_public_key returned {} bytes, expected 33",
-            result.public_key.len()
-        )
-    })?;
-    let key = CompressedPublicKey::from_bytes(bytes);
-    key.address()
-        .map_err(|error| format!("the threshold key is not a curve point: {error}"))?;
-    with_state(|s| s.set_governance_key(key));
-    Ok(key)
 }
 
 /// Only controllers get past this, so spam costs the canister nothing.
@@ -402,13 +156,23 @@ async fn set_quorum(min_nodes: u16, recommended: u16) -> Result<u64, String> {
     .await
 }
 
-/// Governance forces a signing round. Returns the new version.
+/// Governance re-signs the registry with no change. Returns the new version.
 #[ic_cdk::update]
 async fn republish() -> Result<u64, String> {
     if !is_governance() {
         return Err(StateError::NotGovernance.to_string());
     }
-    publish(Document::Registry).await
+    mutate_and_publish(Document::Registry, |_| Ok(())).await
+}
+
+/// Governance re-signs the client list with no change, for example to publish
+/// an empty list before the first client. Returns the new client-list version.
+#[ic_cdk::update]
+async fn republish_clients() -> Result<u64, String> {
+    if !is_governance() {
+        return Err(StateError::NotGovernance.to_string());
+    }
+    mutate_and_publish(Document::Clients, |_| Ok(())).await
 }
 
 /// Governance authorises a client. `pubkey` is its 33-byte compressed

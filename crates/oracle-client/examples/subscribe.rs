@@ -5,10 +5,11 @@
 //! cargo run -p oracle-client --example subscribe -- \
 //!   registry.json 0x<governance-address> CRYPTO.BTC/USDT \
 //!   --client-id c-1 --client-key client.key
-//! # From the registry canister, refreshing on rotation.
+//! # From the registry canister, refreshing on rotation. Add `--root-key`
+//! # off mainnet.
 //! cargo run -p oracle-client --example subscribe -- \
-//!   https://<canister-id>.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT \
-//!   --client-id c-1 --client-key client.key
+//!   https://<canister-id>.raw.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT \
+//!   --canister-id <canister-id> --client-id c-1 --client-key client.key
 //! ```
 //!
 //! The `client_key` example makes a key; governance lists it with `add_client`.
@@ -20,12 +21,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use oracle_client::{HttpRegistrySource, OracleClient, Status};
+use oracle_client::{Certification, HttpRegistrySource, OracleClient, Status};
 
 /// Subscribe to live nodes and print verified prices.
 #[derive(Parser)]
 struct Args {
-    /// A registry JSON file, or an `http(s)://` URL that serves one.
+    /// A registry JSON file, or the canister's `/registry.json` URL.
     registry: String,
     /// The pinned governance address, `0x`-hex.
     governance: oracle_wire::Address,
@@ -44,6 +45,12 @@ struct Args {
     /// File holding the client API key as hex.
     #[arg(long)]
     client_key: std::path::PathBuf,
+    /// The registry canister, whose certificate a URL response must carry.
+    #[arg(long)]
+    canister_id: Option<String>,
+    /// The network's root key in hex. Mainnet if not set.
+    #[arg(long)]
+    root_key: Option<String>,
 }
 
 #[tokio::main]
@@ -53,7 +60,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A URL refreshes on its own when a node rotates. A file is pinned until
     // the process restarts.
     let builder = if args.registry.starts_with("http://") || args.registry.starts_with("https://") {
-        let source = Arc::new(HttpRegistrySource::new(args.registry.clone())?);
+        let canister = args
+            .canister_id
+            .as_deref()
+            .ok_or("--canister-id is needed with a URL")?;
+        let certification = match &args.root_key {
+            Some(root_key) => Certification::new(canister, root_key)?,
+            None => Certification::mainnet(canister)?,
+        };
+        let source = Arc::new(HttpRegistrySource::new(&args.registry, certification)?);
         OracleClient::builder_from_source(source, args.governance).await?
     } else {
         let registry: oracle_wire::Registry =

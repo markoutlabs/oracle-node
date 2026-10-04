@@ -30,11 +30,11 @@ oracle-server = { path = "crates/oracle-server", version = "0.1.0" }
 oracle-node = { path = "crates/oracle-node", version = "0.1.0" }
 oracle-transport = { path = "crates/oracle-transport", version = "0.1.0" }
 
-# Internet Computer. Only the registry canister and its test use these.
+# Internet Computer. The canister uses these; the SDK and the node use
+# `ic-response-verification` to check the certificate on fetched documents.
 candid = "0.10"
 ic-cdk = "0.20"
 ic-cdk-management-canister = "0.2"
-ic-cdk-timers = "1"
 pocket-ic = "9"
 ic-http-certification = "4"
 ic-response-verification = "4"

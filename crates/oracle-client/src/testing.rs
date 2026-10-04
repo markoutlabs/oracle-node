@@ -22,8 +22,7 @@ use crate::source::{FetchError, RegistryFuture, RegistrySource};
 /// A conventional node id for single-node tests.
 pub const NODE_ID: &str = "oracle-test-1";
 
-/// Issue time of test registries, unix seconds. Matches the `NOW` the tests
-/// use, so a freshly built registry is never reported stale.
+/// Issue time of test registries, unix seconds. Tests use it as their clock.
 pub const REGISTRY_ISSUED_AT: u64 = 1_754_582_400;
 
 /// Seed for the governance key that signs test registries.
@@ -262,21 +261,11 @@ pub fn registry_with(nodes: &[&TestNode]) -> VerifiedRegistry {
 /// Panics if the entries cannot form a valid registry.
 #[must_use]
 pub fn signed_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
-    signed_registry_at(version, REGISTRY_ISSUED_AT, entries)
-}
-
-/// Builds a signed registry issued at an explicit time, for staleness tests.
-///
-/// # Panics
-///
-/// Panics if the entries cannot form a valid registry.
-#[must_use]
-pub fn signed_registry_at(version: u64, issued_at: u64, entries: Vec<NodeEntry>) -> Registry {
     let quorum = Quorum {
         min_nodes: u16::try_from(entries.len()).unwrap_or(u16::MAX),
         recommended: u16::try_from(entries.len()).unwrap_or(u16::MAX),
     };
-    Registry::sign(&governance(), version, issued_at, entries, quorum)
+    Registry::sign(&governance(), version, REGISTRY_ISSUED_AT, entries, quorum)
         .expect("test registry encodes")
 }
 

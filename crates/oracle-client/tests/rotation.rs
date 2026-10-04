@@ -10,15 +10,15 @@
 //! - The retired key keeps verifying, or triggers fetches forever.
 //! - The replay floor resets with the new key.
 //! - A de-listed node keeps counting until its last update ages out.
-//! - A document that stops being refreshed is reported as healthy.
+//! - A registry the source stops confirming is reported as healthy.
 
 use std::sync::Arc;
 
 use oracle_client::testing::{
     REGISTRY_ISSUED_AT, TestNode, TestSource, forged_registry, governance, registry_with,
-    signed_registry, signed_registry_at, update_at,
+    signed_registry, update_at,
 };
-use oracle_client::{ClientError, Concern, OracleClient, RejectReason, Status};
+use oracle_client::{ClientError, Concern, OracleClient, RejectReason, Status, now_unix_nanos};
 use oracle_types::NANOS_PER_SEC;
 use oracle_wire::{NodeEntry, VerifyError};
 
@@ -308,35 +308,39 @@ fn a_refresh_does_not_reopen_the_replay_window() {
     assert_eq!(client.stats().replayed, 1);
 }
 
-/// The canister re-signs daily even with no change. A document two days old
-/// means the consumer is cut off from membership changes, and that must show.
-#[test]
-fn a_stale_registry_degrades_every_feed() {
+/// The canister publishes only on change, so freshness is each certified
+/// fetch. A source that stops confirming leaves the consumer blind to
+/// membership changes, and that must show.
+#[tokio::test]
+async fn an_unconfirmed_registry_degrades_every_feed() {
     let nodes = fleet();
-    let mut client = client(&nodes);
+    let source = TestSource::serving(signed_registry(1, entries(&nodes)));
+    let mut client = client_with_source(&nodes, source);
+    // Confirmations use the wall clock, so these frames are two days past it.
+    let later = now_unix_nanos() + 49 * 3_600 * NANOS_PER_SEC;
+    assert!(client.registry_is_stale(later));
 
     for node in &nodes {
         client
-            .ingest(&node.sign(&update_at(NOW, 1)), NOW)
+            .ingest(&node.sign(&update_at(later, 1)), later)
             .expect("accepted");
     }
-    let three_days = 3 * 86_400;
-    client
-        .refresh_registry(&signed_registry_at(
-            2,
-            REGISTRY_ISSUED_AT - three_days,
-            entries(&nodes),
-        ))
-        .expect("adopted");
-    assert!(client.registry_is_stale(NOW));
-
     let resolved = client
         .ingest(
-            &nodes.first().expect("a node").sign(&update_at(NOW, 2)),
-            NOW,
+            &nodes.first().expect("a node").sign(&update_at(later, 2)),
+            later,
         )
         .expect("accepted");
     assert_eq!(resolved.status, Status::Degraded);
     assert!(resolved.concerns.contains(&Concern::RegistryStale));
     assert_eq!(resolved.nodes, 5, "the prices themselves are fine");
+
+    // The same version, served again, confirms it.
+    let before = client.registry_age(now_unix_nanos());
+    assert_eq!(client.refresh_from_source().await.expect("fetches"), None);
+    assert!(client.registry_age(now_unix_nanos()) <= before);
+    assert!(!client.registry_is_stale(now_unix_nanos()));
+
+    // A pinned registry has nothing to confirm it, and never goes stale.
+    assert!(!self::client(&nodes).registry_is_stale(later));
 }

@@ -213,6 +213,11 @@ key_file = {signing_key_file}
 
 [registry]
 path = {registry_path}
+# A deployed node fetches from the canister instead of `path`:
+# url = "https://<canister-id>.raw.icp0.io/registry.json"
+# Each fetched document must carry this canister's certificate. Set `root_key`
+# (hex) only off mainnet.
+canister_id = "<canister-id>"
 # Pinned here rather than taken from the registry itself, which would let the
 # document vouch for its own author. Ask governance for this address; do not
 # copy it out of a registry file you were sent.
@@ -221,7 +226,7 @@ governance_address = "0x0000000000000000000000000000000000000000"
 # The governance-signed client list (SPEC §6.1). The node serves prices only to
 # these clients, encrypted, over /v2/ws, and refuses to start without the list.
 [clients]
-url = "https://<canister-id>.icp0.io/clients.json"
+url = "https://<canister-id>.raw.icp0.io/clients.json"
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT"

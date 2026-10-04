@@ -155,7 +155,7 @@ async fn connections_follow_the_registry() {
     assert_eq!(client.registry_version(), 2);
 }
 
-/// Without the poll, a quiet client reports `RegistryStale` after 48 hours.
+/// A new version with the same nodes, such as a `republish`, moves no connection.
 #[tokio::test]
 async fn a_re_sign_is_adopted_without_reconnecting() {
     let (tx, mut events) = mpsc::unbounded_channel();

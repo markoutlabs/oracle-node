@@ -36,10 +36,11 @@ const SAFE_QUORUM: usize = 3;
 /// against the registry.
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Default registry age above which feeds are reported degraded.
+/// Default time without a freshness confirmation before feeds are reported
+/// degraded.
 ///
-/// The canister re-signs at least daily (SPEC §3.6). Two missed heartbeats
-/// means the fetch path is broken or newer versions are being withheld.
+/// Each certified fetch confirms the registry (SPEC §3.6). This long without
+/// one means the fetch path is broken or newer versions are being withheld.
 const DEFAULT_MAX_REGISTRY_AGE: Duration = Duration::from_secs(48 * 3_600);
 
 /// Bounds how long a de-listed node keeps its seat.
@@ -163,7 +164,8 @@ impl OracleClientBuilder {
         self
     }
 
-    /// Sets the registry age above which feeds are reported degraded.
+    /// Sets how long the source may go without confirming the registry before
+    /// feeds are reported degraded.
     #[must_use]
     pub const fn max_registry_age(mut self, age: Duration) -> Self {
         self.max_registry_age = age;
@@ -254,6 +256,7 @@ impl OracleClientBuilder {
             refresh_interval: self.refresh_interval,
             poll_interval: self.poll_interval,
             max_registry_age: self.max_registry_age,
+            confirmed_ns: now_unix_nanos(),
             last_refresh_attempt_ns: None,
             subscription: None,
             runtime: None,
@@ -332,6 +335,8 @@ pub struct OracleClient {
     refresh_interval: Duration,
     poll_interval: Duration,
     max_registry_age: Duration,
+    /// When a source last proved the trusted registry current.
+    confirmed_ns: u64,
     last_refresh_attempt_ns: Option<u64>,
     subscription: Option<String>,
     // Kept so that `refresh_registry` can open connections from any thread.
@@ -394,21 +399,18 @@ impl OracleClient {
         self.registry.version()
     }
 
-    /// Returns how long ago the trusted registry was issued.
+    /// Returns how long ago a source last proved the trusted registry current,
+    /// or how long ago the client was built if none has yet.
     #[must_use]
     pub fn registry_age(&self, now_ns: u64) -> Duration {
-        let issued_ns = self
-            .registry
-            .as_registry()
-            .effective_from
-            .saturating_mul(NANOS_PER_SEC);
-        Duration::from_nanos(now_ns.saturating_sub(issued_ns))
+        Duration::from_nanos(now_ns.saturating_sub(self.confirmed_ns))
     }
 
-    /// Returns `true` if the trusted registry is older than `max_registry_age`.
+    /// Returns `true` if the source has not confirmed the registry within
+    /// `max_registry_age`. A registry with no source is pinned, never stale.
     #[must_use]
     pub fn registry_is_stale(&self, now_ns: u64) -> bool {
-        self.registry_age(now_ns) > self.max_registry_age
+        self.source.is_some() && self.registry_age(now_ns) > self.max_registry_age
     }
 
     /// Fetches from the registry source and adopts the document if it is newer.
@@ -434,11 +436,21 @@ impl OracleClient {
         &mut self,
         fetched: Result<Registry, FetchError>,
     ) -> Result<Option<u64>, ClientError> {
+        let current = self.registry.version();
         let outcome = fetched.map_err(ClientError::from).and_then(|registry| {
-            if registry.version <= self.registry.version() {
-                return Ok(None);
+            match registry.version.cmp(&current) {
+                // An older version is not proof that ours is current.
+                std::cmp::Ordering::Less => Ok(None),
+                std::cmp::Ordering::Equal => {
+                    self.confirmed_ns = now_unix_nanos();
+                    Ok(None)
+                }
+                std::cmp::Ordering::Greater => {
+                    let version = self.refresh_registry(&registry)?;
+                    self.confirmed_ns = now_unix_nanos();
+                    Ok(Some(version))
+                }
             }
-            self.refresh_registry(&registry).map(Some)
         });
         if outcome.is_err() {
             self.stats.refresh_failures = self.stats.refresh_failures.saturating_add(1);

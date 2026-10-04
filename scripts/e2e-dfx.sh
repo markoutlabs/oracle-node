@@ -54,12 +54,16 @@ if ! dfx ping >/dev/null 2>&1; then
   dfx start --background --clean >/dev/null 2>&1
 fi
 dfx deploy oracle_registry --identity "$IDENTITY" --argument \
-  '(record { key_name = "dfx_test_key"; rotation_window_secs = 60 : nat64; heartbeat_secs = 86400 : nat64; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = opt (10 : nat64) })' \
+  '(record { key_name = "dfx_test_key"; rotation_window_secs = 60 : nat64; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = opt (10 : nat64) })' \
   >/dev/null 2>&1
 CANISTER=$(dfx canister id oracle_registry)
 URL="$GATEWAY/registry.json?canisterId=$CANISTER"
 CLIENTS_URL="$GATEWAY/clients.json?canisterId=$CANISTER"
 GOV=$(dfx canister call oracle_registry refresh_governance_key --identity "$IDENTITY" --output json | json_value)
+# The node and the client check each fetched document's IC certificate
+# against this replica's root key.
+ROOT_KEY=$(dfx ping | python3 -c 'import sys,json; print(bytes(json.load(sys.stdin)["root_key"]).hex())')
+CERT_ARGS=(--canister-id "$CANISTER" --root-key "$ROOT_KEY")
 echo "canister $CANISTER"
 echo "governance $GOV"
 
@@ -73,13 +77,16 @@ $NODE init --out "$DIR/node1" --node-id "$NODE_ID" --operator e2e \
   --passphrase-file "$DIR/passphrase" > "$DIR/init.out"
 # The e2e identity is the controller, so it plays governance for both calls.
 eval "$(grep '^dfx canister call' "$DIR/init.out") --identity $IDENTITY" >/dev/null
-python3 - "$DIR/node1/config.toml" "$URL" "$GOV" "$CLIENTS_URL" <<'PY'
+python3 - "$DIR/node1/config.toml" "$URL" "$GOV" "$CLIENTS_URL" "$CANISTER" "$ROOT_KEY" <<'PY'
 import sys, re, pathlib
-path, url, gov, clients = sys.argv[1:]
+path, url, gov, clients, canister, root_key = sys.argv[1:]
 p = pathlib.Path(path); s = p.read_text()
 s = re.sub(r'^path = ".*"$', f'url = "{url}"', s, count=1, flags=re.M)
 s = re.sub(r'^governance_address = ".*"$', f'governance_address = "{gov}"', s, count=1, flags=re.M)
-s = s.replace('url = "https://<canister-id>.icp0.io/clients.json"',
+assert 'canister_id = "<canister-id>"' in s, "the starter config has no canister_id"
+s = s.replace('canister_id = "<canister-id>"',
+              f'canister_id = "{canister}"\nroot_key = "{root_key}"')
+s = s.replace('url = "https://<canister-id>.raw.icp0.io/clients.json"',
               f'url = "{clients}"\npoll_secs = 5')
 assert '[clients]\nurl' in s, "the starter config has no [clients] block"
 p.write_text(s)
@@ -111,7 +118,7 @@ start_node "$DIR/node1.log"
 echo "signer $(grep -o "0x[0-9a-f]\{40\}" "$DIR/node1.log" | head -1)"
 
 say "client baseline, 15s"
-$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT --seconds 15 --every 1000 \
+$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 15 --every 1000 \
   --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-baseline.log" 2>&1 \
   || { cat "$DIR/client-baseline.log"; die "baseline client failed"; }
 tail -1 "$DIR/client-baseline.log"
@@ -119,7 +126,7 @@ tail -1 "$DIR/client-baseline.log"
 [ "$(stat untrusted "$DIR/client-baseline.log")" -eq 0 ] || die "untrusted frames in baseline"
 
 say "rotation under a live client, 90s"
-$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT --seconds 90 --every 1000 \
+$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 90 --every 1000 \
   --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-rotation.log" 2>&1 &
 CLIENT_PID=$!
 sleep 10
@@ -142,7 +149,7 @@ tail -1 "$DIR/client-rotation.log"
 [ "$(stat refresh_failures "$DIR/client-rotation.log")" -eq 0 ] || die "a refresh failed"
 
 say "revocation: governance removes c-1 under a live session"
-$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT --seconds 30 --every 1000 \
+$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 30 --every 1000 \
   --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-revoked.log" 2>&1 &
 CLIENT_PID=$!
 sleep 8
@@ -157,7 +164,7 @@ echo "revoked: session closed, keys rotated, no subscriber left"
 say "expiry: c-2 is listed for about 25 s"
 echo "client list v$(add_client c-2 $(( $(date +%s) + 25 )))"
 sleep 7
-$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT --seconds 30 --every 1000 \
+$CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 30 --every 1000 \
   --client-id c-2 --client-key "$DIR/c-2.key" > "$DIR/client-expiry.log" 2>&1 || true
 plain "$DIR/node1b.log" | grep -q 'client session closed client_id="\?c-2"\? reason=Expired' || die "the session outlived its deadline"
 [ "$(stat accepted "$DIR/client-expiry.log")" -gt 0 ] || die "c-2 never received a price"

@@ -95,28 +95,16 @@ pub struct Config {
     pub key_name: String,
     /// Minimum seconds between two rotations fleet-wide.
     pub rotation_window_secs: u64,
-    /// Seconds between heartbeat re-signs.
-    pub heartbeat_secs: u64,
     /// Broadcast-key epoch, published in the client list.
     #[serde(default = "default_epoch_secs")]
     pub epoch_secs: u64,
-    /// Seconds between client-list heartbeat re-signs.
-    #[serde(default = "default_clients_heartbeat_secs")]
-    pub clients_heartbeat_secs: u64,
 }
 
 /// Default broadcast-key epoch (SPEC §6.1).
 pub const DEFAULT_EPOCH_SECS: u64 = 60;
-/// Default client-list heartbeat. Nodes stop admitting clients after three
-/// missed beats, so it bounds how long a withheld revocation can go unseen.
-pub const DEFAULT_CLIENTS_HEARTBEAT_SECS: u64 = 3_600;
 
 const fn default_epoch_secs() -> u64 {
     DEFAULT_EPOCH_SECS
-}
-
-const fn default_clients_heartbeat_secs() -> u64 {
-    DEFAULT_CLIENTS_HEARTBEAT_SECS
 }
 
 /// One authorised client.
@@ -234,8 +222,6 @@ pub struct State {
     pub published: Option<Registry>,
     /// The threshold public key, once fetched.
     pub governance_key: Option<CompressedPublicKey>,
-    /// A mutation happened since the last publish.
-    pub dirty: bool,
     /// Authorised clients by id. Absent in states saved before clients existed.
     #[serde(default)]
     pub clients: BTreeMap<String, ClientRecord>,
@@ -245,9 +231,6 @@ pub struct State {
     /// The last signed client list.
     #[serde(default)]
     pub clients_published: Option<ClientList>,
-    /// A client change happened since the last client-list publish.
-    #[serde(default)]
-    pub clients_dirty: bool,
 }
 
 impl State {
@@ -267,11 +250,9 @@ impl State {
             last_rotation_at: None,
             published: None,
             governance_key: None,
-            dirty: true,
             clients: BTreeMap::new(),
             clients_version: 0,
             clients_published: None,
-            clients_dirty: true,
         })
     }
 
@@ -341,7 +322,6 @@ impl State {
                 keys,
             },
         );
-        self.dirty = true;
         Ok(())
     }
 
@@ -392,7 +372,6 @@ impl State {
         );
         node.live = generation;
         self.last_rotation_at = Some(now);
-        self.dirty = true;
         Ok(())
     }
 
@@ -426,7 +405,6 @@ impl State {
         };
         node.retire_live(now);
         self.removed.insert(node_id.to_owned(), node);
-        self.dirty = true;
         Ok(())
     }
 
@@ -442,7 +420,6 @@ impl State {
         }
         check_quorum(quorum)?;
         self.quorum = quorum;
-        self.dirty = true;
         Ok(())
     }
 
@@ -496,37 +473,7 @@ impl State {
             governance_signature,
         });
         self.version = document.version;
-        self.dirty = false;
         Ok(self.version)
-    }
-
-    /// `true` if the published document is missing or behind the state.
-    #[must_use]
-    pub const fn needs_publish(&self) -> bool {
-        self.dirty || self.published.is_none()
-    }
-
-    /// `true` if the registry needs a signing round now: a change, or a
-    /// heartbeat that is due.
-    #[must_use]
-    pub fn registry_due(&self, now: u64) -> bool {
-        self.needs_publish()
-            || self.published.as_ref().is_some_and(|registry| {
-                now >= registry
-                    .effective_from
-                    .saturating_add(self.config.heartbeat_secs)
-            })
-    }
-
-    /// `true` if the client list needs a signing round now.
-    #[must_use]
-    pub fn clients_due(&self, now: u64) -> bool {
-        self.clients_dirty
-            || self.clients_published.as_ref().is_none_or(|list| {
-                now >= list
-                    .effective_from
-                    .saturating_add(self.config.clients_heartbeat_secs)
-            })
     }
 
     /// Governance authorises a client until `expires_at`. Bumps the client list.
@@ -584,7 +531,6 @@ impl State {
                 added_at: now,
             },
         );
-        self.clients_dirty = true;
         Ok(())
     }
 
@@ -607,7 +553,6 @@ impl State {
             .get_mut(client_id)
             .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
         record.expires_at = expires_at;
-        self.clients_dirty = true;
         Ok(())
     }
 
@@ -627,7 +572,6 @@ impl State {
         self.clients
             .remove(client_id)
             .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
-        self.clients_dirty = true;
         Ok(())
     }
 
@@ -684,7 +628,6 @@ impl State {
             governance_signature,
         });
         self.clients_version = list.version;
-        self.clients_dirty = false;
         Ok(self.clients_version)
     }
 
@@ -847,9 +790,7 @@ mod tests {
         Config {
             key_name: "dfx_test_key".to_owned(),
             rotation_window_secs: WINDOW,
-            heartbeat_secs: 86_400,
             epoch_secs: 60,
-            clients_heartbeat_secs: 3_600,
         }
     }
 
@@ -935,7 +876,6 @@ mod tests {
             Operator::new(3, "c"),
         ];
         let mut state = State::new(config(), quorum(3)).expect("valid");
-        assert!(state.needs_publish());
         let first = ops.first().expect("three operators");
         assert_eq!(
             state.add_node(false, first.entry(NOW), NOW),
@@ -953,7 +893,6 @@ mod tests {
         assert_eq!(registry.version, 1);
         assert_eq!(registry.nodes.len(), 3);
         assert!(registry.nodes.iter().all(|n| n.signing_keys.len() == 1));
-        assert!(!state.needs_publish());
 
         // The in-process stand-in verifies exactly like the threshold key will.
         let verified = registry
@@ -1114,8 +1053,8 @@ mod tests {
             .expect("a well-formed entry is accepted");
     }
 
-    /// States saved by earlier canister versions still load: dropped fields are
-    /// ignored and new ones take their defaults.
+    /// States saved by earlier canister versions still load: dropped fields,
+    /// such as the heartbeat settings, are ignored and new ones take their defaults.
     #[test]
     fn a_state_saved_by_an_earlier_version_still_loads() {
         let state = listed(&[Operator::new(1, "a")], 1);
@@ -1127,12 +1066,18 @@ mod tests {
                 "operator_principal",
                 Some(serde_json::json!("aaaaa-aa")),
             ),
+            ("", "dirty", Some(serde_json::json!(false))),
+            ("", "clients_dirty", Some(serde_json::json!(true))),
+            ("/config", "heartbeat_secs", Some(serde_json::json!(86_400))),
+            (
+                "/config",
+                "clients_heartbeat_secs",
+                Some(serde_json::json!(3_600)),
+            ),
             ("", "clients", None),
             ("", "clients_version", None),
             ("", "clients_published", None),
-            ("", "clients_dirty", None),
             ("/config", "epoch_secs", None),
-            ("/config", "clients_heartbeat_secs", None),
         ] {
             let object = saved
                 .pointer_mut(path)
@@ -1151,14 +1096,7 @@ mod tests {
         assert_eq!(loaded.nodes, state.nodes);
         assert!(loaded.clients.is_empty());
         assert_eq!(loaded.config.epoch_secs, DEFAULT_EPOCH_SECS);
-        assert_eq!(
-            loaded.config.clients_heartbeat_secs,
-            DEFAULT_CLIENTS_HEARTBEAT_SECS
-        );
-        assert!(
-            loaded.clients_due(NOW),
-            "a list that was never published is due"
-        );
+        assert!(loaded.clients_published.is_none());
     }
 
     fn client_key(seed: u8) -> CompressedPublicKey {
@@ -1231,11 +1169,6 @@ mod tests {
         state
             .add_client(true, "c-1".to_owned(), client_key(1), NOW + 600, NOW)
             .expect("adds");
-        assert!(state.clients_due(NOW));
-        assert!(
-            !state.registry_due(NOW),
-            "a client change leaves the registry alone"
-        );
 
         let list = state.unsigned_client_list(NOW).expect("encodes");
         let signature = governance_signer().sign_payload(&list.signing_bytes);
@@ -1247,11 +1180,6 @@ mod tests {
             .expect("verifies with oracle-wire");
         assert_eq!(verified.epoch_secs(), 60);
         assert_eq!(verified.get("c-1").map(|c| c.expires_at), Some(NOW + 600));
-
-        assert!(!state.clients_due(NOW + 3_599));
-        assert!(state.clients_due(NOW + 3_600), "the hourly heartbeat");
-        assert!(!state.registry_due(NOW + 3_600));
-        assert!(state.registry_due(NOW + 86_400), "the daily heartbeat");
 
         let signature = governance_signer().sign_payload(&list.signing_bytes);
         assert!(matches!(

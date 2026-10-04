@@ -2,6 +2,7 @@
 //! deadlines and revocation. The cryptography is in `oracle-transport`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,9 +27,11 @@ pub struct TransportConfig {
     pub max_handshakes: usize,
     /// Time from upgrade to `auth_ok`.
     pub handshake_timeout: Duration,
-    /// Refuse new sessions when the client list is older than this, seconds.
+    /// Refuse new sessions when no fetch has confirmed the client list for
+    /// this long, seconds.
     pub admit_within: u64,
-    /// Close every session when the client list is older than this, seconds.
+    /// Close every session when no fetch has confirmed the client list for
+    /// this long, seconds.
     pub serve_within: u64,
 }
 
@@ -92,6 +95,8 @@ pub struct NodeTransport {
     hub: Arc<Hub>,
     sealer: Arc<BroadcastSealer>,
     clients: RwLock<VerifiedClientList>,
+    /// When a fetch last proved the client list current, unix seconds.
+    confirmed_at: AtomicU64,
     keys: Mutex<Keys>,
     handshakes: Arc<Semaphore>,
     config: TransportConfig,
@@ -124,6 +129,7 @@ impl NodeTransport {
             hub: Arc::new(Hub::new(max_pending, Arc::clone(&sealer))),
             sealer,
             clients: RwLock::new(clients),
+            confirmed_at: AtomicU64::new(now),
             keys: Mutex::new(Keys {
                 schedule,
                 sessions: HashMap::new(),
@@ -204,7 +210,7 @@ impl NodeTransport {
         now: u64,
     ) -> Result<(HandshakeMessage, Established), TransportError> {
         let clients = self.read_clients();
-        if now.saturating_sub(clients.effective_from()) > self.config.admit_within {
+        if self.unconfirmed_for(now) > self.config.admit_within {
             return Err(TransportError::Malformed(
                 "the node's client list is stale; try another node".to_owned(),
             ));
@@ -259,8 +265,7 @@ impl NodeTransport {
     /// Advances the key schedule, closes sessions past their deadline, and
     /// enforces the freshness limit. Call about once a second.
     pub fn tick(&self, now: u64) {
-        let stale =
-            now.saturating_sub(self.read_clients().effective_from()) > self.config.serve_within;
+        let stale = self.unconfirmed_for(now) > self.config.serve_within;
         let mut keys = self.lock_keys();
         if stale {
             close_all(&mut keys.sessions, CloseReason::Stale);
@@ -286,6 +291,15 @@ impl NodeTransport {
                 true
             }
         });
+    }
+
+    /// Records that a fetch proved the current client list is still the latest.
+    pub fn confirm_clients(&self, now: u64) {
+        self.confirmed_at.fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn unconfirmed_for(&self, now: u64) -> u64 {
+        now.saturating_sub(self.confirmed_at.load(Ordering::Relaxed))
     }
 
     /// Adopts a newer client list. Sessions whose client was removed, rekeyed
@@ -347,6 +361,7 @@ impl NodeTransport {
             warn!(revoked, "client sessions revoked; broadcast keys rotated");
         }
         *clients = verified;
+        self.confirm_clients(now);
         Ok(revoked)
     }
 }

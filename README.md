@@ -222,16 +222,19 @@ finds out from the first frame it cannot verify:
    `RetiredKey` and never trigger another fetch. A few right after a rotation
    are frames that were in flight. A steady stream is a stolen key in use.
 
-The canister re-signs the document daily even when nothing changed, so a
-registry older than `max_registry_age` (48h by default) means the fetch path is
-broken or newer versions are being withheld. Every feed is then reported
-`Degraded` with `Concern::RegistryStale`. The prices are still verified; the
-membership may not be current.
+The canister publishes only when something changes, so a document's age says
+nothing. Instead, every fetch checks the canister's IC certificate, which is at
+most five minutes old, and confirms the registry. A registry unconfirmed for
+longer than `max_registry_age` (48h by default) means the fetch path is broken or
+newer versions are being withheld. Every feed is then reported `Degraded` with
+`Concern::RegistryStale`. The prices are still verified; the membership may not
+be current.
 
-`HttpRegistrySource::canister(id)` fetches `/registry.json` from the canister.
-The canister certifies that response on every publish, so the gateway accepts a
-plain query. The document carries its own governance signature either way, which
-is the check every consumer runs.
+`HttpRegistrySource::canister(id)` fetches `/registry.json` from the canister's
+`raw` domain and checks the certificate against the mainnet root key. On another
+network, pass `Certification::new(id, root_key)` to `HttpRegistrySource::new`.
+The governance signature is checked on top: the certificate says the document is
+current, the signature says it is genuine.
 
 Stored frames are a separate path. `verify_historical` checks a frame against
 the key that was live at its publish time, using the node's key history from the
@@ -308,10 +311,12 @@ is still accepted in a key file or `key_env` so the local playground can hand a
 seeded key to the node; a real key never goes there. There is no KMS and no HSM
 by design (SPEC §9.2): a cloud key service is a third party in the signing path.
 
-The registry comes from `registry.path`, a file, or `registry.url`, usually the
-registry canister's `/registry.json`. A file is pinned
-until the node restarts. Either way the document is verified against the pinned
-`governance_address` before anything else happens.
+The registry comes from `registry.path`, a file, or `registry.url`, the
+registry canister's `/registry.json`. A file is pinned until the node restarts. A
+URL response must carry the certificate of `registry.canister_id`, checked
+against `registry.root_key` off mainnet; `clients.url` must too. Either way the
+document is verified against the pinned `governance_address` before anything
+else happens.
 
 At startup the node checks that the registry actually authorises its own signing
 address, and **refuses to start** if not. This is a hard failure rather than a
@@ -411,14 +416,18 @@ right now, and which keys it held before.
   threshold ECDSA key on secp256k1, so the governance address consumers pin is
   the address of that key and `Registry::verify` is unchanged. No governance
   private key exists anywhere. Consumers need no Internet Computer agent; they
-  fetch `/registry.json` and verify the signature they already verify.
+  fetch `/registry.json`, check its IC certificate, and verify the signature
+  they already verify.
 - **One live key per node.** `rotate_key` is an atomic swap. The old key gets a
   `retired_at` and stays in `get_key_history` for stored-frame verification,
   but it never verifies a live frame again, and its address can never be listed
   again by anyone.
 - **Rules are code, not policy.** One rotation fleet-wide per window, never
-  below `min_nodes`, a heartbeat re-sign so a withheld document is detectable
-  by age. Each rule is a unit test in `state.rs`, with no canister runtime.
+  below `min_nodes`. Each rule is a unit test in `state.rs`, with no canister
+  runtime.
+- **Publication only on change.** Each change signs one new version; nothing
+  re-signs on a timer. A failed signing round changes nothing. Freshness is
+  the IC certificate on each fetch, not the document's age.
 - **Governance is the controller set, and the only caller.** Nodes never call
   the canister. An operator sends `node-entry.json` or `rotation-cert.json` to
   governance, which runs `add_node` or `rotate_key`. `inspect_message` drops
@@ -564,9 +573,9 @@ a restarted node began its sequence numbers at zero and was refused as a replay
 for every frame until it caught up, which is why `Aggregator::with_sequence_floor`
 exists.
 
-The local gateway, like the mainnet one, verifies responses. The canister serves
-`/registry.json` as a certified query, so the same URL shape works in both places
-and no `raw` domain is involved.
+The SDK and the node check the canister's certificate themselves, against the
+replica's root key from `dfx ping`. The local gateway passes the certificate
+headers through, as the mainnet `raw` domain does.
 
 ### Rotating a signing key
 
@@ -601,7 +610,7 @@ to sign a document; the rules a rotation needs live in the canister.
 from the consumer's side: never learning about the new key, fetching on every
 unknown frame, a retired key that keeps verifying, the replay floor resetting
 with the new key, a de-listed node counting until its last update ages out, and a
-stale document reported as healthy.
+registry the source stops confirming reported as healthy.
 
 ### End to end
 

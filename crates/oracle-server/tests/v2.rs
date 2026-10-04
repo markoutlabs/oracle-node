@@ -51,6 +51,10 @@ struct Node {
 }
 
 async fn start(list: &ClientList, config: TransportConfig) -> Node {
+    start_confirmed_at(list, config, unix_now()).await
+}
+
+async fn start_confirmed_at(list: &ClientList, config: TransportConfig, confirmed_at: u64) -> Node {
     let verified = list
         .verify(governance_key().address(), 0)
         .expect("verifies");
@@ -60,7 +64,7 @@ async fn start(list: &ClientList, config: TransportConfig) -> Node {
         verified,
         config,
         64,
-        unix_now(),
+        confirmed_at,
     );
     let symbols: Vec<Symbol> = vec![BTC.parse().expect("valid")];
     let state = ServerState::new(NODE_ID, &symbols, test_registry(), Arc::clone(&transport));
@@ -429,22 +433,13 @@ async fn a_grid_rotation_delivers_the_next_key_before_using_it() {
     assert!(session.keys.open(&sealed).is_ok());
 }
 
+/// Freshness is the last fetch that confirmed the list, never its issue time:
+/// the canister publishes only on change.
 #[tokio::test]
-async fn a_stale_client_list_stops_admissions_then_sessions() {
-    let stale = ClientList::sign(
-        &governance_key(),
-        1,
-        unix_now() - 100,
-        60,
-        vec![ClientEntry {
-            client_id: "c-1".to_owned(),
-            pubkey: key(1).public_key(),
-            expires_at: unix_now() + 3_600,
-        }],
-    )
-    .expect("signs");
+async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
+    let list = client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]);
     let node = start(
-        &stale,
+        &list,
         TransportConfig {
             admit_within: 1_000,
             serve_within: 1_000,
@@ -454,12 +449,13 @@ async fn a_stale_client_list_stops_admissions_then_sessions() {
     .await;
     let (mut socket, mut session) = connect(&node, "c-1", &key(1)).await;
 
-    let refusing = start(
-        &stale,
+    let refusing = start_confirmed_at(
+        &list,
         TransportConfig {
             admit_within: 50,
             ..TransportConfig::default()
         },
+        unix_now() - 100,
     )
     .await;
     let mut refused = open(&refusing).await;
@@ -473,11 +469,21 @@ async fn a_stale_client_list_stops_admissions_then_sessions() {
         Some(HandshakeMessage::Refused { .. })
     ));
 
-    // Past the serve limit, live sessions close too.
-    node.transport.tick(unix_now() + 1_000);
-    assert!(matches!(
-        receive(&mut socket, &mut session).await,
-        Received::Control(Control::Close(CloseReason::Stale))
-    ));
+    // A fetch of the same version is a confirmation and keeps sessions open.
+    node.transport.confirm_clients(unix_now() + 900);
+    node.transport.tick(unix_now() + 1_100);
+    assert_eq!(node.transport.session_count(), 1);
+
+    // Past the serve limit, live sessions close too. The earlier tick rotated
+    // the keys, so key updates arrive first.
+    node.transport.tick(unix_now() + 2_000);
+    let reason = loop {
+        match receive(&mut socket, &mut session).await {
+            Received::Control(Control::KeyUpdate(_)) => {}
+            Received::Control(Control::Close(reason)) => break reason,
+            _ => panic!("expected key updates, then a close"),
+        }
+    };
+    assert_eq!(reason, CloseReason::Stale);
     assert_eq!(node.transport.session_count(), 0);
 }

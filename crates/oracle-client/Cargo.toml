@@ -14,7 +14,11 @@ oracle-types.workspace = true
 oracle-wire.workspace = true
 
 backon.workspace = true
+candid.workspace = true
 futures-util.workspace = true
+hex.workspace = true
+ic-http-certification.workspace = true
+ic-response-verification.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

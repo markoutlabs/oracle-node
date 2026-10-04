@@ -15,14 +15,15 @@ use candid::{CandidType, Decode, Encode, Principal};
 use ic_http_certification::StatusCode;
 use ic_response_verification::types::VerificationInfo;
 use ic_response_verification::{ResponseVerificationError, verify_request_response_pair};
+use oracle_client::{
+    Certification, FetchError, HttpDocumentSource, HttpRegistrySource, RegistrySource as _,
+};
 use oracle_registry_canister::{HttpRequest, HttpResponse, InitArgs};
 use oracle_wire::{ClientList, NodeEntry, Registry, Signer, SigningKeyCert, VerifyError};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 use serde::de::DeserializeOwned;
 
 const ROTATION_WINDOW: u64 = 600;
-const HEARTBEAT: u64 = 86_400;
-const CLIENTS_HEARTBEAT: u64 = 3_600;
 const REGISTRY: &str = "/registry.json";
 const CLIENTS: &str = "/clients.json";
 const MAX_CERT_AGE_NS: u128 = 300 * 1_000_000_000;
@@ -86,6 +87,10 @@ struct Harness {
 
 impl Harness {
     fn new(min_nodes: u16) -> Self {
+        Self::with_key(min_nodes, "dfx_test_key")
+    }
+
+    fn with_key(min_nodes: u16, key_name: &str) -> Self {
         // The NNS subnet supplies the root key that certificates chain to.
         let pic = PocketIcBuilder::new()
             .with_server_binary(server_binary())
@@ -103,13 +108,11 @@ impl Harness {
         let canister = pic.create_canister_on_subnet(Some(governance), None, app_subnet);
         pic.add_cycles(canister, 1_000_000_000_000_000);
         let args = Encode!(&InitArgs {
-            key_name: "dfx_test_key".to_owned(),
+            key_name: key_name.to_owned(),
             rotation_window_secs: ROTATION_WINDOW,
-            heartbeat_secs: HEARTBEAT,
             min_nodes,
             recommended: 3,
             epoch_secs: None,
-            clients_heartbeat_secs: Some(CLIENTS_HEARTBEAT),
         })
         .expect("encodes");
         pic.install_canister(canister, build_wasm(), args, Some(governance));
@@ -166,6 +169,27 @@ impl Harness {
             &root_key,
             2,
         )
+    }
+
+    /// The check the SDK and the nodes run on a fetched document, at `now_ns`.
+    fn sdk_check(
+        &self,
+        path: &str,
+        response: &HttpResponse<'static>,
+        now_ns: u64,
+    ) -> Result<Vec<u8>, FetchError> {
+        self.certification().verify(
+            path,
+            response.status_code().as_u16(),
+            response.headers().to_vec(),
+            response.body().to_vec(),
+            now_ns,
+        )
+    }
+
+    fn certification(&self) -> Certification {
+        let root_key = self.pic.root_key().expect("the NNS subnet has a root key");
+        Certification::new(&self.canister.to_text(), &hex::encode(root_key)).expect("valid")
     }
 
     fn add_args(&self, op: &Operator) -> Vec<u8> {
@@ -419,17 +443,29 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
             .contains("already known")
     );
 
-    // The heartbeat re-signs even with nothing changed, so a withheld document
-    // is detectable by age.
+    // Publication is on demand: a quiet day signs nothing. Freshness comes from
+    // the certificate, which the subnet renews with its state.
     let before = h.registry();
-    h.pass_time(HEARTBEAT + 5);
+    h.pass_time(86_400);
     let after = h.registry();
-    assert!(after.version > before.version, "heartbeat published");
-    assert!(after.effective_from > before.effective_from);
-    assert_eq!(after.nodes, before.nodes);
-    after
-        .verify(governance, before.version)
-        .expect("heartbeat version verifies");
+    assert_eq!(after, before, "nothing re-signs on a timer");
+    let response = h.get_json(REGISTRY);
+    let now_ns = h.pic.get_time().as_nanos_since_unix_epoch();
+    let body = h
+        .sdk_check(REGISTRY, &response, now_ns)
+        .expect("the unchanged document is certified as current");
+    assert_eq!(
+        serde_json::from_slice::<Registry>(&body).expect("parses"),
+        after
+    );
+    let replayed_later = now_ns + 6 * 60 * 1_000_000_000;
+    assert!(
+        matches!(
+            h.sdk_check(REGISTRY, &response, replayed_later),
+            Err(FetchError::Uncertified(_))
+        ),
+        "a replayed response goes stale with its certificate"
+    );
 
     // The certification tree is not in stable memory. `post_upgrade` rebuilds it.
     h.pic
@@ -505,19 +541,18 @@ fn the_canister_publishes_a_certified_client_list() {
             .is_empty()
     );
 
-    // The hourly heartbeat re-signs the list with nothing changed. It signs the
-    // registry first, so allow a few more rounds than one signature needs.
-    h.pass_time(CLIENTS_HEARTBEAT + 5);
-    let mut beat = removed.clone();
-    for _ in 0..30 {
-        beat = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
-        if beat.version > 3 {
-            break;
-        }
-        h.pic.tick();
-    }
-    assert!(beat.version > 3, "heartbeat published");
-    assert!(beat.effective_from > removed.effective_from);
+    // Nothing re-signs on a timer; governance can re-sign on demand.
+    h.pass_time(3_600);
+    let quiet: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
+    assert_eq!(quiet, removed);
+    let version: Result<u64, String> = h.update(
+        h.governance,
+        "republish_clients",
+        Encode!().expect("encodes"),
+    );
+    assert_eq!(version, Ok(4));
+    let beat: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
+    assert_eq!(beat.clients, removed.clients);
 
     h.pic
         .upgrade_canister(
@@ -533,4 +568,88 @@ fn the_canister_publishes_a_certified_client_list() {
     }
     let after: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
     assert_eq!(after, beat);
+}
+
+/// A round works on a copy, so a signature that fails leaves no trace and
+/// governance retries the same call.
+#[test]
+fn a_failed_signing_round_changes_nothing() {
+    let h = Harness::with_key(1, "no_such_key");
+    let a = Operator::new(1, "oracle-a");
+    let refused = h.add(&a).expect_err("the key does not exist");
+    assert!(refused.contains("ecdsa_public_key"), "{refused}");
+    let version: u64 = h.query("get_version", Encode!().expect("encodes"));
+    assert_eq!(version, 0);
+    let history: Option<String> =
+        h.query("get_key_history", Encode!(&"oracle-a").expect("encodes"));
+    assert_eq!(history, None, "the node was not listed");
+    assert!(
+        h.add(&a).expect_err("still no key").contains("ecdsa"),
+        "a retry runs the whole round again, not `already listed`"
+    );
+}
+
+/// The SDK and the nodes fetch through a real HTTP gateway and check the
+/// certificate themselves.
+#[test]
+fn the_sdk_checks_the_certificate_through_the_http_gateway() {
+    let mut h = Harness::new(1);
+    let a = Operator::new(1, "oracle-a");
+    assert_eq!(h.add(&a), Ok(1));
+    let client = Signer::from_secret_bytes([0x42; 32]).expect("valid key");
+    let args = Encode!(
+        &"c-1",
+        &client.public_key().to_string(),
+        &(h.now() + 86_400)
+    )
+    .expect("encodes");
+    let version: Result<u64, String> = h.update(h.governance, "add_client", args);
+    assert_eq!(version, Ok(1));
+    let registry = h.registry();
+    let certification = h.certification();
+    let gateway = h.pic.make_live(None);
+    let url = |path: &str| format!("{gateway}{}?canisterId={}", &path[1..], h.canister);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let fetched = runtime
+        .block_on(
+            HttpRegistrySource::new(&url(REGISTRY), certification.clone())
+                .expect("builds")
+                .fetch(),
+        )
+        .expect("certified registry");
+    assert_eq!(fetched, registry);
+    let clients: ClientList = runtime
+        .block_on(
+            HttpDocumentSource::new(&url(CLIENTS), certification)
+                .expect("builds")
+                .fetch(),
+        )
+        .expect("certified client list");
+    assert_eq!(clients.version, 1);
+
+    let root_key = hex::encode(h.pic.root_key().expect("root key"));
+    for (label, wrong) in [
+        (
+            "another canister",
+            Certification::new("aaaaa-aa", &root_key).expect("valid"),
+        ),
+        (
+            "another network",
+            Certification::mainnet(&h.canister.to_text()).expect("valid"),
+        ),
+    ] {
+        let result = runtime.block_on(
+            HttpRegistrySource::new(&url(REGISTRY), wrong)
+                .expect("builds")
+                .fetch(),
+        );
+        assert!(
+            matches!(result, Err(FetchError::Uncertified(_))),
+            "{label}: {result:?}"
+        );
+    }
 }
