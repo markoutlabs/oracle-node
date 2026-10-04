@@ -4,8 +4,12 @@
 //! consumers can stand up a fake node. **The keys are derived from small
 //! integers — never use them in production.**
 
+use std::sync::Arc;
+
 use oracle_types::{FeedId, Flags, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{NodeEntry, Quorum, Registry, Signer, SigningKeyCert};
+use oracle_wire::{ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer, SigningKeyCert};
+
+use crate::transport::{NodeTransport, TransportConfig, unix_now};
 
 /// The node id used by [`test_registry`].
 pub const NODE_ID: &str = "oracle-test-1";
@@ -60,7 +64,7 @@ pub fn test_registry() -> Registry {
         node_id: NODE_ID.to_owned(),
         operator: "test".to_owned(),
         identity_pubkey: identity.public_key(),
-        endpoints: vec!["ws://127.0.0.1:0/v1/ws".to_owned()],
+        endpoints: vec!["ws://127.0.0.1:0/v2/ws".to_owned()],
         signing_keys: vec![cert],
         weight: 1,
     };
@@ -98,4 +102,58 @@ pub fn sample_update(feed_id: FeedId) -> PriceUpdate {
         num_sources: 5,
         sources: Venue::ALL.into_iter().collect::<VenueSet>(),
     }
+}
+
+/// The client id of [`client_key`] in [`test_client_list`].
+pub const CLIENT_ID: &str = "c-1";
+
+/// The test client's API key.
+///
+/// # Panics
+///
+/// Cannot panic: the seed is a valid curve scalar.
+#[must_use]
+pub fn client_key() -> Signer {
+    Signer::from_secret_bytes([0x51; 32]).expect("valid test key")
+}
+
+/// A client list naming [`client_key`] for a day, signed by [`governance_key`].
+///
+/// # Panics
+///
+/// Cannot panic: the fixture encodes.
+#[must_use]
+pub fn test_client_list() -> ClientList {
+    ClientList::sign(
+        &governance_key(),
+        1,
+        unix_now(),
+        60,
+        vec![ClientEntry {
+            client_id: CLIENT_ID.to_owned(),
+            pubkey: client_key().public_key(),
+            expires_at: unix_now() + 86_400,
+        }],
+    )
+    .expect("fixture client list encodes")
+}
+
+/// A transport that admits [`client_key`] and signs with [`signing_key`].
+///
+/// # Panics
+///
+/// Cannot panic: the fixture list is signed by the fixture governance key.
+#[must_use]
+pub fn test_transport() -> Arc<NodeTransport> {
+    let clients = test_client_list()
+        .verify(governance_key().address(), 0)
+        .expect("fixture client list verifies");
+    NodeTransport::new(
+        NODE_ID,
+        Arc::new(signing_key()),
+        clients,
+        TransportConfig::default(),
+        64,
+        unix_now(),
+    )
 }

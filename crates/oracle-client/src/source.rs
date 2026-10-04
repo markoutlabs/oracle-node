@@ -33,18 +33,16 @@ pub trait RegistrySource: Send + Sync {
     fn fetch(&self) -> RegistryFuture<'_>;
 }
 
-/// Fetches the registry document over HTTP.
-///
-/// The response is not checked beyond parsing. The document carries its own
-/// governance signature, which is the check every consumer runs, so a
-/// tampering gateway can only serve what governance signed. Freshness is the
-/// client's `max_registry_age`.
-pub struct HttpRegistrySource {
+/// Fetches a governance-signed JSON document over HTTP: the registry or the
+/// client list. The response is not checked beyond parsing; the document's own
+/// governance signature is the check, so a tampering gateway can only serve
+/// what governance signed.
+pub struct HttpDocumentSource {
     url: String,
     client: reqwest::Client,
 }
 
-impl HttpRegistrySource {
+impl HttpDocumentSource {
     /// How long one fetch may take.
     pub const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -70,6 +68,54 @@ impl HttpRegistrySource {
         })
     }
 
+    /// The URL fetched.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Fetches and parses the document. Unverified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::Transport`] for a transport failure or an error
+    /// status, and [`FetchError::Malformed`] for a body that does not parse.
+    pub async fn fetch<T: serde::de::DeserializeOwned>(&self) -> Result<T, FetchError> {
+        let text = self
+            .client
+            .get(&self.url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| FetchError::Transport(error.to_string()))?
+            .text()
+            .await
+            .map_err(|error| FetchError::Transport(error.to_string()))?;
+        serde_json::from_str(&text).map_err(|error| FetchError::Malformed(error.to_string()))
+    }
+}
+
+/// Fetches the registry document over HTTP. Freshness is the client's
+/// `max_registry_age`.
+pub struct HttpRegistrySource {
+    document: HttpDocumentSource,
+}
+
+impl HttpRegistrySource {
+    /// How long one fetch may take.
+    pub const TIMEOUT: Duration = HttpDocumentSource::TIMEOUT;
+
+    /// A source at an explicit URL.
+    ///
+    /// # Errors
+    ///
+    /// See [`HttpDocumentSource::new`].
+    pub fn new(url: impl Into<String>) -> Result<Self, FetchError> {
+        Ok(Self {
+            document: HttpDocumentSource::new(url)?,
+        })
+    }
+
     /// The registry canister's `/registry.json` on the Internet Computer.
     ///
     /// The canister certifies the response, so no `raw` domain is needed. The
@@ -85,25 +131,13 @@ impl HttpRegistrySource {
     /// The URL fetched.
     #[must_use]
     pub fn url(&self) -> &str {
-        &self.url
+        self.document.url()
     }
 }
 
 impl RegistrySource for HttpRegistrySource {
     fn fetch(&self) -> RegistryFuture<'_> {
-        Box::pin(async move {
-            let text = self
-                .client
-                .get(&self.url)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .map_err(|error| FetchError::Transport(error.to_string()))?
-                .text()
-                .await
-                .map_err(|error| FetchError::Transport(error.to_string()))?;
-            serde_json::from_str(&text).map_err(|error| FetchError::Malformed(error.to_string()))
-        })
+        Box::pin(self.document.fetch::<Registry>())
     }
 }
 

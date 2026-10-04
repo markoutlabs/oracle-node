@@ -1,0 +1,29 @@
+[package]
+name = "oracle-transport"
+description = "v2 transport: client auth handshake, session channel, and broadcast-key encryption. Pure, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oracle-wire.workspace = true
+
+aes-gcm-siv.workspace = true
+# 0.4, not the workspace 0.3: `hpke` takes `rand_core` 0.10 RNGs, and only
+# getrandom 0.4's `SysRng` implements them.
+getrandom = { version = "0.4", features = ["sys_rng"] }
+hex = { workspace = true, features = ["serde"] }
+hkdf.workspace = true
+hpke.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

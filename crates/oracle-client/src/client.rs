@@ -10,10 +10,14 @@ use std::time::Duration;
 
 use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
 use futures_util::{SinkExt as _, StreamExt as _};
+use oracle_transport::{
+    ClientHandshake, ClientSession, Control, HandshakeMessage, KEY_GRACE_SECS, TYPE_CONTROL,
+    TYPE_FRAME, TransportError, os_rng,
+};
 use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
-use oracle_wire::{Address, Registry, VerifiedRegistry, VerifyError, feed_id};
+use oracle_wire::{Address, Registry, Signer, VerifiedRegistry, VerifyError, feed_id};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -78,6 +82,10 @@ pub enum ClientError {
     #[error("no node endpoints available")]
     NoEndpoints,
 
+    /// Nodes serve only listed clients; set one with `client_key`.
+    #[error("no client key: nodes serve only listed clients (SPEC §6.1)")]
+    NoClientKey,
+
     /// A connection failed.
     #[error("connection to {endpoint} failed: {reason}")]
     Connect {
@@ -108,9 +116,28 @@ pub struct OracleClientBuilder {
     refresh_interval: Duration,
     poll_interval: Duration,
     max_registry_age: Duration,
+    credentials: Option<Arc<Credentials>>,
+}
+
+/// A client's identity on the nodes.
+struct Credentials {
+    client_id: String,
+    key: Signer,
 }
 
 impl OracleClientBuilder {
+    /// Authenticates to nodes (SPEC §6.1) as `client_id`, with the client's
+    /// secp256k1 API key. Governance must list the key in the client list.
+    /// Needed for [`OracleClient::subscribe`].
+    #[must_use]
+    pub fn client_key(mut self, client_id: impl Into<String>, key: Signer) -> Self {
+        self.credentials = Some(Arc::new(Credentials {
+            client_id: client_id.into(),
+            key,
+        }));
+        self
+    }
+
     /// Sets where newer registry versions are fetched from.
     ///
     /// Without a source the client stays on the registry it was built with
@@ -212,6 +239,7 @@ impl OracleClientBuilder {
         self.quorum_config.quorum = self.quorum;
 
         let (tx, rx) = mpsc::channel(self.channel_capacity);
+        let (registry_watch, _) = watch::channel(self.registry.clone());
         Ok(OracleClient {
             verifier: Verifier::new(self.registry.clone(), self.verify),
             registry: self.registry,
@@ -231,6 +259,8 @@ impl OracleClientBuilder {
             runtime: None,
             connections: HashMap::new(),
             polling: false,
+            credentials: self.credentials,
+            registry_watch,
         })
     }
 }
@@ -277,6 +307,9 @@ impl ClientStats {
 enum Inbound {
     Frame(Vec<u8>),
     Polled(Result<Registry, FetchError>),
+    /// A node signed `auth_ok` with a key this registry does not list: it
+    /// probably rotated. The handshake twin of an unknown signer on a frame.
+    UnknownNodeKey,
 }
 
 struct NodeConnection {
@@ -305,6 +338,10 @@ pub struct OracleClient {
     runtime: Option<Handle>,
     connections: HashMap<String, NodeConnection>,
     polling: bool,
+    credentials: Option<Arc<Credentials>>,
+    /// The trusted registry for connection tasks, which check each node's
+    /// `auth_ok` against its live key.
+    registry_watch: watch::Sender<VerifiedRegistry>,
 }
 
 impl OracleClient {
@@ -319,6 +356,7 @@ impl OracleClient {
             quorum_config: QuorumConfig::default(),
             channel_capacity: 4_096,
             source: None,
+            credentials: None,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             poll_interval: DEFAULT_REGISTRY_POLL_INTERVAL,
             max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
@@ -460,6 +498,7 @@ impl OracleClient {
 
         let version = verified.version();
         self.verifier.set_registry(verified.clone());
+        self.registry_watch.send_replace(verified.clone());
         self.registry = verified;
         self.reconcile_connections();
         Ok(version)
@@ -471,9 +510,13 @@ impl OracleClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::InvalidSymbol`] for an unparseable symbol, or
+    /// Returns [`ClientError::NoClientKey`] without a client key,
+    /// [`ClientError::InvalidSymbol`] for an unparseable symbol, or
     /// [`ClientError::NoEndpoints`] if the registry lists none.
     pub async fn subscribe(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
+        if self.credentials.is_none() {
+            return Err(ClientError::NoClientKey);
+        }
         let mut parsed = Vec::with_capacity(symbols.len());
         for text in symbols {
             let symbol: Symbol = text
@@ -502,7 +545,9 @@ impl OracleClient {
     }
 
     fn reconcile_connections(&mut self) {
-        let (Some(request), Some(runtime)) = (&self.subscription, &self.runtime) else {
+        let (Some(request), Some(runtime), Some(credentials)) =
+            (&self.subscription, &self.runtime, &self.credentials)
+        else {
             return;
         };
         let wanted: HashMap<&str, &str> = self
@@ -531,8 +576,13 @@ impl OracleClient {
             }
             let cancel = self.shutdown.child_token();
             runtime.spawn(node_loop(
-                endpoint.to_owned(),
-                request.clone(),
+                NodeTarget {
+                    node_id: node_id.to_owned(),
+                    endpoint: endpoint.to_owned(),
+                    request: request.clone(),
+                    credentials: Arc::clone(credentials),
+                    registry: self.registry_watch.subscribe(),
+                },
                 self.inbound_tx.clone(),
                 cancel.clone(),
             ));
@@ -667,6 +717,16 @@ impl OracleClient {
                     }
                     continue;
                 }
+                Inbound::UnknownNodeKey => {
+                    let now_ns = now_unix_nanos();
+                    if self.refresh_due(now_ns) {
+                        self.last_refresh_attempt_ns = Some(now_ns);
+                        if let Err(error) = self.refresh_from_source().await {
+                            warn!(%error, "registry refresh failed");
+                        }
+                    }
+                    continue;
+                }
             };
             let now_ns = now_unix_nanos();
             match self.ingest_with_refresh(&frame, now_ns).await {
@@ -710,7 +770,7 @@ impl Drop for OracleClient {
 /// Builds the subscribe control frame.
 fn subscribe_frame(symbols: &[Symbol]) -> String {
     let feeds: Vec<String> = symbols.iter().map(ToString::to_string).collect();
-    serde_json::json!({ "op": "subscribe", "feeds": feeds, "encoding": "binary" }).to_string()
+    serde_json::json!({ "op": "subscribe", "feeds": feeds }).to_string()
 }
 
 /// Ceiling on the reconnect delay.
@@ -763,25 +823,32 @@ async fn poll_loop(
     }
 }
 
-/// Connects to one node and forwards its binary frames, reconnecting on failure.
-async fn node_loop(
+/// Everything one connection task needs.
+struct NodeTarget {
+    node_id: String,
     endpoint: String,
     request: String,
-    tx: mpsc::Sender<Inbound>,
-    shutdown: CancellationToken,
-) {
+    credentials: Arc<Credentials>,
+    registry: watch::Receiver<VerifiedRegistry>,
+}
+
+/// Time from connect to `auth_ok`.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connects to one node and forwards its binary frames, reconnecting on failure.
+async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: CancellationToken) {
     let mut backoff = reconnect_ladder();
     while !shutdown.is_cancelled() {
         // Also drops a de-listed node in the middle of a handshake.
         let outcome = tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
-            outcome = connect_and_pump(&endpoint, &request, &tx) => outcome,
+            outcome = connect_and_pump(&target, &tx) => outcome,
         };
         match outcome {
             Ok(()) => backoff = reconnect_ladder(),
             Err(reason) => {
-                warn!(%endpoint, %reason, "node connection failed");
+                warn!(endpoint = %target.endpoint, %reason, "node connection failed");
             }
         }
         if shutdown.is_cancelled() {
@@ -796,32 +863,127 @@ async fn node_loop(
     }
 }
 
-async fn connect_and_pump(
-    endpoint: &str,
-    request: &str,
-    tx: &mpsc::Sender<Inbound>,
-) -> Result<(), String> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(endpoint)
+async fn connect_and_pump(target: &NodeTarget, tx: &mpsc::Sender<Inbound>) -> Result<(), String> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(&target.endpoint)
         .await
         .map_err(|e| e.to_string())?;
+    pump(&mut socket, target, tx).await
+}
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// One session: handshake, then sealed control and broadcast frames. Opened
+/// frames go to the verifier like any other; decryption proves nothing.
+async fn pump(
+    socket: &mut Socket,
+    target: &NodeTarget,
+    tx: &mpsc::Sender<Inbound>,
+) -> Result<(), String> {
+    let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(socket, target, tx))
+        .await
+        .map_err(|_| "handshake timed out".to_owned())??;
+    // Only now, after the node proved its live key, do the subscriptions leave.
+    let subscribe = session
+        .sealer
+        .seal(&Control::App(target.request.as_bytes().to_vec()))
+        .map_err(|e| e.to_string())?;
     socket
-        .send(Message::Text(request.into()))
+        .send(Message::Binary(subscribe.into()))
         .await
         .map_err(|e| e.to_string())?;
 
+    let mut missing_since: Option<u64> = None;
     while let Some(message) = socket.next().await {
-        match message.map_err(|e| e.to_string())? {
-            Message::Binary(bytes) => {
-                if tx.send(Inbound::Frame(bytes.to_vec())).await.is_err() {
-                    return Ok(());
+        let bytes = match message.map_err(|e| e.to_string())? {
+            Message::Binary(bytes) => bytes,
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            Message::Text(_) => return Err("plaintext after the handshake".to_owned()),
+            Message::Close(_) => return Ok(()),
+        };
+        let now = now_unix_nanos() / NANOS_PER_SEC;
+        match bytes.get(1).copied() {
+            Some(TYPE_FRAME) => {
+                session.keys.prune(now);
+                match session.keys.open(&bytes) {
+                    Ok(frame) => {
+                        missing_since = None;
+                        if tx.send(Inbound::Frame(frame)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(TransportError::UnknownKey) => {
+                        let since = *missing_since.get_or_insert(now);
+                        if now.saturating_sub(since) > KEY_GRACE_SECS {
+                            return Err("no key for the node's frames".to_owned());
+                        }
+                    }
+                    Err(error) => return Err(error.to_string()),
                 }
             }
-            // Control replies and acknowledgements; the data path is binary.
-            Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-            Message::Close(_) => return Ok(()),
+            Some(TYPE_CONTROL) => match session.opener.open(&bytes).map_err(|e| e.to_string())? {
+                Control::KeyUpdate(grant) => session.keys.insert(grant),
+                Control::SessionUpdate { deadline } => session.deadline = deadline,
+                Control::Close(reason) => {
+                    return Err(format!("node closed the session: {reason:?}"));
+                }
+                Control::App(_) => {}
+            },
+            _ => return Err("unknown message type".to_owned()),
         }
     }
     Ok(())
+}
+
+async fn handshake(
+    socket: &mut Socket,
+    target: &NodeTarget,
+    tx: &mpsc::Sender<Inbound>,
+) -> Result<ClientSession, String> {
+    let credentials = &target.credentials;
+    let challenge = next_handshake(socket).await?;
+    let (auth, waiting) = ClientHandshake::new(&target.node_id, &mut os_rng())
+        .respond(&challenge, &credentials.client_id, &credentials.key)
+        .map_err(|e| e.to_string())?;
+    let auth = serde_json::to_string(&auth).map_err(|e| e.to_string())?;
+    socket
+        .send(Message::Text(auth.into()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let auth_ok = next_handshake(socket).await?;
+    let expected = live_signer(&target.registry.borrow(), &target.node_id)?;
+    waiting.finish(&auth_ok, expected).map_err(|error| {
+        if matches!(error, TransportError::UntrustedNode { .. }) {
+            let _ = tx.try_send(Inbound::UnknownNodeKey);
+        }
+        error.to_string()
+    })
+}
+
+async fn next_handshake(socket: &mut Socket) -> Result<HandshakeMessage, String> {
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(&text).map_err(|e| e.to_string());
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(other)) => return Err(format!("expected a handshake message, got {other:?}")),
+            Some(Err(error)) => return Err(error.to_string()),
+            None => return Err("closed during the handshake".to_owned()),
+        }
+    }
+}
+
+/// The node's live signing address in the trusted registry.
+fn live_signer(registry: &VerifiedRegistry, node_id: &str) -> Result<Address, String> {
+    let now = now_unix_nanos();
+    registry
+        .nodes()
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .and_then(|node| node.signing_keys.iter().find(|cert| cert.covers(now)))
+        .map(|cert| cert.address)
+        .ok_or_else(|| format!("node `{node_id}` has no live key in the registry"))
 }
 
 /// Reads the wall clock in unix nanoseconds.

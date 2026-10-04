@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+oracle-transport.workspace = true
 oracle-types.workspace = true
 oracle-wire.workspace = true
 
@@ -23,7 +24,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 oracle-client.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-tungstenite = { workspace = true, features = ["connect"] }
 
 [lints]

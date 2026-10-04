@@ -2,13 +2,12 @@
 //!
 //! A node has two keys. The **identity key** is long-lived, stays encrypted on
 //! the operator's machine, and signs nothing but certificates. The **signing key** lives in process
-//! memory, signs every price update, and is rotated on a schedule. A certificate
-//! is the identity key's statement that a given signing address is authorised
-//! for a given window.
+//! memory and signs every price update. A certificate is the identity key's
+//! statement that a given signing address is authorised for a given window.
 //!
-//! The point of the split is blast radius: a stolen signing key is bad for at
-//! most its remaining validity window and is revoked by publishing a registry
-//! that omits it. A stolen identity key requires governance action.
+//! The point of the split is blast radius: a stolen signing key is revoked by
+//! publishing a registry that omits it. A stolen identity key requires
+//! governance action.
 
 use oracle_types::NANOS_PER_SEC;
 
@@ -18,6 +17,9 @@ use crate::{Address, Signature, Signer, VerifyError, WireError, domain, signer};
 
 /// Maximum length of a node identifier, in bytes.
 pub const MAX_NODE_ID_LEN: usize = 64;
+
+/// `not_after` of a certificate that never expires (SPEC §3.5).
+pub const NO_EXPIRY: u64 = u64::MAX;
 
 /// An identity key's authorisation of a signing key for a time window.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

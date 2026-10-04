@@ -24,7 +24,7 @@ enum Seen {
 
 async fn fake_node(label: &'static str, events: mpsc::UnboundedSender<Seen>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
-    let url = format!("ws://{}/v1/ws", listener.local_addr().expect("bound"));
+    let url = format!("ws://{}/v2/ws", listener.local_addr().expect("bound"));
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let events = events.clone();
@@ -55,6 +55,10 @@ fn client_for(registry: &Registry, source: Arc<TestSource>) -> OracleClient {
         .quorum(3)
         .registry_source(source)
         .registry_poll_interval(POLL)
+        .client_key(
+            "c-1",
+            oracle_wire::Signer::from_secret_bytes([0x51; 32]).expect("valid key"),
+        )
         .build()
         .expect("builds")
 }
@@ -215,4 +219,22 @@ async fn a_second_subscribe_keeps_one_connection_per_node() {
         collect(&mut client, &mut events, &restart).await,
         sorted(restart)
     );
+}
+
+#[tokio::test]
+async fn subscribing_without_a_client_key_is_refused() {
+    let registry = signed_registry(1, vec![TestNode::new(1, "oracle-1").entry()]);
+    let mut client = OracleClient::builder(
+        registry
+            .verify(governance().address(), 0)
+            .expect("verifies"),
+    )
+    .quorum(1)
+    .i_understand_this_provides_no_protection_against_a_bad_node()
+    .build()
+    .expect("builds");
+    assert!(matches!(
+        client.subscribe(&[SYMBOL]).await,
+        Err(oracle_client::ClientError::NoClientKey)
+    ));
 }

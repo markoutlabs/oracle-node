@@ -24,7 +24,9 @@ pub mod app;
 pub mod hub;
 pub mod protocol;
 pub mod testing;
+pub mod transport;
 
 pub use app::{FeedEntry, ServerState, router};
 pub use hub::{Hub, PreparedUpdate, Subscriber};
-pub use protocol::{ClientMessage, Encoding, JsonUpdate, ServerMessage};
+pub use protocol::{ClientMessage, ServerMessage};
+pub use transport::{NodeTransport, TransportConfig, unix_now};

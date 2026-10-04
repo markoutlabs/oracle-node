@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
@@ -13,7 +14,7 @@ use oracle_node::{
     InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, build_adapters,
     candid_call,
 };
-use oracle_server::{ServerState, router};
+use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -24,16 +25,6 @@ use tracing::{error, info, warn};
 /// growing without limit. Dropping the socket is recoverable; running out of
 /// memory is not.
 const INGEST_CAPACITY: usize = 8_192;
-
-/// Remaining certificate validity below which the operator is warned (SPEC §9.3).
-const CERT_EXPIRY_WARNING: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
-
-/// How often the certificate countdown is re-checked while running.
-///
-/// Checked repeatedly rather than only at startup: nodes run for months, and a
-/// certificate issued with 30 days of validity will lapse mid-flight long before
-/// anything else prompts a restart.
-const CERT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -96,9 +87,6 @@ struct InitArgs {
     /// The WebSocket endpoint subscribers will connect to.
     #[arg(long, default_value_t = InitOptions::default().endpoint)]
     endpoint: String,
-    /// Signing certificate lifetime, in days.
-    #[arg(long, default_value_t = InitOptions::default().validity_days)]
-    validity_days: u64,
     /// Write the keys, registry entry, and a starter config to DIR instead of
     /// printing the secrets to the terminal. The keys are encrypted at rest.
     #[arg(long, value_name = "DIR")]
@@ -107,7 +95,7 @@ struct InitArgs {
     /// `--out` prompts at the terminal. Recorded in the starter config.
     #[arg(long, value_name = "FILE", requires = "out")]
     passphrase_file: Option<PathBuf>,
-    /// The registry canister id. Prints the `dfx` call that submits the entry.
+    /// The registry canister id. Prints the `dfx` call governance runs to add the node.
     #[arg(long, value_name = "CANISTER_ID")]
     canister: Option<String>,
 }
@@ -117,12 +105,9 @@ struct RotateArgs {
     /// The directory `init --out` wrote: identity.key, signing.key, config.toml.
     #[arg(long, value_name = "DIR")]
     dir: PathBuf,
-    /// The registry canister id. Prints the `dfx` call that swaps the key.
+    /// The registry canister id. Prints the `dfx` call governance runs to swap the key.
     #[arg(long, value_name = "CANISTER_ID")]
     canister: Option<String>,
-    /// Signing certificate lifetime, in days.
-    #[arg(long, default_value_t = InitOptions::default().validity_days)]
-    validity_days: u64,
     /// A 0600 file holding the passphrase that opens the identity key and
     /// encrypts the new signing key. Defaults to the config's
     /// `signing.passphrase_file`, then to a prompt.
@@ -167,7 +152,7 @@ async fn start(
     let config = NodeConfig::load(&path)?;
     let resolved = config.resolve()?;
     // Both fail loudly at startup rather than at the first publish.
-    let signer = config.load_signing_key()?;
+    let signer = Arc::new(config.load_signing_key()?);
     let signer_address = signer.address();
     let registry = config.fetch_registry().await?;
 
@@ -192,21 +177,51 @@ async fn start(
         )
         .into());
     }
-    report_cert_expiry(&verified, signer_address);
 
     // Sequence numbers must never go backwards for this node, including across
     // restarts. Milliseconds since the epoch outrun any publish counter.
     let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?
         .with_sequence_floor(wall_clock_unix_nanos() / 1_000_000);
-    let mut pipeline = Pipeline::new(aggregator, signer);
+    let mut pipeline = Pipeline::new(aggregator, Arc::clone(&signer));
 
-    let state = ServerState::new(
-        &config.node_id,
-        &resolved.symbols,
-        registry,
-        config.server.max_pending_feeds,
+    // Prices go only to listed clients (SPEC §6.1), so the node fails closed:
+    // no client list, no start.
+    let clients = config
+        .fetch_client_list()
+        .await?
+        .ok_or("the config needs a [clients] section: nodes serve only listed clients")?
+        .verify(config.governance()?, 0)?;
+    info!(
+        version = clients.version(),
+        clients = clients.clients().len(),
+        "client list verified"
     );
+    // Freshness limits catch a withheld canister update. An operator's own file
+    // cannot be withheld, and is never refreshed, so it is exempt.
+    let limits = if config.clients.as_ref().is_some_and(|c| c.path.is_some()) {
+        TransportConfig {
+            admit_within: u64::MAX,
+            serve_within: u64::MAX,
+            ..TransportConfig::default()
+        }
+    } else {
+        TransportConfig::default()
+    };
+    let transport = NodeTransport::new(
+        &config.node_id,
+        Arc::clone(&signer),
+        clients,
+        limits,
+        config.server.max_pending_feeds,
+        unix_now(),
+    );
+    let state = ServerState::new(&config.node_id, &resolved.symbols, registry, transport);
     let shutdown = CancellationToken::new();
+    spawn_transport_tasks(
+        Arc::clone(state.transport()),
+        config.clone(),
+        shutdown.clone(),
+    );
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
 
     // The same adapters either way; `--record` only wraps the transport.
@@ -280,24 +295,6 @@ async fn start(
         })
     };
 
-    {
-        let verified = verified.clone();
-        let address = signer_address;
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(CERT_CHECK_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await; // The immediate first tick; startup already reported.
-            loop {
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => break,
-                    _ = ticker.tick() => report_cert_expiry(&verified, address),
-                }
-            }
-        });
-    }
-
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     info!(listen = %listener.local_addr()?, "serving subscribers");
     let server = axum::serve(listener, router(state)).with_graceful_shutdown({
@@ -318,22 +315,76 @@ async fn start(
     Ok(())
 }
 
+/// Runs the transport's clock: key rotation and deadlines every second, and a
+/// client-list poll when it comes from a URL.
+fn spawn_transport_tasks(
+    transport: Arc<NodeTransport>,
+    config: oracle_node::NodeConfig,
+    shutdown: CancellationToken,
+) {
+    {
+        let transport = Arc::clone(&transport);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    _ = ticker.tick() => transport.tick(unix_now()),
+                }
+            }
+        });
+    }
+    let Some(poll_secs) = config
+        .clients
+        .as_ref()
+        .filter(|clients| clients.url.is_some())
+        .map(|clients| clients.poll_secs.max(1))
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            match config.fetch_client_list().await {
+                Ok(Some(list)) if list.version > transport.clients_version() => {
+                    match transport.replace_clients(&list, unix_now()) {
+                        Ok(revoked) => {
+                            info!(version = list.version, revoked, "adopted client list")
+                        }
+                        Err(error) => warn!(%error, "client list refused"),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "client list fetch failed"),
+            }
+        }
+    });
+}
+
 /// Generates a node identity and prints everything needed to run it.
 fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let options = InitOptions {
         node_id: args.node_id,
         operator: args.operator,
         endpoint: args.endpoint,
-        validity_days: args.validity_days,
     };
     let out = args.out;
 
     let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
     let keys = NodeKeys::generate(options, now)?;
     let entry = serde_json::to_string_pretty(&keys.registry_entry())?;
-    let submit_call = args.canister.as_deref().map(|canister| {
+    let add_call = args.canister.as_deref().map(|canister| {
         let compact = serde_json::to_string(&keys.registry_entry()).expect("entry serialises");
-        candid_call(canister, "submit_entry", &[&compact])
+        candid_call(canister, "add_node", &[&compact])
     });
 
     println!("Generated a new identity for `{}`.\n", keys.options.node_id);
@@ -344,18 +395,10 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  signing   {}", keys.signing.address());
     println!(
-        "            What your price updates recover to. Lives in node memory and\n\
-         \x20           is what you rotate every {} days.",
-        keys.options.validity_days
+        "            What your price updates recover to. Lives in node memory.\n\
+         \x20           It never expires; rotate it if you think it leaked."
     );
-    println!(
-        "  valid     unix {} .. {} ({} days)",
-        keys.cert.not_before, keys.cert.not_after, keys.options.validity_days
-    );
-    println!(
-        "            The node refuses to start once this lapses, and warns from\n\
-         \x20           seven days out. Rotate before then."
-    );
+    println!("  valid     from unix {}, no expiry", keys.cert.not_before);
 
     match &out {
         Some(dir) => {
@@ -397,19 +440,19 @@ fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("\nSend to governance\n\n{entry}");
         }
     }
-    if let Some(call) = submit_call {
-        println!(
-            "\nSubmit the entry to the registry canister as this node's operator, then \
-             ask governance to approve it:\n\n{call}"
-        );
+    if let Some(call) = add_call {
+        println!("\nGovernance adds the node to the registry canister with:\n\n{call}");
     }
 
     println!("\nNext");
     println!(
-        "  1. Governance adds that entry and publishes a new registry version.\n     \
-         Until it does, nothing this node signs verifies for anyone."
+        "  1. Send the entry to governance. Nodes never call the canister. Until\n     \
+         governance adds it, nothing this node signs verifies for anyone."
     );
-    println!("  2. Put the governance-signed registry.json on disk.");
+    println!(
+        "  2. Point `registry.url` and `clients.url` in the config at the canister's\n     \
+         /registry.json and /clients.json."
+    );
     println!(
         "  3. Set `governance_address` in the config. Ask governance for it —\n     \
          reading it out of the registry file you were sent would let that\n     \
@@ -518,18 +561,18 @@ fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let identity = keyfile::load_signer(&args.dir.join("identity.key"), Some(&passphrase))?;
 
     let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
-    let rotation = Rotation::generate(&identity, &config.node_id, args.validity_days, now)?;
+    let rotation = Rotation::generate(&identity, &config.node_id, now)?;
     let (key_path, cert_path) = rotation.write(&args.dir, &passphrase)?;
 
     println!("Generated a new signing key for `{}`.\n", config.node_id);
     println!("  new signing  {}", rotation.signing.address());
     println!(
-        "  valid        unix {} .. {} ({} days)",
-        rotation.cert.not_before, rotation.cert.not_after, args.validity_days
+        "  valid        from unix {}, no expiry",
+        rotation.cert.not_before
     );
     println!("\nWritten");
     println!("  {}  (age, 0600 — not loaded yet)", key_path.display());
-    println!("  {}  (send to the registry)", cert_path.display());
+    println!("  {}  (send to governance)", cert_path.display());
 
     let call = args.canister.as_deref().map_or_else(
         || {
@@ -539,7 +582,8 @@ fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
         |canister| rotation.canister_call(canister),
     );
     println!(
-        "\nNext\n\n  1. Submit the rotation as this node's operator:\n\n     {call}\n\n  \
+        "\nNext\n\n  1. Send the certificate to governance. They swap the key in with:\n\n     \
+         {call}\n\n  \
          2. Once the call succeeds the registry lists only the new key. Move it into \
          place and restart:\n\n     mv {key} {live}\n\n  \
          3. Consumers pick the new key up from the first frame it signs. The old key \
@@ -548,32 +592,4 @@ fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
         live = args.dir.join("signing.key").display(),
     );
     Ok(())
-}
-
-/// Logs how long this node's signing certificate remains valid.
-///
-/// SPEC §9.3 alerts on an expiry under seven days, because a lapsed certificate
-/// is the quietest way for a node to fail: it keeps publishing, and consumers
-/// silently stop counting it toward their quorum.
-fn report_cert_expiry(registry: &oracle_wire::VerifiedRegistry, signer: oracle_wire::Address) {
-    let Some(not_after) = registry.authorized_until(signer) else {
-        return;
-    };
-    let remaining = not_after.saturating_sub(wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC);
-    if remaining <= CERT_EXPIRY_WARNING.as_secs() {
-        warn!(
-            %signer,
-            not_after,
-            remaining_secs = remaining,
-            "signing certificate expires soon; rotate now — once it lapses every \
-             subscriber refuses this node while it goes on looking healthy here"
-        );
-    } else {
-        info!(
-            %signer,
-            not_after,
-            remaining_days = remaining / 86_400,
-            "signing certificate valid"
-        );
-    }
 }

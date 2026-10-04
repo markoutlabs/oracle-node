@@ -247,14 +247,11 @@ impl Registry {
             });
         }
 
-        let bytes = self.to_signing_bytes()?;
-        let found = signer::recover_payload_signer(&bytes, &self.governance_signature)?;
-        if found != governance {
-            return Err(VerifyError::UntrustedGovernance {
-                found,
-                expected: governance,
-            });
-        }
+        check_governance(
+            &self.to_signing_bytes()?,
+            &self.governance_signature,
+            governance,
+        )?;
 
         let mut seen_nodes: HashMap<&str, ()> = HashMap::with_capacity(self.nodes.len());
         let mut by_address: HashMap<Address, usize> = HashMap::new();
@@ -315,6 +312,22 @@ impl Registry {
             governance,
         })
     }
+}
+
+/// Checks that `signature` over `payload` recovers to the pinned governance address.
+pub(crate) fn check_governance(
+    payload: &[u8],
+    signature: &Signature,
+    governance: Address,
+) -> Result<(), VerifyError> {
+    let found = signer::recover_payload_signer(payload, signature)?;
+    if found != governance {
+        return Err(VerifyError::UntrustedGovernance {
+            found,
+            expected: governance,
+        });
+    }
+    Ok(())
 }
 
 /// A registry whose governance signature and certificates have been checked.
@@ -398,11 +411,7 @@ impl VerifiedRegistry {
     }
 
     /// Returns the last second at which `signer` is authorised, across every
-    /// certificate listing it.
-    ///
-    /// This is the expiry countdown from §9.3: a node whose certificate lapses
-    /// keeps signing perfectly valid frames that every consumer then refuses, and
-    /// nothing node-local notices. Returns `None` if the address is unlisted.
+    /// certificate listing it. Returns `None` if the address is unlisted.
     #[must_use]
     pub fn authorized_until(&self, signer: Address) -> Option<u64> {
         let index = *self.by_address.get(&signer)?;

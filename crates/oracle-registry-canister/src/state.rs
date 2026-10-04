@@ -6,11 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use candid::Principal;
 use oracle_wire::{
-    Address, CompressedPublicKey, KeyHistoryEntry, MAX_ENDPOINT_LEN, MAX_ENDPOINTS,
-    MAX_NODE_ID_LEN, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry, Quorum, Registry, Signature,
-    SigningKeyCert, WireError,
+    Address, ClientEntry, ClientList, CompressedPublicKey, KeyHistoryEntry, MAX_CLIENT_ID_LEN,
+    MAX_CLIENTS, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODE_ID_LEN, MAX_NODES, MAX_OPERATOR_LEN,
+    NodeEntry, Quorum, Registry, Signature, SigningKeyCert, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,21 +20,12 @@ pub enum StateError {
     /// Only a canister controller may do this.
     #[error("only governance (a canister controller) may do this")]
     NotGovernance,
-    /// The caller is not the principal that submitted this node.
-    #[error("caller is not the operator of node `{0}`")]
-    NotOperator(String),
     /// No listed node has this id.
     #[error("unknown node `{0}`")]
     UnknownNode(String),
     /// The node is already in the registry.
     #[error("node `{0}` is already listed")]
     AlreadyListed(String),
-    /// Another principal already has a pending entry under this id.
-    #[error("node `{0}` already has a pending entry from another operator")]
-    PendingByOther(String),
-    /// Nothing is pending under this id.
-    #[error("no pending entry for `{0}`")]
-    NoPending(String),
     /// The entry failed a structural check.
     #[error("invalid entry: {0}")]
     InvalidEntry(String),
@@ -67,6 +57,21 @@ pub enum StateError {
     /// The wire format caps the node count.
     #[error("the registry already holds {MAX_NODES} nodes")]
     TooManyNodes,
+    /// No client has this id.
+    #[error("unknown client `{0}`")]
+    UnknownClient(String),
+    /// A client with this id is already listed.
+    #[error("client `{0}` is already listed")]
+    ClientExists(String),
+    /// Another client already uses this key.
+    #[error("the key is already used by client `{0}`")]
+    ClientKeyInUse(String),
+    /// The client failed a check.
+    #[error("invalid client: {0}")]
+    InvalidClient(String),
+    /// The wire format caps the client count.
+    #[error("the client list already holds {MAX_CLIENTS} clients")]
+    TooManyClients,
     /// The quorum values are inconsistent.
     #[error("invalid quorum: {0}")]
     InvalidQuorum(String),
@@ -92,6 +97,52 @@ pub struct Config {
     pub rotation_window_secs: u64,
     /// Seconds between heartbeat re-signs.
     pub heartbeat_secs: u64,
+    /// Broadcast-key epoch, published in the client list.
+    #[serde(default = "default_epoch_secs")]
+    pub epoch_secs: u64,
+    /// Seconds between client-list heartbeat re-signs.
+    #[serde(default = "default_clients_heartbeat_secs")]
+    pub clients_heartbeat_secs: u64,
+}
+
+/// Default broadcast-key epoch (SPEC §6.1).
+pub const DEFAULT_EPOCH_SECS: u64 = 60;
+/// Default client-list heartbeat. Nodes stop admitting clients after three
+/// missed beats, so it bounds how long a withheld revocation can go unseen.
+pub const DEFAULT_CLIENTS_HEARTBEAT_SECS: u64 = 3_600;
+
+const fn default_epoch_secs() -> u64 {
+    DEFAULT_EPOCH_SECS
+}
+
+const fn default_clients_heartbeat_secs() -> u64 {
+    DEFAULT_CLIENTS_HEARTBEAT_SECS
+}
+
+/// One authorised client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientRecord {
+    /// The client's secp256k1 API key.
+    pub pubkey: CompressedPublicKey,
+    /// End of authorisation, unix seconds.
+    pub expires_at: u64,
+    /// When governance added it, unix seconds.
+    pub added_at: u64,
+}
+
+/// A client list ready to sign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsignedClientList {
+    /// `State::clients_version + 1`.
+    pub version: u64,
+    /// The issue time, unix seconds.
+    pub effective_from: u64,
+    /// The broadcast-key epoch.
+    pub epoch_secs: u64,
+    /// The clients.
+    pub clients: Vec<ClientEntry>,
+    /// `ClientList::signing_bytes` over the above.
+    pub signing_bytes: Vec<u8>,
 }
 
 /// One signing key of one node, live or retired.
@@ -110,8 +161,6 @@ pub struct KeyRecord {
 pub struct NodeRecord {
     /// Who runs it.
     pub operator: String,
-    /// The principal allowed to rotate this node's key.
-    pub operator_principal: Principal,
     /// The long-lived identity key that issues the node's certificates.
     pub identity_pubkey: CompressedPublicKey,
     /// WebSocket endpoints.
@@ -151,17 +200,6 @@ impl NodeRecord {
     }
 }
 
-/// An entry an operator submitted that governance has not approved.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingEntry {
-    /// The entry as submitted, with exactly one certificate.
-    pub entry: NodeEntry,
-    /// Who submitted it, and who will be allowed to rotate its key.
-    pub operator_principal: Principal,
-    /// When, unix seconds.
-    pub submitted_at: u64,
-}
-
 /// A registry document ready to sign.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsignedDocument {
@@ -188,8 +226,6 @@ pub struct State {
     pub nodes: BTreeMap<String, NodeRecord>,
     /// Nodes governance removed, kept for their key history.
     pub removed: BTreeMap<String, NodeRecord>,
-    /// Submitted, not yet approved.
-    pub pending: BTreeMap<String, PendingEntry>,
     /// Version of the last published document. Zero before the first.
     pub version: u64,
     /// When the last rotation happened, unix seconds.
@@ -200,6 +236,18 @@ pub struct State {
     pub governance_key: Option<CompressedPublicKey>,
     /// A mutation happened since the last publish.
     pub dirty: bool,
+    /// Authorised clients by id. Absent in states saved before clients existed.
+    #[serde(default)]
+    pub clients: BTreeMap<String, ClientRecord>,
+    /// Version of the last published client list. Zero before the first.
+    #[serde(default)]
+    pub clients_version: u64,
+    /// The last signed client list.
+    #[serde(default)]
+    pub clients_published: Option<ClientList>,
+    /// A client change happened since the last client-list publish.
+    #[serde(default)]
+    pub clients_dirty: bool,
 }
 
 impl State {
@@ -215,107 +263,59 @@ impl State {
             quorum,
             nodes: BTreeMap::new(),
             removed: BTreeMap::new(),
-            pending: BTreeMap::new(),
             version: 0,
             last_rotation_at: None,
             published: None,
             governance_key: None,
             dirty: true,
+            clients: BTreeMap::new(),
+            clients_version: 0,
+            clients_published: None,
+            clients_dirty: true,
         })
     }
 
-    /// An operator proposes a node. Nothing is published until governance
-    /// approves it.
-    ///
-    /// A resubmission by the same principal replaces the pending entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the id is listed or pending under another
-    /// principal, or if the entry or its certificate fails a check.
-    pub fn submit_entry(
-        &mut self,
-        caller: Principal,
-        entry: NodeEntry,
-        now: u64,
-    ) -> Result<(), StateError> {
-        let node_id = entry.node_id.clone();
-        if self.nodes.contains_key(&node_id) {
-            return Err(StateError::AlreadyListed(node_id));
-        }
-        if let Some(existing) = self.pending.get(&node_id)
-            && existing.operator_principal != caller
-        {
-            return Err(StateError::PendingByOther(node_id));
-        }
-        if !self.pending.contains_key(&node_id) && self.pending.len() >= MAX_NODES {
-            return Err(StateError::TooManyNodes);
-        }
-
-        // Validate against everything except the entry this one replaces.
-        let previous = self.pending.remove(&node_id);
-        let checked = self.validate_entry(&entry, now);
-        match checked {
-            Ok(()) => {
-                self.pending.insert(
-                    node_id,
-                    PendingEntry {
-                        entry,
-                        operator_principal: caller,
-                        submitted_at: now,
-                    },
-                );
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(previous) = previous {
-                    self.pending.insert(node_id, previous);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    /// Governance lists a pending node. Bumps the document.
+    /// Governance lists a node from the entry its operator sent. Bumps the document.
     ///
     /// A node that was removed earlier continues its generation numbers, so
     /// its key history never has two generation ones.
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance, nothing is pending
-    /// under the id, or the registry is full.
-    pub fn approve_entry(
+    /// Returns an error if the caller is not governance, the id is listed, the
+    /// registry is full, or the entry or its certificate fails a check.
+    pub fn add_node(
         &mut self,
         is_governance: bool,
-        node_id: &str,
+        entry: NodeEntry,
         now: u64,
     ) -> Result<(), StateError> {
         if !is_governance {
             return Err(StateError::NotGovernance);
         }
+        if self.nodes.contains_key(&entry.node_id) {
+            return Err(StateError::AlreadyListed(entry.node_id));
+        }
         if self.nodes.len() >= MAX_NODES {
             return Err(StateError::TooManyNodes);
         }
-        let cert = self
-            .pending
-            .get(node_id)
-            .ok_or_else(|| StateError::NoPending(node_id.to_owned()))?
-            .entry
-            .signing_keys
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                StateError::InvalidEntry("pending entry has no certificate".to_owned())
-            })?;
-        let pending = self
-            .pending
-            .remove(node_id)
-            .ok_or_else(|| StateError::NoPending(node_id.to_owned()))?;
+        self.validate_entry(&entry, now)?;
+        let NodeEntry {
+            node_id,
+            operator,
+            identity_pubkey,
+            endpoints,
+            signing_keys,
+            weight,
+        } = entry;
+        let cert = signing_keys
+            .into_iter()
+            .next()
+            .ok_or_else(|| StateError::InvalidEntry("entry has no certificate".to_owned()))?;
 
         let mut keys = self
             .removed
-            .remove(node_id)
+            .remove(&node_id)
             .map(|old| old.keys)
             .unwrap_or_default();
         let generation = keys
@@ -331,13 +331,12 @@ impl State {
             },
         );
         self.nodes.insert(
-            node_id.to_owned(),
+            node_id,
             NodeRecord {
-                operator: pending.entry.operator,
-                operator_principal: pending.operator_principal,
-                identity_pubkey: pending.entry.identity_pubkey,
-                endpoints: pending.entry.endpoints,
-                weight: pending.entry.weight,
+                operator,
+                identity_pubkey,
+                endpoints,
+                weight,
                 live: generation,
                 keys,
             },
@@ -346,43 +345,29 @@ impl State {
         Ok(())
     }
 
-    /// Governance drops a pending entry.
+    /// Governance swaps a node's signing key with the certificate its operator
+    /// sent. Atomic: the new generation is live and the old one retired in the
+    /// same call. Bumps the document.
     ///
     /// # Errors
     ///
-    /// Returns an error if the caller is not governance or nothing is pending.
-    pub fn reject_entry(&mut self, is_governance: bool, node_id: &str) -> Result<(), StateError> {
-        if !is_governance {
-            return Err(StateError::NotGovernance);
-        }
-        self.pending
-            .remove(node_id)
-            .map(|_| ())
-            .ok_or_else(|| StateError::NoPending(node_id.to_owned()))
-    }
-
-    /// The operator swaps the node's signing key. Atomic: the new generation
-    /// is live and the old one retired in the same call. Bumps the document.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the node is unknown, the caller is not its
-    /// operator, the certificate fails a check, or another rotation happened
-    /// inside the rotation window.
+    /// Returns an error if the caller is not governance, the node is unknown,
+    /// the certificate fails a check, or another rotation happened inside the
+    /// rotation window.
     pub fn rotate_key(
         &mut self,
-        caller: Principal,
+        is_governance: bool,
         node_id: &str,
         cert: SigningKeyCert,
         now: u64,
     ) -> Result<(), StateError> {
+        if !is_governance {
+            return Err(StateError::NotGovernance);
+        }
         let node = self
             .nodes
             .get(node_id)
             .ok_or_else(|| StateError::UnknownNode(node_id.to_owned()))?;
-        if node.operator_principal != caller {
-            return Err(StateError::NotOperator(node_id.to_owned()));
-        }
         let identity = node.identity_pubkey;
         self.validate_cert(node_id, &identity, &cert, now)?;
         if let Some(last) = self.last_rotation_at {
@@ -521,6 +506,188 @@ impl State {
         self.dirty || self.published.is_none()
     }
 
+    /// `true` if the registry needs a signing round now: a change, or a
+    /// heartbeat that is due.
+    #[must_use]
+    pub fn registry_due(&self, now: u64) -> bool {
+        self.needs_publish()
+            || self.published.as_ref().is_some_and(|registry| {
+                now >= registry
+                    .effective_from
+                    .saturating_add(self.config.heartbeat_secs)
+            })
+    }
+
+    /// `true` if the client list needs a signing round now.
+    #[must_use]
+    pub fn clients_due(&self, now: u64) -> bool {
+        self.clients_dirty
+            || self.clients_published.as_ref().is_none_or(|list| {
+                now >= list
+                    .effective_from
+                    .saturating_add(self.config.clients_heartbeat_secs)
+            })
+    }
+
+    /// Governance authorises a client until `expires_at`. Bumps the client list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller is not governance, the id is taken or
+    /// invalid, the key is not a curve point or belongs to another client, the
+    /// list is full, or `expires_at` is not in the future.
+    pub fn add_client(
+        &mut self,
+        is_governance: bool,
+        client_id: String,
+        pubkey: CompressedPublicKey,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<(), StateError> {
+        if !is_governance {
+            return Err(StateError::NotGovernance);
+        }
+        let trimmed = client_id.trim();
+        if trimmed.is_empty() || trimmed != client_id || client_id.len() > MAX_CLIENT_ID_LEN {
+            return Err(StateError::InvalidClient(format!(
+                "client_id must be 1..={MAX_CLIENT_ID_LEN} bytes with no surrounding whitespace"
+            )));
+        }
+        if self.clients.contains_key(&client_id) {
+            return Err(StateError::ClientExists(client_id));
+        }
+        if self.clients.len() >= MAX_CLIENTS {
+            return Err(StateError::TooManyClients);
+        }
+        if pubkey.decompress().is_err() {
+            return Err(StateError::InvalidClient(
+                "the key is not a curve point".to_owned(),
+            ));
+        }
+        if let Some((other, _)) = self
+            .clients
+            .iter()
+            .find(|(_, record)| record.pubkey == pubkey)
+        {
+            return Err(StateError::ClientKeyInUse(other.clone()));
+        }
+        if expires_at <= now {
+            return Err(StateError::InvalidClient(
+                "expires_at must be in the future".to_owned(),
+            ));
+        }
+        self.clients.insert(
+            client_id,
+            ClientRecord {
+                pubkey,
+                expires_at,
+                added_at: now,
+            },
+        );
+        self.clients_dirty = true;
+        Ok(())
+    }
+
+    /// Governance moves a client's expiry, earlier or later. Bumps the client list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller is not governance or the client is unknown.
+    pub fn set_client_expiry(
+        &mut self,
+        is_governance: bool,
+        client_id: &str,
+        expires_at: u64,
+    ) -> Result<(), StateError> {
+        if !is_governance {
+            return Err(StateError::NotGovernance);
+        }
+        let record = self
+            .clients
+            .get_mut(client_id)
+            .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
+        record.expires_at = expires_at;
+        self.clients_dirty = true;
+        Ok(())
+    }
+
+    /// Governance removes a client. Bumps the client list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the caller is not governance or the client is unknown.
+    pub fn remove_client(
+        &mut self,
+        is_governance: bool,
+        client_id: &str,
+    ) -> Result<(), StateError> {
+        if !is_governance {
+            return Err(StateError::NotGovernance);
+        }
+        self.clients
+            .remove(client_id)
+            .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
+        self.clients_dirty = true;
+        Ok(())
+    }
+
+    /// Builds the next client list and its canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a wire error if the list does not encode.
+    pub fn unsigned_client_list(&self, now: u64) -> Result<UnsignedClientList, StateError> {
+        let version = self.clients_version.saturating_add(1);
+        let clients: Vec<ClientEntry> = self
+            .clients
+            .iter()
+            .map(|(client_id, record)| ClientEntry {
+                client_id: client_id.clone(),
+                pubkey: record.pubkey,
+                expires_at: record.expires_at,
+            })
+            .collect();
+        let signing_bytes =
+            ClientList::signing_bytes(version, now, self.config.epoch_secs, &clients)?;
+        Ok(UnsignedClientList {
+            version,
+            effective_from: now,
+            epoch_secs: self.config.epoch_secs,
+            clients,
+            signing_bytes,
+        })
+    }
+
+    /// Stores a signed client list as the published one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::VersionMismatch`] if the list was built for a
+    /// version other than the next one.
+    pub fn publish_clients(
+        &mut self,
+        list: UnsignedClientList,
+        governance_signature: Signature,
+    ) -> Result<u64, StateError> {
+        let expected = self.clients_version.saturating_add(1);
+        if list.version != expected {
+            return Err(StateError::VersionMismatch {
+                expected,
+                got: list.version,
+            });
+        }
+        self.clients_published = Some(ClientList {
+            version: list.version,
+            effective_from: list.effective_from,
+            epoch_secs: list.epoch_secs,
+            clients: list.clients,
+            governance_signature,
+        });
+        self.clients_version = list.version;
+        self.clients_dirty = false;
+        Ok(self.clients_version)
+    }
+
     /// Every generation of a node's keys, listed or removed.
     #[must_use]
     pub fn key_history(&self, node_id: &str) -> Option<Vec<KeyHistoryEntry>> {
@@ -541,22 +708,14 @@ impl State {
         )
     }
 
-    /// `true` if any key of any node, listed, removed or pending, has this
-    /// address.
+    /// `true` if any key of any node, listed or removed, has this address.
     #[must_use]
     pub fn address_known(&self, address: Address) -> bool {
-        let in_records = self
-            .nodes
+        self.nodes
             .values()
             .chain(self.removed.values())
             .flat_map(|node| node.keys.values())
-            .any(|record| record.cert.address == address);
-        let in_pending = self
-            .pending
-            .values()
-            .flat_map(|pending| pending.entry.signing_keys.iter())
-            .any(|cert| cert.address == address);
-        in_records || in_pending
+            .any(|record| record.cert.address == address)
     }
 
     fn validate_entry(&self, entry: &NodeEntry, now: u64) -> Result<(), StateError> {
@@ -610,11 +769,6 @@ impl State {
             .iter()
             .find(|(_, node)| node.identity_pubkey == entry.identity_pubkey)
         {
-            return Err(StateError::IdentityInUse(other_id.clone()));
-        }
-        if let Some((other_id, _)) = self.pending.iter().find(|(id, pending)| {
-            pending.entry.identity_pubkey == entry.identity_pubkey && **id != entry.node_id
-        }) {
             return Err(StateError::IdentityInUse(other_id.clone()));
         }
         let cert = entry
@@ -694,6 +848,8 @@ mod tests {
             key_name: "dfx_test_key".to_owned(),
             rotation_window_secs: WINDOW,
             heartbeat_secs: 86_400,
+            epoch_secs: 60,
+            clients_heartbeat_secs: 3_600,
         }
     }
 
@@ -710,7 +866,6 @@ mod tests {
 
     /// A node operator with an identity key and a signing key.
     struct Operator {
-        principal: Principal,
         identity: Signer,
         signing: Signer,
         node_id: String,
@@ -719,7 +874,6 @@ mod tests {
     impl Operator {
         fn new(seed: u8, node_id: &str) -> Self {
             Self {
-                principal: Principal::self_authenticating([seed]),
                 identity: Signer::from_secret_bytes([seed; 32]).expect("valid key"),
                 signing: Signer::from_secret_bytes([seed.wrapping_add(100); 32])
                     .expect("valid key"),
@@ -767,19 +921,14 @@ mod tests {
     fn listed(ops: &[Operator], min_nodes: u16) -> State {
         let mut state = State::new(config(), quorum(min_nodes)).expect("valid");
         for op in ops {
-            state
-                .submit_entry(op.principal, op.entry(NOW), NOW)
-                .expect("submits");
-            state
-                .approve_entry(true, &op.node_id, NOW)
-                .expect("approves");
+            state.add_node(true, op.entry(NOW), NOW).expect("adds");
         }
         publish(&mut state, NOW);
         state
     }
 
     #[test]
-    fn approved_nodes_publish_with_one_live_key_each() {
+    fn added_nodes_publish_with_one_live_key_each() {
         let ops = [
             Operator::new(1, "a"),
             Operator::new(2, "b"),
@@ -787,22 +936,18 @@ mod tests {
         ];
         let mut state = State::new(config(), quorum(3)).expect("valid");
         assert!(state.needs_publish());
-        for op in &ops {
-            state
-                .submit_entry(op.principal, op.entry(NOW), NOW)
-                .expect("submits");
-        }
-        assert_eq!(state.pending.len(), 3);
+        let first = ops.first().expect("three operators");
         assert_eq!(
-            state.approve_entry(false, "a", NOW),
+            state.add_node(false, first.entry(NOW), NOW),
             Err(StateError::NotGovernance)
         );
         for op in &ops {
-            state
-                .approve_entry(true, &op.node_id, NOW)
-                .expect("approves");
+            state.add_node(true, op.entry(NOW), NOW).expect("adds");
         }
-        assert!(state.pending.is_empty());
+        assert_eq!(
+            state.add_node(true, first.entry(NOW), NOW),
+            Err(StateError::AlreadyListed("a".to_owned()))
+        );
 
         let registry = publish(&mut state, NOW);
         assert_eq!(registry.version, 1);
@@ -828,7 +973,7 @@ mod tests {
         let a_signing = Signer::from_secret_bytes([101; 32]).expect("valid key");
         entry.signing_keys = vec![b.cert_for(&a_signing, NOW)];
         assert_eq!(
-            state.submit_entry(b.principal, entry, NOW),
+            state.add_node(true, entry, NOW),
             Err(StateError::AddressInUse(a_signing.address()))
         );
     }
@@ -842,16 +987,11 @@ mod tests {
 
         let cert = a.rotate(50, NOW + 10);
         assert_eq!(
-            state.rotate_key(
-                Principal::self_authenticating([9]),
-                "a",
-                cert.clone(),
-                NOW + 10
-            ),
-            Err(StateError::NotOperator("a".to_owned()))
+            state.rotate_key(false, "a", cert.clone(), NOW + 10),
+            Err(StateError::NotGovernance)
         );
         state
-            .rotate_key(a.principal, "a", cert.clone(), NOW + 10)
+            .rotate_key(true, "a", cert.clone(), NOW + 10)
             .expect("rotates");
 
         let registry = publish(&mut state, NOW + 10);
@@ -878,7 +1018,7 @@ mod tests {
             NOW + 20,
         );
         assert_eq!(
-            state.rotate_key(a.principal, "a", revived, NOW + WINDOW + 20),
+            state.rotate_key(true, "a", revived, NOW + WINDOW + 20),
             Err(StateError::AddressInUse(old_address))
         );
     }
@@ -890,18 +1030,18 @@ mod tests {
         let mut state = listed(&[Operator::new(1, "a"), Operator::new(2, "b")], 2);
 
         state
-            .rotate_key(a.principal, "a", a.rotate(50, NOW), NOW)
+            .rotate_key(true, "a", a.rotate(50, NOW), NOW)
             .expect("rotates");
         let cert_b = b.rotate(51, NOW + 1);
         assert_eq!(
-            state.rotate_key(b.principal, "b", cert_b.clone(), NOW + 1),
+            state.rotate_key(true, "b", cert_b.clone(), NOW + 1),
             Err(StateError::RotationTooSoon {
                 last: NOW,
                 next_allowed: NOW + WINDOW,
             })
         );
         state
-            .rotate_key(b.principal, "b", cert_b, NOW + WINDOW)
+            .rotate_key(true, "b", cert_b, NOW + WINDOW)
             .expect("rotates once the window has passed");
     }
 
@@ -934,10 +1074,7 @@ mod tests {
         let mut c = Operator::new(3, "c");
         let mut entry = c.entry(NOW + 2);
         entry.signing_keys = vec![c.rotate(60, NOW + 2)];
-        state
-            .submit_entry(c.principal, entry, NOW + 2)
-            .expect("submits");
-        state.approve_entry(true, "c", NOW + 2).expect("approves");
+        state.add_node(true, entry, NOW + 2).expect("re-adds");
         let history = state.key_history("c").expect("known");
         assert_eq!(history.len(), 2);
         assert_eq!(history.get(1).map(|k| k.generation), Some(2));
@@ -951,7 +1088,7 @@ mod tests {
         let mut stale = a.entry(NOW);
         stale.signing_keys = vec![a.cert_for(&a.signing, NOW - 365 * 86_400)];
         assert!(matches!(
-            state.submit_entry(a.principal, stale, NOW),
+            state.add_node(true, stale, NOW),
             Err(StateError::InvalidCert(_))
         ));
 
@@ -959,7 +1096,7 @@ mod tests {
         let mut forged = a.entry(NOW);
         forged.signing_keys = vec![impostor.cert_for(&a.signing, NOW)];
         assert!(matches!(
-            state.submit_entry(a.principal, forged, NOW),
+            state.add_node(true, forged, NOW),
             Err(StateError::InvalidCert(_))
         ));
 
@@ -968,13 +1105,159 @@ mod tests {
             .signing_keys
             .push(a.cert_for(&impostor.signing, NOW));
         assert!(matches!(
-            state.submit_entry(a.principal, two_keys, NOW),
+            state.add_node(true, two_keys, NOW),
             Err(StateError::InvalidEntry(_))
         ));
 
         state
-            .submit_entry(a.principal, a.entry(NOW), NOW)
+            .add_node(true, a.entry(NOW), NOW)
             .expect("a well-formed entry is accepted");
+    }
+
+    /// States saved by earlier canister versions still load: dropped fields are
+    /// ignored and new ones take their defaults.
+    #[test]
+    fn a_state_saved_by_an_earlier_version_still_loads() {
+        let state = listed(&[Operator::new(1, "a")], 1);
+        let mut saved = serde_json::to_value(&state).expect("serialises");
+        for (path, field, value) in [
+            ("", "pending", Some(serde_json::json!({}))),
+            (
+                "/nodes/a",
+                "operator_principal",
+                Some(serde_json::json!("aaaaa-aa")),
+            ),
+            ("", "clients", None),
+            ("", "clients_version", None),
+            ("", "clients_published", None),
+            ("", "clients_dirty", None),
+            ("/config", "epoch_secs", None),
+            ("/config", "clients_heartbeat_secs", None),
+        ] {
+            let object = saved
+                .pointer_mut(path)
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("an object");
+            match value {
+                Some(value) => {
+                    object.insert(field.to_owned(), value);
+                }
+                None => {
+                    object.remove(field);
+                }
+            }
+        }
+        let loaded: State = serde_json::from_value(saved).expect("loads");
+        assert_eq!(loaded.nodes, state.nodes);
+        assert!(loaded.clients.is_empty());
+        assert_eq!(loaded.config.epoch_secs, DEFAULT_EPOCH_SECS);
+        assert_eq!(
+            loaded.config.clients_heartbeat_secs,
+            DEFAULT_CLIENTS_HEARTBEAT_SECS
+        );
+        assert!(
+            loaded.clients_due(NOW),
+            "a list that was never published is due"
+        );
+    }
+
+    fn client_key(seed: u8) -> CompressedPublicKey {
+        Signer::from_secret_bytes([seed; 32])
+            .expect("valid key")
+            .public_key()
+    }
+
+    #[test]
+    fn client_changes_follow_the_rules() {
+        let mut state = State::new(config(), quorum(1)).expect("valid");
+        let add = |state: &mut State, governance: bool, id: &str, seed: u8, expires_at: u64| {
+            state.add_client(governance, id.to_owned(), client_key(seed), expires_at, NOW)
+        };
+        assert_eq!(
+            add(&mut state, false, "c-1", 1, NOW + 60),
+            Err(StateError::NotGovernance)
+        );
+        add(&mut state, true, "c-1", 1, NOW + 60).expect("adds");
+        assert_eq!(
+            add(&mut state, true, "c-1", 2, NOW + 60),
+            Err(StateError::ClientExists("c-1".to_owned()))
+        );
+        assert_eq!(
+            add(&mut state, true, "c-2", 1, NOW + 60),
+            Err(StateError::ClientKeyInUse("c-1".to_owned()))
+        );
+        for (id, expires_at) in [(" c-3", NOW + 60), ("", NOW + 60), ("c-3", NOW)] {
+            assert!(matches!(
+                add(&mut state, true, id, 3, expires_at),
+                Err(StateError::InvalidClient(_))
+            ));
+        }
+        let mut bad_key = *client_key(4).as_bytes();
+        bad_key[0] = 0x05;
+        assert!(matches!(
+            state.add_client(
+                true,
+                "c-4".to_owned(),
+                CompressedPublicKey::from_bytes(bad_key),
+                NOW + 60,
+                NOW
+            ),
+            Err(StateError::InvalidClient(_))
+        ));
+
+        assert_eq!(
+            state.set_client_expiry(false, "c-1", NOW),
+            Err(StateError::NotGovernance)
+        );
+        state
+            .set_client_expiry(true, "c-1", NOW + 120)
+            .expect("extends");
+        assert_eq!(
+            state.clients.get("c-1").map(|c| c.expires_at),
+            Some(NOW + 120)
+        );
+        assert_eq!(
+            state.remove_client(true, "c-9"),
+            Err(StateError::UnknownClient("c-9".to_owned()))
+        );
+        state.remove_client(true, "c-1").expect("removes");
+        assert!(state.clients.is_empty());
+    }
+
+    #[test]
+    fn the_client_list_publishes_with_its_own_version() {
+        let mut state = listed(&[Operator::new(1, "a")], 1);
+        let registry_version = state.version;
+        state
+            .add_client(true, "c-1".to_owned(), client_key(1), NOW + 600, NOW)
+            .expect("adds");
+        assert!(state.clients_due(NOW));
+        assert!(
+            !state.registry_due(NOW),
+            "a client change leaves the registry alone"
+        );
+
+        let list = state.unsigned_client_list(NOW).expect("encodes");
+        let signature = governance_signer().sign_payload(&list.signing_bytes);
+        assert_eq!(state.publish_clients(list.clone(), signature), Ok(1));
+        assert_eq!(state.version, registry_version);
+        let published = state.clients_published.clone().expect("published");
+        let verified = published
+            .verify(governance_signer().address(), 0)
+            .expect("verifies with oracle-wire");
+        assert_eq!(verified.epoch_secs(), 60);
+        assert_eq!(verified.get("c-1").map(|c| c.expires_at), Some(NOW + 600));
+
+        assert!(!state.clients_due(NOW + 3_599));
+        assert!(state.clients_due(NOW + 3_600), "the hourly heartbeat");
+        assert!(!state.registry_due(NOW + 3_600));
+        assert!(state.registry_due(NOW + 86_400), "the daily heartbeat");
+
+        let signature = governance_signer().sign_payload(&list.signing_bytes);
+        assert!(matches!(
+            state.publish_clients(list, signature),
+            Err(StateError::VersionMismatch { .. })
+        ));
     }
 
     #[test]

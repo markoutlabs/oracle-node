@@ -120,44 +120,50 @@ type InitArgs = record {
   recommended : nat16;
   // Seconds between heartbeat re-signs.
   heartbeat_secs : nat64;
+  // Broadcast-key epoch for the client list. Default 60.
+  epoch_secs : opt nat64;
   // Threshold ECDSA key name: `dfx_test_key` locally, `key_1` on mainnet.
   key_name : text;
   // Fewest nodes a consumer should require.
   min_nodes : nat16;
+  // Seconds between client-list re-signs. Default 3600.
+  clients_heartbeat_secs : opt nat64;
 };
 type Result = variant { Ok : nat64; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
-type Result_2 = variant { Ok; Err : text };
 service : (InitArgs) -> {
-  // Governance lists a pending node. Returns the new version.
-  approve_entry : (text) -> (Result);
+  // Governance authorises a client. `pubkey` is its 33-byte compressed
+  // secp256k1 API key in hex. Returns the new client-list version.
+  add_client : (text, text, nat64) -> (Result);
+  // Governance lists a node. `entry_json` is the operator's `NodeEntry`, with
+  // exactly one certificate. Returns the new version.
+  add_node : (text) -> (Result);
+  // The last published client list as JSON, if any.
+  get_clients : () -> (opt text) query;
   // The governance address, once the threshold key has been fetched.
   get_governance : () -> (opt text) query;
   // Every generation of a node's keys as JSON, for stored-frame verification.
   get_key_history : (text) -> (opt text) query;
-  // Pending entries as JSON.
-  get_pending : () -> (text) query;
   // The last published registry document as JSON, if any.
   get_registry : () -> (opt text) query;
   // The version of the last published document. Zero before the first.
   get_version : () -> (nat64) query;
-  // Serves `/registry.json` as a certified query response.
+  // Serves `/registry.json` and `/clients.json` as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.
   refresh_governance_key : () -> (Result_1);
-  // Governance drops a pending entry.
-  reject_entry : (text) -> (Result_2);
+  // Governance removes a client. Returns the new client-list version.
+  remove_client : (text) -> (Result);
   // Governance de-lists a node. Returns the new version.
   remove_node : (text) -> (Result);
   // Governance forces a signing round. Returns the new version.
   republish : () -> (Result);
-  // The node's operator swaps its signing key. `cert_json` is a
-  // `SigningKeyCert` issued by the node's identity key. Returns the new version.
+  // Governance swaps a node's signing key. `cert_json` is a `SigningKeyCert`
+  // the node's identity key issued. Returns the new version.
   rotate_key : (text, text) -> (Result);
+  // Governance moves a client's expiry. Returns the new client-list version.
+  set_client_expiry : (text, nat64) -> (Result);
   // Governance changes the quorum guidance. Returns the new version.
   set_quorum : (nat16, nat16) -> (Result);
-  // An operator proposes a node. `entry_json` is a `NodeEntry` with exactly
-  // one certificate. Nothing is published until governance approves it.
-  submit_entry : (text) -> (Result_2);
 }

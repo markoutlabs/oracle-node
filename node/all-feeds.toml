@@ -30,6 +30,9 @@ key_env = "ORACLE_SIGNING_KEY"
 path = "node/registry.json"
 governance_address = "0x5cbdd86a2fa8dc4bddd8a8f69dba48572eec07fb"
 
+[clients]
+path = "node/clients.json"
+
 # ---------------------------------------------------------------- the peg
 #
 # Must come from native-USD venues only. Sourcing CRYPTO.USDT/USD from a

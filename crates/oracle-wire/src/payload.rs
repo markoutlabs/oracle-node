@@ -26,6 +26,15 @@ pub const KIND_SIGNING_KEY_CERT: u8 = 0x81;
 /// Payload kind for a node registry.
 pub const KIND_REGISTRY: u8 = 0x82;
 
+/// Payload kind for a client's transport authentication (SPEC §6.1).
+pub const KIND_CLIENT_AUTH: u8 = 0x83;
+
+/// Payload kind for a node's acceptance of a transport session.
+pub const KIND_NODE_AUTH_OK: u8 = 0x84;
+
+/// Payload kind for the client allow-list.
+pub const KIND_CLIENT_LIST: u8 = 0x85;
+
 /// Size of an encoded price update.
 pub const PRICE_UPDATE_SIZE: usize = 96;
 

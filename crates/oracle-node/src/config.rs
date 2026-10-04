@@ -52,6 +52,10 @@ pub enum ConfigError {
     #[error("cannot load the signing key: {0}")]
     SigningKey(String),
 
+    /// The client list could not be loaded.
+    #[error("cannot load the client list: {0}")]
+    Clients(String),
+
     /// The registry could not be loaded or verified.
     #[error("cannot load the registry: {0}")]
     Registry(String),
@@ -69,6 +73,10 @@ pub struct NodeConfig {
     pub signing: SigningSettings,
     /// Where to find the registry this node publishes as a hint.
     pub registry: RegistrySettings,
+    /// Where the client list comes from. `start` requires it; it is optional
+    /// here so tools that only read the feeds, such as replay, can share configs.
+    #[serde(default)]
+    pub clients: Option<ClientsSettings>,
     /// How often to evaluate every feed, in milliseconds.
     ///
     /// Must be at or below the tightest feed's rate cap, or the cap becomes the
@@ -112,6 +120,26 @@ pub struct SigningSettings {
     /// environment variable (SPEC §9.2).
     #[serde(default)]
     pub key_env: Option<String>,
+}
+
+/// Where the client list comes from. Exactly one of `path` and `url`. It is
+/// verified against `registry.governance_address`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientsSettings {
+    /// Path to a signed client list JSON file. Read once; for local runs.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// URL of the canister's `/clients.json`, polled every `poll_secs`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Seconds between polls. Bounds how long a revocation takes to land.
+    #[serde(default = "default_clients_poll_secs")]
+    pub poll_secs: u64,
+}
+
+const fn default_clients_poll_secs() -> u64 {
+    30
 }
 
 /// Where the registry comes from. Exactly one of `path` and `url`.
@@ -329,6 +357,50 @@ impl NodeConfig {
             .verify(governance, 0)
             .map_err(|e| ConfigError::Registry(e.to_string()))?;
         Ok(registry)
+    }
+
+    /// Returns the pinned governance address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Registry`] if it does not parse.
+    pub fn governance(&self) -> Result<oracle_wire::Address, ConfigError> {
+        self.registry
+            .governance_address
+            .parse()
+            .map_err(|e| ConfigError::Registry(format!("bad governance address: {e}")))
+    }
+
+    /// Fetches the client list, unverified, or `None` without a `[clients]`
+    /// section. Verifying it against the governance address is the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Clients`] if neither or both of `path` and `url`
+    /// are set, or the document cannot be read or fetched.
+    pub async fn fetch_client_list(&self) -> Result<Option<oracle_wire::ClientList>, ConfigError> {
+        let Some(clients) = &self.clients else {
+            return Ok(None);
+        };
+        let list = match (&clients.path, &clients.url) {
+            (Some(path), None) => {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| ConfigError::Clients(format!("{}: {e}", path.display())))?;
+                serde_json::from_str(&text)
+                    .map_err(|e| ConfigError::Clients(format!("{}: {e}", path.display())))?
+            }
+            (None, Some(url)) => oracle_client::HttpDocumentSource::new(url.clone())
+                .map_err(|e| ConfigError::Clients(e.to_string()))?
+                .fetch()
+                .await
+                .map_err(|e| ConfigError::Clients(format!("{url}: {e}")))?,
+            _ => {
+                return Err(ConfigError::Clients(
+                    "set exactly one of clients.path and clients.url".to_owned(),
+                ));
+            }
+        };
+        Ok(Some(list))
     }
 
     /// Resolves the config into everything the node needs to run.
@@ -938,6 +1010,29 @@ sources = [
         );
         assert_ne!(text, SAMPLE, "the sample registry section must be replaced");
         parse(&text)
+    }
+
+    #[tokio::test]
+    async fn the_clients_section_is_optional_and_exactly_one_source() {
+        let none = parse(SAMPLE);
+        assert!(none.clients.is_none());
+        assert!(
+            none.fetch_client_list()
+                .await
+                .expect("no section")
+                .is_none()
+        );
+
+        let with = |body: &str| parse(&format!("{SAMPLE}\n[clients]\n{body}\n"));
+        let url = with("url = \"http://127.0.0.1:1/clients.json\"");
+        assert_eq!(url.clients.as_ref().map(|c| c.poll_secs), Some(30));
+        for bad in [
+            with("poll_secs = 5"),
+            with("path = \"c.json\"\nurl = \"http://127.0.0.1:1/clients.json\""),
+        ] {
+            let error = bad.fetch_client_list().await.expect_err("must refuse");
+            assert!(error.to_string().contains("exactly one"), "{error}");
+        }
     }
 
     #[tokio::test]

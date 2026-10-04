@@ -50,10 +50,14 @@
 //! use std::time::Duration;
 //! use oracle_client::{OracleClient, Status};
 //!
-//! # async fn run(registry: oracle_wire::VerifiedRegistry) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn run(
+//! #     registry: oracle_wire::VerifiedRegistry,
+//! #     api_key: oracle_wire::Signer,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! let mut client = OracleClient::builder(registry)
 //!     .quorum(3)
 //!     .max_age(Duration::from_secs(2))
+//!     .client_key("c-7f3a", api_key) // listed by governance (SPEC §6.1)
 //!     .build()?;
 //!
 //! client.subscribe(&["CRYPTO.BTC/USD"]).await?;
@@ -77,5 +81,5 @@ pub mod verify;
 
 pub use client::{ClientError, ClientStats, OracleClient, OracleClientBuilder, now_unix_nanos};
 pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
-pub use source::{FetchError, HttpRegistrySource, RegistrySource};
+pub use source::{FetchError, HttpDocumentSource, HttpRegistrySource, RegistrySource};
 pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig, verify_historical};

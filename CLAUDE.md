@@ -12,3 +12,10 @@
   the `HALF_CURVE_ORDER` byte compare (backend-independent).
 - Code that must build for `wasm32-unknown-unknown` (`oracle-wire`,
   `oracle-registry-canister`) chooses pure-Rust crates.
+
+## Code comments
+
+- Do not put a doc comment over every method, field, or test.
+- Private items: no comment, unless the reason is not clear from the code.
+- Public items: one line. The workspace `missing_docs` lint requires it.
+- A comment says why, not what. Two sentences at most.

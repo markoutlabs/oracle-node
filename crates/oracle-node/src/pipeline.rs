@@ -14,6 +14,8 @@
 //! order on one task. Anything that fans events across workers would break the
 //! guarantee silently: a book carried across a gap looks live and is not.
 
+use std::sync::Arc;
+
 use oracle_agg::{AggError, Aggregator, FeedStats};
 use oracle_ingest::IngestEvent;
 use oracle_types::FeedId;
@@ -37,14 +39,14 @@ pub struct PipelineStats {
 /// Owns the aggregator and the hot signing key.
 pub struct Pipeline {
     aggregator: Aggregator,
-    signer: Signer,
+    signer: Arc<Signer>,
     stats: PipelineStats,
 }
 
 impl Pipeline {
     /// Builds a pipeline.
     #[must_use]
-    pub fn new(aggregator: Aggregator, signer: Signer) -> Self {
+    pub fn new(aggregator: Aggregator, signer: Arc<Signer>) -> Self {
         Self {
             aggregator,
             signer,
@@ -145,7 +147,7 @@ mod tests {
         config.min_sources = 2;
         let aggregator = Aggregator::new(vec![config]).expect("valid config");
         let signer = Signer::from_secret_bytes([9; 32]).expect("valid key");
-        Pipeline::new(aggregator, signer)
+        Pipeline::new(aggregator, Arc::new(signer))
     }
 
     fn book(venue: Venue, mid: &str, recv_ns: u64) -> IngestEvent {
@@ -304,7 +306,7 @@ mod tests {
 
         let aggregator = Aggregator::new(vec![healthy, broken]).expect("valid config");
         let signer = Signer::from_secret_bytes([9; 32]).expect("valid key");
-        let mut pipeline = Pipeline::new(aggregator, signer);
+        let mut pipeline = Pipeline::new(aggregator, Arc::new(signer));
 
         pipeline.observe(&book(Venue::Binance, "64000", START));
         let (signed, errors) = pipeline.tick(START);

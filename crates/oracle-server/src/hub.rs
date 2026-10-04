@@ -18,72 +18,56 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use oracle_transport::{BroadcastSealer, os_rng};
 use oracle_types::{FeedId, Symbol};
 use oracle_wire::SignedUpdate;
 use tokio::sync::Notify;
 
-use crate::protocol::{Encoding, JsonUpdate};
-
-/// A signed update, serialized once and shared by every subscriber.
+/// A signed update, serialized and sealed once and shared by every subscriber.
 ///
-/// Signing and encoding happen once per update rather than once per subscriber —
-/// with a few hundred subscribers that is the difference between a fanout that
-/// scales and one that does not.
+/// Signing, encoding and sealing happen once per update rather than once per
+/// subscriber; with a few hundred subscribers that is the difference between a
+/// fanout that scales and one that does not.
 pub struct PreparedUpdate {
     /// The feed.
     pub feed_id: FeedId,
     /// The canonical symbol.
     pub symbol: Symbol,
-    /// The 182-byte wire frame.
+    /// The 182-byte signed frame.
     binary: Bytes,
-    /// The JSON view, built on first request and then shared.
-    json: OnceLock<Bytes>,
+    /// `binary` sealed under the broadcast key: what every subscriber receives.
+    sealed: Bytes,
     signed: SignedUpdate,
 }
 
 impl PreparedUpdate {
-    /// Prepares a signed update for fanout.
+    /// Prepares a signed update for fanout, sealing it once.
     #[must_use]
-    pub fn new(symbol: Symbol, signed: SignedUpdate) -> Self {
+    pub fn new(symbol: Symbol, signed: SignedUpdate, sealer: &BroadcastSealer) -> Self {
+        let binary = Bytes::copy_from_slice(&signed.encode_frame());
+        let sealed = Bytes::from(sealer.seal(&binary, &mut os_rng()));
         Self {
             feed_id: signed.update().feed_id,
             symbol,
-            binary: Bytes::copy_from_slice(&signed.encode_frame()),
-            json: OnceLock::new(),
+            binary,
+            sealed,
             signed,
         }
+    }
+
+    /// Returns the sealed frame, the same bytes for every subscriber.
+    #[must_use]
+    pub fn sealed(&self) -> Bytes {
+        self.sealed.clone()
     }
 
     /// Returns the binary frame.
     #[must_use]
     pub fn binary(&self) -> Bytes {
         self.binary.clone()
-    }
-
-    /// Returns the JSON view, building it on first use.
-    ///
-    /// Lazy because most subscribers take binary, and serializing JSON for
-    /// nobody is pure waste at a few thousand updates a second.
-    #[must_use]
-    pub fn json(&self) -> Bytes {
-        self.json
-            .get_or_init(|| {
-                let view = JsonUpdate::new(&self.symbol, &self.signed);
-                Bytes::from(serde_json::to_vec(&view).unwrap_or_else(|_| b"{}".to_vec()))
-            })
-            .clone()
-    }
-
-    /// Returns the encoded frame for a subscriber's chosen encoding.
-    #[must_use]
-    pub fn encoded(&self, encoding: Encoding) -> Bytes {
-        match encoding {
-            Encoding::Binary => self.binary(),
-            Encoding::Json => self.json(),
-        }
     }
 
     /// Returns the signed update.
@@ -115,8 +99,7 @@ impl Selection {
 /// One subscriber's conflating mailbox.
 pub struct Subscriber {
     id: u64,
-    /// Negotiated in the subscribe message, so it is settable after registration.
-    encoding: Mutex<Encoding>,
+    client_id: String,
     selection: Mutex<Selection>,
     pending: Mutex<HashMap<FeedId, Arc<PreparedUpdate>>>,
     dropped: AtomicU64,
@@ -133,19 +116,10 @@ impl Subscriber {
         self.id
     }
 
-    /// Returns the negotiated encoding.
+    /// Returns the authenticated client.
     #[must_use]
-    pub fn encoding(&self) -> Encoding {
-        self.encoding
-            .lock()
-            .map_or(Encoding::Binary, |encoding| *encoding)
-    }
-
-    /// Sets the encoding, as negotiated in the subscribe message.
-    pub fn set_encoding(&self, encoding: Encoding) {
-        if let Ok(mut current) = self.encoding.lock() {
-            *current = encoding;
-        }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
     }
 
     /// Replaces the feed selection.
@@ -261,29 +235,32 @@ pub struct Hub {
     latest: Mutex<HashMap<FeedId, Arc<PreparedUpdate>>>,
     next_id: AtomicU64,
     max_pending: usize,
+    sealer: Arc<BroadcastSealer>,
 }
 
 impl Hub {
     /// Builds a hub.
     ///
     /// `max_pending` bounds how many distinct feeds may be outstanding for one
-    /// subscriber before it is declared lagged.
+    /// subscriber before it is declared lagged. `sealer` seals each update once
+    /// under the node's broadcast key.
     #[must_use]
-    pub fn new(max_pending: usize) -> Self {
+    pub fn new(max_pending: usize, sealer: Arc<BroadcastSealer>) -> Self {
         Self {
             subscribers: Mutex::new(HashMap::new()),
             latest: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             max_pending: max_pending.max(1),
+            sealer,
         }
     }
 
-    /// Registers a subscriber.
+    /// Registers an authenticated subscriber.
     #[must_use]
-    pub fn subscribe(&self, encoding: Encoding) -> Arc<Subscriber> {
+    pub fn subscribe(&self, client_id: &str) -> Arc<Subscriber> {
         let subscriber = Arc::new(Subscriber {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            encoding: Mutex::new(encoding),
+            client_id: client_id.to_owned(),
             selection: Mutex::new(Selection::Feeds(std::collections::HashSet::new())),
             pending: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
@@ -315,9 +292,10 @@ impl Hub {
             .map_or(0, |subscribers| subscribers.len())
     }
 
-    /// Publishes an update to every interested subscriber.
+    /// Publishes an update to every interested subscriber. This is the one place
+    /// a frame is sealed, before any subscriber sees it.
     pub fn publish(&self, symbol: Symbol, signed: SignedUpdate) -> Arc<PreparedUpdate> {
-        let prepared = Arc::new(PreparedUpdate::new(symbol, signed));
+        let prepared = Arc::new(PreparedUpdate::new(symbol, signed, &self.sealer));
         if let Ok(mut latest) = self.latest.lock() {
             latest.insert(prepared.feed_id, Arc::clone(&prepared));
         }
@@ -329,12 +307,6 @@ impl Hub {
             }
         }
         prepared
-    }
-
-    /// Returns the latest update for a feed.
-    #[must_use]
-    pub fn latest(&self, feed_id: FeedId) -> Option<Arc<PreparedUpdate>> {
-        self.latest.lock().ok()?.get(&feed_id).cloned()
     }
 
     /// Returns the latest update for every feed.
@@ -349,8 +321,18 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oracle_transport::NodeKeySchedule;
     use oracle_types::{Flags, PriceUpdate, Venue, VenueSet};
     use oracle_wire::{Signer, feed_id};
+
+    fn sealer() -> Arc<BroadcastSealer> {
+        let schedule = NodeKeySchedule::new("oracle-a", 60, 1_754_582_400, &mut os_rng());
+        Arc::new(BroadcastSealer::new(Arc::clone(schedule.current())))
+    }
+
+    fn hub(max_pending: usize) -> Hub {
+        Hub::new(max_pending, sealer())
+    }
 
     fn symbol(text: &str) -> Symbol {
         text.parse().expect("valid symbol")
@@ -375,11 +357,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_subscriber_receives_the_feeds_it_selected() {
-        let hub = Hub::new(64);
+        let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
         let eth = symbol("CRYPTO.ETH/USD");
 
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let subscriber = hub.subscribe("c-1");
         subscriber.select([feed_id(&btc)].into_iter().collect());
 
         hub.publish(btc, signed(&btc, 1));
@@ -397,9 +379,9 @@ mod tests {
     /// backlog of old ones.
     #[tokio::test]
     async fn a_slow_subscriber_gets_the_latest_not_a_backlog() {
-        let hub = Hub::new(64);
+        let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let subscriber = hub.subscribe("c-1");
         subscriber.select([feed_id(&btc)].into_iter().collect());
 
         for seq in 1..=100 {
@@ -418,10 +400,10 @@ mod tests {
 
     #[tokio::test]
     async fn conflation_is_per_feed_not_global() {
-        let hub = Hub::new(64);
+        let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
         let eth = symbol("CRYPTO.ETH/USD");
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let subscriber = hub.subscribe("c-1");
         subscriber.select_firehose();
 
         for seq in 1..=10 {
@@ -436,8 +418,8 @@ mod tests {
     #[tokio::test]
     async fn a_subscriber_too_far_behind_is_marked_lagged() {
         // Room for two distinct feeds outstanding.
-        let hub = Hub::new(2);
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let hub = hub(2);
+        let subscriber = hub.subscribe("c-1");
         subscriber.select_firehose();
 
         for index in 0..5_u8 {
@@ -457,9 +439,9 @@ mod tests {
 
     #[tokio::test]
     async fn drain_waits_until_something_arrives() {
-        let hub = Arc::new(Hub::new(64));
+        let hub = Arc::new(hub(64));
         let btc = symbol("CRYPTO.BTC/USD");
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let subscriber = hub.subscribe("c-1");
         subscriber.select_firehose();
 
         let waiter = {
@@ -475,8 +457,8 @@ mod tests {
 
     #[tokio::test]
     async fn closing_wakes_a_waiting_subscriber() {
-        let hub = Arc::new(Hub::new(64));
-        let subscriber = hub.subscribe(Encoding::Binary);
+        let hub = Arc::new(hub(64));
+        let subscriber = hub.subscribe("c-1");
         subscriber.select_firehose();
 
         let waiter = {
@@ -491,26 +473,43 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_update_is_retained_for_rest_callers() {
-        let hub = Hub::new(64);
+    fn the_latest_update_is_retained_for_health() {
+        let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
         hub.publish(btc, signed(&btc, 1));
         hub.publish(btc, signed(&btc, 2));
 
-        let latest = hub.latest(feed_id(&btc)).expect("present");
-        assert_eq!(latest.signed().update().seq, 2);
-        assert_eq!(hub.latest_all().len(), 1);
+        let latest = hub.latest_all();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest.first().map(|u| u.signed().update().seq), Some(2));
     }
 
-    #[test]
-    fn encoding_is_produced_once_and_shared() {
+    /// Check 1: the publish path seals once per update, whatever the number of
+    /// subscribers, and every subscriber gets the same bytes.
+    #[tokio::test]
+    async fn an_update_is_sealed_once_for_any_number_of_subscribers() {
+        let sealer = sealer();
+        let hub = Hub::new(64, Arc::clone(&sealer));
         let btc = symbol("CRYPTO.BTC/USD");
-        let prepared = PreparedUpdate::new(btc, signed(&btc, 1));
-
-        assert_eq!(prepared.binary().len(), oracle_wire::FRAME_SIZE);
-        // The lazily-built JSON must be identical across calls, not rebuilt.
-        assert_eq!(prepared.json(), prepared.json());
-        assert_eq!(prepared.encoded(Encoding::Binary), prepared.binary());
-        assert_eq!(prepared.encoded(Encoding::Json), prepared.json());
+        for (round, count) in [(1_u64, 1_usize), (2, 10), (3, 1000)] {
+            let subscribers: Vec<Arc<Subscriber>> = (0..count)
+                .map(|_| {
+                    let subscriber = hub.subscribe("c-1");
+                    subscriber.select_firehose();
+                    subscriber
+                })
+                .collect();
+            let before = sealer.seals();
+            hub.publish(btc, signed(&btc, round));
+            assert_eq!(sealer.seals() - before, 1, "{count} subscribers");
+            let mut copies = Vec::with_capacity(count);
+            for subscriber in &subscribers {
+                let drained = subscriber.drain().await;
+                let update = drained.first().expect("delivered");
+                copies.push(update.sealed());
+                hub.unsubscribe(subscriber.id());
+            }
+            assert!(copies.iter().all(|copy| Some(copy) == copies.first()));
+        }
     }
 }

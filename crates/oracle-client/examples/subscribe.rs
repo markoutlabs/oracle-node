@@ -1,13 +1,17 @@
-//! Subscribes to live nodes and prints verified prices.
+//! Subscribes to live nodes as a listed client and prints verified prices.
 //!
 //! ```sh
 //! # From a registry file.
 //! cargo run -p oracle-client --example subscribe -- \
-//!   registry.json 0x<governance-address> CRYPTO.BTC/USDT
+//!   registry.json 0x<governance-address> CRYPTO.BTC/USDT \
+//!   --client-id c-1 --client-key client.key
 //! # From the registry canister, refreshing on rotation.
 //! cargo run -p oracle-client --example subscribe -- \
-//!   https://<canister-id>.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT
+//!   https://<canister-id>.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT \
+//!   --client-id c-1 --client-key client.key
 //! ```
+//!
+//! The `client_key` example makes a key; governance lists it with `add_client`.
 //!
 //! Uses a quorum of one so it can run against a single local node. That is
 //! explicitly unsafe, and the API makes you say so.
@@ -34,6 +38,12 @@ struct Args {
     /// Print every Nth resolved price.
     #[arg(long, default_value_t = 20)]
     every: u32,
+    /// Client id in the nodes' client list.
+    #[arg(long)]
+    client_id: String,
+    /// File holding the client API key as hex.
+    #[arg(long)]
+    client_key: std::path::PathBuf,
 }
 
 #[tokio::main]
@@ -51,6 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OracleClient::builder(registry.verify(args.governance, 0)?)
     };
 
+    let key = oracle_wire::Signer::from_hex(std::fs::read_to_string(&args.client_key)?.trim())?;
+    let builder = builder.client_key(args.client_id.clone(), key);
     let mut client = builder
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()

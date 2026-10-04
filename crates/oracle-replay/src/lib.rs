@@ -204,7 +204,7 @@ pub async fn run(
     let clock = MonotonicClock::driven(Arc::clone(&now_ns));
 
     let aggregator = Aggregator::new(resolved.feeds)?;
-    let mut pipeline = Pipeline::new(aggregator, signer);
+    let mut pipeline = Pipeline::new(aggregator, std::sync::Arc::new(signer));
     let adapters = build_adapters(resolved.binance, resolved.venues, connector, clock)?;
 
     let shutdown = CancellationToken::new();

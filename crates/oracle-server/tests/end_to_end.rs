@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oracle_client::{OracleClient, Status, testing as client_testing};
-use oracle_server::testing::{NODE_ID, sample_update, signing_key};
+use oracle_server::testing::{
+    CLIENT_ID, NODE_ID, client_key, sample_update, signing_key, test_transport,
+};
 use oracle_server::{ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
 use oracle_wire::{Registry, Signer, VerifiedRegistry, feed_id};
@@ -86,7 +88,7 @@ async fn start_node() -> Node {
         node_id: NODE_ID.to_owned(),
         operator: "test".to_owned(),
         identity_pubkey: identity.public_key(),
-        endpoints: vec![format!("ws://{addr}/v1/ws")],
+        endpoints: vec![format!("ws://{addr}/v2/ws")],
         signing_keys: vec![cert],
         weight: 1,
     };
@@ -103,7 +105,7 @@ async fn start_node() -> Node {
     .expect("signs");
     let verified = registry.verify(governance.address(), 0).expect("verifies");
 
-    let state = ServerState::new(NODE_ID, &[symbol()], registry, 64);
+    let state = ServerState::new(NODE_ID, &[symbol()], registry, test_transport());
     let app = router(Arc::clone(&state));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -130,7 +132,8 @@ fn update(seq: u64, price: i64, flags: Flags) -> PriceUpdate {
 
 // ------------------------------------------------------------------- tests
 
-/// The headline path: node signs, socket carries, client verifies.
+/// The headline path: node signs and seals, socket carries, a listed client
+/// authenticates, opens and verifies.
 #[tokio::test]
 async fn a_signed_update_travels_the_wire_and_verifies() {
     let node = start_node().await;
@@ -138,6 +141,7 @@ async fn a_signed_update_travels_the_wire_and_verifies() {
     let mut client = OracleClient::builder(node.registry.clone())
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()
+        .client_key(CLIENT_ID, client_key())
         .build()
         .expect("valid configuration");
     client.subscribe(&[BTC]).await.expect("subscribes");
@@ -306,45 +310,24 @@ async fn one_lying_node_among_three_is_outvoted_and_visible() {
     assert!(resolved.is_usable());
 }
 
-/// The REST surface a consumer needs before it can subscribe to anything.
+/// The open routes a consumer needs before it can subscribe to anything. None
+/// of them carries a price.
 #[tokio::test]
-async fn rest_serves_the_catalogue_health_and_the_latest_price() {
+async fn the_open_routes_serve_the_catalogue_and_health() {
     let node = start_node().await;
-    let _ = node.state.publish(
-        node.signer
-            .sign_update(&update(1, 6_400_000_000_000, Flags::NONE)),
-    );
 
-    let (status, body) = get(&node.addr, "/v1/feeds").await;
+    let (status, body) = get(&node.addr, "/v2/feeds").await;
     assert_eq!(status, 200);
     assert!(
         body.contains(BTC),
         "the catalogue must list the feed: {body}"
     );
 
-    let (status, body) = get(&node.addr, "/v1/health").await;
+    let (status, body) = get(&node.addr, "/v2/health").await;
     assert_eq!(status, 200);
     assert!(
         body.contains(NODE_ID),
         "health must identify the node: {body}"
-    );
-
-    let (status, body) = get(&node.addr, "/v1/price/CRYPTO.BTC%2FUSD/latest").await;
-    assert_eq!(status, 200);
-    assert!(
-        body.contains("\"payload\""),
-        "the signed bytes must be served: {body}"
-    );
-    // The field a JSON-number parser would silently mangle.
-    assert!(
-        body.contains("\"publish_time_ns\":\""),
-        "timestamps must be strings: {body}"
-    );
-
-    let (status, _) = get(&node.addr, "/v1/price/CRYPTO.DOGE%2FUSD/latest").await;
-    assert_eq!(
-        status, 404,
-        "an unknown feed must 404, not 200 with nothing"
     );
 }
 

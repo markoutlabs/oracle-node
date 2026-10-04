@@ -168,8 +168,8 @@ pub enum VerifyError {
         published: u64,
     },
 
-    /// The registry's governance signature did not match the pinned key.
-    #[error("registry governance signature is from {found}, expected {expected}")]
+    /// A governance document's signature did not match the pinned key.
+    #[error("governance signature is from {found}, expected {expected}")]
     UntrustedGovernance {
         /// Address recovered from the registry signature.
         found: Address,
@@ -207,4 +207,17 @@ pub enum VerifyError {
     /// The registry was structurally invalid.
     #[error("malformed registry: {0}")]
     MalformedRegistry(String),
+
+    /// The client list version was not newer than the version already trusted.
+    #[error("client list version {found} is not newer than the trusted version {minimum}")]
+    StaleClientList {
+        /// Version in the supplied list.
+        found: u64,
+        /// Minimum the caller will accept.
+        minimum: u64,
+    },
+
+    /// The client list was structurally invalid.
+    #[error("malformed client list: {0}")]
+    MalformedClientList(String),
 }

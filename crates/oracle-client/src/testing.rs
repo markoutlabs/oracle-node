@@ -147,7 +147,7 @@ impl TestNode {
             node_id: self.node_id.clone(),
             operator: "test".to_owned(),
             identity_pubkey: self.identity.public_key(),
-            endpoints: vec![format!("wss://{}.test/v1/ws", self.node_id)],
+            endpoints: vec![format!("wss://{}.test/v2/ws", self.node_id)],
             signing_keys: vec![self.cert(self.signing.address())],
             weight: 1,
         }

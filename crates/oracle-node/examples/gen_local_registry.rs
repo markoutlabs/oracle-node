@@ -3,8 +3,10 @@
 //! The keys are derived from small integers. **Never use them anywhere real.**
 //!
 //! ```text
-//! # A five-node deployment: the shape SPEC §9.2 asks for.
-//! cargo run -p oracle-node --example gen_local_registry -- --nodes 5 > registry.json
+//! # A five-node deployment: the shape SPEC §9.2 asks for, plus the client
+//! # list every node needs and one local client to subscribe with.
+//! cargo run -p oracle-node --example gen_local_registry -- \
+//!     --nodes 5 --clients clients.json > registry.json
 //!
 //! # Sign in a node generated with `oracle-node init`, which has real keys but
 //! # no governance key of its own.
@@ -19,13 +21,21 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oracle_wire::{NodeEntry, Quorum, Registry, Signer, SigningKeyCert, WireError};
+use oracle_wire::{
+    ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, WireError,
+};
 
 /// Far-future expiry for generated keys.
 const FOREVER: u64 = 4_102_444_800;
 
 /// Governance key seed. Signs the registry; pinned by every consumer.
 const GOVERNANCE_SEED: u8 = 0x33;
+
+/// The local client's API key seed.
+const CLIENT_SEED: u8 = 0x60;
+
+/// The local client's id in the client list.
+const CLIENT_ID: &str = "local-client";
 
 /// Generates a governance-signed local registry with deterministic keys.
 ///
@@ -45,6 +55,10 @@ struct Options {
     /// A node entry from `oracle-node init` to sign in. Repeatable.
     #[arg(long = "entry", value_name = "node-entry.json")]
     entries: Vec<PathBuf>,
+    /// Also write a signed client list naming one local client, which every
+    /// node needs to start (SPEC §6.1).
+    #[arg(long, value_name = "clients.json")]
+    clients: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,6 +105,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Registry::sign(&governance, options.version, now, entries, quorum)?;
     println!("{}", serde_json::to_string_pretty(&registry)?);
 
+    if let Some(path) = &options.clients {
+        let client = Signer::from_secret_bytes([CLIENT_SEED; 32])?;
+        let list = ClientList::sign(
+            &governance,
+            options.version,
+            now,
+            60,
+            vec![ClientEntry {
+                client_id: CLIENT_ID.to_owned(),
+                pubkey: client.public_key(),
+                expires_at: FOREVER,
+            }],
+        )?;
+        std::fs::write(path, serde_json::to_string_pretty(&list)?)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        eprintln!("# client list written to {}", path.display());
+        eprintln!("LOCAL_CLIENT_ID={CLIENT_ID}");
+        eprintln!("LOCAL_CLIENT_KEY={}", hex32(CLIENT_SEED));
+    }
+
     eprintln!("GOVERNANCE={}", governance.address());
     eprintln!("# Pin this address in every node and consumer config.");
     for index in 1..=options.nodes {
@@ -117,7 +151,7 @@ fn entry(index: u8, options: &Options) -> Result<NodeEntry, WireError> {
         operator: format!("local-{index}"),
         identity_pubkey: identity.public_key(),
         endpoints: vec![format!(
-            "ws://127.0.0.1:{}/v1/ws",
+            "ws://127.0.0.1:{}/v2/ws",
             options.base_port + u16::from(index) - 1
         )],
         signing_keys: vec![cert],

@@ -70,8 +70,10 @@
 //! ```
 
 mod address;
+mod auth;
 mod backend;
 mod cert;
+mod clients;
 mod codec;
 pub mod domain;
 mod error;
@@ -83,16 +85,22 @@ mod signature;
 mod signer;
 
 pub use address::{Address, CompressedPublicKey};
+pub use auth::{
+    AUTH_PAYLOAD_SIZE, TRANSPORT_PROTOCOL, auth_ok_payload, auth_ok_transcript,
+    client_auth_payload, client_auth_transcript,
+};
 pub use backend::name as backend_name;
-pub use cert::{MAX_NODE_ID_LEN, SigningKeyCert};
+pub use cert::{MAX_NODE_ID_LEN, NO_EXPIRY, SigningKeyCert};
+pub use clients::{ClientEntry, ClientList, MAX_CLIENT_ID_LEN, MAX_CLIENTS, VerifiedClientList};
 pub use error::{VerifyError, WireError};
 pub use frame::{
     FRAME_SIZE, FRAME_TYPE_PRICE_UPDATE, SignedUpdate, UnverifiedFrame, VerifiedUpdate,
 };
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
-    KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_SIGNING_KEY_CERT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE,
-    decode_price_update, encode_price_update, feed_id,
+    KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_NODE_AUTH_OK, KIND_PRICE_UPDATE, KIND_REGISTRY,
+    KIND_SIGNING_KEY_CERT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update,
+    encode_price_update, feed_id,
 };
 pub use registry::{
     KeyHistoryEntry, MAX_CERTS_PER_NODE, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES,

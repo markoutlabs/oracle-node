@@ -5,12 +5,11 @@
 //! ```text
 //! identity key ── long-lived. Signs only signing-key certificates, never prices.
 //!      │          Encrypted at rest on the operator's machine.
-//!      └── signing key ── in process memory, rotated every 30 days.
+//!      └── signing key ── in process memory, no expiry.
 //!                         Signs every PriceUpdate.
 //! ```
 //!
-//! A stolen signing key is bad for at most its remaining validity window and is
-//! revoked by publishing a registry without it. A stolen identity key means
+//! A stolen signing key is revoked by publishing a registry without it. A stolen identity key means
 //! governance has to rotate the node entry itself. Generating both here, and
 //! writing them to separate files, is what makes that distinction real rather
 //! than aspirational.
@@ -18,12 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
-use oracle_wire::{NodeEntry, Signer, SigningKeyCert};
+use oracle_wire::{NO_EXPIRY, NodeEntry, Signer, SigningKeyCert};
 
 use crate::keyfile;
-
-/// Default certificate validity, in days (SPEC §3.5).
-pub const DEFAULT_VALIDITY_DAYS: u64 = 30;
 
 /// Something went wrong generating or writing the node's identity.
 #[derive(Debug, thiserror::Error)]
@@ -56,8 +52,6 @@ pub struct InitOptions {
     pub operator: String,
     /// The WebSocket endpoint subscribers will connect to.
     pub endpoint: String,
-    /// How long the signing certificate is valid, in days.
-    pub validity_days: u64,
 }
 
 impl Default for InitOptions {
@@ -65,8 +59,7 @@ impl Default for InitOptions {
         Self {
             node_id: "oracle-1".to_owned(),
             operator: "unset".to_owned(),
-            endpoint: "ws://127.0.0.1:8791/v1/ws".to_owned(),
-            validity_days: DEFAULT_VALIDITY_DAYS,
+            endpoint: "ws://127.0.0.1:8791/v2/ws".to_owned(),
         }
     }
 }
@@ -86,8 +79,7 @@ pub struct NodeKeys {
 impl NodeKeys {
     /// Generates both keys and issues the signing certificate.
     ///
-    /// `now` is unix seconds; the certificate starts there and runs for
-    /// [`InitOptions::validity_days`].
+    /// `now` is unix seconds; the certificate starts there and never expires.
     ///
     /// # Errors
     ///
@@ -109,13 +101,12 @@ impl NodeKeys {
 
         let identity = Signer::generate()?;
         let signing = Signer::generate()?;
-        let not_after = now.saturating_add(options.validity_days.saturating_mul(86_400));
         let cert = SigningKeyCert::issue(
             &identity,
             &options.node_id,
             signing.address(),
             now,
-            not_after,
+            NO_EXPIRY,
         )?;
 
         Ok(Self {
@@ -227,6 +218,11 @@ path = {registry_path}
 # copy it out of a registry file you were sent.
 governance_address = "0x0000000000000000000000000000000000000000"
 
+# The governance-signed client list (SPEC §6.1). The node serves prices only to
+# these clients, encrypted, over /v2/ws, and refuses to start without the list.
+[clients]
+url = "https://<canister-id>.icp0.io/clients.json"
+
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT"
 min_sources = 2
@@ -267,15 +263,9 @@ impl Rotation {
     /// Returns [`InitError::NodeId`] if the node id is too long for the
     /// certificate encoding, or [`InitError::Key`] if the OS entropy source
     /// cannot be read.
-    pub fn generate(
-        identity: &Signer,
-        node_id: &str,
-        validity_days: u64,
-        now: u64,
-    ) -> Result<Self, InitError> {
+    pub fn generate(identity: &Signer, node_id: &str, now: u64) -> Result<Self, InitError> {
         let signing = Signer::generate()?;
-        let not_after = now.saturating_add(validity_days.saturating_mul(86_400));
-        let cert = SigningKeyCert::issue(identity, node_id, signing.address(), now, not_after)
+        let cert = SigningKeyCert::issue(identity, node_id, signing.address(), now, NO_EXPIRY)
             .map_err(|error| match error {
                 oracle_wire::WireError::FieldTooLong { .. } => {
                     InitError::NodeId(format!("`{node_id}` is too long for a certificate"))
@@ -315,7 +305,7 @@ impl Rotation {
         Ok((key_path, cert_path))
     }
 
-    /// The `dfx canister call` that submits this rotation to the registry.
+    /// The `dfx canister call` governance runs to swap this key in.
     ///
     /// # Panics
     ///
@@ -407,8 +397,7 @@ mod tests {
         InitOptions {
             node_id: "oracle-eu-1".to_owned(),
             operator: "acme".to_owned(),
-            endpoint: "wss://eu1.example/v1/ws".to_owned(),
-            validity_days: 30,
+            endpoint: "wss://eu1.example/v2/ws".to_owned(),
         }
     }
 
@@ -445,10 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn the_certificate_window_matches_the_requested_validity() {
+    fn the_certificate_never_expires() {
         let keys = NodeKeys::generate(options(), NOW).expect("generates");
         assert_eq!(keys.cert.not_before, NOW);
-        assert_eq!(keys.cert.not_after, NOW + 30 * 86_400);
+        assert_eq!(keys.cert.not_after, NO_EXPIRY);
+        assert!(keys.cert.covers(u64::MAX - 1));
         assert!(keys.cert.has_valid_window());
         assert!(keys.cert.covers(NOW * oracle_types::NANOS_PER_SEC));
     }
@@ -488,7 +478,7 @@ mod tests {
     fn a_rotation_keeps_the_identity_and_changes_the_signing_key() {
         let keys = NodeKeys::generate(options(), NOW).expect("generates");
         let rotation =
-            Rotation::generate(&keys.identity, "oracle-eu-1", 30, NOW + 10).expect("rotates");
+            Rotation::generate(&keys.identity, "oracle-eu-1", NOW + 10).expect("rotates");
         assert_ne!(rotation.signing.address(), keys.signing.address());
         assert_eq!(
             rotation.cert.recover_issuer().expect("recovers"),
@@ -496,7 +486,7 @@ mod tests {
         );
         assert_eq!(rotation.cert.address, rotation.signing.address());
         assert_eq!(rotation.cert.not_before, NOW + 10);
-        assert_eq!(rotation.cert.not_after, NOW + 10 + 30 * 86_400);
+        assert_eq!(rotation.cert.not_after, NO_EXPIRY);
 
         // The printed call carries the certificate the canister will parse.
         let call = rotation.canister_call("aaaaa-aa");
@@ -631,7 +621,7 @@ mod tests {
     #[test]
     fn the_config_listen_port_ignores_colons_in_the_path() {
         let options = InitOptions {
-            endpoint: "ws://127.0.0.1:9001/v1/ws?x=a:1".to_owned(),
+            endpoint: "ws://127.0.0.1:9001/v2/ws?x=a:1".to_owned(),
             ..options()
         };
         let keys = NodeKeys::generate(options, NOW).expect("generates");
@@ -643,7 +633,7 @@ mod tests {
     #[test]
     fn the_config_listen_port_follows_the_endpoint() {
         let options = InitOptions {
-            endpoint: "ws://127.0.0.1:9001/v1/ws".to_owned(),
+            endpoint: "ws://127.0.0.1:9001/v2/ws".to_owned(),
             ..options()
         };
         let keys = NodeKeys::generate(options, NOW).expect("generates");
