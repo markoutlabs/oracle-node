@@ -10,7 +10,6 @@ members = [
     "crates/oracle-node",
     "crates/oracle-registry-canister",
     "crates/oracle-replay",
-    "crates/oracle-monitor",
 ]
 
 [workspace.package]
@@ -46,8 +45,6 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # `rustls-no-provider`, not `rustls`: the workspace already pins rustls to the
 # `ring` provider through tokio-tungstenite, and a second provider makes
 # `ClientConfig::builder()` refuse to pick one at runtime.

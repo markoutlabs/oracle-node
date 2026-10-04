@@ -25,6 +25,6 @@ pub mod hub;
 pub mod protocol;
 pub mod testing;
 
-pub use app::{FeedEntry, MetricsRender, ServerState, router};
+pub use app::{FeedEntry, ServerState, router};
 pub use hub::{Hub, PreparedUpdate, Subscriber};
 pub use protocol::{ClientMessage, Encoding, JsonUpdate, ServerMessage};
