@@ -72,9 +72,8 @@ impl HttpRegistrySource {
 
     /// The registry canister's `/registry.json` on the Internet Computer.
     ///
-    /// The canister answers through an update call, so the gateway's response
-    /// verification passes and no `raw` domain is needed. The document's own
-    /// governance signature remains the check that matters.
+    /// The canister certifies the response, so no `raw` domain is needed. The
+    /// document's own governance signature remains the check that matters.
     ///
     /// # Errors
     ///

@@ -12,54 +12,17 @@
 //! - A de-listed node keeps counting until its last update ages out.
 //! - A document that stops being refreshed is reported as healthy.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use oracle_client::source::RegistryFuture;
 use oracle_client::testing::{
-    REGISTRY_ISSUED_AT, TestNode, forged_registry, governance, registry_with, signed_registry,
-    signed_registry_at, update_at,
+    REGISTRY_ISSUED_AT, TestNode, TestSource, forged_registry, governance, registry_with,
+    signed_registry, signed_registry_at, update_at,
 };
-use oracle_client::{ClientError, Concern, OracleClient, RegistrySource, RejectReason, Status};
+use oracle_client::{ClientError, Concern, OracleClient, RejectReason, Status};
 use oracle_types::NANOS_PER_SEC;
-use oracle_wire::{NodeEntry, Registry, VerifyError};
+use oracle_wire::{NodeEntry, VerifyError};
 
 const NOW: u64 = REGISTRY_ISSUED_AT * NANOS_PER_SEC;
-
-/// A registry source that serves whatever the test put in it, and counts.
-#[derive(Default)]
-struct MockSource {
-    document: Mutex<Option<Registry>>,
-    fetches: AtomicUsize,
-}
-
-impl MockSource {
-    fn serving(registry: Registry) -> Arc<Self> {
-        Arc::new(Self {
-            document: Mutex::new(Some(registry)),
-            fetches: AtomicUsize::new(0),
-        })
-    }
-
-    fn serve(&self, registry: Registry) {
-        *self.document.lock().expect("not poisoned") = Some(registry);
-    }
-
-    fn fetches(&self) -> usize {
-        self.fetches.load(Ordering::SeqCst)
-    }
-}
-
-impl RegistrySource for MockSource {
-    fn fetch(&self) -> RegistryFuture<'_> {
-        self.fetches.fetch_add(1, Ordering::SeqCst);
-        let document = self.document.lock().expect("not poisoned").clone();
-        Box::pin(async move {
-            document
-                .ok_or_else(|| oracle_client::FetchError::Transport("nothing to serve".to_owned()))
-        })
-    }
-}
 
 /// The deployment §9.2 calls for: five nodes, quorum of three.
 fn fleet() -> Vec<TestNode> {
@@ -80,7 +43,7 @@ fn client(nodes: &[TestNode]) -> OracleClient {
         .expect("five nodes satisfy a quorum of three")
 }
 
-fn client_with_source(nodes: &[TestNode], source: Arc<MockSource>) -> OracleClient {
+fn client_with_source(nodes: &[TestNode], source: Arc<TestSource>) -> OracleClient {
     let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
     OracleClient::builder(registry)
         .quorum(3)
@@ -113,7 +76,7 @@ fn five_nodes_resolve_at_a_quorum_of_three() {
 #[tokio::test]
 async fn a_rotation_costs_the_consumer_one_fetch() {
     let mut nodes = fleet();
-    let source = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let source = TestSource::serving(signed_registry(1, entries(&nodes)));
     let mut client = client_with_source(&nodes, Arc::clone(&source));
 
     for node in &nodes {
@@ -174,7 +137,7 @@ async fn a_rotation_costs_the_consumer_one_fetch() {
 #[tokio::test]
 async fn unknown_signers_fetch_at_most_once_per_interval() {
     let nodes = fleet();
-    let source = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let source = TestSource::serving(signed_registry(1, entries(&nodes)));
     let mut client = client_with_source(&nodes, Arc::clone(&source));
     let impostor = TestNode::new(200, "impostor");
 
@@ -299,7 +262,7 @@ fn a_registry_signed_by_anyone_else_is_refused() {
 #[tokio::test]
 async fn building_from_a_source_verifies_against_the_pinned_governance_key() {
     let nodes = fleet();
-    let good = MockSource::serving(signed_registry(1, entries(&nodes)));
+    let good = TestSource::serving(signed_registry(1, entries(&nodes)));
     let client = OracleClient::builder_from_source(good, governance().address())
         .await
         .expect("fetched and verified")
@@ -308,14 +271,14 @@ async fn building_from_a_source_verifies_against_the_pinned_governance_key() {
         .expect("builds");
     assert_eq!(client.registry_version(), 1);
 
-    let forged = MockSource::serving(forged_registry(1, entries(&nodes)));
+    let forged = TestSource::serving(forged_registry(1, entries(&nodes)));
     let error = OracleClient::builder_from_source(forged, governance().address())
         .await
         .err()
         .expect("must refuse");
     assert!(matches!(error, ClientError::Registry(_)), "got {error:?}");
 
-    let empty = Arc::new(MockSource::default());
+    let empty = Arc::new(TestSource::default());
     let error = OracleClient::builder_from_source(empty, governance().address())
         .await
         .err()

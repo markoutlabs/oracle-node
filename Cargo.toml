@@ -34,6 +34,8 @@ ic-cdk = "0.20"
 ic-cdk-management-canister = "0.2"
 ic-cdk-timers = "1"
 pocket-ic = "9"
+ic-http-certification = "4"
+ic-response-verification = "4"
 
 age = { version = "0.11", features = ["armor"] }
 async-trait = "0.1"

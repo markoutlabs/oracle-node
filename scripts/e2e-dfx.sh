@@ -113,7 +113,8 @@ echo "signer $(grep -o "0x[0-9a-f]\{40\}" "$DIR/node1b.log" | head -1)"
 wait "$CLIENT_PID" || { cat "$DIR/client-rotation.log"; die "rotation client failed"; }
 grep -- "--- adopted registry" "$DIR/client-rotation.log" || die "client never adopted the new registry"
 tail -1 "$DIR/client-rotation.log"
-[ "$(stat refreshes "$DIR/client-rotation.log")" -eq 1 ] || die "expected exactly one registry refresh"
+# A scheduled poll can adopt the new key first, so zero refreshes is fine too.
+[ "$(stat refreshes "$DIR/client-rotation.log")" -le 1 ] || die "a rotation cost more than one registry refresh"
 [ "$(stat untrusted "$DIR/client-rotation.log")" -eq 0 ] || die "untrusted frames during rotation"
 [ "$(stat replayed "$DIR/client-rotation.log")" -eq 0 ] || die "replays after the restart: seq did not survive"
 [ "$(stat refresh_failures "$DIR/client-rotation.log")" -eq 0 ] || die "a refresh failed"

@@ -38,15 +38,32 @@ use ic_cdk_management_canister::{
     EcdsaCurve, EcdsaKeyId, EcdsaPublicKeyArgs, SignWithEcdsaArgs, ecdsa_public_key,
     sign_with_ecdsa,
 };
+use ic_http_certification::utils::add_v2_certificate_header;
+use ic_http_certification::{
+    CERTIFICATE_EXPRESSION_HEADER_NAME, DefaultCelBuilder, DefaultResponseCertification,
+    HttpCertification, HttpCertificationPath, HttpCertificationTree, HttpCertificationTreeEntry,
+    Method, StatusCode,
+};
+pub use ic_http_certification::{HttpRequest, HttpResponse};
 use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, Signature, SigningKeyCert};
 use serde::Deserialize;
 
 use crate::state::{Config, State, StateError};
 
+const REGISTRY_PATH: &str = "/registry.json";
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     /// A signing round is in flight.
     static BUSY: Cell<bool> = const { Cell::new(false) };
+    // Not in stable memory: rebuilt from `STATE` in `post_upgrade`.
+    static CERTIFIED: RefCell<Option<CertifiedResponse>> = const { RefCell::new(None) };
+}
+
+struct CertifiedResponse {
+    tree: HttpCertificationTree,
+    entry: HttpCertificationTreeEntry<'static>,
+    response: HttpResponse<'static>,
 }
 
 /// Install arguments.
@@ -62,32 +79,6 @@ pub struct InitArgs {
     pub min_nodes: u16,
     /// Recommended quorum.
     pub recommended: u16,
-}
-
-/// An HTTP request as the gateway delivers it.
-#[derive(CandidType, Deserialize, Clone, Debug)]
-pub struct HttpRequest {
-    /// HTTP method.
-    pub method: String,
-    /// Path and query.
-    pub url: String,
-    /// Request headers.
-    pub headers: Vec<(String, String)>,
-    /// Request body.
-    pub body: Vec<u8>,
-}
-
-/// An HTTP response for the gateway.
-#[derive(CandidType, Deserialize, Clone, Debug)]
-pub struct HttpResponse {
-    /// HTTP status.
-    pub status_code: u16,
-    /// Response headers.
-    pub headers: Vec<(String, String)>,
-    /// Response body.
-    pub body: Vec<u8>,
-    /// Ask the gateway to repeat the request as an update call.
-    pub upgrade: Option<bool>,
 }
 
 fn now_secs() -> u64 {
@@ -142,6 +133,7 @@ fn init(args: InitArgs) {
     )
     .unwrap_or_else(|error| ic_cdk::trap(error.to_string()));
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
+    certify_registry();
     schedule_heartbeat();
 }
 
@@ -157,6 +149,7 @@ fn post_upgrade() {
         ic_cdk::storage::stable_restore().expect("stable memory holds the state");
     let state: State = serde_json::from_slice(&bytes).expect("state deserialises");
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
+    certify_registry();
     schedule_heartbeat();
 }
 
@@ -205,7 +198,51 @@ async fn publish_inner() -> Result<u64, String> {
     let signature = Signature::from_compact_for(&digest, &compact, expected)
         .map_err(|error| format!("cannot adapt the threshold signature: {error}"))?;
 
-    with_state(|s| s.publish(document, signature)).map_err(|error| error.to_string())
+    let version =
+        with_state(|s| s.publish(document, signature)).map_err(|error| error.to_string())?;
+    certify_registry();
+    Ok(version)
+}
+
+/// Certifies the current `/registry.json` response, so the query path can serve it.
+fn certify_registry() {
+    let cel = DefaultCelBuilder::response_only_certification()
+        .with_response_certification(DefaultResponseCertification::response_header_exclusions(
+            vec![],
+        ))
+        .build();
+    let headers = |content_type: &str| {
+        vec![
+            ("content-type".to_owned(), content_type.to_owned()),
+            ("cache-control".to_owned(), "no-cache".to_owned()),
+            (
+                CERTIFICATE_EXPRESSION_HEADER_NAME.to_owned(),
+                cel.to_string(),
+            ),
+        ]
+    };
+    let response = match get_registry() {
+        Some(json) => HttpResponse::ok(json.into_bytes(), headers("application/json")).build(),
+        None => HttpResponse::builder()
+            .with_status_code(StatusCode::SERVICE_UNAVAILABLE)
+            .with_headers(headers("text/plain"))
+            .with_body(b"no registry version has been published yet".to_vec())
+            .build(),
+    };
+    let certification = HttpCertification::response_only(&cel, &response, None)
+        .expect("the response carries its own CEL expression");
+    let entry =
+        HttpCertificationTreeEntry::new(HttpCertificationPath::exact(REGISTRY_PATH), certification);
+    let mut tree = HttpCertificationTree::default();
+    tree.insert(&entry);
+    ic_cdk::api::certified_data_set(tree.root_hash());
+    CERTIFIED.with(|cell| {
+        *cell.borrow_mut() = Some(CertifiedResponse {
+            tree,
+            entry,
+            response,
+        });
+    });
 }
 
 async fn ensure_governance_key() -> Result<CompressedPublicKey, String> {
@@ -351,64 +388,39 @@ fn get_pending() -> String {
     })
 }
 
-/// Answers a gateway request for `/registry.json` by asking for an update call.
-///
-/// HTTP gateways refuse a query response the canister has not certified. This
-/// canister does not build certification trees; instead it upgrades the request
-/// to an update call, whose result consensus certifies on its own. Fetches are
-/// rare (startup, rotation, once per `refresh_interval`), so the update-call
-/// latency is acceptable, and the document still carries its own governance
-/// signature, which is the check every consumer runs.
+/// Serves `/registry.json` as a certified query response.
 #[ic_cdk::query]
-fn http_request(request: HttpRequest) -> HttpResponse {
-    if !is_registry_request(&request) {
-        return not_found();
+fn http_request(request: HttpRequest<'static>) -> HttpResponse<'static> {
+    let is_registry = request.method() == Method::GET
+        && request.get_path().is_ok_and(|path| path == REGISTRY_PATH);
+    if !is_registry {
+        return HttpResponse::not_found(
+            b"not found".to_vec(),
+            vec![("content-type".to_owned(), "text/plain".to_owned())],
+        )
+        .build();
     }
-    HttpResponse {
-        status_code: 200,
-        headers: Vec::new(),
-        body: Vec::new(),
-        upgrade: Some(true),
-    }
-}
-
-/// Serves the registry document at `/registry.json`, as an update call.
-#[ic_cdk::update]
-fn http_request_update(request: HttpRequest) -> HttpResponse {
-    if !is_registry_request(&request) {
-        return not_found();
-    }
-    match get_registry() {
-        Some(json) => HttpResponse {
-            status_code: 200,
-            headers: vec![
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("cache-control".to_owned(), "no-cache".to_owned()),
-            ],
-            body: json.into_bytes(),
-            upgrade: None,
-        },
-        None => HttpResponse {
-            status_code: 503,
-            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
-            body: b"no registry version has been published yet".to_vec(),
-            upgrade: None,
-        },
-    }
-}
-
-fn is_registry_request(request: &HttpRequest) -> bool {
-    let path = request.url.split('?').next().unwrap_or_default();
-    request.method == "GET" && path == "/registry.json"
-}
-
-fn not_found() -> HttpResponse {
-    HttpResponse {
-        status_code: 404,
-        headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
-        body: b"not found".to_vec(),
-        upgrade: None,
-    }
+    CERTIFIED.with(|cell| {
+        let cell = cell.borrow();
+        let certified = cell
+            .as_ref()
+            .expect("certified in init, post_upgrade, and every publish");
+        let mut response = certified.response.clone();
+        // `None` in a replicated call, where consensus certifies the reply.
+        if let Some(certificate) = ic_cdk::api::data_certificate() {
+            let witness = certified
+                .tree
+                .witness(&certified.entry, REGISTRY_PATH)
+                .expect("the entry is in the tree");
+            add_v2_certificate_header(
+                &certificate,
+                &mut response,
+                &witness,
+                &HttpCertificationPath::exact(REGISTRY_PATH).to_expr_path(),
+            );
+        }
+        response
+    })
 }
 
 // Generates `__get_candid_interface_tmp_hack`, which `candid-extractor` reads

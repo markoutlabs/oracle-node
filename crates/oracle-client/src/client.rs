@@ -8,14 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use backon::{BackoffBuilder, ExponentialBuilder};
+use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
-use oracle_wire::{Address, VerifiedRegistry, VerifyError, feed_id};
+use oracle_wire::{Address, Registry, VerifiedRegistry, VerifyError, feed_id};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
@@ -36,6 +37,9 @@ const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// The canister re-signs at least daily (SPEC §3.6). Two missed heartbeats
 /// means the fetch path is broken or newer versions are being withheld.
 const DEFAULT_MAX_REGISTRY_AGE: Duration = Duration::from_secs(48 * 3_600);
+
+/// Bounds how long a de-listed node keeps its seat.
+const DEFAULT_REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A client construction or connection failure.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +106,7 @@ pub struct OracleClientBuilder {
     channel_capacity: usize,
     source: Option<Arc<dyn RegistrySource>>,
     refresh_interval: Duration,
+    poll_interval: Duration,
     max_registry_age: Duration,
 }
 
@@ -121,6 +126,13 @@ impl OracleClientBuilder {
     #[must_use]
     pub const fn refresh_interval(mut self, interval: Duration) -> Self {
         self.refresh_interval = interval;
+        self
+    }
+
+    /// Sets the longest time between two scheduled registry fetches.
+    #[must_use]
+    pub const fn registry_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
         self
     }
 
@@ -206,14 +218,19 @@ impl OracleClientBuilder {
             quorum_config: self.quorum_config,
             views: HashMap::new(),
             symbols: HashMap::new(),
-            frames_tx: tx,
-            frames_rx: rx,
+            inbound_tx: tx,
+            inbound_rx: rx,
             shutdown: CancellationToken::new(),
             stats: ClientStats::default(),
             source: self.source,
             refresh_interval: self.refresh_interval,
+            poll_interval: self.poll_interval,
             max_registry_age: self.max_registry_age,
             last_refresh_attempt_ns: None,
+            subscription: None,
+            runtime: None,
+            connections: HashMap::new(),
+            polling: false,
         })
     }
 }
@@ -233,8 +250,10 @@ pub struct ClientStats {
     pub incoherent: u64,
     /// Frames refused because their key has been retired.
     pub retired: u64,
-    /// Registry fetches made.
+    /// Registry fetches made outside the schedule: unknown signers and manual calls.
     pub refreshes: u64,
+    /// Scheduled registry fetches.
+    pub polls: u64,
     /// Registry fetches that failed or did not verify.
     pub refresh_failures: u64,
 }
@@ -255,6 +274,16 @@ impl ClientStats {
     }
 }
 
+enum Inbound {
+    Frame(Vec<u8>),
+    Polled(Result<Registry, FetchError>),
+}
+
+struct NodeConnection {
+    endpoint: String,
+    cancel: CancellationToken,
+}
+
 /// Verifies signed updates from many nodes and resolves them into one price.
 pub struct OracleClient {
     verifier: Verifier,
@@ -262,14 +291,20 @@ pub struct OracleClient {
     quorum_config: QuorumConfig,
     views: HashMap<FeedId, FeedView>,
     symbols: HashMap<FeedId, Symbol>,
-    frames_tx: mpsc::Sender<Vec<u8>>,
-    frames_rx: mpsc::Receiver<Vec<u8>>,
+    inbound_tx: mpsc::Sender<Inbound>,
+    inbound_rx: mpsc::Receiver<Inbound>,
     shutdown: CancellationToken,
     stats: ClientStats,
     source: Option<Arc<dyn RegistrySource>>,
     refresh_interval: Duration,
+    poll_interval: Duration,
     max_registry_age: Duration,
     last_refresh_attempt_ns: Option<u64>,
+    subscription: Option<String>,
+    // Kept so that `refresh_registry` can open connections from any thread.
+    runtime: Option<Handle>,
+    connections: HashMap<String, NodeConnection>,
+    polling: bool,
 }
 
 impl OracleClient {
@@ -285,6 +320,7 @@ impl OracleClient {
             channel_capacity: 4_096,
             source: None,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            poll_interval: DEFAULT_REGISTRY_POLL_INTERVAL,
             max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
         }
     }
@@ -352,14 +388,20 @@ impl OracleClient {
             return Ok(None);
         };
         self.stats.refreshes = self.stats.refreshes.saturating_add(1);
-        let outcome = async {
-            let registry = source.fetch().await?;
+        let fetched = source.fetch().await;
+        self.adopt_fetched(fetched)
+    }
+
+    fn adopt_fetched(
+        &mut self,
+        fetched: Result<Registry, FetchError>,
+    ) -> Result<Option<u64>, ClientError> {
+        let outcome = fetched.map_err(ClientError::from).and_then(|registry| {
             if registry.version <= self.registry.version() {
                 return Ok(None);
             }
             self.refresh_registry(&registry).map(Some)
-        }
-        .await;
+        });
         if outcome.is_err() {
             self.stats.refresh_failures = self.stats.refresh_failures.saturating_add(1);
         }
@@ -376,6 +418,8 @@ impl OracleClient {
     /// Feed state and replay high-water marks survive the swap. Observations from
     /// nodes the new version de-lists do not — revocation has to bite immediately,
     /// not once the revoked node's last update happens to age out.
+    ///
+    /// After `subscribe`, the connections follow the new node list.
     ///
     /// Returns the newly adopted version.
     ///
@@ -417,10 +461,13 @@ impl OracleClient {
         let version = verified.version();
         self.verifier.set_registry(verified.clone());
         self.registry = verified;
+        self.reconcile_connections();
         Ok(version)
     }
 
     /// Connects to every node in the registry and subscribes to `symbols`.
+    ///
+    /// A later call adds symbols and reconnects every node with the full set.
     ///
     /// # Errors
     ///
@@ -432,32 +479,88 @@ impl OracleClient {
             let symbol: Symbol = text
                 .parse()
                 .map_err(|_| ClientError::InvalidSymbol((*text).to_owned()))?;
+            parsed.push(symbol);
+        }
+        for symbol in parsed {
             let id = feed_id(&symbol);
             self.symbols.insert(id, symbol);
             self.views.entry(id).or_insert_with(|| FeedView::new(id));
-            parsed.push(symbol);
         }
 
-        let request = subscribe_frame(&parsed);
-        let endpoints: Vec<String> = self
+        let all: Vec<Symbol> = self.symbols.values().copied().collect();
+        self.subscription = Some(subscribe_frame(&all));
+        self.runtime = Some(Handle::current());
+        for (_, connection) in self.connections.drain() {
+            connection.cancel.cancel();
+        }
+        self.reconcile_connections();
+        if self.connections.is_empty() {
+            return Err(ClientError::NoEndpoints);
+        }
+        self.start_polling();
+        Ok(())
+    }
+
+    fn reconcile_connections(&mut self) {
+        let (Some(request), Some(runtime)) = (&self.subscription, &self.runtime) else {
+            return;
+        };
+        let wanted: HashMap<&str, &str> = self
             .registry
             .nodes()
             .iter()
-            .filter_map(|node| node.endpoints.first().cloned())
+            .filter_map(|node| {
+                node.endpoints
+                    .first()
+                    .map(|endpoint| (node.node_id.as_str(), endpoint.as_str()))
+            })
             .collect();
-        if endpoints.is_empty() {
-            return Err(ClientError::NoEndpoints);
-        }
 
-        for endpoint in endpoints {
-            let tx = self.frames_tx.clone();
-            let shutdown = self.shutdown.clone();
-            let request = request.clone();
-            tokio::spawn(async move {
-                node_loop(endpoint, request, tx, shutdown).await;
-            });
+        self.connections.retain(|node_id, connection| {
+            let keep = wanted.get(node_id.as_str()) == Some(&connection.endpoint.as_str());
+            if !keep {
+                connection.cancel.cancel();
+                info!(%node_id, endpoint = %connection.endpoint, "disconnected from node");
+            }
+            keep
+        });
+
+        for (node_id, endpoint) in wanted {
+            if self.connections.contains_key(node_id) {
+                continue;
+            }
+            let cancel = self.shutdown.child_token();
+            runtime.spawn(node_loop(
+                endpoint.to_owned(),
+                request.clone(),
+                self.inbound_tx.clone(),
+                cancel.clone(),
+            ));
+            info!(%node_id, %endpoint, "connecting to node");
+            self.connections.insert(
+                node_id.to_owned(),
+                NodeConnection {
+                    endpoint: endpoint.to_owned(),
+                    cancel,
+                },
+            );
         }
-        Ok(())
+    }
+
+    fn start_polling(&mut self) {
+        if self.polling {
+            return;
+        }
+        let (Some(source), Some(runtime)) = (self.source.clone(), &self.runtime) else {
+            return;
+        };
+        self.polling = true;
+        runtime.spawn(poll_loop(
+            source,
+            self.poll_interval,
+            self.inbound_tx.clone(),
+            self.shutdown.clone(),
+        ));
     }
 
     /// Feeds one frame in directly, bypassing the network and the registry source.
@@ -550,9 +653,21 @@ impl OracleClient {
     /// Yields one resolution per accepted frame, so a consumer sees the feed
     /// state change as soon as any node reports. Returns `None` once every node
     /// connection has ended.
+    /// Scheduled registry fetches are adopted here, so keep calling it.
     pub async fn next(&mut self) -> Option<Resolved> {
         loop {
-            let frame = self.frames_rx.recv().await?;
+            let frame = match self.inbound_rx.recv().await? {
+                Inbound::Frame(frame) => frame,
+                Inbound::Polled(fetched) => {
+                    self.stats.polls = self.stats.polls.saturating_add(1);
+                    match self.adopt_fetched(fetched) {
+                        Ok(Some(version)) => info!(version, "adopted a newer registry"),
+                        Ok(None) => debug!("registry unchanged"),
+                        Err(error) => warn!(%error, "scheduled registry fetch failed"),
+                    }
+                    continue;
+                }
+            };
             let now_ns = now_unix_nanos();
             match self.ingest_with_refresh(&frame, now_ns).await {
                 Ok(resolved) => return Some(resolved),
@@ -615,16 +730,55 @@ fn reconnect_ladder() -> backon::ExponentialBackoff {
         .build()
 }
 
+/// Jittered so that clients started together do not fetch together.
+fn poll_waits(interval: Duration) -> backon::ConstantBackoff {
+    ConstantBuilder::default()
+        .with_delay(interval / 2)
+        .with_jitter()
+        .without_max_times()
+        .build()
+}
+
+/// Runs off the frame path, because a canister update call takes seconds.
+async fn poll_loop(
+    source: Arc<dyn RegistrySource>,
+    interval: Duration,
+    tx: mpsc::Sender<Inbound>,
+    shutdown: CancellationToken,
+) {
+    let mut waits = poll_waits(interval);
+    loop {
+        let wait = waits.next().unwrap_or(interval);
+        let fetched = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            fetched = async {
+                tokio::time::sleep(wait).await;
+                source.fetch().await
+            } => fetched,
+        };
+        if tx.send(Inbound::Polled(fetched)).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Connects to one node and forwards its binary frames, reconnecting on failure.
 async fn node_loop(
     endpoint: String,
     request: String,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Inbound>,
     shutdown: CancellationToken,
 ) {
     let mut backoff = reconnect_ladder();
     while !shutdown.is_cancelled() {
-        match connect_and_pump(&endpoint, &request, &tx, &shutdown).await {
+        // Also drops a de-listed node in the middle of a handshake.
+        let outcome = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            outcome = connect_and_pump(&endpoint, &request, &tx) => outcome,
+        };
+        match outcome {
             Ok(()) => backoff = reconnect_ladder(),
             Err(reason) => {
                 warn!(%endpoint, %reason, "node connection failed");
@@ -645,8 +799,7 @@ async fn node_loop(
 async fn connect_and_pump(
     endpoint: &str,
     request: &str,
-    tx: &mpsc::Sender<Vec<u8>>,
-    shutdown: &CancellationToken,
+    tx: &mpsc::Sender<Inbound>,
 ) -> Result<(), String> {
     let (mut socket, _) = tokio_tungstenite::connect_async(endpoint)
         .await
@@ -656,18 +809,10 @@ async fn connect_and_pump(
         .await
         .map_err(|e| e.to_string())?;
 
-    loop {
-        let message = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return Ok(()),
-            message = socket.next() => message,
-        };
-        let Some(message) = message else {
-            return Ok(());
-        };
+    while let Some(message) = socket.next().await {
         match message.map_err(|e| e.to_string())? {
             Message::Binary(bytes) => {
-                if tx.send(bytes.to_vec()).await.is_err() {
+                if tx.send(Inbound::Frame(bytes.to_vec())).await.is_err() {
                     return Ok(());
                 }
             }
@@ -676,6 +821,7 @@ async fn connect_and_pump(
             Message::Close(_) => return Ok(()),
         }
     }
+    Ok(())
 }
 
 /// Reads the wall clock in unix nanoseconds.

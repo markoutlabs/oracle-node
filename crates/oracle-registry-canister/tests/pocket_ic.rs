@@ -12,6 +12,9 @@ use std::process::Command;
 use std::time::Duration;
 
 use candid::{CandidType, Decode, Encode, Principal};
+use ic_http_certification::StatusCode;
+use ic_response_verification::types::VerificationInfo;
+use ic_response_verification::{ResponseVerificationError, verify_request_response_pair};
 use oracle_registry_canister::{HttpRequest, HttpResponse, InitArgs};
 use oracle_wire::{NodeEntry, Registry, Signer, SigningKeyCert, VerifyError};
 use pocket_ic::{PocketIc, PocketIcBuilder};
@@ -19,6 +22,7 @@ use serde::de::DeserializeOwned;
 
 const ROTATION_WINDOW: u64 = 600;
 const HEARTBEAT: u64 = 86_400;
+const MAX_CERT_AGE_NS: u128 = 300 * 1_000_000_000;
 
 fn server_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("POCKET_IC_BIN") {
@@ -79,8 +83,10 @@ struct Harness {
 
 impl Harness {
     fn new(min_nodes: u16) -> Self {
+        // The NNS subnet supplies the root key that certificates chain to.
         let pic = PocketIcBuilder::new()
             .with_server_binary(server_binary())
+            .with_nns_subnet()
             .with_fiduciary_subnet()
             .with_application_subnet()
             .build();
@@ -132,6 +138,28 @@ impl Harness {
             .query_call(self.canister, Principal::anonymous(), method, args)
             .unwrap_or_else(|error| panic!("{method} rejected: {error}"));
         Decode!(&bytes, T).unwrap_or_else(|error| panic!("{method} reply decodes: {error}"))
+    }
+
+    fn get_registry_json(&self) -> HttpResponse<'static> {
+        let request = HttpRequest::get("/registry.json?x=1").build();
+        self.query("http_request", Encode!(&request).expect("encodes"))
+    }
+
+    /// The check an HTTP gateway runs on a query response.
+    fn verify_http(
+        &self,
+        response: HttpResponse<'static>,
+    ) -> Result<VerificationInfo, ResponseVerificationError> {
+        let root_key = self.pic.root_key().expect("the NNS subnet has a root key");
+        verify_request_response_pair(
+            HttpRequest::get("/registry.json?x=1").build(),
+            response,
+            self.canister.as_slice(),
+            u128::from(self.pic.get_time().as_nanos_since_unix_epoch()),
+            MAX_CERT_AGE_NS,
+            &root_key,
+            2,
+        )
     }
 
     fn submit(&self, op: &Operator) -> Result<(), String> {
@@ -243,6 +271,10 @@ impl Operator {
 #[test]
 fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
     let h = Harness::new(3);
+    let empty = h.get_registry_json();
+    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    h.verify_http(empty)
+        .expect("the empty state is certified at init");
     let mut a = Operator::new(1, "oracle-a");
     let mut b = Operator::new(2, "oracle-b");
     let c = Operator::new(3, "oracle-c");
@@ -281,33 +313,25 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
         Err(VerifyError::StaleRegistry { .. })
     ));
 
-    // The HTTP endpoint upgrades to an update call, which then serves the
-    // same bytes. The gateway does the second hop; here it is explicit.
-    let request = HttpRequest {
-        method: "GET".to_owned(),
-        url: "/registry.json?x=1".to_owned(),
-        headers: Vec::new(),
-        body: Vec::new(),
-    };
-    let first: HttpResponse = h.query("http_request", Encode!(&request).expect("encodes"));
-    assert_eq!(first.upgrade, Some(true));
-    let response: HttpResponse = h.update(
-        Principal::anonymous(),
-        "http_request_update",
-        Encode!(&request).expect("encodes"),
-    );
-    assert_eq!(response.status_code, 200);
-    let served: Registry = serde_json::from_slice(&response.body).expect("parses");
+    // A plain query, certified the way an HTTP gateway checks it.
+    let response = h.get_registry_json();
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.upgrade(), None);
+    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
     assert_eq!(served, registry);
+    let tampered = HttpResponse::builder()
+        .with_status_code(StatusCode::OK)
+        .with_headers(response.headers().to_vec())
+        .with_body(b"{}".to_vec())
+        .build();
+    let checked = h.verify_http(response).expect("the gateway accepts it");
+    assert_eq!(checked.verification_version, 2);
+    assert!(h.verify_http(tampered).is_err(), "a changed body must fail");
     let missing: HttpResponse = h.query(
         "http_request",
-        Encode!(&HttpRequest {
-            url: "/other".to_owned(),
-            ..request
-        })
-        .expect("encodes"),
+        Encode!(&HttpRequest::get("/other").build()).expect("encodes"),
     );
-    assert_eq!(missing.status_code, 404);
+    assert_eq!(missing.status_code(), StatusCode::NOT_FOUND);
 
     // Rotation: atomic swap, one live key, history kept, retired_at set.
     let old_a = a.signing.address();
@@ -320,6 +344,10 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
     assert_eq!(h.rotate(a.principal, "oracle-a", &cert), Ok(4));
     let registry = h.registry();
     registry.verify(governance, 3).expect("v4 verifies");
+    let response = h.get_registry_json();
+    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
+    assert_eq!(served, registry, "each publish re-certifies");
+    h.verify_http(response).expect("v4 is certified");
     let listed_a = registry
         .nodes
         .iter()
@@ -387,4 +415,18 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
     after
         .verify(governance, before.version)
         .expect("heartbeat version verifies");
+
+    // The certification tree is not in stable memory. `post_upgrade` rebuilds it.
+    h.pic
+        .upgrade_canister(
+            h.canister,
+            build_wasm(),
+            Encode!().expect("encodes"),
+            Some(h.governance),
+        )
+        .expect("upgrades");
+    let response = h.get_registry_json();
+    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
+    assert_eq!(served, after);
+    h.verify_http(response).expect("certified after an upgrade");
 }

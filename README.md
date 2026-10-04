@@ -209,10 +209,9 @@ broken or newer versions are being withheld. Every feed is then reported
 membership may not be current.
 
 `HttpRegistrySource::canister(id)` fetches `/registry.json` from the canister.
-The canister answers through an update call, so the gateway's response
-verification passes without the canister building certification trees. The
-document carries its own governance signature either way, which is the check
-every consumer runs.
+The canister certifies that response on every publish, so the gateway accepts a
+plain query. The document carries its own governance signature either way, which
+is the check every consumer runs.
 
 Stored frames are a separate path. `verify_historical` checks a frame against
 the key that was live at its publish time, using the node's key history from the
@@ -511,9 +510,9 @@ a restarted node began its sequence numbers at zero and was refused as a replay
 for every frame until it caught up, which is why `Aggregator::with_sequence_floor`
 exists.
 
-The local gateway, like the mainnet one, verifies responses. The canister answers
-`/registry.json` through an update call rather than building certification trees,
-so the same URL shape works in both places and no `raw` domain is involved.
+The local gateway, like the mainnet one, verifies responses. The canister serves
+`/registry.json` as a certified query, so the same URL shape works in both places
+and no `raw` domain is involved.
 
 ### Rotating a signing key
 
