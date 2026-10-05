@@ -165,22 +165,6 @@
       "frame": "0x0103a1bba60b5aa37094cf16123add674c0158948801010007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff8000000000000000ffffffffffffffff80000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000001f873f8c2aac648ed809bd81c2d0b5679ac5a005d8eaab4154beff75ef0934de993a7687406e7fc0df14653dc5b51a2f055488ade805a301820ab86990189afe1a1b"
     }
   ],
-  "certificates": [
-    {
-      "name": "oracle_eu_1_signing_key",
-      "identity_secret_key": "0x2222222222222222222222222222222222222222222222222222222222222222",
-      "issuer": "0x1563915e194d8cfba1943570603f7606a3115508",
-      "cert": {
-        "node_id": "oracle-eu-1",
-        "address": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
-        "not_before": 1754496000,
-        "not_after": 1757174400,
-        "signature": "0x1c756eecb9ad9ffdad965829b5d4efe1e9b8fc61d2db7bb9c73251600f4299d419d14a1bfd200bcbd6acef5b12794d8a159c10d00fabd79cc57caa0a69fdd32d1c"
-      },
-      "signing_bytes": "0x0181000b6f7261636c652d65752d3119e7e376e7c213b7e7e7e46cc70a5dd086daff2a0000000068937c000000000068bc5a80",
-      "digest": "0xd2a0ff96042b53b806daa9a1c19f862e98514349414f920d8b595834316dead4"
-    }
-  ],
   "registry": {
     "governance_secret_key": "0x9191919191919191919191919191919191919191919191919191919191919191",
     "governance_address": "0x751562ab6780c7cad6f2c383b4b807f3a5ec72c1",
@@ -189,20 +173,10 @@
       "effective_from": 1754582400,
       "nodes": [
         {
-          "node_id": "oracle-eu-1",
+          "address": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
           "operator": "acme",
-          "identity_pubkey": "0x02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
           "endpoints": [
-            "wss://eu1.oracle.example/v1/ws"
-          ],
-          "signing_keys": [
-            {
-              "node_id": "oracle-eu-1",
-              "address": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
-              "not_before": 1754496000,
-              "not_after": 1757174400,
-              "signature": "0x1c756eecb9ad9ffdad965829b5d4efe1e9b8fc61d2db7bb9c73251600f4299d419d14a1bfd200bcbd6acef5b12794d8a159c10d00fabd79cc57caa0a69fdd32d1c"
-            }
+            "wss://eu1.oracle.example/v2/ws"
           ],
           "weight": 1
         }
@@ -211,9 +185,9 @@
         "min_nodes": 3,
         "recommended": 5
       },
-      "governance_signature": "0x8cf113f1692336c1da7f71cafbfbb56547c982164e09aed0416d2a88d23d0bff2fd8f8bee44b01326762d126b111fceaaabe6f4564ec8d60231fcde64201f3e11c"
+      "governance_signature": "0x4c7e66af8c9ac911df061813c3fac57e4404fbd954605b03ba7ee3b1ca2efdda2f6b5140832d019135873ff3bf4f85b1318d6375c1adf698e49e1b451b8456221b"
     },
-    "signing_bytes": "0x01820000000000000001000000006894cd800003000500000001000b6f7261636c652d65752d31000461636d6502466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f2700010001001e7773733a2f2f6575312e6f7261636c652e6578616d706c652f76312f777300010181000b6f7261636c652d65752d3119e7e376e7c213b7e7e7e46cc70a5dd086daff2a0000000068937c000000000068bc5a801c756eecb9ad9ffdad965829b5d4efe1e9b8fc61d2db7bb9c73251600f4299d419d14a1bfd200bcbd6acef5b12794d8a159c10d00fabd79cc57caa0a69fdd32d1c",
-    "digest": "0xaf241211dd700ee4a1317f9818d4b3697da5e66e86a363cfc2487fd774e1d155"
+    "signing_bytes": "0x01820000000000000001000000006894cd80000300050000000119e7e376e7c213b7e7e7e46cc70a5dd086daff2a000461636d6500010001001e7773733a2f2f6575312e6f7261636c652e6578616d706c652f76322f7773",
+    "digest": "0x32d57c9011612f249d511c6f4be6af279fc68cf657b4c0dd4075fda21d400334"
   }
 }

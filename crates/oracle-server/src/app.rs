@@ -14,7 +14,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_transport::{CloseReason, Control, HandshakeMessage, KeyGrant};
 use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Registry, SignedUpdate, feed_id};
+use oracle_wire::{Address, Registry, SignedUpdate, feed_id};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
@@ -43,7 +43,6 @@ pub struct ServerState {
     catalog: HashMap<FeedId, Symbol>,
     by_symbol: HashMap<String, FeedId>,
     registry: Registry,
-    node_id: String,
     transport: Arc<NodeTransport>,
 }
 
@@ -51,12 +50,7 @@ impl ServerState {
     /// Builds server state for a fixed feed catalogue. The hub is the
     /// transport's, so every update is sealed once before fan-out.
     #[must_use]
-    pub fn new(
-        node_id: impl Into<String>,
-        feeds: &[Symbol],
-        registry: Registry,
-        transport: Arc<NodeTransport>,
-    ) -> Arc<Self> {
+    pub fn new(feeds: &[Symbol], registry: Registry, transport: Arc<NodeTransport>) -> Arc<Self> {
         let hub = Arc::clone(transport.hub());
         let mut catalog = HashMap::with_capacity(feeds.len());
         let mut by_symbol = HashMap::with_capacity(feeds.len());
@@ -70,7 +64,6 @@ impl ServerState {
             catalog,
             by_symbol,
             registry,
-            node_id: node_id.into(),
             transport,
         })
     }
@@ -148,7 +141,7 @@ async fn registry(State(state): State<Arc<ServerState>>) -> Response {
 
 #[derive(Serialize)]
 struct Health {
-    node_id: String,
+    address: Address,
     feeds: usize,
     subscribers: usize,
     publishing: usize,
@@ -156,7 +149,7 @@ struct Health {
 
 async fn health(State(state): State<Arc<ServerState>>) -> Response {
     axum::Json(Health {
-        node_id: state.node_id.clone(),
+        address: state.transport.address(),
         feeds: state.catalog.len(),
         subscribers: state.hub.subscriber_count(),
         publishing: state.hub.latest_all().len(),
@@ -297,7 +290,7 @@ async fn serve(
                 };
                 if let Control::Close(reason) = &next {
                     tracing::info!(
-                        client_id = subscriber.client_id(),
+                        client = %subscriber.client(),
                         ?reason,
                         "client session closed"
                     );
@@ -420,12 +413,7 @@ mod tests {
     }
 
     fn state() -> Arc<ServerState> {
-        ServerState::new(
-            "oracle-test-1",
-            &symbols(),
-            test_registry(),
-            test_transport(),
-        )
+        ServerState::new(&symbols(), test_registry(), test_transport())
     }
 
     #[test]
@@ -443,7 +431,9 @@ mod tests {
     #[test]
     fn subscribing_selects_known_feeds_and_reports_unknown_ones() {
         let state = state();
-        let subscriber = state.hub().subscribe("c-1");
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let json = serde_json::to_string(&handle_control(
             r#"{"op":"subscribe","feeds":["CRYPTO.BTC/USD","CRYPTO.DOGE/USD"]}"#,
             &state,
@@ -463,7 +453,9 @@ mod tests {
     #[test]
     fn the_firehose_selects_everything() {
         let state = state();
-        let subscriber = state.hub().subscribe("c-1");
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let _ = handle_control(r#"{"op":"subscribe","feeds":["*"]}"#, &state, &subscriber);
         assert!(subscriber.wants(state.lookup("CRYPTO.BTC/USD").expect("known")));
         assert!(subscriber.wants(state.lookup("CRYPTO.ETH/USD").expect("known")));
@@ -472,7 +464,9 @@ mod tests {
     #[test]
     fn unsubscribing_removes_the_feed() {
         let state = state();
-        let subscriber = state.hub().subscribe("c-1");
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let _ = handle_control(
             r#"{"op":"subscribe","feeds":["CRYPTO.BTC/USD"]}"#,
             &state,
@@ -489,7 +483,9 @@ mod tests {
     #[test]
     fn a_ping_is_answered_with_its_id() {
         let state = state();
-        let subscriber = state.hub().subscribe("c-1");
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let json = serde_json::to_string(&handle_control(
             r#"{"op":"ping","id":99}"#,
             &state,
@@ -503,7 +499,9 @@ mod tests {
     #[test]
     fn a_malformed_control_message_is_answered_not_fatal() {
         let state = state();
-        let subscriber = state.hub().subscribe("c-1");
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let json = serde_json::to_string(&handle_control("{not json", &state, &subscriber))
             .expect("serialises");
         assert!(json.contains(r#""op":"error""#));

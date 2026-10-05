@@ -7,6 +7,7 @@ use aes_gcm_siv::Aes256GcmSiv;
 use aes_gcm_siv::aead::KeyInit as _;
 use hkdf::Hkdf;
 use hpke::rand_core::CryptoRng;
+use oracle_wire::Address;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -27,7 +28,7 @@ const KEY_ID_INFO: &[u8] = b"price-oracle/2 key-id";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyContext {
     /// The node that seals with it.
-    pub node_id: String,
+    pub node: Address,
     /// The grid epoch, `not_before / epoch_secs` for a grid key.
     pub epoch_index: u64,
     /// Strictly increasing within one node process, across every key it makes.
@@ -40,9 +41,9 @@ pub struct KeyContext {
 
 impl KeyContext {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 + self.node_id.len());
+        let mut out = Vec::with_capacity(80);
         put_prefixed(&mut out, CONTEXT_LABEL);
-        put_prefixed(&mut out, self.node_id.as_bytes());
+        out.extend_from_slice(self.node.as_bytes());
         for value in [
             self.epoch_index,
             self.generation,
@@ -173,7 +174,7 @@ pub enum Tick {
 /// A node's broadcast keys: the current one and, near a boundary, the next.
 #[derive(Debug)]
 pub struct NodeKeySchedule {
-    node_id: String,
+    node: Address,
     epoch_secs: u64,
     generation: u64,
     current: Arc<EpochKey>,
@@ -182,11 +183,11 @@ pub struct NodeKeySchedule {
 
 impl NodeKeySchedule {
     /// Starts with a key for the epoch that contains `now`.
-    pub fn new(node_id: &str, epoch_secs: u64, now: u64, rng: &mut impl CryptoRng) -> Self {
+    pub fn new(node: Address, epoch_secs: u64, now: u64, rng: &mut impl CryptoRng) -> Self {
         let epoch_secs = epoch_secs.max(1);
-        let current = Arc::new(grid_key(node_id, epoch_secs, now / epoch_secs, 1, rng));
+        let current = Arc::new(grid_key(node, epoch_secs, now / epoch_secs, 1, rng));
         Self {
-            node_id: node_id.to_owned(),
+            node,
             epoch_secs,
             generation: 1,
             current,
@@ -253,7 +254,7 @@ impl NodeKeySchedule {
         self.generation = self.generation.saturating_add(1);
         let current = Arc::new(EpochKey::generate(
             KeyContext {
-                node_id: self.node_id.clone(),
+                node: self.node,
                 epoch_index: previous.epoch_index,
                 generation: self.generation,
                 not_before: now.min(previous.not_after.saturating_sub(1)),
@@ -274,7 +275,7 @@ impl NodeKeySchedule {
     fn make_grid_key(&mut self, epoch_index: u64, rng: &mut impl CryptoRng) -> Arc<EpochKey> {
         self.generation = self.generation.saturating_add(1);
         Arc::new(grid_key(
-            &self.node_id,
+            self.node,
             self.epoch_secs,
             epoch_index,
             self.generation,
@@ -284,7 +285,7 @@ impl NodeKeySchedule {
 }
 
 fn grid_key(
-    node_id: &str,
+    node: Address,
     epoch_secs: u64,
     epoch_index: u64,
     generation: u64,
@@ -292,7 +293,7 @@ fn grid_key(
 ) -> EpochKey {
     EpochKey::generate(
         KeyContext {
-            node_id: node_id.to_owned(),
+            node,
             epoch_index,
             generation,
             not_before: epoch_index.saturating_mul(epoch_secs),
@@ -310,8 +311,10 @@ mod tests {
     const T: u64 = 60;
     const BOUNDARY: u64 = 1_754_582_400; // a multiple of 60
 
+    const NODE_A: Address = Address::from_bytes([0xA1; 20]);
+
     fn schedule(now: u64) -> NodeKeySchedule {
-        NodeKeySchedule::new("oracle-a", T, now, &mut os_rng())
+        NodeKeySchedule::new(NODE_A, T, now, &mut os_rng())
     }
 
     #[test]
@@ -333,7 +336,7 @@ mod tests {
     #[test]
     fn a_key_goes_only_to_sessions_that_outlive_its_epoch() {
         let key = KeyContext {
-            node_id: "oracle-a".to_owned(),
+            node: NODE_A,
             epoch_index: BOUNDARY / T - 1,
             generation: 1,
             not_before: BOUNDARY - T,
@@ -441,7 +444,7 @@ mod tests {
     fn the_same_secret_under_another_context_is_another_key() {
         let secret = [7_u8; 32];
         let context = KeyContext {
-            node_id: "oracle-a".to_owned(),
+            node: NODE_A,
             epoch_index: 1,
             generation: 1,
             not_before: 60,
@@ -450,7 +453,7 @@ mod tests {
         let base = EpochKey::from_secret(context.clone(), Zeroizing::new(secret));
         for other in [
             KeyContext {
-                node_id: "oracle-b".to_owned(),
+                node: Address::from_bytes([0xB2; 20]),
                 ..context.clone()
             },
             KeyContext {

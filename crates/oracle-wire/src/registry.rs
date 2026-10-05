@@ -13,13 +13,14 @@
 //! 2. Registry versions only move forward. [`Registry::verify`] demands a
 //!    minimum version, so replaying an old registry cannot reinstate a revoked
 //!    key.
+//!
+//! A node is its signing key: the address is the node's id (SPEC §3.5).
 
 use std::collections::HashMap;
 
-use crate::cert::{MAX_NODE_ID_LEN, SigningKeyCert};
 use crate::codec::Sink as _;
 use crate::payload::{KIND_REGISTRY, PAYLOAD_VERSION};
-use crate::{Address, CompressedPublicKey, Signature, Signer, VerifyError, WireError, signer};
+use crate::{Address, Signature, Signer, VerifyError, WireError, signer};
 
 /// Maximum nodes in one registry.
 pub const MAX_NODES: usize = 256;
@@ -29,10 +30,6 @@ pub const MAX_OPERATOR_LEN: usize = 64;
 pub const MAX_ENDPOINT_LEN: usize = 256;
 /// Maximum endpoints per node.
 pub const MAX_ENDPOINTS: usize = 16;
-/// Maximum concurrently-listed signing keys per node.
-///
-/// Rotation needs two (outgoing and incoming); the rest is headroom.
-pub const MAX_CERTS_PER_NODE: usize = 16;
 
 /// Quorum guidance published alongside the node list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,41 +41,33 @@ pub struct Quorum {
     pub recommended: u16,
 }
 
-/// One generation of a node's signing keys, as the registry canister serves it.
+/// When the registry canister listed a signing address, as it serves it.
 ///
 /// Live frames never consult this. It exists for stored-frame verification
-/// (SPEC §3.5): a frame signed last month must verify against the key that was
-/// live at its `publish_time_ns`, bounded by when that key was retired.
-///
-/// The certificate is signed by the node's identity key and can be checked.
-/// `added_at` and `retired_at` are the canister's word and cannot be; a signed
-/// key history is future work.
+/// (SPEC §3.5). The times are the canister's word and carry no signature.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct KeyHistoryEntry {
-    /// Generation number, from 1.
-    pub generation: u32,
-    /// The certificate the operator issued with the node's identity key.
-    pub cert: SigningKeyCert,
-    /// When the key became live, unix seconds.
+#[serde(deny_unknown_fields)]
+pub struct NodeListing {
+    /// The node's signing address.
+    pub address: Address,
+    /// Who ran it.
+    pub operator: String,
+    /// When the address was listed, unix seconds.
     pub added_at: u64,
-    /// When it stopped being live, unix seconds. `None` while live.
-    pub retired_at: Option<u64>,
+    /// When it stopped being listed, unix seconds. `None` while listed.
+    pub removed_at: Option<u64>,
 }
 
 /// One node in the registry.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeEntry {
-    /// Stable node identifier.
-    pub node_id: String,
+    /// The node's signing address. It is also the node's id.
+    pub address: Address,
     /// Who runs it. Operator diversity is what makes the median meaningful.
     pub operator: String,
-    /// The node's long-lived identity key, which issues its certificates.
-    pub identity_pubkey: CompressedPublicKey,
     /// WebSocket endpoints.
     pub endpoints: Vec<String>,
-    /// Currently-listed signing keys.
-    pub signing_keys: Vec<SigningKeyCert>,
     /// Relative weight hint for consumers that weight rather than plain-median.
     pub weight: u16,
 }
@@ -102,9 +91,9 @@ pub struct Registry {
 impl Registry {
     /// Builds the canonical bytes the governance key signs.
     ///
-    /// Nodes are sorted by `node_id` and certificates by `(not_before, address)`
-    /// so that the encoding is independent of the order fields happen to appear
-    /// in JSON. JSON is transport; these bytes are the artifact.
+    /// Nodes are sorted by address so that the encoding is independent of the
+    /// order fields happen to appear in JSON. JSON is transport; these bytes
+    /// are the artifact.
     ///
     /// # Errors
     ///
@@ -116,75 +105,43 @@ impl Registry {
         nodes: &[NodeEntry],
         quorum: Quorum,
     ) -> Result<Vec<u8>, WireError> {
+        let too_many = || WireError::FieldTooLong {
+            field: "nodes",
+            actual: nodes.len(),
+            limit: MAX_NODES,
+        };
         if nodes.len() > MAX_NODES {
-            return Err(WireError::FieldTooLong {
-                field: "nodes",
-                actual: nodes.len(),
-                limit: MAX_NODES,
-            });
+            return Err(too_many());
         }
 
         let mut ordered: Vec<&NodeEntry> = nodes.iter().collect();
-        ordered.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        ordered.sort_by_key(|node| node.address);
 
-        let mut out = Vec::with_capacity(64 + nodes.len() * 256);
+        let mut out = Vec::with_capacity(64 + nodes.len() * 128);
         out.put_u8(PAYLOAD_VERSION);
         out.put_u8(KIND_REGISTRY);
         out.put_u64(version);
         out.put_u64(effective_from);
         out.put_u16(quorum.min_nodes);
         out.put_u16(quorum.recommended);
-        let node_count = u32::try_from(ordered.len()).map_err(|_| WireError::FieldTooLong {
-            field: "nodes",
-            actual: ordered.len(),
-            limit: MAX_NODES,
-        })?;
-        out.put_u32(node_count);
+        out.put_u32(u32::try_from(ordered.len()).map_err(|_| too_many())?);
 
         for node in ordered {
-            out.try_put_str("node_id", &node.node_id, MAX_NODE_ID_LEN)?;
+            out.put_bytes(node.address.as_bytes());
             out.try_put_str("operator", &node.operator, MAX_OPERATOR_LEN)?;
-            out.put_bytes(node.identity_pubkey.as_bytes());
             out.put_u16(node.weight);
 
+            let too_many_endpoints = || WireError::FieldTooLong {
+                field: "endpoints",
+                actual: node.endpoints.len(),
+                limit: MAX_ENDPOINTS,
+            };
             if node.endpoints.len() > MAX_ENDPOINTS {
-                return Err(WireError::FieldTooLong {
-                    field: "endpoints",
-                    actual: node.endpoints.len(),
-                    limit: MAX_ENDPOINTS,
-                });
+                return Err(too_many_endpoints());
             }
-            let endpoint_count =
-                u16::try_from(node.endpoints.len()).map_err(|_| WireError::FieldTooLong {
-                    field: "endpoints",
-                    actual: node.endpoints.len(),
-                    limit: MAX_ENDPOINTS,
-                })?;
-            out.put_u16(endpoint_count);
+            out.put_u16(u16::try_from(node.endpoints.len()).map_err(|_| too_many_endpoints())?);
             for endpoint in &node.endpoints {
                 out.try_put_str("endpoint", endpoint, MAX_ENDPOINT_LEN)?;
-            }
-
-            if node.signing_keys.len() > MAX_CERTS_PER_NODE {
-                return Err(WireError::FieldTooLong {
-                    field: "signing_keys",
-                    actual: node.signing_keys.len(),
-                    limit: MAX_CERTS_PER_NODE,
-                });
-            }
-            let cert_count =
-                u16::try_from(node.signing_keys.len()).map_err(|_| WireError::FieldTooLong {
-                    field: "signing_keys",
-                    actual: node.signing_keys.len(),
-                    limit: MAX_CERTS_PER_NODE,
-                })?;
-            out.put_u16(cert_count);
-
-            let mut certs: Vec<&SigningKeyCert> = node.signing_keys.iter().collect();
-            certs.sort_by_key(|c| (c.not_before, *c.address.as_bytes()));
-            for cert in certs {
-                out.put_bytes(&cert.to_signing_bytes()?);
-                out.put_bytes(cert.signature.as_bytes());
             }
         }
         Ok(out)
@@ -231,10 +188,7 @@ impl Registry {
     ///
     /// - [`VerifyError::StaleRegistry`] if `version` is not above `min_version`.
     /// - [`VerifyError::UntrustedGovernance`] if the signature is not the pinned key's.
-    /// - [`VerifyError::CertificateIssuerMismatch`] if a certificate was not
-    ///   issued by its own node's identity key.
-    /// - [`VerifyError::MalformedRegistry`] for duplicate node ids, duplicate
-    ///   signing addresses, inverted validity windows, or invalid identity keys.
+    /// - [`VerifyError::MalformedRegistry`] if one address is listed twice.
     pub fn verify(
         &self,
         governance: Address,
@@ -253,56 +207,15 @@ impl Registry {
             governance,
         )?;
 
-        let mut seen_nodes: HashMap<&str, ()> = HashMap::with_capacity(self.nodes.len());
-        let mut by_address: HashMap<Address, usize> = HashMap::new();
-
+        let mut by_address: HashMap<Address, usize> = HashMap::with_capacity(self.nodes.len());
         for (index, node) in self.nodes.iter().enumerate() {
-            if seen_nodes.insert(node.node_id.as_str(), ()).is_some() {
+            // One key counted as two nodes would defeat the quorum it is
+            // counted against.
+            if by_address.insert(node.address, index).is_some() {
                 return Err(VerifyError::MalformedRegistry(format!(
-                    "duplicate node id `{}`",
-                    node.node_id
+                    "node {} is listed twice",
+                    node.address
                 )));
-            }
-            let identity = node.identity_pubkey.address().map_err(|_| {
-                VerifyError::MalformedRegistry(format!(
-                    "node `{}` has an invalid identity public key",
-                    node.node_id
-                ))
-            })?;
-
-            for cert in &node.signing_keys {
-                if cert.node_id != node.node_id {
-                    return Err(VerifyError::MalformedRegistry(format!(
-                        "certificate for {} claims node `{}` but is listed under `{}`",
-                        cert.address, cert.node_id, node.node_id
-                    )));
-                }
-                if !cert.has_valid_window() {
-                    return Err(VerifyError::MalformedRegistry(format!(
-                        "certificate for {} has not_before >= not_after",
-                        cert.address
-                    )));
-                }
-                let issuer = cert.recover_issuer()?;
-                if issuer != identity {
-                    return Err(VerifyError::CertificateIssuerMismatch {
-                        node_id: node.node_id.clone(),
-                        address: cert.address,
-                        issuer,
-                        expected: identity,
-                    });
-                }
-                // A signing address must belong to exactly one node. Otherwise a
-                // single key could masquerade as two independent signers and
-                // defeat the quorum it is supposed to be counted against.
-                if let Some(existing) = by_address.insert(cert.address, index)
-                    && existing != index
-                {
-                    return Err(VerifyError::MalformedRegistry(format!(
-                        "signing address {} is listed under more than one node",
-                        cert.address
-                    )));
-                }
             }
         }
 
@@ -330,7 +243,7 @@ pub(crate) fn check_governance(
     Ok(())
 }
 
-/// A registry whose governance signature and certificates have been checked.
+/// A registry whose governance signature and structure have been checked.
 ///
 /// Obtaining one is the only way to verify a price update, which makes the trust
 /// check unskippable rather than merely recommended.
@@ -388,99 +301,22 @@ impl VerifiedRegistry {
         self.registry.nodes.get(index)
     }
 
-    /// Returns a node's identifier by index.
-    ///
-    /// Indices are positional and shift whenever the node list changes, so
-    /// anything that outlives one registry version — replay high-water marks,
-    /// per-node quorum state — must be keyed by this instead.
-    #[must_use]
-    pub fn node_id(&self, index: usize) -> Option<&str> {
-        self.registry
-            .nodes
-            .get(index)
-            .map(|node| node.node_id.as_str())
-    }
-
-    /// Returns `true` if `node_id` is listed.
-    #[must_use]
-    pub fn contains_node(&self, node_id: &str) -> bool {
-        self.registry
-            .nodes
-            .iter()
-            .any(|node| node.node_id == node_id)
-    }
-
-    /// Returns the last second at which `signer` is authorised, across every
-    /// certificate listing it. Returns `None` if the address is unlisted.
-    #[must_use]
-    pub fn authorized_until(&self, signer: Address) -> Option<u64> {
-        let index = *self.by_address.get(&signer)?;
-        self.registry
-            .nodes
-            .get(index)?
-            .signing_keys
-            .iter()
-            .filter(|cert| cert.address == signer)
-            .map(|cert| cert.not_after)
-            .max()
-    }
-
     /// Returns the underlying registry.
     #[must_use]
     pub const fn as_registry(&self) -> &Registry {
         &self.registry
     }
 
-    /// Resolves a recovered signer to the node index it is authorised for.
+    /// Resolves a recovered signer to the index of its node.
     ///
     /// # Errors
     ///
-    /// - [`VerifyError::UnknownSigner`] if the address is in no certificate.
-    /// - [`VerifyError::CertificateNotYetValid`] or
-    ///   [`VerifyError::CertificateExpired`] if it is listed but not authorised
-    ///   at `publish_time_ns`.
-    pub fn authorize(&self, signer: Address, publish_time_ns: u64) -> Result<usize, VerifyError> {
-        let index = *self
-            .by_address
+    /// Returns [`VerifyError::UnknownSigner`] if no node has this address.
+    pub fn authorize(&self, signer: Address) -> Result<usize, VerifyError> {
+        self.by_address
             .get(&signer)
-            .ok_or(VerifyError::UnknownSigner { signer })?;
-        let node = self
-            .registry
-            .nodes
-            .get(index)
-            .ok_or(VerifyError::UnknownSigner { signer })?;
-
-        let mut candidates = node
-            .signing_keys
-            .iter()
-            .filter(|cert| cert.address == signer)
-            .peekable();
-        if candidates.peek().is_none() {
-            return Err(VerifyError::UnknownSigner { signer });
-        }
-
-        let mut first_error = None;
-        for cert in candidates {
-            match cert.check_covers(publish_time_ns) {
-                Ok(()) => return Ok(index),
-                // Report the window that came closest: an expired certificate is
-                // a more useful diagnostic than one that has not started.
-                Err(err) => {
-                    let replace = matches!(
-                        (&first_error, &err),
-                        (None, _)
-                            | (
-                                Some(VerifyError::CertificateNotYetValid { .. }),
-                                VerifyError::CertificateExpired { .. }
-                            )
-                    );
-                    if replace {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-        Err(first_error.unwrap_or(VerifyError::UnknownSigner { signer }))
+            .copied()
+            .ok_or(VerifyError::UnknownSigner { signer })
     }
 }
 
@@ -488,47 +324,44 @@ impl VerifiedRegistry {
 mod tests {
     use super::*;
 
-    const DAY: u64 = 86_400;
-
     fn governance() -> Signer {
         Signer::from_secret_bytes([0x91; 32]).expect("valid key")
     }
 
-    fn node(index: u8, now: u64) -> (NodeEntry, Signer) {
-        let identity = Signer::from_secret_bytes([index; 32]).expect("valid key");
-        let hot = Signer::from_secret_bytes([index.wrapping_add(100); 32]).expect("valid key");
-        let node_id = format!("oracle-{index}");
-        let cert = SigningKeyCert::issue(&identity, &node_id, hot.address(), now, now + 30 * DAY)
-            .expect("issues");
+    fn node(index: u8) -> (NodeEntry, Signer) {
+        let key = Signer::from_secret_bytes([index; 32]).expect("valid key");
         (
             NodeEntry {
-                node_id,
+                address: key.address(),
                 operator: format!("operator-{index}"),
-                identity_pubkey: identity.public_key(),
-                endpoints: vec![format!("wss://node{index}.example/v1/ws")],
-                signing_keys: vec![cert],
+                endpoints: vec![format!("wss://node{index}.example/v2/ws")],
                 weight: 1,
             },
-            hot,
+            key,
         )
     }
 
     fn registry(now: u64) -> (Registry, Vec<Signer>) {
-        let mut nodes = Vec::new();
-        let mut hots = Vec::new();
-        for index in 1..=3_u8 {
-            let (entry, hot) = node(index, now);
-            nodes.push(entry);
-            hots.push(hot);
-        }
+        let (nodes, keys): (Vec<_>, Vec<_>) = (1..=3_u8).map(node).unzip();
         let quorum = Quorum {
             min_nodes: 2,
             recommended: 3,
         };
         (
             Registry::sign(&governance(), 7, now, nodes, quorum).expect("signs"),
-            hots,
+            keys,
         )
+    }
+
+    fn resign(registry: &Registry) -> Registry {
+        Registry::sign(
+            &governance(),
+            registry.version,
+            registry.effective_from,
+            registry.nodes.clone(),
+            registry.quorum,
+        )
+        .expect("signs")
     }
 
     #[test]
@@ -570,7 +403,7 @@ mod tests {
     fn rejects_tampering_with_any_node_field() {
         let now = 1_000_000;
         let expected = governance().address();
-        let mutations: [fn(&mut Registry); 7] = [
+        let mutations: [fn(&mut Registry); 8] = [
             |r| {
                 if let Some(node) = r.nodes.first_mut() {
                     node.weight = 99;
@@ -584,6 +417,11 @@ mod tests {
             |r| {
                 if let Some(node) = r.nodes.first_mut() {
                     node.endpoints = vec!["wss://evil.example".to_owned()];
+                }
+            },
+            |r| {
+                if let Some(node) = r.nodes.first_mut() {
+                    node.address = Address::from_bytes([0xEE; 20]);
                 }
             },
             |r| r.version = 8,
@@ -615,58 +453,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_certificate_issued_by_the_wrong_identity() {
-        let now = 1_000_000;
-        let (mut registry, _) = registry(now);
-        let rogue = Signer::from_secret_bytes([0x77; 32]).expect("valid key");
-        let hot = Signer::from_secret_bytes([0x78; 32]).expect("valid key");
-        if let Some(node) = registry.nodes.first_mut() {
-            node.signing_keys = vec![
-                SigningKeyCert::issue(&rogue, &node.node_id, hot.address(), now, now + DAY)
-                    .expect("issues"),
-            ];
+    fn rejects_one_address_listed_twice() {
+        let (mut registry, _) = registry(1_000_000);
+        let first = registry.nodes.first().expect("a node").address;
+        if let Some(node) = registry.nodes.get_mut(1) {
+            node.address = first;
         }
-        // Re-sign so the governance check passes and the certificate check is
-        // what actually fires.
-        let resigned = Registry::sign(
-            &governance(),
-            registry.version,
-            registry.effective_from,
-            registry.nodes.clone(),
-            registry.quorum,
-        )
-        .expect("signs");
-        assert!(matches!(
-            resigned.verify(governance().address(), 0),
-            Err(VerifyError::CertificateIssuerMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_one_signing_key_shared_by_two_nodes() {
-        let now = 1_000_000;
-        let (mut registry, _) = registry(now);
-        let shared = Signer::from_secret_bytes([0x55; 32]).expect("valid key");
-        for index in 0..2 {
-            let Some(node) = registry.nodes.get_mut(index) else {
-                continue;
-            };
-            let identity = Signer::from_secret_bytes([u8::try_from(index + 1).unwrap_or(1); 32])
-                .expect("valid key");
-            node.signing_keys = vec![
-                SigningKeyCert::issue(&identity, &node.node_id, shared.address(), now, now + DAY)
-                    .expect("issues"),
-            ];
-        }
-        let resigned = Registry::sign(
-            &governance(),
-            registry.version,
-            registry.effective_from,
-            registry.nodes.clone(),
-            registry.quorum,
-        )
-        .expect("signs");
-        let err = resigned
+        let err = resign(&registry)
             .verify(governance().address(), 0)
             .expect_err("must reject");
         assert!(
@@ -676,44 +469,21 @@ mod tests {
     }
 
     #[test]
-    fn authorizes_only_within_the_certificate_window() {
-        let now = 1_000_000;
-        let (registry, hots) = registry(now);
+    fn authorizes_listed_addresses_only() {
+        let (registry, keys) = registry(1_000_000);
         let verified = registry
             .verify(governance().address(), 0)
             .expect("verifies");
-        let hot = hots.first().expect("one node");
-
-        let inside = (now + DAY) * oracle_types::NANOS_PER_SEC;
-        assert_eq!(
-            verified
-                .authorize(hot.address(), inside)
-                .expect("authorized"),
-            0
-        );
-
-        let before = (now - 1) * oracle_types::NANOS_PER_SEC;
-        assert!(matches!(
-            verified.authorize(hot.address(), before),
-            Err(VerifyError::CertificateNotYetValid { .. })
-        ));
-
-        let after = (now + 31 * DAY) * oracle_types::NANOS_PER_SEC;
-        assert!(matches!(
-            verified.authorize(hot.address(), after),
-            Err(VerifyError::CertificateExpired { .. })
-        ));
-    }
-
-    #[test]
-    fn unknown_signers_are_rejected() {
-        let (registry, _) = registry(1_000_000);
-        let verified = registry
-            .verify(governance().address(), 0)
-            .expect("verifies");
+        for key in &keys {
+            let index = verified.authorize(key.address()).expect("authorized");
+            assert_eq!(
+                verified.node(index).map(|node| node.address),
+                Some(key.address())
+            );
+        }
         let stranger = Signer::from_secret_bytes([0xAA; 32]).expect("valid key");
         assert!(matches!(
-            verified.authorize(stranger.address(), 1_000_000 * oracle_types::NANOS_PER_SEC),
+            verified.authorize(stranger.address()),
             Err(VerifyError::UnknownSigner { .. })
         ));
     }
@@ -753,59 +523,6 @@ mod tests {
             verified.accept_successor(&forged),
             Err(VerifyError::UntrustedGovernance { .. })
         ));
-    }
-
-    #[test]
-    fn reports_when_a_signing_key_stops_being_authorized() {
-        let now = 1_000_000;
-        let (registry, hots) = registry(now);
-        let verified = registry
-            .verify(governance().address(), 0)
-            .expect("verifies");
-        let hot = hots.first().expect("one node");
-        assert_eq!(
-            verified.authorized_until(hot.address()),
-            Some(now + 30 * DAY)
-        );
-
-        let stranger = Signer::from_secret_bytes([0xAA; 32]).expect("valid key");
-        assert_eq!(verified.authorized_until(stranger.address()), None);
-    }
-
-    /// During a rotation overlap a node lists two certificates. The countdown
-    /// must follow the later one, or an operator rotating correctly would be
-    /// paged about an expiry that no longer matters.
-    #[test]
-    fn expiry_follows_the_newest_certificate_for_an_address() {
-        let now = 1_000_000;
-        let identity = Signer::from_secret_bytes([1_u8; 32]).expect("valid key");
-        let hot = Signer::from_secret_bytes([101_u8; 32]).expect("valid key");
-        let node_id = "oracle-1";
-        let nodes = vec![NodeEntry {
-            node_id: node_id.to_owned(),
-            operator: "operator-1".to_owned(),
-            identity_pubkey: identity.public_key(),
-            endpoints: vec!["wss://node1.example/v1/ws".to_owned()],
-            signing_keys: vec![
-                SigningKeyCert::issue(&identity, node_id, hot.address(), now, now + DAY)
-                    .expect("issues"),
-                SigningKeyCert::issue(&identity, node_id, hot.address(), now + DAY, now + 30 * DAY)
-                    .expect("issues"),
-            ],
-            weight: 1,
-        }];
-        let quorum = Quorum {
-            min_nodes: 1,
-            recommended: 1,
-        };
-        let verified = Registry::sign(&governance(), 1, now, nodes, quorum)
-            .expect("signs")
-            .verify(governance().address(), 0)
-            .expect("verifies");
-        assert_eq!(
-            verified.authorized_until(hot.address()),
-            Some(now + 30 * DAY)
-        );
     }
 
     #[test]

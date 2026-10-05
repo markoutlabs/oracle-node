@@ -237,9 +237,8 @@ impl UnverifiedFrame {
     ///
     /// # What this checks, and what it does not
     ///
-    /// Checked here: payload well-formedness, signature canonicality, that the
-    /// recovered signer is a registered node, and that its certificate covered
-    /// the update's publish time.
+    /// Checked here: payload well-formedness, signature canonicality, and that
+    /// the recovered signer is a registered node.
     ///
     /// **Not** checked here, and mandatory before acting on the price:
     /// sequence-number monotonicity per `(node, feed)`, staleness against the
@@ -250,12 +249,11 @@ impl UnverifiedFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`VerifyError`] for malformed payloads, unknown signers, and
-    /// certificates that did not cover the publish time.
+    /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedUpdate, VerifyError> {
         let update = decode_price_update(&self.payload)?;
         let signer = self.recover_signer()?;
-        let node_index = registry.authorize(signer, update.publish_time_ns)?;
+        let node_index = registry.authorize(signer)?;
         Ok(VerifiedUpdate {
             update,
             signer,
@@ -304,12 +302,10 @@ impl VerifiedUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SigningKeyCert;
     use crate::registry::{NodeEntry, Quorum, Registry};
     use oracle_types::{FeedId, Flags, NANOS_PER_SEC, Venue};
 
     const NOW_SECS: u64 = 1_754_582_400;
-    const DAY: u64 = 86_400;
 
     fn governance() -> Signer {
         Signer::from_secret_bytes([0x91; 32]).expect("valid key")
@@ -319,25 +315,11 @@ mod tests {
         Signer::from_secret_bytes([0x21; 32]).expect("valid key")
     }
 
-    fn identity() -> Signer {
-        Signer::from_secret_bytes([0x22; 32]).expect("valid key")
-    }
-
     fn verified_registry() -> VerifiedRegistry {
-        let cert = SigningKeyCert::issue(
-            &identity(),
-            "oracle-eu-1",
-            hot().address(),
-            NOW_SECS - DAY,
-            NOW_SECS + DAY,
-        )
-        .expect("issues");
         let node = NodeEntry {
-            node_id: "oracle-eu-1".to_owned(),
+            address: hot().address(),
             operator: "acme".to_owned(),
-            identity_pubkey: identity().public_key(),
-            endpoints: vec!["wss://eu1.example/v1/ws".to_owned()],
-            signing_keys: vec![cert],
+            endpoints: vec!["wss://eu1.example/v2/ws".to_owned()],
             weight: 1,
         };
         Registry::sign(
@@ -440,18 +422,6 @@ mod tests {
         assert!(matches!(
             parsed.verify(&verified_registry()),
             Err(VerifyError::UnknownSigner { .. })
-        ));
-    }
-
-    #[test]
-    fn updates_signed_outside_the_certificate_window_are_rejected() {
-        let mut stale = update();
-        stale.publish_time_ns = (NOW_SECS + 30 * DAY) * NANOS_PER_SEC;
-        let frame = hot().sign_update(&stale).encode_frame();
-        let parsed = UnverifiedFrame::parse(&frame).expect("parses");
-        assert!(matches!(
-            parsed.verify(&verified_registry()),
-            Err(VerifyError::CertificateExpired { .. })
         ));
     }
 

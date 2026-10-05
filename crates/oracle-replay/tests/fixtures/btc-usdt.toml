@@ -3,7 +3,6 @@
 #
 # The Binance URL embeds the subscribed streams, so a replay must use exactly
 # this feed list or the recording's connections will not match.
-node_id = "adversarial-fixture"
 tick_interval_ms = 25
 
 [server]

@@ -24,8 +24,7 @@ use std::time::Duration;
 
 use oracle_agg::stats;
 use oracle_types::{FeedId, Fixed, PriceUpdate};
-
-use crate::verify::NodeId;
+use oracle_wire::Address;
 
 /// Quorum and divergence policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,13 +119,12 @@ impl Resolved {
 
 /// The latest accepted update from each node, for one feed.
 ///
-/// Keyed by node rather than by signing key. Keys rotate and registry indices
-/// shift on every refresh; the node id is the one key that survives both, so a
-/// node's seat and its last update follow it through a rotation.
+/// Keyed by node address, because registry indices shift on every refresh. A
+/// rotation lists a new address, so the seat moves to it.
 #[derive(Clone, Debug, Default)]
 pub struct FeedView {
     feed_id: FeedId,
-    per_node: HashMap<NodeId, PriceUpdate>,
+    per_node: HashMap<Address, PriceUpdate>,
 }
 
 impl FeedView {
@@ -143,7 +141,7 @@ impl FeedView {
     ///
     /// Out-of-order arrival across nodes is normal; the verifier guarantees
     /// monotonicity per node, so a lower sequence here is a duplicate.
-    pub fn record(&mut self, node: NodeId, update: PriceUpdate) {
+    pub fn record(&mut self, node: Address, update: PriceUpdate) {
         match self.per_node.get(&node) {
             Some(existing) if existing.seq >= update.seq => {}
             _ => {
@@ -158,7 +156,7 @@ impl FeedView {
     /// effect on the spot: a node left in place would keep counting toward the
     /// quorum on the strength of updates it sent while still trusted, for as long
     /// as those updates stayed inside the staleness window.
-    pub fn retain_nodes(&mut self, keep: &dyn Fn(&str) -> bool) {
+    pub fn retain_nodes(&mut self, keep: &dyn Fn(&Address) -> bool) {
         self.per_node.retain(|node, _| keep(node));
     }
 
@@ -169,7 +167,7 @@ impl FeedView {
     }
 
     /// Every node's latest accepted update, in no particular order.
-    pub fn latest(&self) -> impl Iterator<Item = (&NodeId, &PriceUpdate)> {
+    pub fn latest(&self) -> impl Iterator<Item = (&Address, &PriceUpdate)> {
         self.per_node.iter()
     }
 
@@ -276,8 +274,8 @@ mod tests {
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
 
-    fn node(index: u8) -> NodeId {
-        NodeId::from(format!("oracle-{index}").as_str())
+    fn node(index: u8) -> Address {
+        Address::from_bytes([index; 20])
     }
 
     fn update(price: &str, conf: &str, seq: u64, flags: Flags) -> PriceUpdate {

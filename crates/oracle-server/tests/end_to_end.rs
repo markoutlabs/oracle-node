@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oracle_client::{OracleClient, Status, testing as client_testing};
-use oracle_server::testing::{
-    CLIENT_ID, NODE_ID, client_key, sample_update, signing_key, test_transport,
-};
+use oracle_server::testing::{client_key, sample_update, signing_key, test_transport};
 use oracle_server::{ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
 use oracle_wire::{Registry, Signer, VerifiedRegistry, feed_id};
@@ -74,22 +72,11 @@ async fn start_node() -> Node {
 
     // The registry must advertise the port we actually got, so the client can
     // find us the same way it would in production.
-    let identity = oracle_server::testing::identity_key();
     let governance = oracle_server::testing::governance_key();
-    let cert = oracle_wire::SigningKeyCert::issue(
-        &identity,
-        NODE_ID,
-        signing_key().address(),
-        0,
-        4_102_444_800,
-    )
-    .expect("issues");
     let entry = oracle_wire::NodeEntry {
-        node_id: NODE_ID.to_owned(),
+        address: signing_key().address(),
         operator: "test".to_owned(),
-        identity_pubkey: identity.public_key(),
         endpoints: vec![format!("ws://{addr}/v2/ws")],
-        signing_keys: vec![cert],
         weight: 1,
     };
     let registry = Registry::sign(
@@ -105,7 +92,7 @@ async fn start_node() -> Node {
     .expect("signs");
     let verified = registry.verify(governance.address(), 0).expect("verifies");
 
-    let state = ServerState::new(NODE_ID, &[symbol()], registry, test_transport());
+    let state = ServerState::new(&[symbol()], registry, test_transport());
     let app = router(Arc::clone(&state));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -141,7 +128,7 @@ async fn a_signed_update_travels_the_wire_and_verifies() {
     let mut client = OracleClient::builder(node.registry.clone())
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()
-        .client_key(CLIENT_ID, client_key())
+        .client_key(client_key())
         .build()
         .expect("valid configuration");
     client.subscribe(&[BTC]).await.expect("subscribes");
@@ -274,9 +261,8 @@ async fn a_halted_node_stops_counting() {
 /// consumer writing a line of logic for it.
 #[tokio::test]
 async fn one_lying_node_among_three_is_outvoted_and_visible() {
-    let nodes: Vec<client_testing::TestNode> = (1..=3_u8)
-        .map(|seed| client_testing::TestNode::new(seed, &format!("oracle-{seed}")))
-        .collect();
+    let nodes: Vec<client_testing::TestNode> =
+        (1..=3_u8).map(client_testing::TestNode::new).collect();
     let registry = client_testing::registry_with(&nodes.iter().collect::<Vec<_>>());
 
     let mut client = OracleClient::builder(registry)
@@ -326,7 +312,7 @@ async fn the_open_routes_serve_the_catalogue_and_health() {
     let (status, body) = get(&node.addr, "/v2/health").await;
     assert_eq!(status, 200);
     assert!(
-        body.contains(NODE_ID),
+        body.contains(&signing_key().address().to_string()),
         "health must identify the node: {body}"
     );
 }

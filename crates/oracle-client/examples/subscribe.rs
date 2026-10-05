@@ -3,16 +3,16 @@
 //! ```sh
 //! # From a registry file.
 //! cargo run -p oracle-client --example subscribe -- \
-//!   registry.json 0x<governance-address> CRYPTO.BTC/USDT \
-//!   --client-id c-1 --client-key client.key
+//!   registry.json 0x<governance-address> CRYPTO.BTC/USDT --client-key client.key
 //! # From the registry canister, refreshing on rotation. Add `--root-key`
 //! # off mainnet.
 //! cargo run -p oracle-client --example subscribe -- \
 //!   https://<canister-id>.raw.icp0.io/registry.json 0x<governance-address> CRYPTO.BTC/USDT \
-//!   --canister-id <canister-id> --client-id c-1 --client-key client.key
+//!   --canister-id <canister-id> --client-key client.key
 //! ```
 //!
-//! The `client_key` example makes a key; governance lists it with `add_client`.
+//! The `client_key` example makes a key; governance lists its address with
+//! `add_client`.
 //!
 //! Uses a quorum of one so it can run against a single local node. That is
 //! explicitly unsafe, and the API makes you say so.
@@ -39,10 +39,7 @@ struct Args {
     /// Print every Nth resolved price.
     #[arg(long, default_value_t = 20)]
     every: u32,
-    /// Client id in the nodes' client list.
-    #[arg(long)]
-    client_id: String,
-    /// File holding the client API key as hex.
+    /// File holding the client API key as hex. Its address must be listed.
     #[arg(long)]
     client_key: std::path::PathBuf,
     /// The registry canister, whose certificate a URL response must carry.
@@ -77,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let key = oracle_wire::Signer::from_hex(std::fs::read_to_string(&args.client_key)?.trim())?;
-    let builder = builder.client_key(args.client_id.clone(), key);
+    let builder = builder.client_key(key);
     let mut client = builder
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()

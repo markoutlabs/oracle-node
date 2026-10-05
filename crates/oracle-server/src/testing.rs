@@ -7,14 +7,11 @@
 use std::sync::Arc;
 
 use oracle_types::{FeedId, Flags, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer, SigningKeyCert};
+use oracle_wire::{ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer};
 
 use crate::transport::{NodeTransport, TransportConfig, unix_now};
 
-/// The node id used by [`test_registry`].
-pub const NODE_ID: &str = "oracle-test-1";
-
-/// Returns the fixture node's hot signing key.
+/// Returns the fixture node's key. Its address is the node's id.
 ///
 /// # Panics
 ///
@@ -22,16 +19,6 @@ pub const NODE_ID: &str = "oracle-test-1";
 #[must_use]
 pub fn signing_key() -> Signer {
     Signer::from_secret_bytes([0x41; 32]).expect("valid test key")
-}
-
-/// Returns the fixture node's identity key.
-///
-/// # Panics
-///
-/// Cannot panic: the seed is a valid curve scalar.
-#[must_use]
-pub fn identity_key() -> Signer {
-    Signer::from_secret_bytes([0x01; 32]).expect("valid test key")
 }
 
 /// Returns the governance key that signs the fixture registry.
@@ -51,21 +38,10 @@ pub fn governance_key() -> Signer {
 /// Panics if the fixture cannot be encoded, which would be a bug here.
 #[must_use]
 pub fn test_registry() -> Registry {
-    let identity = identity_key();
-    let cert = SigningKeyCert::issue(
-        &identity,
-        NODE_ID,
-        signing_key().address(),
-        0,
-        4_102_444_800,
-    )
-    .expect("fixture node id is short enough");
     let node = NodeEntry {
-        node_id: NODE_ID.to_owned(),
+        address: signing_key().address(),
         operator: "test".to_owned(),
-        identity_pubkey: identity.public_key(),
         endpoints: vec!["ws://127.0.0.1:0/v2/ws".to_owned()],
-        signing_keys: vec![cert],
         weight: 1,
     };
     // Issued now, not at the epoch: a client treats a registry older than its
@@ -104,9 +80,6 @@ pub fn sample_update(feed_id: FeedId) -> PriceUpdate {
     }
 }
 
-/// The client id of [`client_key`] in [`test_client_list`].
-pub const CLIENT_ID: &str = "c-1";
-
 /// The test client's API key.
 ///
 /// # Panics
@@ -130,8 +103,7 @@ pub fn test_client_list() -> ClientList {
         unix_now(),
         60,
         vec![ClientEntry {
-            client_id: CLIENT_ID.to_owned(),
-            pubkey: client_key().public_key(),
+            address: client_key().address(),
             expires_at: unix_now() + 86_400,
         }],
     )
@@ -149,7 +121,6 @@ pub fn test_transport() -> Arc<NodeTransport> {
         .verify(governance_key().address(), 0)
         .expect("fixture client list verifies");
     NodeTransport::new(
-        NODE_ID,
         Arc::new(signing_key()),
         clients,
         TransportConfig::default(),

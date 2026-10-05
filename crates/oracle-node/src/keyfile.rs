@@ -1,8 +1,8 @@
 //! Key files encrypted at rest.
 //!
-//! Both node keys live on the operator's machine, never in a KMS or an HSM
-//! (SPEC §9.2). At rest they are `age` files encrypted with a passphrase. In
-//! memory they are wiped on drop; nothing here page-locks them.
+//! The node key lives on the operator's machine, never in a KMS or an HSM
+//! (SPEC §9.2). At rest it is an `age` file encrypted with a passphrase. In
+//! memory it is wiped on drop; nothing here page-locks it.
 //!
 //! Plaintext hex is still accepted on load, so a local playground can hand a
 //! seeded key to the node. A file is told apart by its armor header, never by

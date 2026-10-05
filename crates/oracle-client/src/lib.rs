@@ -31,18 +31,18 @@
 //!
 //! # Rotation
 //!
-//! A node holds one live signing key at a time (SPEC §3.5). When it rotates, the
-//! registry swaps the key atomically, and this client learns about it the first
-//! time it sees a frame from the new key: an unknown signer triggers one fetch
-//! from the [`RegistrySource`], at most once per `refresh_interval`, and the
-//! frame is retried. [`OracleClient::refresh_registry`] adopts the newer
-//! governance-signed document in place, with no reconnect and no lost feed state.
-//! The old key is reported as [`RejectReason::RetiredKey`] from then on, without
-//! a fetch. Both halves key their state by [`NodeId`], never by signing key, so a
-//! node's quorum seat and its replay floor follow it through the rotation.
+//! A node has one key, and its address is the node's id (SPEC §3.5). A rotation
+//! is governance's `replace_node`: the registry lists the new address in place
+//! of the old one, at the same endpoint. This client learns about it the first
+//! time it sees a frame from the new key, or a challenge from the new address:
+//! either triggers one fetch from the [`RegistrySource`], at most once per
+//! `refresh_interval`. [`OracleClient::refresh_registry`] adopts the newer
+//! governance-signed document in place, with no lost feed state. The quorum
+//! seat moves to the new address, and the old key is reported as
+//! [`RejectReason::RetiredKey`] from then on, without a fetch.
 //!
 //! Stored frames are a separate path: [`verify_historical`] checks a frame
-//! against the key that was live at its publish time.
+//! against when its signer was listed.
 //!
 //! # Example
 //!
@@ -57,7 +57,7 @@
 //! let mut client = OracleClient::builder(registry)
 //!     .quorum(3)
 //!     .max_age(Duration::from_secs(2))
-//!     .client_key("c-7f3a", api_key) // listed by governance (SPEC §6.1)
+//!     .client_key(api_key) // its address is listed by governance (SPEC §6.1)
 //!     .build()?;
 //!
 //! client.subscribe(&["CRYPTO.BTC/USD"]).await?;
@@ -85,4 +85,4 @@ pub use source::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, IC_MAINNET_ROOT_KEY,
     RegistrySource,
 };
-pub use verify::{Accepted, NodeId, RejectReason, Verifier, VerifyConfig, verify_historical};
+pub use verify::{Accepted, RejectReason, Verifier, VerifyConfig, verify_historical};

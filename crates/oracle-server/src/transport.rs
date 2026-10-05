@@ -10,7 +10,7 @@ use oracle_transport::{
     BroadcastSealer, CloseReason, EpochKey, HandshakeMessage, NodeHandshake, NodeKeySchedule,
     Opener, Sealer, Tick, TransportError, eligible, os_rng, session_deadline,
 };
-use oracle_wire::{Signer, VerifiedClientList};
+use oracle_wire::{Address, Signer, VerifiedClientList};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
@@ -76,8 +76,7 @@ pub struct Established {
 }
 
 struct Session {
-    client_id: String,
-    pubkey: oracle_wire::CompressedPublicKey,
+    client: Address,
     deadline: u64,
     push: mpsc::Sender<Outbound>,
     subscriber: Arc<Subscriber>,
@@ -90,7 +89,6 @@ struct Keys {
 
 /// One node's transport state.
 pub struct NodeTransport {
-    node_id: String,
     signer: Arc<Signer>,
     hub: Arc<Hub>,
     sealer: Arc<BroadcastSealer>,
@@ -114,17 +112,16 @@ impl NodeTransport {
     /// Builds the transport and the sealer the hub publishes through.
     #[must_use]
     pub fn new(
-        node_id: &str,
         signer: Arc<Signer>,
         clients: VerifiedClientList,
         config: TransportConfig,
         max_pending: usize,
         now: u64,
     ) -> Arc<Self> {
-        let schedule = NodeKeySchedule::new(node_id, clients.epoch_secs(), now, &mut os_rng());
+        let schedule =
+            NodeKeySchedule::new(signer.address(), clients.epoch_secs(), now, &mut os_rng());
         let sealer = Arc::new(BroadcastSealer::new(Arc::clone(schedule.current())));
         Arc::new(Self {
-            node_id: node_id.to_owned(),
             signer,
             hub: Arc::new(Hub::new(max_pending, Arc::clone(&sealer))),
             sealer,
@@ -145,10 +142,10 @@ impl NodeTransport {
         &self.hub
     }
 
-    /// Returns the node id.
+    /// Returns the node's address, its id in the registry.
     #[must_use]
-    pub fn node_id(&self) -> &str {
-        &self.node_id
+    pub fn address(&self) -> Address {
+        self.signer.address()
     }
 
     /// Returns the limits.
@@ -192,7 +189,7 @@ impl NodeTransport {
     /// Opens a handshake: the challenge to send first.
     #[must_use]
     pub fn start(&self) -> (NodeHandshake, HandshakeMessage) {
-        NodeHandshake::start(&self.node_id, &mut os_rng())
+        NodeHandshake::start(self.signer.address(), &mut os_rng())
     }
 
     /// Checks a client's `Auth` and, if it passes, opens the session.
@@ -216,25 +213,20 @@ impl NodeTransport {
             ));
         }
         let admitted = handshake.verify(auth, &clients, now)?;
-        let pubkey = clients
-            .get(admitted.client_id())
-            .map(|entry| entry.pubkey)
-            .ok_or_else(|| TransportError::UnknownClient(admitted.client_id().to_owned()))?;
 
         let mut keys = self.lock_keys();
         let offered = keys.schedule.keys_for(admitted.deadline());
-        let client_id = admitted.client_id().to_owned();
+        let client = admitted.client();
         let deadline = admitted.deadline();
         let (auth_ok, session) = admitted.accept(&self.signer, &offered, &mut os_rng())?;
 
-        let subscriber = self.hub.subscribe(&client_id);
+        let subscriber = self.hub.subscribe(client);
         let (push, outbox) = mpsc::channel(OUTBOX_CAPACITY);
         let replies = push.clone();
         keys.sessions.insert(
             subscriber.id(),
             Session {
-                client_id: client_id.clone(),
-                pubkey,
+                client,
                 deadline,
                 push,
                 subscriber: Arc::clone(&subscriber),
@@ -242,7 +234,7 @@ impl NodeTransport {
         );
         drop(keys);
         drop(clients);
-        info!(%client_id, deadline, "client session opened");
+        info!(%client, deadline, "client session opened");
         Ok((
             auth_ok,
             Established {
@@ -341,8 +333,7 @@ impl NodeTransport {
             .collect();
         keys.sessions.retain(|_, session| {
             let new_deadline = verified
-                .get(&session.client_id)
-                .filter(|entry| entry.pubkey == session.pubkey)
+                .get(session.client)
                 .map(|entry| session_deadline(entry.expires_at, epoch_secs));
             match new_deadline {
                 Some(deadline) if deadline >= session.deadline && deadline > now => {

@@ -4,11 +4,10 @@
 //! through [`domain::digest`](crate::domain::digest) like every other payload.
 //! Their kinds keep them apart from price updates and from each other.
 
-use crate::cert::MAX_NODE_ID_LEN;
 use crate::codec::Sink as _;
 use crate::keccak::keccak256;
 use crate::payload::{KIND_CLIENT_AUTH, KIND_NODE_AUTH_OK, PAYLOAD_VERSION};
-use crate::{CompressedPublicKey, WireError};
+use crate::{Address, CompressedPublicKey, WireError};
 
 /// The protocol name a node announces in its challenge.
 pub const TRANSPORT_PROTOCOL: &str = "price-oracle/2";
@@ -20,14 +19,15 @@ const CLIENT_AUTH_LABEL: &str = "price-oracle/2 client-auth";
 const AUTH_OK_LABEL: &str = "price-oracle/2 auth-ok";
 const LABEL_LIMIT: usize = 64;
 
-/// Hashes what a client signs to authenticate: the node, the node's challenge,
-/// the client's own nonce, its API key, and its per-connection X25519 key.
+/// Hashes what a client signs to authenticate: the node's address, the node's
+/// challenge, the client's own nonce, its API key, and its per-connection
+/// X25519 key.
 ///
 /// # Errors
 ///
-/// Returns [`WireError::FieldTooLong`] if `node_id` exceeds its cap.
+/// Cannot fail today; fallible like the other builders so the label can grow.
 pub fn client_auth_transcript(
-    node_id: &str,
+    node: Address,
     challenge: &[u8; 32],
     client_nonce: &[u8; 32],
     client_pubkey: &CompressedPublicKey,
@@ -35,7 +35,7 @@ pub fn client_auth_transcript(
 ) -> Result<[u8; 32], WireError> {
     let mut out = Vec::with_capacity(256);
     out.try_put_str("label", CLIENT_AUTH_LABEL, LABEL_LIMIT)?;
-    out.try_put_str("node_id", node_id, MAX_NODE_ID_LEN)?;
+    out.put_bytes(node.as_bytes());
     out.put_bytes(challenge);
     out.put_bytes(client_nonce);
     out.put_bytes(client_pubkey.as_bytes());
@@ -93,9 +93,9 @@ mod tests {
         Signer::from_secret_bytes([seed; 32]).expect("valid key")
     }
 
-    fn transcript(node_id: &str, challenge: u8, nonce: u8, client: u8, eph: u8) -> [u8; 32] {
+    fn transcript(node: u8, challenge: u8, nonce: u8, client: u8, eph: u8) -> [u8; 32] {
         client_auth_transcript(
-            node_id,
+            key(node).address(),
             &[challenge; 32],
             &[nonce; 32],
             &key(client).public_key(),
@@ -106,13 +106,13 @@ mod tests {
 
     #[test]
     fn every_bound_field_changes_the_client_transcript() {
-        let base = transcript("n1", 1, 2, 3, 4);
+        let base = transcript(1, 1, 2, 3, 4);
         for other in [
-            transcript("n2", 1, 2, 3, 4),
-            transcript("n1", 9, 2, 3, 4),
-            transcript("n1", 1, 9, 3, 4),
-            transcript("n1", 1, 2, 9, 4),
-            transcript("n1", 1, 2, 3, 9),
+            transcript(2, 1, 2, 3, 4),
+            transcript(1, 9, 2, 3, 4),
+            transcript(1, 1, 9, 3, 4),
+            transcript(1, 1, 2, 9, 4),
+            transcript(1, 1, 2, 3, 9),
         ] {
             assert_ne!(base, other);
         }
@@ -137,7 +137,7 @@ mod tests {
     /// The two auth kinds and a price update can never stand in for each other.
     #[test]
     fn auth_signatures_do_not_cross_contexts() {
-        let t = transcript("n1", 1, 2, 3, 4);
+        let t = transcript(1, 1, 2, 3, 4);
         let client_payload = client_auth_payload(&t);
         let node_payload = auth_ok_payload(&t);
         assert_eq!(client_payload[1], KIND_CLIENT_AUTH);

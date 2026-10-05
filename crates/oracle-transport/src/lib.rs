@@ -48,20 +48,18 @@ pub enum TransportError {
     /// The peer speaks another protocol version.
     #[error("unsupported protocol `{0}`")]
     Protocol(String),
-    /// The challenge names another node than the one dialled.
-    #[error("challenge is from node `{got}`, expected `{expected}`")]
+    /// The challenge names another node than the one dialled. After a
+    /// rotation, the endpoint serves the node's new address.
+    #[error("challenge is from node {got}, expected {expected}")]
     WrongNode {
         /// The node the client dialled.
-        expected: String,
+        expected: oracle_wire::Address,
         /// The node named in the challenge.
-        got: String,
+        got: oracle_wire::Address,
     },
-    /// The client id is not in the client list.
-    #[error("unknown client `{0}`")]
-    UnknownClient(String),
-    /// The presented key is not the one listed for the client.
-    #[error("client `{0}` presented a key that is not its listed key")]
-    KeyMismatch(String),
+    /// The client's address is not in the client list.
+    #[error("unknown client {0}")]
+    UnknownClient(oracle_wire::Address),
     /// The client's authorisation has ended.
     #[error("client authorisation ended at {deadline} (now {now})")]
     Expired {
@@ -73,12 +71,12 @@ pub enum TransportError {
     /// The client's signature does not match its key and this transcript.
     #[error("client signature does not verify")]
     BadSignature,
-    /// The node's signature does not come from its live signing key.
-    #[error("auth_ok is signed by {found}, expected the node's live key {expected}")]
+    /// The node's signature does not come from the dialled address.
+    #[error("auth_ok is signed by {found}, expected the node {expected}")]
     UntrustedNode {
         /// Address recovered from the signature.
         found: oracle_wire::Address,
-        /// The node's live signing address in the registry.
+        /// The node the client dialled.
         expected: oracle_wire::Address,
     },
     /// HPKE setup or export failed.

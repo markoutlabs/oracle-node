@@ -1,14 +1,14 @@
-//! M5.5: five nodes, a quorum of three, and a signing-key rotation under the
-//! one-live-key model (SPEC §3.5).
+//! M5.5: five nodes, a quorum of three, and a key rotation (SPEC §3.5).
 //!
-//! A rotation is an atomic swap in the registry. The consumer learns about it
-//! from the first frame it cannot verify, fetches the registry once, and carries
-//! on. The ways that can go wrong, each a test here:
+//! A rotation is governance's `replace_node`: the registry lists the node's
+//! new address in place of the old one. The consumer learns about it from the
+//! first frame it cannot verify, fetches the registry once, and carries on.
+//! The ways that can go wrong, each a test here:
 //!
 //! - The consumer never learns about the new key, or fetches on every unknown
 //!   frame and becomes a load generator against the registry.
 //! - The retired key keeps verifying, or triggers fetches forever.
-//! - The replay floor resets with the new key.
+//! - The old and the new address both count toward the quorum.
 //! - A de-listed node keeps counting until its last update ages out.
 //! - A registry the source stops confirming is reported as healthy.
 
@@ -26,9 +26,7 @@ const NOW: u64 = REGISTRY_ISSUED_AT * NANOS_PER_SEC;
 
 /// The deployment §9.2 calls for: five nodes, quorum of three.
 fn fleet() -> Vec<TestNode> {
-    (1..=5_u8)
-        .map(|seed| TestNode::new(seed, &format!("oracle-{seed}")))
-        .collect()
+    (1..=5_u8).map(TestNode::new).collect()
 }
 
 fn entries(nodes: &[TestNode]) -> Vec<NodeEntry> {
@@ -87,8 +85,8 @@ async fn a_rotation_costs_the_consumer_one_fetch() {
     }
     assert_eq!(source.fetches(), 0, "known signers never fetch");
 
-    // The operator rotates node 1. The canister publishes v2 with only the new
-    // key. The consumer has no idea yet.
+    // Governance replaces node 1's address. The canister publishes v2 with
+    // only the new one. The consumer has no idea yet.
     nodes.first_mut().expect("a node").rotate();
     source.serve(signed_registry(2, entries(&nodes)));
 
@@ -99,7 +97,7 @@ async fn a_rotation_costs_the_consumer_one_fetch() {
         .expect("the new key is accepted after one refresh");
     assert_eq!(source.fetches(), 1);
     assert_eq!(client.registry_version(), 2);
-    assert_eq!(resolved.nodes, 5, "the node kept its seat through the swap");
+    assert_eq!(resolved.nodes, 5, "the seat moved to the new address");
     assert_eq!(resolved.status, Status::Ok);
 
     // A frame that was in flight under the old key: refused, and no fetch.
@@ -139,7 +137,7 @@ async fn unknown_signers_fetch_at_most_once_per_interval() {
     let nodes = fleet();
     let source = TestSource::serving(signed_registry(1, entries(&nodes)));
     let mut client = client_with_source(&nodes, Arc::clone(&source));
-    let impostor = TestNode::new(200, "impostor");
+    let impostor = TestNode::new(200);
 
     for seq in 1..=5 {
         let error = client

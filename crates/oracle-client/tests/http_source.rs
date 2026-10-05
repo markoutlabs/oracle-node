@@ -10,9 +10,7 @@ use oracle_client::{Certification, FetchError, HttpRegistrySource, RegistrySourc
 
 #[tokio::test]
 async fn a_document_without_the_canister_certificate_is_refused() {
-    let nodes: Vec<TestNode> = (1..=3_u8)
-        .map(|seed| TestNode::new(seed, &format!("oracle-{seed}")))
-        .collect();
+    let nodes: Vec<TestNode> = (1..=3_u8).map(TestNode::new).collect();
     let registry = signed_registry(7, nodes.iter().map(TestNode::entry).collect());
     let json = serde_json::to_string(&registry).expect("serialises");
 

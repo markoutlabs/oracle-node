@@ -5,6 +5,7 @@
 
 use aes_gcm_siv::aead::{Aead as _, KeyInit as _, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
+use oracle_wire::Address;
 use zeroize::Zeroizing;
 
 use crate::schedule::{EpochKey, KeyContext, put_prefixed};
@@ -61,7 +62,7 @@ impl CloseReason {
     }
 }
 
-/// A broadcast key as delivered. The receiver adds the `node_id` it dialled.
+/// A broadcast key as delivered. The receiver adds the address it dialled.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyGrant {
     /// The key's epoch.
@@ -92,10 +93,10 @@ impl KeyGrant {
 
     /// Rebuilds the key, bound to the node this session was opened with.
     #[must_use]
-    pub fn into_key(self, node_id: &str) -> EpochKey {
+    pub fn into_key(self, node: Address) -> EpochKey {
         EpochKey::from_secret(
             KeyContext {
-                node_id: node_id.to_owned(),
+                node,
                 epoch_index: self.epoch_index,
                 generation: self.generation,
                 not_before: self.not_before,
@@ -411,9 +412,9 @@ mod tests {
 
     #[test]
     fn a_granted_key_rebuilds_only_under_the_dialled_node() {
-        let a = grant().into_key("oracle-a");
-        let again = grant().into_key("oracle-a");
-        let b = grant().into_key("oracle-b");
+        let a = grant().into_key(Address::from_bytes([0xA1; 20]));
+        let again = grant().into_key(Address::from_bytes([0xA1; 20]));
+        let b = grant().into_key(Address::from_bytes([0xB2; 20]));
         assert_eq!(a.key_id(), again.key_id());
         assert_ne!(a.key_id(), b.key_id());
         assert_eq!(KeyGrant::from_key(&a), grant());

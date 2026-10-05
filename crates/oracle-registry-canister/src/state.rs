@@ -4,12 +4,12 @@
 //! test in this file rather than a PocketIC run, and the canister glue in
 //! `lib.rs` only adds the caller, the clock, and the threshold signature.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use oracle_wire::{
-    Address, ClientEntry, ClientList, CompressedPublicKey, KeyHistoryEntry, MAX_CLIENT_ID_LEN,
-    MAX_CLIENTS, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODE_ID_LEN, MAX_NODES, MAX_OPERATOR_LEN,
-    NodeEntry, Quorum, Registry, Signature, SigningKeyCert, WireError,
+    Address, ClientEntry, ClientList, CompressedPublicKey, MAX_CLIENTS, MAX_ENDPOINT_LEN,
+    MAX_ENDPOINTS, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry, NodeListing, Quorum, Registry,
+    Signature, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,32 +17,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
-    /// No listed node has this id.
-    #[error("unknown node `{0}`")]
-    UnknownNode(String),
-    /// The node is already in the registry.
-    #[error("node `{0}` is already listed")]
-    AlreadyListed(String),
+    /// No listed node has this address.
+    #[error("unknown node {0}")]
+    UnknownNode(Address),
     /// The entry failed a structural check.
     #[error("invalid entry: {0}")]
     InvalidEntry(String),
-    /// The certificate failed a check.
-    #[error("invalid certificate: {0}")]
-    InvalidCert(String),
-    /// A signing address may belong to one key of one node, ever.
-    #[error("signing address {0} is already known to the registry")]
-    AddressInUse(Address),
-    /// An identity key may back one node.
-    #[error("identity key is already used by node `{0}`")]
-    IdentityInUse(String),
-    /// Rotations are serialised fleet-wide (SPEC §3.6).
-    #[error("a rotation happened at {last}; the next is allowed at {next_allowed}")]
-    RotationTooSoon {
-        /// When the last rotation happened, unix seconds.
-        last: u64,
-        /// When the next one is allowed, unix seconds.
-        next_allowed: u64,
-    },
+    /// An address is listed once, ever, as a node or as a client.
+    #[error("address {0} is or was already in the registry; use a new key")]
+    AddressUsed(Address),
     /// Removing the node would leave consumers unable to reach the quorum.
     #[error("removing the node would leave {remaining} nodes, below min_nodes {min_nodes}")]
     BelowQuorum {
@@ -54,15 +37,9 @@ pub enum StateError {
     /// The wire format caps the node count.
     #[error("the registry already holds {MAX_NODES} nodes")]
     TooManyNodes,
-    /// No client has this id.
-    #[error("unknown client `{0}`")]
-    UnknownClient(String),
-    /// A client with this id is already listed.
-    #[error("client `{0}` is already listed")]
-    ClientExists(String),
-    /// Another client already uses this key.
-    #[error("the key is already used by client `{0}`")]
-    ClientKeyInUse(String),
+    /// No listed client has this address.
+    #[error("unknown client {0}")]
+    UnknownClient(Address),
     /// The client failed a check.
     #[error("invalid client: {0}")]
     InvalidClient(String),
@@ -90,29 +67,71 @@ pub enum StateError {
 pub struct Config {
     /// Threshold ECDSA key name: `dfx_test_key` locally, `key_1` on mainnet.
     pub key_name: String,
-    /// Minimum seconds between two rotations fleet-wide.
-    pub rotation_window_secs: u64,
     /// Broadcast-key epoch, published in the client list.
-    #[serde(default = "default_epoch_secs")]
     pub epoch_secs: u64,
 }
 
 /// Default broadcast-key epoch (SPEC §6.1).
 pub const DEFAULT_EPOCH_SECS: u64 = 60;
 
-const fn default_epoch_secs() -> u64 {
-    DEFAULT_EPOCH_SECS
+/// A listed node. Its address is the map key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRecord {
+    /// Who runs it.
+    pub operator: String,
+    /// WebSocket endpoints.
+    pub endpoints: Vec<String>,
+    /// Relative weight hint.
+    pub weight: u16,
+    /// When governance listed it, unix seconds.
+    pub added_at: u64,
 }
 
-/// One authorised client.
+impl NodeRecord {
+    fn entry(&self, address: Address) -> NodeEntry {
+        NodeEntry {
+            address,
+            operator: self.operator.clone(),
+            endpoints: self.endpoints.clone(),
+            weight: self.weight,
+        }
+    }
+}
+
+/// A node governance replaced or removed. Kept so the address is never
+/// listed again, and for stored-frame verification.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredNode {
+    /// Who ran it.
+    pub operator: String,
+    /// When governance listed it, unix seconds.
+    pub added_at: u64,
+    /// When governance replaced or removed it, unix seconds.
+    pub removed_at: u64,
+}
+
+/// One authorised client. Its address is the map key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientRecord {
-    /// The client's secp256k1 API key.
-    pub pubkey: CompressedPublicKey,
     /// End of authorisation, unix seconds.
     pub expires_at: u64,
     /// When governance added it, unix seconds.
     pub added_at: u64,
+}
+
+/// A registry document ready to sign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsignedDocument {
+    /// `State::version + 1`.
+    pub version: u64,
+    /// The issue time, unix seconds.
+    pub effective_from: u64,
+    /// The listed nodes.
+    pub nodes: Vec<NodeEntry>,
+    /// The quorum guidance.
+    pub quorum: Quorum,
+    /// `Registry::signing_bytes` over the above.
+    pub signing_bytes: Vec<u8>,
 }
 
 /// A client list ready to sign.
@@ -130,76 +149,6 @@ pub struct UnsignedClientList {
     pub signing_bytes: Vec<u8>,
 }
 
-/// One signing key of one node, live or retired.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeyRecord {
-    /// The certificate the operator issued with the node's identity key.
-    pub cert: SigningKeyCert,
-    /// When the key became live, unix seconds.
-    pub added_at: u64,
-    /// When the key stopped being live, unix seconds. `None` while live.
-    pub retired_at: Option<u64>,
-}
-
-/// A listed node and its whole key history.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeRecord {
-    /// Who runs it.
-    pub operator: String,
-    /// The long-lived identity key that issues the node's certificates.
-    pub identity_pubkey: CompressedPublicKey,
-    /// WebSocket endpoints.
-    pub endpoints: Vec<String>,
-    /// Relative weight hint.
-    pub weight: u16,
-    /// The generation whose key verifies live frames.
-    pub live: u32,
-    /// Every generation, including retired ones.
-    pub keys: BTreeMap<u32, KeyRecord>,
-}
-
-impl NodeRecord {
-    fn live_cert(&self) -> &SigningKeyCert {
-        &self
-            .keys
-            .get(&self.live)
-            .expect("the live generation is always present")
-            .cert
-    }
-
-    fn entry(&self, node_id: &str) -> NodeEntry {
-        NodeEntry {
-            node_id: node_id.to_owned(),
-            operator: self.operator.clone(),
-            identity_pubkey: self.identity_pubkey,
-            endpoints: self.endpoints.clone(),
-            signing_keys: vec![self.live_cert().clone()],
-            weight: self.weight,
-        }
-    }
-
-    fn retire_live(&mut self, now: u64) {
-        if let Some(record) = self.keys.get_mut(&self.live) {
-            record.retired_at = Some(now);
-        }
-    }
-}
-
-/// A registry document ready to sign.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedDocument {
-    /// `State::version + 1`.
-    pub version: u64,
-    /// The issue time, unix seconds.
-    pub effective_from: u64,
-    /// Listed nodes, each with its live certificate only.
-    pub nodes: Vec<NodeEntry>,
-    /// The quorum guidance.
-    pub quorum: Quorum,
-    /// `Registry::signing_bytes` over the above.
-    pub signing_bytes: Vec<u8>,
-}
-
 /// The whole canister state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
@@ -207,26 +156,23 @@ pub struct State {
     pub config: Config,
     /// Quorum guidance published in the document.
     pub quorum: Quorum,
-    /// Listed nodes by id.
-    pub nodes: BTreeMap<String, NodeRecord>,
-    /// Nodes governance removed, kept for their key history.
-    pub removed: BTreeMap<String, NodeRecord>,
+    /// Listed nodes by address.
+    pub nodes: BTreeMap<Address, NodeRecord>,
+    /// Nodes governance replaced or removed, by address.
+    pub retired: BTreeMap<Address, RetiredNode>,
     /// Version of the last published document. Zero before the first.
     pub version: u64,
-    /// When the last rotation happened, unix seconds.
-    pub last_rotation_at: Option<u64>,
     /// The last signed document.
     pub published: Option<Registry>,
     /// The threshold public key, once fetched.
     pub governance_key: Option<CompressedPublicKey>,
-    /// Authorised clients by id. Absent in states saved before clients existed.
-    #[serde(default)]
-    pub clients: BTreeMap<String, ClientRecord>,
+    /// Authorised clients by address.
+    pub clients: BTreeMap<Address, ClientRecord>,
+    /// Clients governance removed. Their addresses are never listed again.
+    pub removed_clients: BTreeSet<Address>,
     /// Version of the last published client list. Zero before the first.
-    #[serde(default)]
     pub clients_version: u64,
     /// The last signed client list.
-    #[serde(default)]
     pub clients_published: Option<ClientList>,
 }
 
@@ -242,12 +188,12 @@ impl State {
             config,
             quorum,
             nodes: BTreeMap::new(),
-            removed: BTreeMap::new(),
+            retired: BTreeMap::new(),
             version: 0,
-            last_rotation_at: None,
             published: None,
             governance_key: None,
             clients: BTreeMap::new(),
+            removed_clients: BTreeSet::new(),
             clients_version: 0,
             clients_published: None,
         })
@@ -255,119 +201,69 @@ impl State {
 
     /// Governance lists a node from the entry its operator sent. Bumps the document.
     ///
-    /// A node that was removed earlier continues its generation numbers, so
-    /// its key history never has two generation ones.
-    ///
     /// # Errors
     ///
-    /// Returns an error if the id is listed, the registry is full, or the entry
-    /// or its certificate fails a check.
+    /// Returns an error if the address was ever used, the entry is invalid,
+    /// or the registry is full.
     pub fn add_node(&mut self, entry: NodeEntry, now: u64) -> Result<(), StateError> {
-        if self.nodes.contains_key(&entry.node_id) {
-            return Err(StateError::AlreadyListed(entry.node_id));
-        }
+        self.check_unused(entry.address)?;
         if self.nodes.len() >= MAX_NODES {
             return Err(StateError::TooManyNodes);
         }
-        self.validate_entry(&entry, now)?;
+        validate_entry(&entry)?;
         let NodeEntry {
-            node_id,
+            address,
             operator,
-            identity_pubkey,
             endpoints,
-            signing_keys,
             weight,
         } = entry;
-        let cert = signing_keys
-            .into_iter()
-            .next()
-            .ok_or_else(|| StateError::InvalidEntry("entry has no certificate".to_owned()))?;
-
-        let mut keys = self
-            .removed
-            .remove(&node_id)
-            .map(|old| old.keys)
-            .unwrap_or_default();
-        let generation = keys
-            .keys()
-            .next_back()
-            .map_or(1, |last| last.saturating_add(1));
-        keys.insert(
-            generation,
-            KeyRecord {
-                cert,
-                added_at: now,
-                retired_at: None,
-            },
-        );
         self.nodes.insert(
-            node_id,
+            address,
             NodeRecord {
                 operator,
-                identity_pubkey,
                 endpoints,
                 weight,
-                live: generation,
-                keys,
+                added_at: now,
             },
         );
         Ok(())
     }
 
-    /// Governance swaps a node's signing key with the certificate its operator
-    /// sent. Atomic: the new generation is live and the old one retired in the
-    /// same call. Bumps the document.
+    /// Governance rotates a node's key: `new` takes the place of `old`, with
+    /// the same operator, endpoints and weight. Bumps the document.
+    ///
+    /// One version for both changes, so consumers never see the node twice
+    /// or not at all, and the node count does not change.
     ///
     /// # Errors
     ///
-    /// Returns an error if the node is unknown, the certificate fails a check,
-    /// or another rotation happened inside the rotation window.
-    pub fn rotate_key(
-        &mut self,
-        node_id: &str,
-        cert: SigningKeyCert,
-        now: u64,
-    ) -> Result<(), StateError> {
-        let node = self
-            .nodes
-            .get(node_id)
-            .ok_or_else(|| StateError::UnknownNode(node_id.to_owned()))?;
-        let identity = node.identity_pubkey;
-        self.validate_cert(node_id, &identity, &cert, now)?;
-        if let Some(last) = self.last_rotation_at {
-            let next_allowed = last.saturating_add(self.config.rotation_window_secs);
-            if now < next_allowed {
-                return Err(StateError::RotationTooSoon { last, next_allowed });
-            }
+    /// Returns an error if `old` is not listed or `new` was ever used.
+    pub fn replace_node(&mut self, old: Address, new: Address, now: u64) -> Result<(), StateError> {
+        if !self.nodes.contains_key(&old) {
+            return Err(StateError::UnknownNode(old));
         }
-
-        let Some(node) = self.nodes.get_mut(node_id) else {
-            return Err(StateError::UnknownNode(node_id.to_owned()));
-        };
-        node.retire_live(now);
-        let generation = node.live.saturating_add(1);
-        node.keys.insert(
-            generation,
-            KeyRecord {
-                cert,
+        self.check_unused(new)?;
+        let record = self.retire(old, now)?;
+        self.nodes.insert(
+            new,
+            NodeRecord {
                 added_at: now,
-                retired_at: None,
+                ..record
             },
         );
-        node.live = generation;
-        self.last_rotation_at = Some(now);
         Ok(())
     }
 
-    /// Governance de-lists a node. Its keys stay in history. Bumps the document.
+    /// Governance de-lists a node. Its address is never listed again. Bumps
+    /// the document.
     ///
     /// # Errors
     ///
     /// Returns an error if the node is unknown, or the remaining count would
     /// fall below `quorum.min_nodes`.
-    pub fn remove_node(&mut self, node_id: &str, now: u64) -> Result<(), StateError> {
-        if !self.nodes.contains_key(node_id) {
-            return Err(StateError::UnknownNode(node_id.to_owned()));
+    pub fn remove_node(&mut self, address: Address, now: u64) -> Result<(), StateError> {
+        if !self.nodes.contains_key(&address) {
+            return Err(StateError::UnknownNode(address));
         }
         let remaining = self.nodes.len().saturating_sub(1);
         if remaining < usize::from(self.quorum.min_nodes) {
@@ -376,12 +272,24 @@ impl State {
                 min_nodes: self.quorum.min_nodes,
             });
         }
-        let Some(mut node) = self.nodes.remove(node_id) else {
-            return Err(StateError::UnknownNode(node_id.to_owned()));
-        };
-        node.retire_live(now);
-        self.removed.insert(node_id.to_owned(), node);
+        self.retire(address, now)?;
         Ok(())
+    }
+
+    fn retire(&mut self, address: Address, now: u64) -> Result<NodeRecord, StateError> {
+        let record = self
+            .nodes
+            .remove(&address)
+            .ok_or(StateError::UnknownNode(address))?;
+        self.retired.insert(
+            address,
+            RetiredNode {
+                operator: record.operator.clone(),
+                added_at: record.added_at,
+                removed_at: now,
+            },
+        );
+        Ok(record)
     }
 
     /// Governance changes the quorum guidance. Bumps the document.
@@ -408,7 +316,11 @@ impl State {
     /// listed entry broke a limit that `validate_entry` should have caught.
     pub fn unsigned_document(&self, now: u64) -> Result<UnsignedDocument, StateError> {
         let version = self.version.saturating_add(1);
-        let nodes: Vec<NodeEntry> = self.nodes.iter().map(|(id, node)| node.entry(id)).collect();
+        let nodes: Vec<NodeEntry> = self
+            .nodes
+            .iter()
+            .map(|(address, node)| node.entry(*address))
+            .collect();
         let signing_bytes = Registry::signing_bytes(version, now, &nodes, self.quorum)?;
         Ok(UnsignedDocument {
             version,
@@ -452,39 +364,17 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns an error if the id is taken or invalid, the key is not a curve
-    /// point or belongs to another client, the list is full, or `expires_at`
-    /// is not in the future.
+    /// Returns an error if the address was ever used, the list is full, or
+    /// `expires_at` is not in the future.
     pub fn add_client(
         &mut self,
-        client_id: String,
-        pubkey: CompressedPublicKey,
+        address: Address,
         expires_at: u64,
         now: u64,
     ) -> Result<(), StateError> {
-        let trimmed = client_id.trim();
-        if trimmed.is_empty() || trimmed != client_id || client_id.len() > MAX_CLIENT_ID_LEN {
-            return Err(StateError::InvalidClient(format!(
-                "client_id must be 1..={MAX_CLIENT_ID_LEN} bytes with no surrounding whitespace"
-            )));
-        }
-        if self.clients.contains_key(&client_id) {
-            return Err(StateError::ClientExists(client_id));
-        }
+        self.check_unused(address)?;
         if self.clients.len() >= MAX_CLIENTS {
             return Err(StateError::TooManyClients);
-        }
-        if pubkey.decompress().is_err() {
-            return Err(StateError::InvalidClient(
-                "the key is not a curve point".to_owned(),
-            ));
-        }
-        if let Some((other, _)) = self
-            .clients
-            .iter()
-            .find(|(_, record)| record.pubkey == pubkey)
-        {
-            return Err(StateError::ClientKeyInUse(other.clone()));
         }
         if expires_at <= now {
             return Err(StateError::InvalidClient(
@@ -492,9 +382,8 @@ impl State {
             ));
         }
         self.clients.insert(
-            client_id,
+            address,
             ClientRecord {
-                pubkey,
                 expires_at,
                 added_at: now,
             },
@@ -509,26 +398,28 @@ impl State {
     /// Returns [`StateError::UnknownClient`] if the client is unknown.
     pub fn set_client_expiry(
         &mut self,
-        client_id: &str,
+        address: Address,
         expires_at: u64,
     ) -> Result<(), StateError> {
         let record = self
             .clients
-            .get_mut(client_id)
-            .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
+            .get_mut(&address)
+            .ok_or(StateError::UnknownClient(address))?;
         record.expires_at = expires_at;
         Ok(())
     }
 
-    /// Governance removes a client. Bumps the client list.
+    /// Governance revokes a client. Its address is never listed again. Bumps
+    /// the client list.
     ///
     /// # Errors
     ///
     /// Returns [`StateError::UnknownClient`] if the client is unknown.
-    pub fn remove_client(&mut self, client_id: &str) -> Result<(), StateError> {
+    pub fn remove_client(&mut self, address: Address) -> Result<(), StateError> {
         self.clients
-            .remove(client_id)
-            .ok_or_else(|| StateError::UnknownClient(client_id.to_owned()))?;
+            .remove(&address)
+            .ok_or(StateError::UnknownClient(address))?;
+        self.removed_clients.insert(address);
         Ok(())
     }
 
@@ -542,9 +433,8 @@ impl State {
         let clients: Vec<ClientEntry> = self
             .clients
             .iter()
-            .map(|(client_id, record)| ClientEntry {
-                client_id: client_id.clone(),
-                pubkey: record.pubkey,
+            .map(|(address, record)| ClientEntry {
+                address: *address,
                 expires_at: record.expires_at,
             })
             .collect();
@@ -588,136 +478,71 @@ impl State {
         Ok(self.clients_version)
     }
 
-    /// Every generation of a node's keys, listed or removed.
+    /// When a node address was listed, whether it still is or not.
     #[must_use]
-    pub fn key_history(&self, node_id: &str) -> Option<Vec<KeyHistoryEntry>> {
-        let node = self
-            .nodes
-            .get(node_id)
-            .or_else(|| self.removed.get(node_id))?;
-        Some(
-            node.keys
-                .iter()
-                .map(|(&generation, record)| KeyHistoryEntry {
-                    generation,
-                    cert: record.cert.clone(),
-                    added_at: record.added_at,
-                    retired_at: record.retired_at,
-                })
-                .collect(),
-        )
+    pub fn node_listing(&self, address: Address) -> Option<NodeListing> {
+        if let Some(node) = self.nodes.get(&address) {
+            return Some(NodeListing {
+                address,
+                operator: node.operator.clone(),
+                added_at: node.added_at,
+                removed_at: None,
+            });
+        }
+        self.retired.get(&address).map(|node| NodeListing {
+            address,
+            operator: node.operator.clone(),
+            added_at: node.added_at,
+            removed_at: Some(node.removed_at),
+        })
     }
 
-    /// `true` if any key of any node, listed or removed, has this address.
+    /// `true` if the address is or was a node or a client.
     #[must_use]
-    pub fn address_known(&self, address: Address) -> bool {
-        self.nodes
-            .values()
-            .chain(self.removed.values())
-            .flat_map(|node| node.keys.values())
-            .any(|record| record.cert.address == address)
+    pub fn address_used(&self, address: Address) -> bool {
+        self.nodes.contains_key(&address)
+            || self.retired.contains_key(&address)
+            || self.clients.contains_key(&address)
+            || self.removed_clients.contains(&address)
     }
 
-    fn validate_entry(&self, entry: &NodeEntry, now: u64) -> Result<(), StateError> {
-        let id = entry.node_id.trim();
-        if id.is_empty() || id != entry.node_id {
-            return Err(StateError::InvalidEntry(
-                "node_id must be non-empty with no surrounding whitespace".to_owned(),
-            ));
-        }
-        if entry.node_id.len() > MAX_NODE_ID_LEN {
-            return Err(StateError::InvalidEntry(format!(
-                "node_id is {} bytes; the limit is {MAX_NODE_ID_LEN}",
-                entry.node_id.len()
-            )));
-        }
-        if entry.operator.trim().is_empty() || entry.operator.len() > MAX_OPERATOR_LEN {
-            return Err(StateError::InvalidEntry(format!(
-                "operator must be 1..={MAX_OPERATOR_LEN} bytes"
-            )));
-        }
-        if entry.endpoints.is_empty() || entry.endpoints.len() > MAX_ENDPOINTS {
-            return Err(StateError::InvalidEntry(format!(
-                "endpoints must number 1..={MAX_ENDPOINTS}"
-            )));
-        }
-        for endpoint in &entry.endpoints {
-            if endpoint.len() > MAX_ENDPOINT_LEN {
-                return Err(StateError::InvalidEntry(format!(
-                    "endpoint `{endpoint}` exceeds {MAX_ENDPOINT_LEN} bytes"
-                )));
-            }
-            if !(endpoint.starts_with("wss://") || endpoint.starts_with("ws://")) {
-                return Err(StateError::InvalidEntry(format!(
-                    "endpoint `{endpoint}` is not a WebSocket URL"
-                )));
-            }
-        }
-        if entry.weight == 0 {
-            return Err(StateError::InvalidEntry(
-                "weight must be at least 1".to_owned(),
-            ));
-        }
-        if entry.signing_keys.len() != 1 {
-            return Err(StateError::InvalidEntry(format!(
-                "exactly one signing certificate is required, got {}",
-                entry.signing_keys.len()
-            )));
-        }
-        if let Some((other_id, _)) = self
-            .nodes
-            .iter()
-            .find(|(_, node)| node.identity_pubkey == entry.identity_pubkey)
-        {
-            return Err(StateError::IdentityInUse(other_id.clone()));
-        }
-        let cert = entry
-            .signing_keys
-            .first()
-            .expect("checked to be exactly one");
-        self.validate_cert(&entry.node_id, &entry.identity_pubkey, cert, now)
-    }
-
-    fn validate_cert(
-        &self,
-        node_id: &str,
-        identity: &CompressedPublicKey,
-        cert: &SigningKeyCert,
-        now: u64,
-    ) -> Result<(), StateError> {
-        if cert.node_id != node_id {
-            return Err(StateError::InvalidCert(format!(
-                "certificate names node `{}`, expected `{node_id}`",
-                cert.node_id
-            )));
-        }
-        if !cert.has_valid_window() {
-            return Err(StateError::InvalidCert(
-                "not_before must be earlier than not_after".to_owned(),
-            ));
-        }
-        if now < cert.not_before || now >= cert.not_after {
-            return Err(StateError::InvalidCert(format!(
-                "window [{}, {}) does not cover now ({now})",
-                cert.not_before, cert.not_after
-            )));
-        }
-        let expected = identity.address().map_err(|_| {
-            StateError::InvalidEntry("identity key is not a curve point".to_owned())
-        })?;
-        let issuer = cert
-            .recover_issuer()
-            .map_err(|e| StateError::InvalidCert(format!("issuer does not recover: {e}")))?;
-        if issuer != expected {
-            return Err(StateError::InvalidCert(format!(
-                "issued by {issuer}, expected the node's identity key {expected}"
-            )));
-        }
-        if self.address_known(cert.address) {
-            return Err(StateError::AddressInUse(cert.address));
+    fn check_unused(&self, address: Address) -> Result<(), StateError> {
+        if self.address_used(address) {
+            return Err(StateError::AddressUsed(address));
         }
         Ok(())
     }
+}
+
+fn validate_entry(entry: &NodeEntry) -> Result<(), StateError> {
+    if entry.operator.trim().is_empty() || entry.operator.len() > MAX_OPERATOR_LEN {
+        return Err(StateError::InvalidEntry(format!(
+            "operator must be 1..={MAX_OPERATOR_LEN} bytes"
+        )));
+    }
+    if entry.endpoints.is_empty() || entry.endpoints.len() > MAX_ENDPOINTS {
+        return Err(StateError::InvalidEntry(format!(
+            "endpoints must number 1..={MAX_ENDPOINTS}"
+        )));
+    }
+    for endpoint in &entry.endpoints {
+        if endpoint.len() > MAX_ENDPOINT_LEN {
+            return Err(StateError::InvalidEntry(format!(
+                "endpoint `{endpoint}` exceeds {MAX_ENDPOINT_LEN} bytes"
+            )));
+        }
+        if !(endpoint.starts_with("wss://") || endpoint.starts_with("ws://")) {
+            return Err(StateError::InvalidEntry(format!(
+                "endpoint `{endpoint}` is not a WebSocket URL"
+            )));
+        }
+    }
+    if entry.weight == 0 {
+        return Err(StateError::InvalidEntry(
+            "weight must be at least 1".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn check_quorum(quorum: Quorum) -> Result<(), StateError> {
@@ -741,12 +566,10 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_754_582_400;
-    const WINDOW: u64 = 600;
 
     fn config() -> Config {
         Config {
             key_name: "dfx_test_key".to_owned(),
-            rotation_window_secs: WINDOW,
             epoch_secs: 60,
         }
     }
@@ -762,48 +585,18 @@ mod tests {
         Signer::from_secret_bytes([0x33; 32]).expect("valid key")
     }
 
-    /// A node operator with an identity key and a signing key.
-    struct Operator {
-        identity: Signer,
-        signing: Signer,
-        node_id: String,
+    fn address(seed: u8) -> Address {
+        Signer::from_secret_bytes([seed; 32])
+            .expect("valid key")
+            .address()
     }
 
-    impl Operator {
-        fn new(seed: u8, node_id: &str) -> Self {
-            Self {
-                identity: Signer::from_secret_bytes([seed; 32]).expect("valid key"),
-                signing: Signer::from_secret_bytes([seed.wrapping_add(100); 32])
-                    .expect("valid key"),
-                node_id: node_id.to_owned(),
-            }
-        }
-
-        fn cert_for(&self, signing: &Signer, now: u64) -> SigningKeyCert {
-            SigningKeyCert::issue(
-                &self.identity,
-                &self.node_id,
-                signing.address(),
-                now.saturating_sub(60),
-                now + 30 * 86_400,
-            )
-            .expect("issues")
-        }
-
-        fn entry(&self, now: u64) -> NodeEntry {
-            NodeEntry {
-                node_id: self.node_id.clone(),
-                operator: format!("op-{}", self.node_id),
-                identity_pubkey: self.identity.public_key(),
-                endpoints: vec![format!("wss://{}.example/v1/ws", self.node_id)],
-                signing_keys: vec![self.cert_for(&self.signing, now)],
-                weight: 1,
-            }
-        }
-
-        fn rotate(&mut self, seed: u8, now: u64) -> SigningKeyCert {
-            self.signing = Signer::from_secret_bytes([seed; 32]).expect("valid key");
-            self.cert_for(&self.signing, now)
+    fn entry(seed: u8) -> NodeEntry {
+        NodeEntry {
+            address: address(seed),
+            operator: format!("op-{seed}"),
+            endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
+            weight: 1,
         }
     }
 
@@ -816,36 +609,29 @@ mod tests {
         state.published.clone().expect("published")
     }
 
-    fn listed(ops: &[Operator], min_nodes: u16) -> State {
+    fn listed(seeds: &[u8], min_nodes: u16) -> State {
         let mut state = State::new(config(), quorum(min_nodes)).expect("valid");
-        for op in ops {
-            state.add_node(op.entry(NOW), NOW).expect("adds");
+        for &seed in seeds {
+            state.add_node(entry(seed), NOW).expect("adds");
         }
         publish(&mut state, NOW);
         state
     }
 
     #[test]
-    fn added_nodes_publish_with_one_live_key_each() {
-        let ops = [
-            Operator::new(1, "a"),
-            Operator::new(2, "b"),
-            Operator::new(3, "c"),
-        ];
+    fn added_nodes_publish_and_verify() {
         let mut state = State::new(config(), quorum(3)).expect("valid");
-        let first = ops.first().expect("three operators");
-        for op in &ops {
-            state.add_node(op.entry(NOW), NOW).expect("adds");
+        for seed in 1..=3 {
+            state.add_node(entry(seed), NOW).expect("adds");
         }
         assert_eq!(
-            state.add_node(first.entry(NOW), NOW),
-            Err(StateError::AlreadyListed("a".to_owned()))
+            state.add_node(entry(1), NOW),
+            Err(StateError::AddressUsed(address(1)))
         );
 
         let registry = publish(&mut state, NOW);
         assert_eq!(registry.version, 1);
         assert_eq!(registry.nodes.len(), 3);
-        assert!(registry.nodes.iter().all(|n| n.signing_keys.len() == 1));
 
         // The in-process stand-in verifies exactly like the threshold key will.
         let verified = registry
@@ -855,258 +641,164 @@ mod tests {
     }
 
     #[test]
-    fn a_signing_address_belongs_to_one_node_ever() {
-        let a = Operator::new(1, "a");
-        let mut state = listed(&[a], 1);
-
-        // A second node whose certificate names node a's live signing key.
-        let b = Operator::new(2, "b");
-        let mut entry = b.entry(NOW);
-        let a_signing = Signer::from_secret_bytes([101; 32]).expect("valid key");
-        entry.signing_keys = vec![b.cert_for(&a_signing, NOW)];
-        assert_eq!(
-            state.add_node(entry, NOW),
-            Err(StateError::AddressInUse(a_signing.address()))
-        );
+    fn invalid_entries_are_refused() {
+        let mut state = State::new(config(), quorum(1)).expect("valid");
+        let mutations: [fn(&mut NodeEntry); 4] = [
+            |e| e.operator = " ".to_owned(),
+            |e| e.endpoints.clear(),
+            |e| e.endpoints = vec!["https://node.example".to_owned()],
+            |e| e.weight = 0,
+        ];
+        for mutate in mutations {
+            let mut bad = entry(1);
+            mutate(&mut bad);
+            assert!(matches!(
+                state.add_node(bad, NOW),
+                Err(StateError::InvalidEntry(_))
+            ));
+        }
+        assert!(state.nodes.is_empty());
     }
 
     #[test]
-    fn rotation_is_atomic_and_keeps_history() {
-        let mut a = Operator::new(1, "a");
-        let b = Operator::new(2, "b");
-        let mut state = listed(&[Operator::new(1, "a"), b], 2);
-        let old_address = a.signing.address();
-
-        let cert = a.rotate(50, NOW + 10);
+    fn a_replacement_swaps_the_address_in_one_version() {
+        let mut state = listed(&[1, 2], 2);
+        let later = NOW + 10;
         state
-            .rotate_key("a", cert.clone(), NOW + 10)
-            .expect("rotates");
+            .replace_node(address(1), address(50), later)
+            .expect("replaces");
 
-        let registry = publish(&mut state, NOW + 10);
+        let registry = publish(&mut state, later);
         assert_eq!(registry.version, 2);
-        let listed_a = registry.nodes.iter().find(|n| n.node_id == "a").expect("a");
-        assert_eq!(listed_a.signing_keys.len(), 1, "one live key per node");
+        assert_eq!(registry.nodes.len(), 2, "the count never changes");
+        let replaced = registry
+            .nodes
+            .iter()
+            .find(|n| n.address == address(50))
+            .expect("the new address is listed");
+        assert_eq!(replaced.operator, "op-1");
+        assert_eq!(replaced.endpoints, entry(1).endpoints);
+        assert!(registry.nodes.iter().all(|n| n.address != address(1)));
+
         assert_eq!(
-            listed_a.signing_keys.first().map(|c| c.address),
-            Some(cert.address)
-        );
-
-        let history = state.key_history("a").expect("known");
-        assert_eq!(history.len(), 2);
-        let gen1 = history.first().expect("generation 1");
-        let gen2 = history.get(1).expect("generation 2");
-        assert_eq!(gen1.cert.address, old_address);
-        assert_eq!(gen1.retired_at, Some(NOW + 10));
-        assert_eq!(gen2.generation, 2);
-        assert_eq!(gen2.retired_at, None);
-
-        // The retired address can never come back, even for the same node.
-        let revived = a.cert_for(
-            &Signer::from_secret_bytes([101; 32]).expect("valid key"),
-            NOW + 20,
-        );
-        assert_eq!(
-            state.rotate_key("a", revived, NOW + WINDOW + 20),
-            Err(StateError::AddressInUse(old_address))
-        );
-    }
-
-    #[test]
-    fn rotations_are_serialised_fleet_wide() {
-        let mut a = Operator::new(1, "a");
-        let mut b = Operator::new(2, "b");
-        let mut state = listed(&[Operator::new(1, "a"), Operator::new(2, "b")], 2);
-
-        state
-            .rotate_key("a", a.rotate(50, NOW), NOW)
-            .expect("rotates");
-        let cert_b = b.rotate(51, NOW + 1);
-        assert_eq!(
-            state.rotate_key("b", cert_b.clone(), NOW + 1),
-            Err(StateError::RotationTooSoon {
-                last: NOW,
-                next_allowed: NOW + WINDOW,
+            state.node_listing(address(1)),
+            Some(NodeListing {
+                address: address(1),
+                operator: "op-1".to_owned(),
+                added_at: NOW,
+                removed_at: Some(later),
             })
         );
-        state
-            .rotate_key("b", cert_b, NOW + WINDOW)
-            .expect("rotates once the window has passed");
+        assert_eq!(
+            state
+                .node_listing(address(50))
+                .map(|l| (l.added_at, l.removed_at)),
+            Some((later, None))
+        );
+        assert_eq!(state.node_listing(address(99)), None);
+
+        assert_eq!(
+            state.replace_node(address(1), address(51), later),
+            Err(StateError::UnknownNode(address(1)))
+        );
+        for used in [address(1), address(2), address(50)] {
+            assert_eq!(
+                state.replace_node(address(2), used, later),
+                Err(StateError::AddressUsed(used))
+            );
+        }
     }
 
     #[test]
-    fn removal_never_goes_below_min_nodes_and_keeps_history() {
-        let ops = [
-            Operator::new(1, "a"),
-            Operator::new(2, "b"),
-            Operator::new(3, "c"),
-        ];
-        let mut state = listed(&ops, 3);
-
+    fn removal_never_goes_below_min_nodes_and_never_comes_back() {
+        let mut state = listed(&[1, 2, 3], 3);
         assert_eq!(
-            state.remove_node("c", NOW + 1),
+            state.remove_node(address(3), NOW + 1),
             Err(StateError::BelowQuorum {
                 remaining: 2,
-                min_nodes: 3,
+                min_nodes: 3
             })
         );
-        state.set_quorum(quorum(2)).expect("sets");
-        state.remove_node("c", NOW + 1).expect("removes");
-        let registry = publish(&mut state, NOW + 1);
-        assert_eq!(registry.nodes.len(), 2);
-        assert_eq!(registry.quorum.min_nodes, 2);
-
-        let history = state.key_history("c").expect("history survives removal");
-        assert_eq!(history.first().map(|k| k.retired_at), Some(Some(NOW + 1)));
-
-        // Re-listing continues the generation count.
-        let mut c = Operator::new(3, "c");
-        let mut entry = c.entry(NOW + 2);
-        entry.signing_keys = vec![c.rotate(60, NOW + 2)];
-        state.add_node(entry, NOW + 2).expect("re-adds");
-        let history = state.key_history("c").expect("known");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.get(1).map(|k| k.generation), Some(2));
+        state.set_quorum(quorum(2)).expect("valid");
+        state.remove_node(address(3), NOW + 1).expect("removes");
+        assert_eq!(
+            state
+                .node_listing(address(3))
+                .and_then(|listing| listing.removed_at),
+            Some(NOW + 1)
+        );
+        assert_eq!(
+            state.add_node(entry(3), NOW + 2),
+            Err(StateError::AddressUsed(address(3)))
+        );
+        assert_eq!(
+            state.remove_node(address(3), NOW + 2),
+            Err(StateError::UnknownNode(address(3)))
+        );
     }
 
+    /// A client key lives on a consumer's machine. It must never become a
+    /// price-signing key, and a revoked one must never come back.
     #[test]
-    fn certificates_are_checked_against_the_identity_key_and_the_clock() {
-        let a = Operator::new(1, "a");
-        let mut state = State::new(config(), quorum(1)).expect("valid");
-
-        let mut stale = a.entry(NOW);
-        stale.signing_keys = vec![a.cert_for(&a.signing, NOW - 365 * 86_400)];
-        assert!(matches!(
-            state.add_node(stale, NOW),
-            Err(StateError::InvalidCert(_))
-        ));
-
-        let impostor = Operator::new(7, "a");
-        let mut forged = a.entry(NOW);
-        forged.signing_keys = vec![impostor.cert_for(&a.signing, NOW)];
-        assert!(matches!(
-            state.add_node(forged, NOW),
-            Err(StateError::InvalidCert(_))
-        ));
-
-        let mut two_keys = a.entry(NOW);
-        two_keys
-            .signing_keys
-            .push(a.cert_for(&impostor.signing, NOW));
-        assert!(matches!(
-            state.add_node(two_keys, NOW),
-            Err(StateError::InvalidEntry(_))
-        ));
-
-        state
-            .add_node(a.entry(NOW), NOW)
-            .expect("a well-formed entry is accepted");
-    }
-
-    /// States saved by earlier canister versions still load: dropped fields,
-    /// such as the heartbeat settings, are ignored and new ones take their defaults.
-    #[test]
-    fn a_state_saved_by_an_earlier_version_still_loads() {
-        let state = listed(&[Operator::new(1, "a")], 1);
-        let mut saved = serde_json::to_value(&state).expect("serialises");
-        for (path, field, value) in [
-            ("", "pending", Some(serde_json::json!({}))),
-            (
-                "/nodes/a",
-                "operator_principal",
-                Some(serde_json::json!("aaaaa-aa")),
-            ),
-            ("", "dirty", Some(serde_json::json!(false))),
-            ("", "clients_dirty", Some(serde_json::json!(true))),
-            ("/config", "heartbeat_secs", Some(serde_json::json!(86_400))),
-            (
-                "/config",
-                "clients_heartbeat_secs",
-                Some(serde_json::json!(3_600)),
-            ),
-            ("", "clients", None),
-            ("", "clients_version", None),
-            ("", "clients_published", None),
-            ("/config", "epoch_secs", None),
-        ] {
-            let object = saved
-                .pointer_mut(path)
-                .and_then(serde_json::Value::as_object_mut)
-                .expect("an object");
-            match value {
-                Some(value) => {
-                    object.insert(field.to_owned(), value);
-                }
-                None => {
-                    object.remove(field);
-                }
-            }
-        }
-        let loaded: State = serde_json::from_value(saved).expect("loads");
-        assert_eq!(loaded.nodes, state.nodes);
-        assert!(loaded.clients.is_empty());
-        assert_eq!(loaded.config.epoch_secs, DEFAULT_EPOCH_SECS);
-        assert!(loaded.clients_published.is_none());
-    }
-
-    fn client_key(seed: u8) -> CompressedPublicKey {
-        Signer::from_secret_bytes([seed; 32])
-            .expect("valid key")
-            .public_key()
+    fn an_address_has_one_role_once() {
+        let mut state = listed(&[1], 1);
+        assert_eq!(
+            state.add_client(address(1), NOW + 60, NOW),
+            Err(StateError::AddressUsed(address(1)))
+        );
+        state.add_client(address(9), NOW + 60, NOW).expect("adds");
+        assert_eq!(
+            state.add_node(entry(9), NOW),
+            Err(StateError::AddressUsed(address(9)))
+        );
+        assert_eq!(
+            state.replace_node(address(1), address(9), NOW),
+            Err(StateError::AddressUsed(address(9)))
+        );
+        state.remove_client(address(9)).expect("removes");
+        assert_eq!(
+            state.add_client(address(9), NOW + 60, NOW),
+            Err(StateError::AddressUsed(address(9)))
+        );
+        assert_eq!(
+            state.add_node(entry(9), NOW),
+            Err(StateError::AddressUsed(address(9)))
+        );
     }
 
     #[test]
     fn client_changes_follow_the_rules() {
         let mut state = State::new(config(), quorum(1)).expect("valid");
-        let add = |state: &mut State, id: &str, seed: u8, expires_at: u64| {
-            state.add_client(id.to_owned(), client_key(seed), expires_at, NOW)
-        };
-        add(&mut state, "c-1", 1, NOW + 60).expect("adds");
+        state.add_client(address(1), NOW + 60, NOW).expect("adds");
         assert_eq!(
-            add(&mut state, "c-1", 2, NOW + 60),
-            Err(StateError::ClientExists("c-1".to_owned()))
+            state.add_client(address(1), NOW + 60, NOW),
+            Err(StateError::AddressUsed(address(1)))
         );
-        assert_eq!(
-            add(&mut state, "c-2", 1, NOW + 60),
-            Err(StateError::ClientKeyInUse("c-1".to_owned()))
-        );
-        for (id, expires_at) in [(" c-3", NOW + 60), ("", NOW + 60), ("c-3", NOW)] {
-            assert!(matches!(
-                add(&mut state, id, 3, expires_at),
-                Err(StateError::InvalidClient(_))
-            ));
-        }
-        let mut bad_key = *client_key(4).as_bytes();
-        bad_key[0] = 0x05;
         assert!(matches!(
-            state.add_client(
-                "c-4".to_owned(),
-                CompressedPublicKey::from_bytes(bad_key),
-                NOW + 60,
-                NOW
-            ),
+            state.add_client(address(2), NOW, NOW),
             Err(StateError::InvalidClient(_))
         ));
 
-        state.set_client_expiry("c-1", NOW + 120).expect("extends");
+        state
+            .set_client_expiry(address(1), NOW + 120)
+            .expect("extends");
         assert_eq!(
-            state.clients.get("c-1").map(|c| c.expires_at),
+            state.clients.get(&address(1)).map(|c| c.expires_at),
             Some(NOW + 120)
         );
         assert_eq!(
-            state.remove_client("c-9"),
-            Err(StateError::UnknownClient("c-9".to_owned()))
+            state.remove_client(address(9)),
+            Err(StateError::UnknownClient(address(9)))
         );
-        state.remove_client("c-1").expect("removes");
+        state.remove_client(address(1)).expect("removes");
         assert!(state.clients.is_empty());
     }
 
     #[test]
     fn the_client_list_publishes_with_its_own_version() {
-        let mut state = listed(&[Operator::new(1, "a")], 1);
+        let mut state = listed(&[1], 1);
         let registry_version = state.version;
-        state
-            .add_client("c-1".to_owned(), client_key(1), NOW + 600, NOW)
-            .expect("adds");
+        state.add_client(address(7), NOW + 600, NOW).expect("adds");
 
         let list = state.unsigned_client_list(NOW).expect("encodes");
         let signature = governance_signer().sign_payload(&list.signing_bytes);
@@ -1117,7 +809,10 @@ mod tests {
             .verify(governance_signer().address(), 0)
             .expect("verifies with oracle-wire");
         assert_eq!(verified.epoch_secs(), 60);
-        assert_eq!(verified.get("c-1").map(|c| c.expires_at), Some(NOW + 600));
+        assert_eq!(
+            verified.get(address(7)).map(|c| c.expires_at),
+            Some(NOW + 600)
+        );
 
         let signature = governance_signer().sign_payload(&list.signing_bytes);
         assert!(matches!(
@@ -1128,8 +823,7 @@ mod tests {
 
     #[test]
     fn a_stale_signing_round_cannot_publish() {
-        let a = Operator::new(1, "a");
-        let mut state = listed(&[a], 1);
+        let mut state = listed(&[1], 1);
         let doc = state.unsigned_document(NOW + 5).expect("encodes");
         publish(&mut state, NOW + 6);
         let signature = governance_signer().sign_payload(&doc.signing_bytes);
@@ -1140,5 +834,36 @@ mod tests {
                 got: 2,
             })
         );
+    }
+
+    #[test]
+    fn the_state_round_trips_through_stable_memory() {
+        let mut state = listed(&[1, 2], 1);
+        state
+            .replace_node(address(1), address(3), NOW + 1)
+            .expect("replaces");
+        state.add_client(address(8), NOW + 60, NOW).expect("adds");
+        state.add_client(address(9), NOW + 60, NOW).expect("adds");
+        state.remove_client(address(9)).expect("removes");
+        publish(&mut state, NOW + 1);
+
+        let bytes = serde_json::to_vec(&state).expect("serialises");
+        let loaded: State = serde_json::from_slice(&bytes).expect("loads");
+        assert_eq!(loaded, state);
+    }
+
+    /// Nothing was deployed with node ids, so there is no migration. An old
+    /// state fails to load, `post_upgrade` traps, and the old wasm stays.
+    #[test]
+    fn a_state_keyed_by_node_id_does_not_load() {
+        let state = listed(&[1], 1);
+        let mut old = serde_json::to_value(&state).expect("serialises");
+        let nodes = old.get_mut("nodes").expect("the nodes");
+        let node = nodes
+            .get(address(1).to_string())
+            .cloned()
+            .expect("the node");
+        *nodes = serde_json::json!({ "oracle-a": node });
+        assert!(serde_json::from_value::<State>(old).is_err());
     }
 }

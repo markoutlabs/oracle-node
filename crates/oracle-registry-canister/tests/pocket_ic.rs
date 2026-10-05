@@ -19,11 +19,10 @@ use oracle_client::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, RegistrySource as _,
 };
 use oracle_registry_canister::{HttpRequest, HttpResponse, InitArgs};
-use oracle_wire::{ClientList, NodeEntry, Registry, Signer, SigningKeyCert, VerifyError};
+use oracle_wire::{Address, ClientList, NodeEntry, NodeListing, Registry, Signer, VerifyError};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 use serde::de::DeserializeOwned;
 
-const ROTATION_WINDOW: u64 = 600;
 const REGISTRY: &str = "/registry.json";
 const CLIENTS: &str = "/clients.json";
 const MAX_CERT_AGE_NS: u128 = 300 * 1_000_000_000;
@@ -109,7 +108,6 @@ impl Harness {
         pic.add_cycles(canister, 1_000_000_000_000_000);
         let args = Encode!(&InitArgs {
             key_name: key_name.to_owned(),
-            rotation_window_secs: ROTATION_WINDOW,
             min_nodes,
             recommended: 3,
             epoch_secs: None,
@@ -192,29 +190,36 @@ impl Harness {
         Certification::new(&self.canister.to_text(), &hex::encode(root_key)).expect("valid")
     }
 
-    fn add_args(&self, op: &Operator) -> Vec<u8> {
-        let json = serde_json::to_string(&op.entry(self.now())).expect("serialises");
+    fn add_args(entry: &NodeEntry) -> Vec<u8> {
+        let json = serde_json::to_string(entry).expect("serialises");
         Encode!(&json).expect("encodes")
     }
 
-    fn add(&self, op: &Operator) -> Result<u64, String> {
-        self.update(self.governance, "add_node", self.add_args(op))
+    fn add(&self, entry: &NodeEntry) -> Result<u64, String> {
+        self.update(self.governance, "add_node", Self::add_args(entry))
     }
 
-    fn rotate(&self, node_id: &str, cert: &SigningKeyCert) -> Result<u64, String> {
-        let json = serde_json::to_string(cert).expect("serialises");
+    fn replace(&self, old: Address, new: Address) -> Result<u64, String> {
         self.update(
             self.governance,
-            "rotate_key",
-            Encode!(&node_id, &json).expect("encodes"),
+            "replace_node",
+            Encode!(&old.to_checksummed(), &new.to_checksummed()).expect("encodes"),
         )
     }
 
-    fn remove(&self, node_id: &str) -> Result<u64, String> {
+    fn remove(&self, node: Address) -> Result<u64, String> {
         self.update(
             self.governance,
             "remove_node",
-            Encode!(&node_id).expect("encodes"),
+            Encode!(&node.to_checksummed()).expect("encodes"),
+        )
+    }
+
+    fn add_client(&self, client: Address, expires_at: u64) -> Result<u64, String> {
+        self.update(
+            self.governance,
+            "add_client",
+            Encode!(&client.to_checksummed(), &expires_at).expect("encodes"),
         )
     }
 
@@ -230,10 +235,12 @@ impl Harness {
             .expect("parses")
     }
 
-    fn history(&self, node_id: &str) -> Vec<serde_json::Value> {
-        let json: Option<String> =
-            self.query("get_key_history", Encode!(&node_id).expect("encodes"));
-        serde_json::from_str(&json.expect("known node")).expect("parses")
+    fn listing(&self, node: Address) -> Option<NodeListing> {
+        let json: Option<String> = self.query(
+            "get_node_listing",
+            Encode!(&node.to_string()).expect("encodes"),
+        );
+        json.map(|json| serde_json::from_str(&json).expect("parses"))
     }
 
     fn pass_time(&self, secs: u64) {
@@ -244,46 +251,16 @@ impl Harness {
     }
 }
 
-struct Operator {
-    identity: Signer,
-    signing: Signer,
-    node_id: String,
+fn key(seed: u8) -> Signer {
+    Signer::from_secret_bytes([seed; 32]).expect("valid key")
 }
 
-impl Operator {
-    fn new(seed: u8, node_id: &str) -> Self {
-        Self {
-            identity: Signer::from_secret_bytes([seed; 32]).expect("valid key"),
-            signing: Signer::from_secret_bytes([seed.wrapping_add(100); 32]).expect("valid key"),
-            node_id: node_id.to_owned(),
-        }
-    }
-
-    fn cert_for(&self, signing: &Signer, now: u64) -> SigningKeyCert {
-        SigningKeyCert::issue(
-            &self.identity,
-            &self.node_id,
-            signing.address(),
-            now.saturating_sub(60),
-            now + 30 * 86_400,
-        )
-        .expect("issues")
-    }
-
-    fn entry(&self, now: u64) -> NodeEntry {
-        NodeEntry {
-            node_id: self.node_id.clone(),
-            operator: format!("op-{}", self.node_id),
-            identity_pubkey: self.identity.public_key(),
-            endpoints: vec![format!("wss://{}.example/v1/ws", self.node_id)],
-            signing_keys: vec![self.cert_for(&self.signing, now)],
-            weight: 1,
-        }
-    }
-
-    fn rotate(&mut self, seed: u8, now: u64) -> SigningKeyCert {
-        self.signing = Signer::from_secret_bytes([seed; 32]).expect("valid key");
-        self.cert_for(&self.signing, now)
+fn node(seed: u8) -> NodeEntry {
+    NodeEntry {
+        address: key(seed).address(),
+        operator: format!("op-{seed}"),
+        endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
+        weight: 1,
     }
 }
 
@@ -294,14 +271,12 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
     assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     h.verify_http(REGISTRY, empty)
         .expect("the empty state is certified at init");
-    let mut a = Operator::new(1, "oracle-a");
-    let mut b = Operator::new(2, "oracle-b");
-    let c = Operator::new(3, "oracle-c");
+    let (a, b, c) = (node(1), node(2), node(3));
 
     // Ingress from anyone but governance is dropped before it executes.
     let stranger = Principal::self_authenticating(b"stranger");
     for (method, args) in [
-        ("add_node", h.add_args(&a)),
+        ("add_node", Harness::add_args(&a)),
         ("refresh_governance_key", Encode!().expect("encodes")),
     ] {
         assert!(
@@ -320,7 +295,7 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
     assert!(
         h.add(&a)
             .expect_err("listed once")
-            .contains("already listed")
+            .contains("already in the registry")
     );
 
     // The crux: the threshold signature verifies through the unchanged path.
@@ -331,7 +306,6 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
         .verify(governance, 0)
         .expect("the threshold signature verifies");
     assert_eq!(verified.nodes().len(), 3);
-    assert!(verified.nodes().iter().all(|n| n.signing_keys.len() == 1));
     assert!(matches!(
         registry.verify(governance, 3),
         Err(VerifyError::StaleRegistry { .. })
@@ -365,86 +339,63 @@ fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
             .unwrap_or_else(|error| panic!("{other}: the 404 is certified: {error}"));
     }
 
-    // Rotation: atomic swap, one live key, history kept, retired_at set.
-    let old_a = a.signing.address();
-    let cert = a.rotate(50, h.now());
+    // Rotation: one call puts a new address in place of the old one.
+    let new_a = key(50).address();
     assert!(
         h.pic
             .update_call(
                 h.canister,
                 stranger,
-                "rotate_key",
-                Encode!(
-                    &"oracle-a",
-                    &serde_json::to_string(&cert).expect("serialises")
-                )
-                .expect("encodes"),
+                "replace_node",
+                Encode!(&a.address.to_string(), &new_a.to_string()).expect("encodes"),
             )
             .is_err(),
         "only governance may rotate"
     );
-    assert_eq!(h.rotate("oracle-a", &cert), Ok(4));
+    assert_eq!(h.replace(a.address, new_a), Ok(4));
     let registry = h.registry();
     registry.verify(governance, 3).expect("v4 verifies");
     let response = h.get_json(REGISTRY);
     let served: Registry = serde_json::from_slice(response.body()).expect("parses");
     assert_eq!(served, registry, "each publish re-certifies");
     h.verify_http(REGISTRY, response).expect("v4 is certified");
+    assert_eq!(registry.nodes.len(), 3);
     let listed_a = registry
         .nodes
         .iter()
-        .find(|n| n.node_id == "oracle-a")
-        .expect("listed");
-    assert_eq!(listed_a.signing_keys.len(), 1);
-    assert_eq!(
-        listed_a.signing_keys.first().map(|c| c.address),
-        Some(cert.address)
-    );
-    let history = h.history("oracle-a");
-    assert_eq!(history.len(), 2);
-    let gen1 = history.first().expect("generation 1");
-    let gen2 = history.get(1).expect("generation 2");
-    assert_eq!(
-        gen1.pointer("/cert/address").and_then(|v| v.as_str()),
-        Some(old_a.to_string().as_str())
-    );
-    assert!(gen1["retired_at"].is_u64());
-    assert!(gen2["retired_at"].is_null());
+        .find(|n| n.address == new_a)
+        .expect("the new address is listed");
+    assert_eq!(listed_a.endpoints, a.endpoints);
+    assert!(registry.nodes.iter().all(|n| n.address != a.address));
+    let retired = h.listing(a.address).expect("the old address is known");
+    assert!(retired.removed_at.is_some());
+    assert_eq!(h.listing(new_a).map(|l| l.removed_at), Some(None));
 
-    // Rotations are serialised fleet-wide.
-    let cert_b = b.rotate(51, h.now());
-    assert!(
-        h.rotate("oracle-b", &cert_b)
-            .expect_err("inside the rotation window")
-            .contains("rotation")
-    );
-    h.pass_time(ROTATION_WINDOW + 1);
-    let cert_b = b.rotate(51, h.now());
-    assert_eq!(h.rotate("oracle-b", &cert_b), Ok(5));
-
-    // Removal never goes below min_nodes; history survives it.
-    assert!(h.remove("oracle-c").expect_err("3 of 3").contains("below"));
+    // Removal never goes below min_nodes; the listing survives it.
+    assert!(h.remove(c.address).expect_err("3 of 3").contains("below"));
     let version: Result<u64, String> = h.update(
         h.governance,
         "set_quorum",
         Encode!(&2_u16, &3_u16).expect("encodes"),
     );
-    assert_eq!(version, Ok(6));
-    assert_eq!(h.remove("oracle-c"), Ok(7));
+    assert_eq!(version, Ok(5));
+    assert_eq!(h.remove(c.address), Ok(6));
     let registry = h.registry();
     assert_eq!(registry.nodes.len(), 2);
-    registry.verify(governance, 6).expect("v7 verifies");
-    let removed = h.history("oracle-c");
-    assert!(removed.first().expect("generation 1")["retired_at"].is_u64());
+    registry.verify(governance, 5).expect("v6 verifies");
+    assert!(
+        h.listing(c.address)
+            .is_some_and(|listing| listing.removed_at.is_some())
+    );
 
     // A retired address can never be listed again, not even by governance.
-    let mut revived = Operator::new(9, "oracle-z");
-    revived.signing = Signer::from_secret_bytes([101; 32]).expect("valid key");
-    assert!(
-        h.add(&revived)
-            .expect_err("old_a is known")
-            .contains("already known")
-    );
+    for refused in [h.add(&a), h.replace(b.address, c.address)] {
+        assert!(
+            refused
+                .expect_err("retired")
+                .contains("already in the registry")
+        );
+    }
 
     // Publication is on demand: a quiet day signs nothing. Freshness comes from
     // the certificate, which the subnet renews with its state.
@@ -494,10 +445,9 @@ fn the_canister_publishes_a_certified_client_list() {
     h.verify_http(CLIENTS, empty)
         .expect("the empty state is certified at init");
 
-    let client = Signer::from_secret_bytes([0x42; 32]).expect("valid key");
-    let pubkey = client.public_key().to_string();
+    let client = key(0x42).address();
     let expires_at = h.now() + 86_400;
-    let args = Encode!(&"c-1", &pubkey, &expires_at).expect("encodes");
+    let args = Encode!(&client.to_checksummed(), &expires_at).expect("encodes");
     let stranger = Principal::self_authenticating(b"stranger");
     assert!(
         h.pic
@@ -505,9 +455,9 @@ fn the_canister_publishes_a_certified_client_list() {
             .is_err(),
         "only governance may add a client"
     );
-    let bad = Encode!(&"c-1", &"0x1234", &expires_at).expect("encodes");
+    let bad = Encode!(&"0x1234", &expires_at).expect("encodes");
     let refused: Result<u64, String> = h.update(h.governance, "add_client", bad);
-    assert!(refused.expect_err("bad key").contains("pubkey"));
+    assert!(refused.expect_err("bad address").contains("address"));
     let version: Result<u64, String> = h.update(h.governance, "add_client", args);
     assert_eq!(version, Ok(1));
 
@@ -517,7 +467,7 @@ fn the_canister_publishes_a_certified_client_list() {
     let served: ClientList = serde_json::from_slice(response.body()).expect("parses");
     h.verify_http(CLIENTS, response).expect("certified");
     let verified = served.verify(governance, 0).expect("governance signed it");
-    assert_eq!(verified.get("c-1").map(|c| c.expires_at), Some(expires_at));
+    assert_eq!(verified.get(client).map(|c| c.expires_at), Some(expires_at));
     assert_eq!(verified.epoch_secs(), 60);
     // The other document stays certified in the same tree.
     h.verify_http(REGISTRY, h.get_json(REGISTRY))
@@ -526,15 +476,20 @@ fn the_canister_publishes_a_certified_client_list() {
     let version: Result<u64, String> = h.update(
         h.governance,
         "set_client_expiry",
-        Encode!(&"c-1", &(expires_at + 60)).expect("encodes"),
+        Encode!(&client.to_string(), &(expires_at + 60)).expect("encodes"),
     );
     assert_eq!(version, Ok(2));
     let version: Result<u64, String> = h.update(
         h.governance,
         "remove_client",
-        Encode!(&"c-1").expect("encodes"),
+        Encode!(&client.to_string()).expect("encodes"),
     );
     assert_eq!(version, Ok(3));
+    assert!(
+        h.add_client(client, expires_at)
+            .expect_err("revoked for good")
+            .contains("already in the registry")
+    );
     let removed: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
     assert!(
         removed
@@ -578,17 +533,15 @@ fn the_canister_publishes_a_certified_client_list() {
 #[test]
 fn a_failed_signing_round_changes_nothing() {
     let h = Harness::with_key(1, "no_such_key");
-    let a = Operator::new(1, "oracle-a");
+    let a = node(1);
     let refused = h.add(&a).expect_err("the key does not exist");
     assert!(refused.contains("ecdsa_public_key"), "{refused}");
     let version: u64 = h.query("get_version", Encode!().expect("encodes"));
     assert_eq!(version, 0);
-    let history: Option<String> =
-        h.query("get_key_history", Encode!(&"oracle-a").expect("encodes"));
-    assert_eq!(history, None, "the node was not listed");
+    assert_eq!(h.listing(a.address), None, "the node was not listed");
     assert!(
         h.add(&a).expect_err("still no key").contains("ecdsa"),
-        "a retry runs the whole round again, not `already listed`"
+        "a retry runs the whole round again, not `already in the registry`"
     );
 }
 
@@ -597,17 +550,8 @@ fn a_failed_signing_round_changes_nothing() {
 #[test]
 fn the_sdk_checks_the_certificate_through_the_http_gateway() {
     let mut h = Harness::new(1);
-    let a = Operator::new(1, "oracle-a");
-    assert_eq!(h.add(&a), Ok(1));
-    let client = Signer::from_secret_bytes([0x42; 32]).expect("valid key");
-    let args = Encode!(
-        &"c-1",
-        &client.public_key().to_string(),
-        &(h.now() + 86_400)
-    )
-    .expect("encodes");
-    let version: Result<u64, String> = h.update(h.governance, "add_client", args);
-    assert_eq!(version, Ok(1));
+    assert_eq!(h.add(&node(1)), Ok(1));
+    assert_eq!(h.add_client(key(0x42).address(), h.now() + 86_400), Ok(1));
     let registry = h.registry();
     let certification = h.certification();
     let gateway = h.pic.make_live(None);

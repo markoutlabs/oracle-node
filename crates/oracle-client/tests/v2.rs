@@ -14,20 +14,20 @@ const NOW: u64 = NOW_S * NANOS_PER_SEC;
 /// frame that decrypts. The node signature is what the verifier checks.
 #[test]
 fn a_frame_that_decrypts_is_still_refused_unless_the_node_signed_it() {
-    let node = TestNode::new(1, "oracle-1");
+    let node = TestNode::new(1);
     let mut client = OracleClient::builder(registry_with(&[&node]))
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()
         .build()
         .expect("builds");
 
-    let schedule = NodeKeySchedule::new("oracle-1", 60, NOW_S, &mut os_rng());
+    let schedule = NodeKeySchedule::new(node.signing_address(), 60, NOW_S, &mut os_rng());
     let sealer = BroadcastSealer::new(Arc::clone(schedule.current()));
-    let mut ring = KeyRing::new("oracle-1");
+    let mut ring = KeyRing::new(node.signing_address());
     ring.insert(KeyGrant::from_key(schedule.current()));
 
     // A key holder signs a price with its own key and seals it.
-    let impostor = TestNode::new(200, "oracle-1");
+    let impostor = TestNode::new(200);
     let forged = sealer.seal(&impostor.sign(&update_at(NOW, 1)), &mut os_rng());
     let opened = ring.open(&forged).expect("it decrypts");
     assert!(matches!(

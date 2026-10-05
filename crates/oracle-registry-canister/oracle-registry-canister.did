@@ -114,8 +114,6 @@ type HttpResponse = record {
 };
 // Install arguments.
 type InitArgs = record {
-  // Minimum seconds between two rotations fleet-wide.
-  rotation_window_secs : nat64;
   // Recommended quorum.
   recommended : nat16;
   // Broadcast-key epoch for the client list. Default 60.
@@ -128,18 +126,18 @@ type InitArgs = record {
 type Result = variant { Ok : nat64; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
 service : (InitArgs) -> {
-  // Governance authorises a client. `pubkey` is its 33-byte compressed
-  // secp256k1 API key in hex. Returns the new client-list version.
-  add_client : (text, text, nat64) -> (Result);
-  // Governance lists a node. `entry_json` is the operator's `NodeEntry`, with
-  // exactly one certificate. Returns the new version.
+  // Governance authorises a client: the address of its secp256k1 API key.
+  // Returns the new client-list version.
+  add_client : (text, nat64) -> (Result);
+  // Governance lists a node. `entry_json` is the operator's `NodeEntry`.
+  // Returns the new version.
   add_node : (text) -> (Result);
   // The last published client list as JSON, if any.
   get_clients : () -> (opt text) query;
   // The governance address, once the threshold key has been fetched.
   get_governance : () -> (opt text) query;
-  // Every generation of a node's keys as JSON, for stored-frame verification.
-  get_key_history : (text) -> (opt text) query;
+  // When a node address was listed, as JSON, for stored-frame verification.
+  get_node_listing : (text) -> (opt text) query;
   // The last published registry document as JSON, if any.
   get_registry : () -> (opt text) query;
   // The version of the last published document. Zero before the first.
@@ -150,18 +148,18 @@ service : (InitArgs) -> {
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.
   refresh_governance_key : () -> (Result_1);
-  // Governance removes a client. Returns the new client-list version.
+  // Governance revokes a client. Returns the new client-list version.
   remove_client : (text) -> (Result);
   // Governance de-lists a node. Returns the new version.
   remove_node : (text) -> (Result);
+  // Governance rotates a node's key: the `new` address takes the place of
+  // `old`, with the same operator, endpoints and weight. Returns the new version.
+  replace_node : (text, text) -> (Result);
   // Governance re-signs the registry with no change. Returns the new version.
   republish : () -> (Result);
   // Governance re-signs the client list with no change, for example to publish
   // an empty list before the first client. Returns the new client-list version.
   republish_clients : () -> (Result);
-  // Governance swaps a node's signing key. `cert_json` is a `SigningKeyCert`
-  // the node's identity key issued. Returns the new version.
-  rotate_key : (text, text) -> (Result);
   // Governance moves a client's expiry. Returns the new client-list version.
   set_client_expiry : (text, nat64) -> (Result);
   // Governance changes the quorum guidance. Returns the new version.

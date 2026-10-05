@@ -17,7 +17,7 @@ use oracle_transport::{
 use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
 use oracle_wire::{Address, Registry, Signer, VerifiedRegistry, VerifyError, feed_id};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -117,25 +117,16 @@ pub struct OracleClientBuilder {
     refresh_interval: Duration,
     poll_interval: Duration,
     max_registry_age: Duration,
-    credentials: Option<Arc<Credentials>>,
-}
-
-/// A client's identity on the nodes.
-struct Credentials {
-    client_id: String,
-    key: Signer,
+    client_key: Option<Arc<Signer>>,
 }
 
 impl OracleClientBuilder {
-    /// Authenticates to nodes (SPEC §6.1) as `client_id`, with the client's
-    /// secp256k1 API key. Governance must list the key in the client list.
-    /// Needed for [`OracleClient::subscribe`].
+    /// Authenticates to nodes (SPEC §6.1) with the client's secp256k1 API key.
+    /// Governance must list the key's address in the client list. Needed for
+    /// [`OracleClient::subscribe`].
     #[must_use]
-    pub fn client_key(mut self, client_id: impl Into<String>, key: Signer) -> Self {
-        self.credentials = Some(Arc::new(Credentials {
-            client_id: client_id.into(),
-            key,
-        }));
+    pub fn client_key(mut self, key: Signer) -> Self {
+        self.client_key = Some(Arc::new(key));
         self
     }
 
@@ -241,7 +232,6 @@ impl OracleClientBuilder {
         self.quorum_config.quorum = self.quorum;
 
         let (tx, rx) = mpsc::channel(self.channel_capacity);
-        let (registry_watch, _) = watch::channel(self.registry.clone());
         Ok(OracleClient {
             verifier: Verifier::new(self.registry.clone(), self.verify),
             registry: self.registry,
@@ -262,8 +252,7 @@ impl OracleClientBuilder {
             runtime: None,
             connections: HashMap::new(),
             polling: false,
-            credentials: self.credentials,
-            registry_watch,
+            client_key: self.client_key,
         })
     }
 }
@@ -310,9 +299,12 @@ impl ClientStats {
 enum Inbound {
     Frame(Vec<u8>),
     Polled(Result<Registry, FetchError>),
-    /// A node signed `auth_ok` with a key this registry does not list: it
-    /// probably rotated. The handshake twin of an unknown signer on a frame.
-    UnknownNodeKey,
+    /// A node's endpoint now serves another address: the node probably
+    /// rotated. The handshake twin of an unknown signer on a frame.
+    NodeMoved {
+        /// The address in the node's challenge.
+        got: Address,
+    },
 }
 
 struct NodeConnection {
@@ -341,12 +333,9 @@ pub struct OracleClient {
     subscription: Option<String>,
     // Kept so that `refresh_registry` can open connections from any thread.
     runtime: Option<Handle>,
-    connections: HashMap<String, NodeConnection>,
+    connections: HashMap<Address, NodeConnection>,
     polling: bool,
-    credentials: Option<Arc<Credentials>>,
-    /// The trusted registry for connection tasks, which check each node's
-    /// `auth_ok` against its live key.
-    registry_watch: watch::Sender<VerifiedRegistry>,
+    client_key: Option<Arc<Signer>>,
 }
 
 impl OracleClient {
@@ -361,7 +350,7 @@ impl OracleClient {
             quorum_config: QuorumConfig::default(),
             channel_capacity: 4_096,
             source: None,
-            credentials: None,
+            client_key: None,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             poll_interval: DEFAULT_REGISTRY_POLL_INTERVAL,
             max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
@@ -498,19 +487,13 @@ impl OracleClient {
             });
         }
 
-        let listed: HashSet<&str> = verified
-            .nodes()
-            .iter()
-            .map(|node| node.node_id.as_str())
-            .collect();
+        let listed: HashSet<Address> = verified.nodes().iter().map(|node| node.address).collect();
         for view in self.views.values_mut() {
-            view.retain_nodes(&|node_id| listed.contains(node_id));
+            view.retain_nodes(&|node| listed.contains(node));
         }
-        drop(listed);
 
         let version = verified.version();
         self.verifier.set_registry(verified.clone());
-        self.registry_watch.send_replace(verified.clone());
         self.registry = verified;
         self.reconcile_connections();
         Ok(version)
@@ -526,7 +509,7 @@ impl OracleClient {
     /// [`ClientError::InvalidSymbol`] for an unparseable symbol, or
     /// [`ClientError::NoEndpoints`] if the registry lists none.
     pub async fn subscribe(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
-        if self.credentials.is_none() {
+        if self.client_key.is_none() {
             return Err(ClientError::NoClientKey);
         }
         let mut parsed = Vec::with_capacity(symbols.len());
@@ -557,50 +540,49 @@ impl OracleClient {
     }
 
     fn reconcile_connections(&mut self) {
-        let (Some(request), Some(runtime), Some(credentials)) =
-            (&self.subscription, &self.runtime, &self.credentials)
+        let (Some(request), Some(runtime), Some(client_key)) =
+            (&self.subscription, &self.runtime, &self.client_key)
         else {
             return;
         };
-        let wanted: HashMap<&str, &str> = self
+        let wanted: HashMap<Address, &str> = self
             .registry
             .nodes()
             .iter()
             .filter_map(|node| {
                 node.endpoints
                     .first()
-                    .map(|endpoint| (node.node_id.as_str(), endpoint.as_str()))
+                    .map(|endpoint| (node.address, endpoint.as_str()))
             })
             .collect();
 
-        self.connections.retain(|node_id, connection| {
-            let keep = wanted.get(node_id.as_str()) == Some(&connection.endpoint.as_str());
+        self.connections.retain(|node, connection| {
+            let keep = wanted.get(node) == Some(&connection.endpoint.as_str());
             if !keep {
                 connection.cancel.cancel();
-                info!(%node_id, endpoint = %connection.endpoint, "disconnected from node");
+                info!(%node, endpoint = %connection.endpoint, "disconnected from node");
             }
             keep
         });
 
-        for (node_id, endpoint) in wanted {
-            if self.connections.contains_key(node_id) {
+        for (node, endpoint) in wanted {
+            if self.connections.contains_key(&node) {
                 continue;
             }
             let cancel = self.shutdown.child_token();
             runtime.spawn(node_loop(
                 NodeTarget {
-                    node_id: node_id.to_owned(),
+                    node,
                     endpoint: endpoint.to_owned(),
                     request: request.clone(),
-                    credentials: Arc::clone(credentials),
-                    registry: self.registry_watch.subscribe(),
+                    client_key: Arc::clone(client_key),
                 },
                 self.inbound_tx.clone(),
                 cancel.clone(),
             ));
-            info!(%node_id, %endpoint, "connecting to node");
+            info!(%node, %endpoint, "connecting to node");
             self.connections.insert(
-                node_id.to_owned(),
+                node,
                 NodeConnection {
                     endpoint: endpoint.to_owned(),
                     cancel,
@@ -679,7 +661,7 @@ impl OracleClient {
             .views
             .entry(feed)
             .or_insert_with(|| FeedView::new(feed));
-        view.record(accepted.node, accepted.update);
+        view.record(accepted.signer, accepted.update);
         let mut resolved = view.resolve(&self.quorum_config, now_ns);
         self.annotate(&mut resolved, now_ns);
         Ok(resolved)
@@ -729,9 +711,11 @@ impl OracleClient {
                     }
                     continue;
                 }
-                Inbound::UnknownNodeKey => {
+                Inbound::NodeMoved { got } => {
+                    // A retired address is the node before its restart: the
+                    // registry is already ahead of it.
                     let now_ns = now_unix_nanos();
-                    if self.refresh_due(now_ns) {
+                    if !self.verifier.is_retired(got) && self.refresh_due(now_ns) {
                         self.last_refresh_attempt_ns = Some(now_ns);
                         if let Err(error) = self.refresh_from_source().await {
                             warn!(%error, "registry refresh failed");
@@ -837,11 +821,10 @@ async fn poll_loop(
 
 /// Everything one connection task needs.
 struct NodeTarget {
-    node_id: String,
+    node: Address,
     endpoint: String,
     request: String,
-    credentials: Arc<Credentials>,
-    registry: watch::Receiver<VerifiedRegistry>,
+    client_key: Arc<Signer>,
 }
 
 /// Time from connect to `auth_ok`.
@@ -895,7 +878,7 @@ async fn pump(
     let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(socket, target, tx))
         .await
         .map_err(|_| "handshake timed out".to_owned())??;
-    // Only now, after the node proved its live key, do the subscriptions leave.
+    // Only now, after the node proved its key, do the subscriptions leave.
     let subscribe = session
         .sealer
         .seal(&Control::App(target.request.as_bytes().to_vec()))
@@ -952,24 +935,22 @@ async fn handshake(
     target: &NodeTarget,
     tx: &mpsc::Sender<Inbound>,
 ) -> Result<ClientSession, String> {
-    let credentials = &target.credentials;
     let challenge = next_handshake(socket).await?;
-    let (auth, waiting) = ClientHandshake::new(&target.node_id, &mut os_rng())
-        .respond(&challenge, &credentials.client_id, &credentials.key)
-        .map_err(|e| e.to_string())?;
+    let (auth, waiting) = ClientHandshake::new(target.node, &mut os_rng())
+        .respond(&challenge, &target.client_key)
+        .map_err(|error| {
+            if let TransportError::WrongNode { got, .. } = error {
+                let _ = tx.try_send(Inbound::NodeMoved { got });
+            }
+            error.to_string()
+        })?;
     let auth = serde_json::to_string(&auth).map_err(|e| e.to_string())?;
     socket
         .send(Message::Text(auth.into()))
         .await
         .map_err(|e| e.to_string())?;
     let auth_ok = next_handshake(socket).await?;
-    let expected = live_signer(&target.registry.borrow(), &target.node_id)?;
-    waiting.finish(&auth_ok, expected).map_err(|error| {
-        if matches!(error, TransportError::UntrustedNode { .. }) {
-            let _ = tx.try_send(Inbound::UnknownNodeKey);
-        }
-        error.to_string()
-    })
+    waiting.finish(&auth_ok).map_err(|e| e.to_string())
 }
 
 async fn next_handshake(socket: &mut Socket) -> Result<HandshakeMessage, String> {
@@ -984,18 +965,6 @@ async fn next_handshake(socket: &mut Socket) -> Result<HandshakeMessage, String>
             None => return Err("closed during the handshake".to_owned()),
         }
     }
-}
-
-/// The node's live signing address in the trusted registry.
-fn live_signer(registry: &VerifiedRegistry, node_id: &str) -> Result<Address, String> {
-    let now = now_unix_nanos();
-    registry
-        .nodes()
-        .iter()
-        .find(|node| node.node_id == node_id)
-        .and_then(|node| node.signing_keys.iter().find(|cert| cert.covers(now)))
-        .map(|cert| cert.address)
-        .ok_or_else(|| format!("node `{node_id}` has no live key in the registry"))
 }
 
 /// Reads the wall clock in unix nanoseconds.
@@ -1019,9 +988,7 @@ mod tests {
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
 
     fn nodes() -> Vec<TestNode> {
-        (1..=3_u8)
-            .map(|seed| TestNode::new(seed, &format!("oracle-{seed}")))
-            .collect()
+        (1..=3_u8).map(TestNode::new).collect()
     }
 
     #[test]
@@ -1043,7 +1010,7 @@ mod tests {
 
     #[test]
     fn a_low_quorum_is_permitted_only_with_an_explicit_acknowledgement() {
-        let node = TestNode::new(1, "oracle-1");
+        let node = TestNode::new(1);
         let registry = registry_with(&[&node]);
         assert!(
             OracleClient::builder(registry)
@@ -1056,7 +1023,7 @@ mod tests {
 
     #[test]
     fn a_quorum_larger_than_the_registry_is_refused() {
-        let node = TestNode::new(1, "oracle-1");
+        let node = TestNode::new(1);
         let registry = registry_with(&[&node]);
         let error = OracleClient::builder(registry)
             .quorum(3)
@@ -1107,7 +1074,7 @@ mod tests {
             .build()
             .expect("valid configuration");
 
-        let impostor = TestNode::new(200, "impostor");
+        let impostor = TestNode::new(200);
         assert!(
             client
                 .ingest(&impostor.sign(&update_at(NOW, 1)), NOW)

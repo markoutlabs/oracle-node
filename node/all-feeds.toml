@@ -12,8 +12,6 @@
 # Ingest subscriptions are DERIVED from the sources below — there is no separate
 # instrument list to keep in sync.
 
-node_id = "oracle-local-1"
-
 # At or below the tightest feed's rate cap (50ms), or the cap becomes the tick
 # rate and the deviation trigger never fires early. This is noisy under --tail;
 # grep it (`| grep published`) rather than raising it.

@@ -72,7 +72,6 @@
 mod address;
 mod auth;
 mod backend;
-mod cert;
 mod clients;
 mod codec;
 pub mod domain;
@@ -90,8 +89,7 @@ pub use auth::{
     client_auth_payload, client_auth_transcript,
 };
 pub use backend::name as backend_name;
-pub use cert::{MAX_NODE_ID_LEN, NO_EXPIRY, SigningKeyCert};
-pub use clients::{ClientEntry, ClientList, MAX_CLIENT_ID_LEN, MAX_CLIENTS, VerifiedClientList};
+pub use clients::{ClientEntry, ClientList, MAX_CLIENTS, VerifiedClientList};
 pub use error::{VerifyError, WireError};
 pub use frame::{
     FRAME_SIZE, FRAME_TYPE_PRICE_UPDATE, SignedUpdate, UnverifiedFrame, VerifiedUpdate,
@@ -99,12 +97,11 @@ pub use frame::{
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
     KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_NODE_AUTH_OK, KIND_PRICE_UPDATE, KIND_REGISTRY,
-    KIND_SIGNING_KEY_CERT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update,
-    encode_price_update, feed_id,
+    PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
 };
 pub use registry::{
-    KeyHistoryEntry, MAX_CERTS_PER_NODE, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES,
-    MAX_OPERATOR_LEN, NodeEntry, Quorum, Registry, VerifiedRegistry,
+    MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry, NodeListing, Quorum,
+    Registry, VerifiedRegistry,
 };
 pub use signature::{SIGNATURE_LEN, Signature};
 pub use signer::{Signer, recover_address, recover_payload_signer};

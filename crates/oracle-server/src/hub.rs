@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use oracle_transport::{BroadcastSealer, os_rng};
 use oracle_types::{FeedId, Symbol};
-use oracle_wire::SignedUpdate;
+use oracle_wire::{Address, SignedUpdate};
 use tokio::sync::Notify;
 
 /// A signed update, serialized and sealed once and shared by every subscriber.
@@ -99,7 +99,7 @@ impl Selection {
 /// One subscriber's conflating mailbox.
 pub struct Subscriber {
     id: u64,
-    client_id: String,
+    client: Address,
     selection: Mutex<Selection>,
     pending: Mutex<HashMap<FeedId, Arc<PreparedUpdate>>>,
     dropped: AtomicU64,
@@ -116,10 +116,10 @@ impl Subscriber {
         self.id
     }
 
-    /// Returns the authenticated client.
+    /// Returns the authenticated client's address.
     #[must_use]
-    pub fn client_id(&self) -> &str {
-        &self.client_id
+    pub const fn client(&self) -> Address {
+        self.client
     }
 
     /// Replaces the feed selection.
@@ -257,10 +257,10 @@ impl Hub {
 
     /// Registers an authenticated subscriber.
     #[must_use]
-    pub fn subscribe(&self, client_id: &str) -> Arc<Subscriber> {
+    pub fn subscribe(&self, client: Address) -> Arc<Subscriber> {
         let subscriber = Arc::new(Subscriber {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            client_id: client_id.to_owned(),
+            client,
             selection: Mutex::new(Selection::Feeds(std::collections::HashSet::new())),
             pending: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
@@ -326,7 +326,12 @@ mod tests {
     use oracle_wire::{Signer, feed_id};
 
     fn sealer() -> Arc<BroadcastSealer> {
-        let schedule = NodeKeySchedule::new("oracle-a", 60, 1_754_582_400, &mut os_rng());
+        let schedule = NodeKeySchedule::new(
+            oracle_wire::Address::from_bytes([0xA1; 20]),
+            60,
+            1_754_582_400,
+            &mut os_rng(),
+        );
         Arc::new(BroadcastSealer::new(Arc::clone(schedule.current())))
     }
 
@@ -361,7 +366,7 @@ mod tests {
         let btc = symbol("CRYPTO.BTC/USD");
         let eth = symbol("CRYPTO.ETH/USD");
 
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select([feed_id(&btc)].into_iter().collect());
 
         hub.publish(btc, signed(&btc, 1));
@@ -381,7 +386,7 @@ mod tests {
     async fn a_slow_subscriber_gets_the_latest_not_a_backlog() {
         let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select([feed_id(&btc)].into_iter().collect());
 
         for seq in 1..=100 {
@@ -403,7 +408,7 @@ mod tests {
         let hub = hub(64);
         let btc = symbol("CRYPTO.BTC/USD");
         let eth = symbol("CRYPTO.ETH/USD");
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select_firehose();
 
         for seq in 1..=10 {
@@ -419,7 +424,7 @@ mod tests {
     async fn a_subscriber_too_far_behind_is_marked_lagged() {
         // Room for two distinct feeds outstanding.
         let hub = hub(2);
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select_firehose();
 
         for index in 0..5_u8 {
@@ -441,7 +446,7 @@ mod tests {
     async fn drain_waits_until_something_arrives() {
         let hub = Arc::new(hub(64));
         let btc = symbol("CRYPTO.BTC/USD");
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select_firehose();
 
         let waiter = {
@@ -458,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn closing_wakes_a_waiting_subscriber() {
         let hub = Arc::new(hub(64));
-        let subscriber = hub.subscribe("c-1");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         subscriber.select_firehose();
 
         let waiter = {
@@ -494,7 +499,7 @@ mod tests {
         for (round, count) in [(1_u64, 1_usize), (2, 10), (3, 1000)] {
             let subscribers: Vec<Arc<Subscriber>> = (0..count)
                 .map(|_| {
-                    let subscriber = hub.subscribe("c-1");
+                    let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
                     subscriber.select_firehose();
                     subscriber
                 })

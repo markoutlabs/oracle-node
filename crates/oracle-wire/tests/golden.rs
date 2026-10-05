@@ -32,13 +32,11 @@ use std::path::PathBuf;
 
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol, Venue};
 use oracle_wire::{
-    NodeEntry, Quorum, Registry, Signer, SigningKeyCert, UnverifiedFrame, domain,
-    encode_price_update, feed_id,
+    NodeEntry, Quorum, Registry, Signer, UnverifiedFrame, domain, encode_price_update, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
 const BASE_TIME_NS: u64 = 1_754_582_400_000_000_000;
-const DAY_SECS: u64 = 86_400;
 
 fn hex0x(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
@@ -56,7 +54,6 @@ struct GoldenFile {
     domain: DomainVector,
     feed_ids: Vec<FeedIdVector>,
     price_updates: Vec<UpdateVector>,
-    certificates: Vec<CertVector>,
     registry: RegistryVector,
 }
 
@@ -85,16 +82,6 @@ struct UpdateVector {
     digest: String,
     signature: String,
     frame: String,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
-struct CertVector {
-    name: String,
-    identity_secret_key: String,
-    issuer: String,
-    cert: SigningKeyCert,
-    signing_bytes: String,
-    digest: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -270,37 +257,17 @@ fn build() -> GoldenFile {
         })
         .collect();
 
-    let (identity_secret, identity) = signer_from(0x22);
-    let (_, hot) = signer_from(0x11);
-    let cert = SigningKeyCert::issue(
-        &identity,
-        "oracle-eu-1",
-        hot.address(),
-        BASE_TIME_NS / NANOS_PER_SEC - DAY_SECS,
-        BASE_TIME_NS / NANOS_PER_SEC + 30 * DAY_SECS,
-    )
-    .expect("issues");
-    let cert_bytes = cert.to_signing_bytes().expect("encodes");
-    let certificates = vec![CertVector {
-        name: "oracle_eu_1_signing_key".to_owned(),
-        identity_secret_key: hex0x(&identity_secret),
-        issuer: identity.address().to_string(),
-        signing_bytes: hex0x(&cert_bytes),
-        digest: hex0x(&domain::digest(&cert_bytes)),
-        cert: cert.clone(),
-    }];
-
+    // The node that signed the `btc_usd_healthy` vector.
+    let (_, node) = signer_from(0x11);
     let (governance_secret, governance) = signer_from(0x91);
     let registry = Registry::sign(
         &governance,
         1,
         BASE_TIME_NS / NANOS_PER_SEC,
         vec![NodeEntry {
-            node_id: "oracle-eu-1".to_owned(),
+            address: node.address(),
             operator: "acme".to_owned(),
-            identity_pubkey: identity.public_key(),
-            endpoints: vec!["wss://eu1.oracle.example/v1/ws".to_owned()],
-            signing_keys: vec![cert],
+            endpoints: vec!["wss://eu1.oracle.example/v2/ws".to_owned()],
             weight: 1,
         }],
         Quorum {
@@ -323,7 +290,6 @@ fn build() -> GoldenFile {
         },
         feed_ids,
         price_updates,
-        certificates,
         registry: RegistryVector {
             governance_secret_key: hex0x(&governance_secret),
             governance_address: governance.address().to_string(),
@@ -417,14 +383,6 @@ fn golden_vectors_are_unchanged() {
         );
     }
 
-    for (got, want) in generated.certificates.iter().zip(&expected.certificates) {
-        assert_eq!(
-            got, want,
-            "certificate encoding changed for `{}`",
-            want.name
-        );
-    }
-
     assert_eq!(
         generated.registry, expected.registry,
         "registry encoding changed"
@@ -477,19 +435,6 @@ fn stored_payloads_round_trip() {
             hex0x(&encode_price_update(&decoded)),
             vector.payload,
             "`{}` did not re-encode identically",
-            vector.name
-        );
-    }
-}
-
-/// The stored certificate must still recover to the stored issuer.
-#[test]
-fn stored_certificates_recover_to_their_issuer() {
-    for vector in load().certificates {
-        assert_eq!(
-            vector.cert.recover_issuer().expect("recovers").to_string(),
-            vector.issuer,
-            "`{}` no longer recovers to its issuer",
             vector.name
         );
     }

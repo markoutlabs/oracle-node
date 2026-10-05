@@ -1,5 +1,5 @@
-//! Generates a client API key (SPEC §6.1) and prints the public
-//! key that governance lists with `add_client`.
+//! Generates a client API key (SPEC §6.1) and prints its address, which
+//! governance lists with `add_client`.
 //!
 //! ```sh
 //! cargo run -p oracle-client --example client_key -- --out client.key
@@ -33,12 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&args.out)?
         .write_all(key.to_secret_hex().as_bytes())?;
 
-    let pubkey = key.public_key();
-    println!("pubkey {pubkey}");
+    let address = key.address().to_checksummed();
+    println!("address {address}");
     println!("written {}", args.out.display());
     println!(
         "\nGovernance lists the client with:\n  \
-         dfx canister call <CANISTER_ID> add_client '(\"<client-id>\", \"{pubkey}\", <expires_at> : nat64)'"
+         dfx canister call <CANISTER_ID> add_client '(\"{address}\", <expires_at> : nat64)'"
     );
     Ok(())
 }

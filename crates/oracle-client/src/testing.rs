@@ -12,25 +12,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Venue, VenueSet};
-use oracle_wire::{
-    Address, CompressedPublicKey, KeyHistoryEntry, NodeEntry, Quorum, Registry, Signer,
-    SigningKeyCert, VerifiedRegistry,
-};
+use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, VerifiedRegistry};
 
 use crate::source::{FetchError, RegistryFuture, RegistrySource};
-
-/// A conventional node id for single-node tests.
-pub const NODE_ID: &str = "oracle-test-1";
 
 /// Issue time of test registries, unix seconds. Tests use it as their clock.
 pub const REGISTRY_ISSUED_AT: u64 = 1_754_582_400;
 
 /// Seed for the governance key that signs test registries.
 const GOVERNANCE_SEED: u8 = 0xC0;
-
-/// Validity window for test certificates: 1970 to far beyond any test clock.
-const CERT_NOT_BEFORE: u64 = 0;
-const CERT_NOT_AFTER: u64 = 4_102_444_800;
 
 /// Returns the governance key test registries are signed with.
 ///
@@ -42,12 +32,10 @@ pub fn governance() -> Signer {
     Signer::from_secret_bytes([GOVERNANCE_SEED; 32]).expect("valid test key")
 }
 
-/// A fake oracle node with an identity key and a hot signing key.
+/// A fake oracle node. Its signing key's address is its id.
 pub struct TestNode {
-    identity: Signer,
     signing: Signer,
     outgoing: Option<Signer>,
-    node_id: String,
     seed: u8,
 }
 
@@ -56,16 +44,14 @@ impl TestNode {
     ///
     /// # Panics
     ///
-    /// Panics if `seed` is zero, which is not a valid curve scalar.
+    /// Panics if `seed` is zero.
     #[must_use]
-    pub fn new(seed: u8, node_id: &str) -> Self {
+    pub fn new(seed: u8) -> Self {
         assert!(seed != 0, "seed 0 is not a valid secret key");
         Self {
-            identity: Signer::from_secret_bytes([seed; 32]).expect("valid test key"),
             signing: Signer::from_secret_bytes([seed.wrapping_add(0x40).max(1); 32])
                 .expect("valid test key"),
             outgoing: None,
-            node_id: node_id.to_owned(),
             seed,
         }
     }
@@ -76,21 +62,9 @@ impl TestNode {
         self.signing.address()
     }
 
-    /// Returns the node id.
-    #[must_use]
-    pub fn node_id(&self) -> &str {
-        &self.node_id
-    }
-
-    /// Returns the identity key, which issues this node's certificates.
-    #[must_use]
-    pub fn identity_key(&self) -> CompressedPublicKey {
-        self.identity.public_key()
-    }
-
-    /// Rotates to a fresh signing key. The old one is remembered for
-    /// [`TestNode::sign_outgoing`], so tests can produce frames a retired key
-    /// signed, but [`TestNode::entry`] lists only the live key (SPEC §3.5).
+    /// Rotates to a fresh key, as governance's `replace_node` does. The old
+    /// key is kept for [`TestNode::sign_outgoing`]; [`TestNode::entry`] lists
+    /// only the new one.
     ///
     /// # Panics
     ///
@@ -135,61 +109,16 @@ impl TestNode {
             .to_vec()
     }
 
-    /// Builds this node's registry entry: one live key.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic: the node id is short enough for the certificate encoding.
+    /// Builds this node's registry entry. The endpoint comes from the seed, so
+    /// a rotation keeps it.
     #[must_use]
     pub fn entry(&self) -> NodeEntry {
         NodeEntry {
-            node_id: self.node_id.clone(),
+            address: self.signing.address(),
             operator: "test".to_owned(),
-            identity_pubkey: self.identity.public_key(),
-            endpoints: vec![format!("wss://{}.test/v2/ws", self.node_id)],
-            signing_keys: vec![self.cert(self.signing.address())],
+            endpoints: vec![format!("wss://node-{}.test/v2/ws", self.seed)],
             weight: 1,
         }
-    }
-
-    /// Builds this node's key history as the registry canister would serve it.
-    ///
-    /// `rotated_at` is when the outgoing key was retired, unix seconds. Ignored
-    /// if the node has not rotated.
-    #[must_use]
-    pub fn history(&self, rotated_at: u64) -> Vec<KeyHistoryEntry> {
-        let mut history = Vec::with_capacity(2);
-        if let Some(outgoing) = &self.outgoing {
-            history.push(KeyHistoryEntry {
-                generation: 1,
-                cert: self.cert(outgoing.address()),
-                added_at: CERT_NOT_BEFORE,
-                retired_at: Some(rotated_at),
-            });
-        }
-        let generation = u32::try_from(history.len()).unwrap_or(0).saturating_add(1);
-        history.push(KeyHistoryEntry {
-            generation,
-            cert: self.cert(self.signing.address()),
-            added_at: if generation == 1 {
-                CERT_NOT_BEFORE
-            } else {
-                rotated_at
-            },
-            retired_at: None,
-        });
-        history
-    }
-
-    fn cert(&self, address: Address) -> SigningKeyCert {
-        SigningKeyCert::issue(
-            &self.identity,
-            &self.node_id,
-            address,
-            CERT_NOT_BEFORE,
-            CERT_NOT_AFTER,
-        )
-        .expect("test node id is short enough")
     }
 }
 

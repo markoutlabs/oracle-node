@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End to end on a local replica: registry canister -> node -> SDK client over
-# the authenticated, encrypted transport (SPEC §6.1), through a node key rotation and restart, a
-# client revocation, and a client expiry.
+# the authenticated, encrypted transport (SPEC §6.1), through a node key rotation
+# (`replace_node`) and restart, a client revocation, and a client expiry.
 #
 # Needs: dfx, the wasm32-unknown-unknown target, python3, and internet access
 # for the venue connections. Uses a throwaway dfx identity, never your default.
@@ -14,7 +14,6 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 IDENTITY=${E2E_IDENTITY:-oracle-e2e}
 DIR=e2e
-NODE_ID=oracle-e2e-1
 GATEWAY=http://127.0.0.1:4943
 CLIENT=./target/debug/examples/subscribe
 CLIENT_KEY=./target/debug/examples/client_key
@@ -53,8 +52,9 @@ dfx identity list 2>/dev/null | grep -qx "$IDENTITY" \
 if ! dfx ping >/dev/null 2>&1; then
   dfx start --background --clean >/dev/null 2>&1
 fi
-dfx deploy oracle_registry --identity "$IDENTITY" --argument \
-  '(record { key_name = "dfx_test_key"; rotation_window_secs = 60 : nat64; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = opt (10 : nat64) })' \
+# Reinstall: a kept replica may hold state from an older build.
+dfx deploy oracle_registry --identity "$IDENTITY" --mode reinstall --yes --argument \
+  '(record { key_name = "dfx_test_key"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = opt (10 : nat64) })' \
   >/dev/null 2>&1
 CANISTER=$(dfx canister id oracle_registry)
 URL="$GATEWAY/registry.json?canisterId=$CANISTER"
@@ -67,12 +67,12 @@ CERT_ARGS=(--canister-id "$CANISTER" --root-key "$ROOT_KEY")
 echo "canister $CANISTER"
 echo "governance $GOV"
 
-say "node identity, added by governance"
+say "node key, added by governance"
 rm -rf "$DIR" && mkdir -p "$DIR"
-# The keys are encrypted at rest; the node opens them with this passphrase file.
+# The key is encrypted at rest; the node opens it with this passphrase file.
 python3 -c 'import secrets; print(secrets.token_hex(16))' > "$DIR/passphrase"
 chmod 600 "$DIR/passphrase"
-$NODE init --out "$DIR/node1" --node-id "$NODE_ID" --operator e2e \
+$NODE init --out "$DIR/node1" --operator e2e \
   --endpoint ws://127.0.0.1:8791/v2/ws --canister "$CANISTER" \
   --passphrase-file "$DIR/passphrase" > "$DIR/init.out"
 # The e2e identity is the controller, so it plays governance for both calls.
@@ -94,14 +94,16 @@ PY
 echo "registry v$(dfx canister call oracle_registry get_version --identity "$IDENTITY" --output json | json_value)"
 
 say "client key, added by governance"
-add_client() { # id, expires_at
+# A client is the address of its key. The node logs it in lowercase.
+address_of() { grep -o '^address 0x[0-9a-fA-F]*' "$DIR/$1.out" | cut -d' ' -f2; }
+add_client() { # name, expires_at
   $CLIENT_KEY --out "$DIR/$1.key" > "$DIR/$1.out"
-  local pubkey
-  pubkey=$(grep -o '^pubkey 0x[0-9a-f]*' "$DIR/$1.out" | cut -d' ' -f2)
-  dfx canister call oracle_registry add_client "(\"$1\", \"$pubkey\", $2 : nat64)" \
+  dfx canister call oracle_registry add_client "(\"$(address_of "$1")\", $2 : nat64)" \
     --identity "$IDENTITY" --output json | json_value
 }
 echo "client list v$(add_client c-1 $(( $(date +%s) + 86400 )))"
+C1=$(address_of c-1)
+echo "client $C1"
 
 start_node() {
   (RUST_LOG=info nohup $NODE start "$DIR/node1/config.toml" > "$1" 2>&1 &)
@@ -115,11 +117,11 @@ start_node() {
 
 say "node starts against the canister"
 start_node "$DIR/node1.log"
-echo "signer $(grep -o "0x[0-9a-f]\{40\}" "$DIR/node1.log" | head -1)"
+echo "node $(grep -o "0x[0-9a-fA-F]\{40\}" "$DIR/node1.log" | head -1)"
 
 say "client baseline, 15s"
 $CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 15 --every 1000 \
-  --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-baseline.log" 2>&1 \
+  --client-key "$DIR/c-1.key" > "$DIR/client-baseline.log" 2>&1 \
   || { cat "$DIR/client-baseline.log"; die "baseline client failed"; }
 tail -1 "$DIR/client-baseline.log"
 [ "$(stat accepted "$DIR/client-baseline.log")" -gt 0 ] || die "no updates verified"
@@ -127,18 +129,21 @@ tail -1 "$DIR/client-baseline.log"
 
 say "rotation under a live client, 90s"
 $CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 90 --every 1000 \
-  --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-rotation.log" 2>&1 &
+  --client-key "$DIR/c-1.key" > "$DIR/client-rotation.log" 2>&1 &
 CLIENT_PID=$!
 sleep 10
 $NODE rotate --dir "$DIR/node1" --canister "$CANISTER" > "$DIR/rotate.out"
-grep -o "new signing  0x[0-9a-f]*" "$DIR/rotate.out" || true
+OLD=$(grep -o 'old address  0x[0-9a-fA-F]*' "$DIR/rotate.out" | awk '{print $3}')
+NEW=$(grep -o 'new address  0x[0-9a-fA-F]*' "$DIR/rotate.out" | awk '{print $3}')
+[ -n "$OLD" ] && [ -n "$NEW" ] || { cat "$DIR/rotate.out"; die "rotate printed no addresses"; }
+echo "replace $OLD -> $NEW"
 eval "$(grep 'dfx canister call' "$DIR/rotate.out" | sed 's/^ *//') --identity $IDENTITY" >/dev/null
 echo "registry v$(dfx canister call oracle_registry get_version --identity "$IDENTITY" --output json | json_value)"
 mv "$DIR/node1/signing.key.next" "$DIR/node1/signing.key"
 pkill -f "oracle-node start $DIR/node1/config.toml"
 sleep 1
 start_node "$DIR/node1b.log"
-echo "signer $(grep -o "0x[0-9a-f]\{40\}" "$DIR/node1b.log" | head -1)"
+echo "node $(grep -o "0x[0-9a-fA-F]\{40\}" "$DIR/node1b.log" | head -1)"
 wait "$CLIENT_PID" || { cat "$DIR/client-rotation.log"; die "rotation client failed"; }
 grep -- "--- adopted registry" "$DIR/client-rotation.log" || die "client never adopted the new registry"
 tail -1 "$DIR/client-rotation.log"
@@ -150,12 +155,12 @@ tail -1 "$DIR/client-rotation.log"
 
 say "revocation: governance removes c-1 under a live session"
 $CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 30 --every 1000 \
-  --client-id c-1 --client-key "$DIR/c-1.key" > "$DIR/client-revoked.log" 2>&1 &
+  --client-key "$DIR/c-1.key" > "$DIR/client-revoked.log" 2>&1 &
 CLIENT_PID=$!
 sleep 8
-echo "client list v$(dfx canister call oracle_registry remove_client '("c-1")' --identity "$IDENTITY" --output json | json_value)"
+echo "client list v$(dfx canister call oracle_registry remove_client "(\"$C1\")" --identity "$IDENTITY" --output json | json_value)"
 sleep 12
-plain "$DIR/node1b.log" | grep -q 'client session closed client_id="\?c-1"\? reason=Revoked' || die "the node did not close the revoked session"
+plain "$DIR/node1b.log" | grep -qi "client session closed client=\"\?$C1\"\? reason=Revoked" || die "the node did not close the revoked session"
 grep -q "broadcast keys rotated" "$DIR/node1b.log" || die "the node did not rotate its broadcast key"
 curl -s "$HEALTH" | grep -q '"subscribers":0' || die "a revoked client is still subscribed"
 wait "$CLIENT_PID" || true
@@ -163,17 +168,21 @@ echo "revoked: session closed, keys rotated, no subscriber left"
 
 say "expiry: c-2 is listed for about 25 s"
 echo "client list v$(add_client c-2 $(( $(date +%s) + 25 )))"
+C2=$(address_of c-2)
 sleep 7
 $CLIENT "$URL" "$GOV" CRYPTO.BTC/USDT "${CERT_ARGS[@]}" --seconds 30 --every 1000 \
-  --client-id c-2 --client-key "$DIR/c-2.key" > "$DIR/client-expiry.log" 2>&1 || true
-plain "$DIR/node1b.log" | grep -q 'client session closed client_id="\?c-2"\? reason=Expired' || die "the session outlived its deadline"
+  --client-key "$DIR/c-2.key" > "$DIR/client-expiry.log" 2>&1 || true
+plain "$DIR/node1b.log" | grep -qi "client session closed client=\"\?$C2\"\? reason=Expired" || die "the session outlived its deadline"
 [ "$(stat accepted "$DIR/client-expiry.log")" -gt 0 ] || die "c-2 never received a price"
 echo "expired: c-2 received prices, then the node closed it at its deadline"
 
-say "key history on the canister"
-dfx canister call oracle_registry get_key_history "(\"$NODE_ID\")" --identity "$IDENTITY" --output json \
-  | json_value | python3 -c 'import sys,json
-for e in json.loads(sys.stdin.read()):
-    print("gen", e["generation"], e["cert"]["address"], "retired_at", e["retired_at"])'
+say "node listings on the canister"
+listing() { dfx canister call oracle_registry get_node_listing "(\"$1\")" --identity "$IDENTITY" --output json | json_value; }
+OLD_LISTING=$(listing "$OLD")
+NEW_LISTING=$(listing "$NEW")
+echo "old $OLD_LISTING"
+echo "new $NEW_LISTING"
+echo "$OLD_LISTING" | grep -q '"removed_at":[0-9]' || die "the old address is not retired"
+echo "$NEW_LISTING" | grep -q '"removed_at":null' || die "the new address is not listed"
 
 say "PASS"

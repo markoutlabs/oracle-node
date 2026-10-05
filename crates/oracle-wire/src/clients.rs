@@ -4,26 +4,22 @@
 //! under its own kind byte, and nodes verify it against the governance address
 //! they already pin (SPEC §3.6).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::codec::Sink as _;
 use crate::payload::{KIND_CLIENT_LIST, PAYLOAD_VERSION};
 use crate::registry::check_governance;
-use crate::{Address, CompressedPublicKey, Signature, Signer, VerifyError, WireError};
+use crate::{Address, Signature, Signer, VerifyError, WireError};
 
 /// Maximum clients in one list.
 pub const MAX_CLIENTS: usize = 4096;
-/// Maximum length of a client identifier, in bytes.
-pub const MAX_CLIENT_ID_LEN: usize = 64;
 
 /// One authorised client.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientEntry {
-    /// Opaque identifier. The list is public, so it must not name the customer.
-    pub client_id: String,
-    /// The client's secp256k1 API key. It only signs.
-    pub pubkey: CompressedPublicKey,
+    /// The address of the client's secp256k1 API key. It is also the client's id.
+    pub address: Address,
     /// End of authorisation, unix seconds.
     pub expires_at: u64,
 }
@@ -46,7 +42,7 @@ pub struct ClientList {
 
 impl ClientList {
     /// Builds the canonical bytes the governance key signs. Clients are sorted
-    /// by `client_id`, so JSON order does not matter.
+    /// by address, so JSON order does not matter.
     ///
     /// # Errors
     ///
@@ -66,9 +62,9 @@ impl ClientList {
             return Err(too_many());
         }
         let mut ordered: Vec<&ClientEntry> = clients.iter().collect();
-        ordered.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        ordered.sort_by_key(|client| client.address);
 
-        let mut out = Vec::with_capacity(32 + clients.len() * 112);
+        let mut out = Vec::with_capacity(32 + clients.len() * 28);
         out.put_u8(PAYLOAD_VERSION);
         out.put_u8(KIND_CLIENT_LIST);
         out.put_u64(version);
@@ -76,8 +72,7 @@ impl ClientList {
         out.put_u64(epoch_secs);
         out.put_u32(u32::try_from(ordered.len()).map_err(|_| too_many())?);
         for client in ordered {
-            out.try_put_str("client_id", &client.client_id, MAX_CLIENT_ID_LEN)?;
-            out.put_bytes(client.pubkey.as_bytes());
+            out.put_bytes(client.address.as_bytes());
             out.put_u64(client.expires_at);
         }
         Ok(out)
@@ -125,8 +120,8 @@ impl ClientList {
     ///
     /// - [`VerifyError::StaleClientList`] if `version` is not above `min_version`.
     /// - [`VerifyError::UntrustedGovernance`] if the signature is not the pinned key's.
-    /// - [`VerifyError::MalformedClientList`] for a zero epoch, a duplicate id or
-    ///   key, or a key that is not a curve point.
+    /// - [`VerifyError::MalformedClientList`] for a zero epoch or a duplicate
+    ///   address.
     pub fn verify(
         &self,
         governance: Address,
@@ -149,33 +144,19 @@ impl ClientList {
             ));
         }
 
-        let mut by_id = HashMap::with_capacity(self.clients.len());
-        let mut keys = HashSet::with_capacity(self.clients.len());
+        let mut by_address = HashMap::with_capacity(self.clients.len());
         for (index, client) in self.clients.iter().enumerate() {
-            if by_id.insert(client.client_id.clone(), index).is_some() {
+            if by_address.insert(client.address, index).is_some() {
                 return Err(VerifyError::MalformedClientList(format!(
-                    "duplicate client id `{}`",
-                    client.client_id
+                    "client {} is listed twice",
+                    client.address
                 )));
             }
-            // One key per client keeps "which client is this" unambiguous.
-            if !keys.insert(client.pubkey) {
-                return Err(VerifyError::MalformedClientList(format!(
-                    "client `{}` reuses another client's key",
-                    client.client_id
-                )));
-            }
-            client.pubkey.decompress().map_err(|_| {
-                VerifyError::MalformedClientList(format!(
-                    "client `{}` has an invalid public key",
-                    client.client_id
-                ))
-            })?;
         }
 
         Ok(VerifiedClientList {
             list: self.clone(),
-            by_id,
+            by_address,
             governance,
         })
     }
@@ -185,7 +166,7 @@ impl ClientList {
 #[derive(Clone, Debug)]
 pub struct VerifiedClientList {
     list: ClientList,
-    by_id: HashMap<String, usize>,
+    by_address: HashMap<Address, usize>,
     governance: Address,
 }
 
@@ -223,11 +204,11 @@ impl VerifiedClientList {
         next.verify(self.governance, self.list.version)
     }
 
-    /// Returns a client by id.
+    /// Returns a client by address.
     #[must_use]
-    pub fn get(&self, client_id: &str) -> Option<&ClientEntry> {
-        self.by_id
-            .get(client_id)
+    pub fn get(&self, address: Address) -> Option<&ClientEntry> {
+        self.by_address
+            .get(&address)
             .and_then(|&index| self.list.clients.get(index))
     }
 
@@ -254,12 +235,15 @@ mod tests {
         Signer::from_secret_bytes([0xC0; 32]).expect("valid key")
     }
 
-    fn client(seed: u8, id: &str) -> ClientEntry {
+    fn address(seed: u8) -> Address {
+        Signer::from_secret_bytes([seed; 32])
+            .expect("valid key")
+            .address()
+    }
+
+    fn client(seed: u8) -> ClientEntry {
         ClientEntry {
-            client_id: id.to_owned(),
-            pubkey: Signer::from_secret_bytes([seed; 32])
-                .expect("valid key")
-                .public_key(),
+            address: address(seed),
             expires_at: NOW + 86_400,
         }
     }
@@ -270,29 +254,29 @@ mod tests {
 
     #[test]
     fn a_signed_list_verifies_and_round_trips_through_json() {
-        let signed = list(1, vec![client(1, "c-1"), client(2, "c-2")]);
+        let signed = list(1, vec![client(1), client(2)]);
         let json = serde_json::to_string(&signed).expect("serialises");
         let parsed: ClientList = serde_json::from_str(&json).expect("parses");
         let verified = parsed.verify(governance().address(), 0).expect("verifies");
         assert_eq!(verified.version(), 1);
         assert_eq!(verified.epoch_secs(), 60);
         assert_eq!(
-            verified.get("c-2").map(|c| c.expires_at),
+            verified.get(address(2)).map(|c| c.expires_at),
             Some(NOW + 86_400)
         );
-        assert!(verified.get("c-3").is_none());
+        assert!(verified.get(address(3)).is_none());
     }
 
     #[test]
     fn the_encoding_ignores_client_order() {
-        let a = ClientList::signing_bytes(1, NOW, 60, &[client(1, "a"), client(2, "b")]);
-        let b = ClientList::signing_bytes(1, NOW, 60, &[client(2, "b"), client(1, "a")]);
+        let a = ClientList::signing_bytes(1, NOW, 60, &[client(1), client(2)]);
+        let b = ClientList::signing_bytes(1, NOW, 60, &[client(2), client(1)]);
         assert_eq!(a.expect("encodes"), b.expect("encodes"));
     }
 
     #[test]
     fn every_field_is_covered_by_the_signature() {
-        let signed = list(2, vec![client(1, "a"), client(2, "b")]);
+        let signed = list(2, vec![client(1), client(2)]);
         let gov = governance().address();
         let tampers: [fn(&mut ClientList); 4] = [
             |l| l.effective_from += 1,
@@ -304,7 +288,7 @@ mod tests {
             },
             |l| {
                 if let Some(c) = l.clients.last_mut() {
-                    c.pubkey = client(9, "x").pubkey;
+                    c.address = address(9);
                 }
             },
         ];
@@ -323,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_list_must_be_newer_and_signed_by_governance() {
-        let signed = list(3, vec![client(1, "a")]);
+        let signed = list(3, vec![client(1)]);
         let gov = governance().address();
         assert!(matches!(
             signed.verify(gov, 3),
@@ -333,7 +317,7 @@ mod tests {
             })
         ));
         let impostor = Signer::from_secret_bytes([0xF0; 32]).expect("valid key");
-        let forged = ClientList::sign(&impostor, 4, NOW, 60, vec![client(1, "a")]).expect("signs");
+        let forged = ClientList::sign(&impostor, 4, NOW, 60, vec![client(1)]).expect("signs");
         assert!(matches!(
             forged.verify(gov, 3),
             Err(VerifyError::UntrustedGovernance { .. })
@@ -344,16 +328,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ids_keys_and_a_zero_epoch_are_refused() {
+    fn duplicate_addresses_and_a_zero_epoch_are_refused() {
         let gov = governance().address();
-        let same_id = list(1, vec![client(1, "a"), client(2, "a")]);
+        let twice = list(1, vec![client(1), client(1)]);
         assert!(matches!(
-            same_id.verify(gov, 0),
-            Err(VerifyError::MalformedClientList(_))
-        ));
-        let same_key = list(1, vec![client(1, "a"), client(1, "b")]);
-        assert!(matches!(
-            same_key.verify(gov, 0),
+            twice.verify(gov, 0),
             Err(VerifyError::MalformedClientList(_))
         ));
         let zero = ClientList::sign(&governance(), 1, NOW, 0, vec![]).expect("signs");

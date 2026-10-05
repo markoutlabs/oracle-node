@@ -65,8 +65,6 @@ pub enum ConfigError {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    /// This node's identifier, which must match its registry entry.
-    pub node_id: String,
     /// Subscriber-facing server settings.
     pub server: ServerSettings,
     /// Where to find the signing key.
@@ -649,8 +647,6 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-node_id = "oracle-eu-1"
-
 [server]
 listen = "127.0.0.1:8080"
 
@@ -791,8 +787,6 @@ sources = [
     #[test]
     fn a_usd_feed_can_mix_native_and_converted_sources() {
         let text = r#"
-node_id = "oracle-eu-1"
-
 [server]
 listen = "127.0.0.1:8080"
 
@@ -895,7 +889,6 @@ sources = [
     fn one_source(venue: &str, market: &str, symbol: &str) -> Result<ResolvedConfig, ConfigError> {
         let text = format!(
             r#"
-node_id = "n"
 [server]
 listen = "127.0.0.1:1"
 [signing]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use oracle_server::testing::{NODE_ID, governance_key, sample_update, signing_key, test_registry};
+use oracle_server::testing::{governance_key, sample_update, signing_key, test_registry};
 use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
 use oracle_transport::{
     ClientHandshake, ClientSession, CloseReason, Control, HandshakeMessage, TYPE_CONTROL,
@@ -26,7 +26,7 @@ fn key(seed: u8) -> Signer {
     Signer::from_secret_bytes([seed; 32]).expect("valid key")
 }
 
-fn client_list(version: u64, epoch_secs: u64, clients: &[(&str, u8, u64)]) -> ClientList {
+fn client_list(version: u64, epoch_secs: u64, clients: &[(u8, u64)]) -> ClientList {
     ClientList::sign(
         &governance_key(),
         version,
@@ -34,9 +34,8 @@ fn client_list(version: u64, epoch_secs: u64, clients: &[(&str, u8, u64)]) -> Cl
         epoch_secs,
         clients
             .iter()
-            .map(|&(id, seed, expires_at)| ClientEntry {
-                client_id: id.to_owned(),
-                pubkey: key(seed).public_key(),
+            .map(|&(seed, expires_at)| ClientEntry {
+                address: key(seed).address(),
                 expires_at,
             })
             .collect(),
@@ -58,16 +57,9 @@ async fn start_confirmed_at(list: &ClientList, config: TransportConfig, confirme
     let verified = list
         .verify(governance_key().address(), 0)
         .expect("verifies");
-    let transport = NodeTransport::new(
-        NODE_ID,
-        Arc::new(signing_key()),
-        verified,
-        config,
-        64,
-        confirmed_at,
-    );
+    let transport = NodeTransport::new(Arc::new(signing_key()), verified, config, 64, confirmed_at);
     let symbols: Vec<Symbol> = vec![BTC.parse().expect("valid")];
-    let state = ServerState::new(NODE_ID, &symbols, test_registry(), Arc::clone(&transport));
+    let state = ServerState::new(&symbols, test_registry(), Arc::clone(&transport));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("bound");
     let app = router(Arc::clone(&state));
@@ -103,17 +95,16 @@ async fn next_handshake(socket: &mut Socket) -> Option<HandshakeMessage> {
     }
 }
 
-async fn connect(node: &Node, client_id: &str, api_key: &Signer) -> (Socket, ClientSession) {
+async fn connect(node: &Node, api_key: &Signer) -> (Socket, ClientSession) {
     let mut socket = open(node).await;
     let challenge = next_handshake(&mut socket).await.expect("challenge");
-    let (auth, waiting) = ClientHandshake::new(NODE_ID, &mut oracle_transport::os_rng())
-        .respond(&challenge, client_id, api_key)
-        .expect("responds");
+    let (auth, waiting) =
+        ClientHandshake::new(signing_key().address(), &mut oracle_transport::os_rng())
+            .respond(&challenge, api_key)
+            .expect("responds");
     send_json(&mut socket, &auth).await;
     let auth_ok = next_handshake(&mut socket).await.expect("auth_ok");
-    let session = waiting
-        .finish(&auth_ok, signing_key().address())
-        .expect("a session");
+    let session = waiting.finish(&auth_ok).expect("a session");
     (socket, session)
 }
 
@@ -203,11 +194,11 @@ async fn next_frame(socket: &mut Socket, session: &mut ClientSession) -> Vec<u8>
 #[tokio::test]
 async fn a_listed_client_receives_sealed_frames_signed_by_the_node() {
     let node = start(
-        &client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]),
+        &client_list(1, 60, &[(1, unix_now() + 3_600)]),
         TransportConfig::default(),
     )
     .await;
-    let (mut socket, mut session) = connect(&node, "c-1", &key(1)).await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
     subscribe(&mut socket, &mut session).await;
     publish(&node, 7);
 
@@ -225,17 +216,18 @@ async fn a_listed_client_receives_sealed_frames_signed_by_the_node() {
 #[tokio::test]
 async fn unknown_clients_and_plaintext_are_refused_before_any_subscriber_exists() {
     let node = start(
-        &client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]),
+        &client_list(1, 60, &[(1, unix_now() + 3_600)]),
         TransportConfig::default(),
     )
     .await;
 
-    for (client_id, api_key) in [("c-9", key(1)), ("c-1", key(2))] {
+    for api_key in [key(9), key(2)] {
         let mut socket = open(&node).await;
         let challenge = next_handshake(&mut socket).await.expect("challenge");
-        let (auth, _) = ClientHandshake::new(NODE_ID, &mut oracle_transport::os_rng())
-            .respond(&challenge, client_id, &api_key)
-            .expect("responds");
+        let (auth, _) =
+            ClientHandshake::new(signing_key().address(), &mut oracle_transport::os_rng())
+                .respond(&challenge, &api_key)
+                .expect("responds");
         send_json(&mut socket, &auth).await;
         assert!(matches!(
             next_handshake(&mut socket).await,
@@ -264,11 +256,7 @@ async fn a_silent_or_oversized_handshake_is_cut_off() {
         handshake_timeout: Duration::from_millis(200),
         ..TransportConfig::default()
     };
-    let node = start(
-        &client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]),
-        config,
-    )
-    .await;
+    let node = start(&client_list(1, 60, &[(1, unix_now() + 3_600)]), config).await;
 
     let mut silent = open(&node).await;
     let _ = next_handshake(&mut silent).await;
@@ -290,11 +278,7 @@ async fn handshakes_beyond_the_cap_get_503() {
         max_handshakes: 1,
         ..TransportConfig::default()
     };
-    let node = start(
-        &client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]),
-        config,
-    )
-    .await;
+    let node = start(&client_list(1, 60, &[(1, unix_now() + 3_600)]), config).await;
     let mut first = open(&node).await;
     let _ = next_handshake(&mut first).await;
     let second = connect_async(format!("ws://{}/v2/ws", node.addr)).await;
@@ -310,19 +294,19 @@ async fn handshakes_beyond_the_cap_get_503() {
 async fn a_revoked_client_is_closed_and_cannot_open_the_next_frames() {
     let expires = unix_now() + 3_600;
     let node = start(
-        &client_list(1, 60, &[("a", 1, expires), ("b", 2, expires)]),
+        &client_list(1, 60, &[(1, expires), (2, expires)]),
         TransportConfig::default(),
     )
     .await;
-    let (mut a, mut a_session) = connect(&node, "a", &key(1)).await;
-    let (mut b, mut b_session) = connect(&node, "b", &key(2)).await;
+    let (mut a, mut a_session) = connect(&node, &key(1)).await;
+    let (mut b, mut b_session) = connect(&node, &key(2)).await;
     subscribe(&mut a, &mut a_session).await;
     subscribe(&mut b, &mut b_session).await;
     let before = node.transport.current_key();
 
     let revoked = node
         .transport
-        .offer_clients(&client_list(2, 60, &[("a", 1, expires)]), unix_now())
+        .offer_clients(&client_list(2, 60, &[(1, expires)]), unix_now())
         .expect("adopts");
     assert_eq!(revoked, Some(1));
     assert_ne!(node.transport.current_key().key_id(), before.key_id());
@@ -349,11 +333,11 @@ async fn a_revoked_client_is_closed_and_cannot_open_the_next_frames() {
 #[tokio::test]
 async fn a_session_closes_at_its_deadline() {
     let node = start(
-        &client_list(1, 1, &[("c-1", 1, unix_now() + 2)]),
+        &client_list(1, 1, &[(1, unix_now() + 2)]),
         TransportConfig::default(),
     )
     .await;
-    let (mut socket, mut session) = connect(&node, "c-1", &key(1)).await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
     let deadline = session.deadline;
     loop {
         match receive(&mut socket, &mut session).await {
@@ -371,7 +355,7 @@ async fn a_session_closes_at_its_deadline() {
 #[tokio::test]
 async fn the_node_serves_no_prices_and_no_v1_routes() {
     let node = start(
-        &client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]),
+        &client_list(1, 60, &[(1, unix_now() + 3_600)]),
         TransportConfig::default(),
     )
     .await;
@@ -406,11 +390,11 @@ async fn the_node_serves_no_prices_and_no_v1_routes() {
 #[tokio::test]
 async fn a_grid_rotation_delivers_the_next_key_before_using_it() {
     let node = start(
-        &client_list(1, 2, &[("c-1", 1, unix_now() + 3_600)]),
+        &client_list(1, 2, &[(1, unix_now() + 3_600)]),
         TransportConfig::default(),
     )
     .await;
-    let (mut socket, mut session) = connect(&node, "c-1", &key(1)).await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
     subscribe(&mut socket, &mut session).await;
     let first = node.transport.current_key();
 
@@ -437,7 +421,7 @@ async fn a_grid_rotation_delivers_the_next_key_before_using_it() {
 /// the canister publishes only on change.
 #[tokio::test]
 async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
-    let list = client_list(1, 60, &[("c-1", 1, unix_now() + 3_600)]);
+    let list = client_list(1, 60, &[(1, unix_now() + 3_600)]);
     let node = start(
         &list,
         TransportConfig {
@@ -447,7 +431,7 @@ async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
         },
     )
     .await;
-    let (mut socket, mut session) = connect(&node, "c-1", &key(1)).await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
 
     let refusing = start_confirmed_at(
         &list,
@@ -460,8 +444,8 @@ async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
     .await;
     let mut refused = open(&refusing).await;
     let challenge = next_handshake(&mut refused).await.expect("challenge");
-    let (auth, _) = ClientHandshake::new(NODE_ID, &mut oracle_transport::os_rng())
-        .respond(&challenge, "c-1", &key(1))
+    let (auth, _) = ClientHandshake::new(signing_key().address(), &mut oracle_transport::os_rng())
+        .respond(&challenge, &key(1))
         .expect("responds");
     send_json(&mut refused, &auth).await;
     assert!(matches!(

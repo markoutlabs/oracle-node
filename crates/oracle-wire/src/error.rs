@@ -142,30 +142,20 @@ pub enum VerifyError {
         signer: Address,
     },
 
-    /// The signing key's certificate had not taken effect when the update was published.
-    #[error("certificate for {signer} is not valid until {not_before} (published at {published})")]
-    CertificateNotYetValid {
-        /// The recovered address.
-        signer: Address,
-        /// Certificate start, unix seconds.
-        not_before: u64,
-        /// Update publish time, unix seconds.
-        published: u64,
-    },
-
-    /// The signing key's certificate had expired when the update was published.
+    /// A stored update was signed while its signer was not listed.
     ///
-    /// Note that this is evaluated against the update's publish time, not the
-    /// current time. Checking against "now" would make every key rotation
-    /// retroactively invalidate the history signed under the previous key.
-    #[error("certificate for {signer} expired at {not_after} (published at {published})")]
-    CertificateExpired {
+    /// Judged against the update's publish time, not the current time, so a
+    /// rotation does not invalidate what the old key signed while listed.
+    #[error("{signer} was not listed at {published} (listed from {added_at} until {removed_at:?})")]
+    NotListedAt {
         /// The recovered address.
         signer: Address,
-        /// Certificate end, unix seconds.
-        not_after: u64,
         /// Update publish time, unix seconds.
         published: u64,
+        /// When the address was listed, unix seconds.
+        added_at: u64,
+        /// When it stopped being listed, unix seconds.
+        removed_at: Option<u64>,
     },
 
     /// A governance document's signature did not match the pinned key.
@@ -174,21 +164,6 @@ pub enum VerifyError {
         /// Address recovered from the registry signature.
         found: Address,
         /// Address the caller pinned.
-        expected: Address,
-    },
-
-    /// A signing-key certificate was not issued by its node's identity key.
-    #[error(
-        "certificate for {address} in node `{node_id}` was issued by {issuer}, not the node's identity key {expected}"
-    )]
-    CertificateIssuerMismatch {
-        /// The node the certificate claims to belong to.
-        node_id: String,
-        /// The certified signing address.
-        address: Address,
-        /// Address recovered from the certificate signature.
-        issuer: Address,
-        /// Address derived from the node's identity public key.
         expected: Address,
     },
 

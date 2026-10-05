@@ -1,10 +1,10 @@
 //! The node registry as an Internet Computer canister (SPEC §3.6).
 //!
-//! The canister is the trust root for membership. It holds every node, its
-//! live signing key and its retired ones, and the authorised clients. It
-//! publishes two documents signed with a threshold ECDSA key: the registry and
-//! the client list. The governance address consumers pin is the address of
-//! that key, so no consumer needs an Internet Computer agent.
+//! The canister is the trust root for membership. It holds every node and
+//! every client by address, and the addresses it retired. It publishes two
+//! documents signed with a threshold ECDSA key: the registry and the client
+//! list. The governance address consumers pin is the address of that key, so
+//! no consumer needs an Internet Computer agent.
 //!
 //! # Roles
 //!
@@ -15,8 +15,8 @@
 //!
 //! # Interchange
 //!
-//! Entries, certificates, the registry document and key histories cross the
-//! Candid boundary as JSON strings in the protocol's own JSON format. The
+//! Entries, the registry document and node listings cross the Candid boundary
+//! as JSON strings in the protocol's own JSON format. Addresses are `0x` hex. The
 //! document a consumer fetches over HTTPS is the same JSON, so there is one
 //! schema, not a Candid mirror of it.
 //!
@@ -36,12 +36,12 @@ pub mod state;
 use candid::CandidType;
 use ic_http_certification::utils::add_v2_certificate_header;
 pub use ic_http_certification::{HttpRequest, HttpResponse};
-use oracle_wire::{CompressedPublicKey, NodeEntry, Quorum, SigningKeyCert};
+use oracle_wire::{NodeEntry, Quorum};
 use serde::Deserialize;
 
 use crate::certify::{CERTIFIED, certify_documents};
 use crate::publish::{Document, mutate_and_publish};
-use crate::runtime::{STATE, governance_only, is_governance, now_secs, read_state};
+use crate::runtime::{STATE, address, governance_only, is_governance, now_secs, read_state};
 use crate::signing::ensure_governance_key;
 use crate::state::{Config, DEFAULT_EPOCH_SECS, State};
 
@@ -50,8 +50,6 @@ use crate::state::{Config, DEFAULT_EPOCH_SECS, State};
 pub struct InitArgs {
     /// Threshold ECDSA key name: `dfx_test_key` locally, `key_1` on mainnet.
     pub key_name: String,
-    /// Minimum seconds between two rotations fleet-wide.
-    pub rotation_window_secs: u64,
     /// Fewest nodes a consumer should require.
     pub min_nodes: u16,
     /// Recommended quorum.
@@ -65,7 +63,6 @@ fn init(args: InitArgs) {
     let state = State::new(
         Config {
             key_name: args.key_name,
-            rotation_window_secs: args.rotation_window_secs,
             epoch_secs: args.epoch_secs.unwrap_or(DEFAULT_EPOCH_SECS).max(1),
         },
         Quorum {
@@ -104,8 +101,8 @@ fn inspect_message() {
     }
 }
 
-/// Governance lists a node. `entry_json` is the operator's `NodeEntry`, with
-/// exactly one certificate. Returns the new version.
+/// Governance lists a node. `entry_json` is the operator's `NodeEntry`.
+/// Returns the new version.
 #[ic_cdk::update(guard = "governance_only")]
 async fn add_node(entry_json: String) -> Result<u64, String> {
     let entry: NodeEntry = serde_json::from_str(&entry_json)
@@ -113,22 +110,19 @@ async fn add_node(entry_json: String) -> Result<u64, String> {
     mutate_and_publish(Document::Registry, |s| s.add_node(entry, now_secs())).await
 }
 
-/// Governance swaps a node's signing key. `cert_json` is a `SigningKeyCert`
-/// the node's identity key issued. Returns the new version.
+/// Governance rotates a node's key: the `new` address takes the place of
+/// `old`, with the same operator, endpoints and weight. Returns the new version.
 #[ic_cdk::update(guard = "governance_only")]
-async fn rotate_key(node_id: String, cert_json: String) -> Result<u64, String> {
-    let cert: SigningKeyCert = serde_json::from_str(&cert_json)
-        .map_err(|error| format!("certificate is not valid JSON: {error}"))?;
-    mutate_and_publish(Document::Registry, |s| {
-        s.rotate_key(&node_id, cert, now_secs())
-    })
-    .await
+async fn replace_node(old: String, new: String) -> Result<u64, String> {
+    let (old, new) = (address(&old)?, address(&new)?);
+    mutate_and_publish(Document::Registry, |s| s.replace_node(old, new, now_secs())).await
 }
 
 /// Governance de-lists a node. Returns the new version.
 #[ic_cdk::update(guard = "governance_only")]
-async fn remove_node(node_id: String) -> Result<u64, String> {
-    mutate_and_publish(Document::Registry, |s| s.remove_node(&node_id, now_secs())).await
+async fn remove_node(node: String) -> Result<u64, String> {
+    let node = address(&node)?;
+    mutate_and_publish(Document::Registry, |s| s.remove_node(node, now_secs())).await
 }
 
 /// Governance changes the quorum guidance. Returns the new version.
@@ -154,30 +148,32 @@ async fn republish_clients() -> Result<u64, String> {
     mutate_and_publish(Document::Clients, |_| Ok(())).await
 }
 
-/// Governance authorises a client. `pubkey` is its 33-byte compressed
-/// secp256k1 API key in hex. Returns the new client-list version.
+/// Governance authorises a client: the address of its secp256k1 API key.
+/// Returns the new client-list version.
 #[ic_cdk::update(guard = "governance_only")]
-async fn add_client(client_id: String, pubkey: String, expires_at: u64) -> Result<u64, String> {
-    let pubkey: CompressedPublicKey = pubkey.parse().map_err(|error| format!("pubkey: {error}"))?;
+async fn add_client(client: String, expires_at: u64) -> Result<u64, String> {
+    let client = address(&client)?;
     mutate_and_publish(Document::Clients, |s| {
-        s.add_client(client_id, pubkey, expires_at, now_secs())
+        s.add_client(client, expires_at, now_secs())
     })
     .await
 }
 
 /// Governance moves a client's expiry. Returns the new client-list version.
 #[ic_cdk::update(guard = "governance_only")]
-async fn set_client_expiry(client_id: String, expires_at: u64) -> Result<u64, String> {
+async fn set_client_expiry(client: String, expires_at: u64) -> Result<u64, String> {
+    let client = address(&client)?;
     mutate_and_publish(Document::Clients, |s| {
-        s.set_client_expiry(&client_id, expires_at)
+        s.set_client_expiry(client, expires_at)
     })
     .await
 }
 
-/// Governance removes a client. Returns the new client-list version.
+/// Governance revokes a client. Returns the new client-list version.
 #[ic_cdk::update(guard = "governance_only")]
-async fn remove_client(client_id: String) -> Result<u64, String> {
-    mutate_and_publish(Document::Clients, |s| s.remove_client(&client_id)).await
+async fn remove_client(client: String) -> Result<u64, String> {
+    let client = address(&client)?;
+    mutate_and_publish(Document::Clients, |s| s.remove_client(client)).await
 }
 
 /// Fetches the threshold public key if it is not cached. Returns the
@@ -226,12 +222,13 @@ fn get_governance() -> Option<String> {
     })
 }
 
-/// Every generation of a node's keys as JSON, for stored-frame verification.
+/// When a node address was listed, as JSON, for stored-frame verification.
 #[ic_cdk::query]
-fn get_key_history(node_id: String) -> Option<String> {
+fn get_node_listing(node: String) -> Option<String> {
+    let node = address(&node).ok()?;
     read_state(|s| {
-        s.key_history(&node_id)
-            .map(|history| serde_json::to_string(&history).expect("history serialises"))
+        s.node_listing(node)
+            .map(|listing| serde_json::to_string(&listing).expect("listing serialises"))
     })
 }
 

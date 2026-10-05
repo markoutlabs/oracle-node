@@ -1,6 +1,9 @@
-//! The canister's runtime context: the state cell, the clock and the caller.
+//! The canister's runtime context: the state cell, the clock, the caller,
+//! and the address arguments.
 
 use std::cell::RefCell;
+
+use oracle_wire::Address;
 
 use crate::state::State;
 
@@ -23,6 +26,11 @@ pub(crate) fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
 
 pub(crate) fn read_state<R>(f: impl FnOnce(&State) -> R) -> R {
     STATE.with(|cell| f(cell.borrow().as_ref().expect("the canister is initialised")))
+}
+
+pub(crate) fn address(text: &str) -> Result<Address, String> {
+    text.parse()
+        .map_err(|error| format!("address `{text}`: {error}"))
 }
 
 pub(crate) fn is_governance() -> bool {

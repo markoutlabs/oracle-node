@@ -184,7 +184,7 @@ impl FromStr for CompressedPublicKey {
         let body = s.strip_prefix("0x").unwrap_or(s);
         let mut bytes = [0_u8; 33];
         hex::decode_to_slice(body, &mut bytes).map_err(|_| WireError::InvalidHex {
-            field: "identity_pubkey",
+            field: "pubkey",
             expected: Self::LEN,
         })?;
         Ok(Self(bytes))

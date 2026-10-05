@@ -21,7 +21,7 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M3.5 | `oracle-node` binary wiring the pipeline | **done** |
 | M4 | Remaining venues + USDT/USD conversion | **done** |
 | M5 | Multi-node deploy + registry rotation | **done** |
-| M5.5 | Registry canister, one live key per node | **done** |
+| M5.5 | Registry canister, one key per node | **done** |
 | M6 | Hardening | in progress: keys encrypted at rest, replay harness, adversarial suite, authenticated and encrypted transport |
 
 ## Crates
@@ -168,8 +168,8 @@ The consumer SDK, and the answer to "so how do I actually use this safely".
 
 Two pure, synchronous halves with a thin async layer on top:
 
-- `Verifier` — one update at a time: signature, registry membership, certificate
-  validity **at publish time**, sequence monotonicity, staleness, coherence.
+- `Verifier` — one update at a time: signature, registry membership, sequence
+  monotonicity, staleness, coherence.
   Replay and staleness are the consumer's job because signatures say nothing
   about freshness: a relay that withholds new updates and rebroadcasts an old one
   passes every cryptographic check flawlessly.
@@ -191,24 +191,27 @@ Nodes serve prices only to listed clients, over `/v2/ws`, encrypted (SPEC
 ```rust
 let client = OracleClient::builder_from_source(source, GOVERNANCE_ADDRESS)
     .await?
-    .client_key("c-7f3a", api_key) // a secp256k1 `Signer`; governance listed its public key
+    .client_key(api_key) // a secp256k1 `Signer`; governance listed its address
     .build()?;
 ```
 
-The SDK runs the handshake on each connection and checks the node's `auth_ok`
-against that node's live key in the registry. Only after that does it send the
+The SDK runs the handshake on each connection and checks that the node's
+`auth_ok` is signed by the address it dialled. Only after that does it send the
 subscription. Every opened frame then goes through the same `Verifier` as
 before. Decryption proves nothing, because every listed client holds the
-broadcast key. `examples/client_key.rs` makes a key and prints the `add_client`
-call for governance.
+broadcast key. `examples/client_key.rs` makes a key and prints its address and
+the `add_client` call for governance.
 
 #### How a rotation reaches the consumer
 
-A node holds one live signing key at a time (SPEC §3.5). When its operator
-rotates it, the registry canister swaps the key atomically, and the consumer
-finds out from the first frame it cannot verify:
+A node has one key, and its address is the node's id (SPEC §3.5). A rotation is
+governance's `replace_node`: in one registry version the new address takes the
+old one's place, at the same endpoint. The consumer finds out from the first
+frame it cannot verify, or from a handshake challenge that names the new
+address:
 
-1. An unknown signer triggers one fetch from the `RegistrySource`, at most once
+1. An unknown signer, or a `WrongNode` challenge, triggers one fetch from the
+   `RegistrySource`, at most once
    per `refresh_interval` (10s by default). Anyone who can inject a frame can
    trigger the fetch, so the floor is what keeps a hostile relay from turning
    the client into a load generator against the registry.
@@ -216,8 +219,10 @@ finds out from the first frame it cannot verify:
    signed by the pinned governance address. No reconnect, no lost feed state.
    Nodes the new version de-lists are dropped from the quorum **on adoption**,
    not once their last update ages out.
-3. The frame is retried. The node is back with its new key, and it kept its seat
-   and its replay floor, because both are keyed by `NodeId` and not by address.
+3. The frame is retried. The quorum seat moves to the new address in the same
+   adoption that drops the old one, so the node never counts twice. The new
+   address starts a fresh replay floor, which is safe: the new key never signed
+   before.
 4. The old key is now **retired**, not unknown. Frames it signed are refused as
    `RetiredKey` and never trigger another fetch. A few right after a rotation
    are frames that were in flight. A steady stream is a stolen key in use.
@@ -237,8 +242,8 @@ The governance signature is checked on top: the certificate says the document is
 current, the signature says it is genuine.
 
 Stored frames are a separate path. `verify_historical` checks a frame against
-the key that was live at its publish time, using the node's key history from the
-canister, bounded by when that key was retired.
+the canister's listing of its signer: when the address was listed, and when it
+was replaced or removed.
 
 ### `oracle-node`
 
@@ -253,8 +258,8 @@ aggregator before any post-reconnect quote — only means something if nothing
 downstream reorders it. Fanning events across workers would break it silently.
 
 ```sh
-oracle-node init [--out DIR] [--canister ID]   # generate this node's keys
-oracle-node rotate --dir DIR [--canister ID]   # generate the next signing key
+oracle-node init [--out DIR] [--canister ID]   # generate this node's key
+oracle-node rotate --dir DIR [--canister ID]   # generate the next key
 oracle-node start <config.toml>                # ingest, aggregate, sign, serve
 oracle-node start <config.toml> --tail         # ...and log the stream as it flows
 ```
@@ -280,16 +285,15 @@ same contract at the same instant, because one is an 8h rate and the other is
 hourly. `lag_ms` is `local_recv − exchange_time` and is diagnostic only —
 staleness is always measured with our own clock, never the venue's.
 
-`init` generates **both** keys — the two-tier split from §3.5 is the design, not
-a suggestion — issues the signing certificate, and prints the registry entry to
-hand to governance. That entry carries no secret: an identity public key, the
-endpoints, and a certificate anyone can check. Nothing the node publishes
+`init` generates the node's one key and prints its address, which is the node's
+id, and the registry entry to hand to governance. That entry carries no secret:
+the address, the operator and the endpoints. Nothing the node publishes
 verifies for anyone until governance signs it into a new registry version.
 
-Secrets go to stdout by default, which puts them in terminal scrollback and shell
-history; `--out DIR` writes them to `0600` files instead, along with a starter
-config. It refuses to overwrite existing keys — silently replacing an identity
-key would orphan every certificate it ever issued.
+The secret goes to stdout by default, which puts it in terminal scrollback and
+shell history; `--out DIR` writes it to a `0600` file instead, along with a
+starter config. It refuses to overwrite an existing key — silently replacing it
+would drop the node out of the registry while it kept running.
 
 Keys come from the OS CSPRNG (`Signer::generate`). The seeded keys in the
 examples and test helpers are derived from small integers and guessable by
@@ -318,13 +322,12 @@ against `registry.root_key` off mainnet; `clients.url` must too. Either way the
 document is verified against the pinned `governance_address` before anything
 else happens.
 
-At startup the node checks that the registry actually authorises its own signing
-address, and **refuses to start** if not. This is a hard failure rather than a
+At startup the node checks that the registry actually lists its own address, and
+**refuses to start** if not. This is a hard failure rather than a
 warning because it is otherwise the quietest way for a node to fail: it goes on
 ingesting, aggregating and signing, every node-local metric reads healthy, and
-every subscriber silently discards the output. Signing certificates have no
-expiry (SPEC §3.5), so once a node is authorised it stays so until governance
-rotates or removes it.
+every subscriber silently discards the output. Keys have no expiry (SPEC §3.5),
+so once a node is listed it stays so until governance replaces or removes it.
 
 #### Funding is not normalised
 
@@ -368,7 +371,6 @@ Byte layouts and cryptography.
 - Canonical 96-byte price update payload — this layout *is* the protocol.
 - secp256k1 recoverable ECDSA over a keccak256 digest, EIP-712-shaped domain separation. `v` is offset by 27, so the bytes are Ethereum's exactly and an on-chain verifier is a port rather than a redesign.
 - Two curve backends behind one private module: `libsecp256k1` on native targets, `k256` on wasm32 (or anywhere with `--features pure-rust`). Nothing outside the module names a backend type. The split exists so the registry canister can reuse the exact encoding and verification code instead of a port. `k256` recovers about five times slower, which is why it is not the default.
-- `SigningKeyCert` — identity key authorises a hot signing key for a window.
 - `Registry` / `VerifiedRegistry` — the trust root.
 - `UnverifiedFrame` → `VerifiedUpdate` typestate.
 - `ClientList` / `VerifiedClientList`: the governance-signed allow-list, plus the
@@ -379,13 +381,13 @@ Byte layouts and cryptography.
 The transport (SPEC §6.1), pure and without I/O. Callers pass the RNG and
 `now`, so every rule is a unit test.
 
-- **Handshake.** The client signs a transcript that binds the node, a fresh
-  challenge, its own nonce and a fresh X25519 key. The node answers through HPKE
-  (RFC 9180) and signs the result with its live key.
+- **Handshake.** The client signs a transcript that binds the node's address, a
+  fresh challenge, its own nonce and a fresh X25519 key. The node answers
+  through HPKE (RFC 9180) and signs the result with its key.
 - **Control channel.** One AES-256-GCM-SIV key per direction per session, with
   strict counters.
 - **Broadcast keys.** One per node per 60 s epoch. Each is derived from its
-  node, epoch and generation, so it cannot be used out of context. The node
+  node's address, epoch and generation, so it cannot be used out of context. The node
   seals each price frame **once**, and every subscriber gets the same bytes.
 - **Expiry and revocation.** Session deadlines snap to the epoch grid, so no
   client holds a key past its deadline. A revocation forces a rotation off the
@@ -409,8 +411,8 @@ Verification stops at "a registered node really signed this". Sequence monotonic
 ### `oracle-registry-canister`
 
 The node registry as an Internet Computer canister (SPEC §3.6). It is the
-trust root for membership: who the nodes are, which signing key each one holds
-right now, and which keys it held before.
+trust root for membership: which addresses are nodes and clients now, and which
+were before.
 
 - **The canister signs the registry.** Every version is signed with a
   threshold ECDSA key on secp256k1, so the governance address consumers pin is
@@ -418,27 +420,28 @@ right now, and which keys it held before.
   private key exists anywhere. Consumers need no Internet Computer agent; they
   fetch `/registry.json`, check its IC certificate, and verify the signature
   they already verify.
-- **One live key per node.** `rotate_key` is an atomic swap. The old key gets a
-  `retired_at` and stays in `get_key_history` for stored-frame verification,
-  but it never verifies a live frame again, and its address can never be listed
-  again by anyone.
-- **Rules are code, not policy.** One rotation fleet-wide per window, never
-  below `min_nodes`. Each rule is a unit test in `state.rs`, with no canister
-  runtime.
+- **One key per node.** `replace_node` is an atomic swap of addresses. The old
+  address gets a `removed_at` and stays in `get_node_listing` for stored-frame
+  verification, but it never verifies a live frame again.
+- **Rules are code, not policy.** An address is listed once, ever, as a node or
+  as a client; a removal never goes below `min_nodes`. Each rule is a unit test
+  in `state.rs`, with no canister runtime.
 - **Publication only on change.** Each change signs one new version; nothing
   re-signs on a timer. A failed signing round changes nothing. Freshness is
   the IC certificate on each fetch, not the document's age.
 - **Governance is the controller set, and the only caller.** Nodes never call
-  the canister. An operator sends `node-entry.json` or `rotation-cert.json` to
-  governance, which runs `add_node` or `rotate_key`. `inspect_message` drops
+  the canister. An operator sends `node-entry.json`, or the two addresses
+  `oracle-node rotate` prints, to governance, which runs `add_node` or
+  `replace_node`. `inspect_message` drops
   every other principal's ingress, so spam costs the canister nothing. A
   single-controller canister is a single governance key with extra steps; put
   it under a multisig or an SNS with timelocked upgrades.
 
 `state.rs` is the whole state machine and has no IC dependency. `lib.rs` adds
-the caller, the clock, stable memory, and the signing round. Entries,
-certificates and documents cross the Candid boundary as JSON strings in the
-protocol's own format, so there is one schema rather than a Candid mirror.
+the caller, the clock, stable memory, and the signing round. Entries, listings
+and documents cross the Candid boundary as JSON strings in the protocol's own
+format, so there is one schema rather than a Candid mirror. Addresses cross as
+`0x` hex.
 
 `tests/pocket_ic.rs` runs the real wasm on PocketIC with real threshold
 signing. It needs the PocketIC server: set `POCKET_IC_BIN`, or have a `dfx`
@@ -474,7 +477,7 @@ cargo run -p oracle-node --example gen_local_registry -- \
 ORACLE_SIGNING_KEY=<signing key> cargo run -p oracle-node -- start node/all-feeds.toml
 echo <LOCAL_CLIENT_KEY> > client.key
 cargo run -p oracle-client --example subscribe -- node/registry.json 0x<governance> \
-  CRYPTO.BTC/USDT --client-id local-client --client-key client.key
+  CRYPTO.BTC/USDT --client-key client.key
 ```
 
 To run a node you generated with `init`, governance has to sign its entry in —
@@ -553,14 +556,14 @@ authenticated, encrypted transport:
 2. Generates a node with `init`, which governance adds through the canister.
 3. Generates a client key, which governance also adds.
 4. Starts the node against the canister URLs and runs the SDK client.
-5. With the client still running, rotates the node's key and restarts the node.
-   It checks the client's counters: at most one registry refresh, no untrusted
-   frames, no replays.
+5. With the client still running, rotates the node's key through
+   `replace_node` and restarts the node. It checks the client's counters: at
+   most one registry refresh, no untrusted frames, no replays.
 6. Removes the client and checks that the node closes its session and rotates
    its broadcast key.
 7. Lists a second client for about 25 s and checks that the node closes it at
    its deadline.
-8. Prints the canister's key history.
+8. Prints the canister's listings of the old and the new node address.
 
 ```sh
 scripts/e2e-dfx.sh                 # about four minutes; stops the replica after
@@ -577,39 +580,40 @@ The SDK and the node check the canister's certificate themselves, against the
 replica's root key from `dfx ping`. The local gateway passes the certificate
 headers through, as the mainnet `raw` domain does.
 
-### Rotating a signing key
+### Rotating a node's key
 
-A rotation is one canister call, not a registry edit. The node generates the
-key, the operator sends the certificate to governance, and governance's call
-swaps it atomically (SPEC §3.5):
+A rotation is one canister call, not a registry edit. The operator generates
+the next key, sends both addresses to governance, and governance's call swaps
+them atomically (SPEC §3.5):
 
 ```sh
 # 1. A new key beside the live one. Nothing on the node changes yet.
 oracle-node rotate --dir node1 --canister <CANISTER_ID>
-#    writes node1/signing.key.next and node1/rotation-cert.json, and prints:
-#    dfx canister call <CANISTER_ID> rotate_key '("oracle-eu-1", "{...cert...}")'
+#    writes node1/signing.key.next and prints:
+#    dfx canister call <CANISTER_ID> replace_node '("0xOLD…", "0xNEW…")'
 
-# 2. Send rotation-cert.json to governance, which runs that call. The canister
-#    checks the certificate against the node's identity key, refuses an address
-#    it has ever seen, and refuses a second rotation inside the fleet-wide window.
+# 2. Governance runs that call. The canister refuses an address it has ever
+#    seen. Stagger rotations, so a consumer never loses two seats at once.
 
-# 3. The registry now lists only the new key. Move it into place and restart.
+# 3. The registry now lists only the new address. Move the key into place and
+#    restart.
 mv node1/signing.key.next node1/signing.key
 oracle-node start node1/config.toml
 ```
 
 The node is out of each consumer's quorum from step 2 until its first frame
-under the new key triggers that consumer's one registry fetch. The other nodes
-carry the feed through it, exactly as through a restart. The old key is retired
-on the canister and can never be listed again, by anyone.
+under the new key, or its first challenge, triggers that consumer's one
+registry fetch. The other nodes carry the feed through it, exactly as through a
+restart. The old address is retired on the canister and can never be listed
+again, by anyone.
 
 The local generator does not model rotation. It stands in for the canister only
 to sign a document; the rules a rotation needs live in the canister.
 
 `crates/oracle-client/tests/rotation.rs` covers the ways a rotation can go wrong
 from the consumer's side: never learning about the new key, fetching on every
-unknown frame, a retired key that keeps verifying, the replay floor resetting
-with the new key, a de-listed node counting until its last update ages out, and a
+unknown frame, a retired key that keeps verifying, the old and the new address
+both counting, a de-listed node counting until its last update ages out, and a
 registry the source stops confirming reported as healthy.
 
 ### End to end
@@ -659,7 +663,7 @@ on perpetual feeds. Everything else — spot `bookTicker` and `aggTrade`, future
 
 ### Golden vectors
 
-`crates/oracle-wire/tests/vectors/golden.json` freezes the protocol: payload bytes, digests, signatures, frames, feed IDs, certificates, and the registry encoding. A diff there means the wire format changed and previously-issued signatures no longer verify.
+`crates/oracle-wire/tests/vectors/golden.json` freezes the protocol: payload bytes, digests, signatures, frames, feed IDs, and the registry encoding. A diff there means the wire format changed and previously-issued signatures no longer verify.
 
 Regenerate deliberately, and read the diff:
 

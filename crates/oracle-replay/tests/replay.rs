@@ -15,7 +15,6 @@ const BINANCE_SPOT: &str =
     "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker";
 
 const CONFIG: &str = r#"
-node_id = "replay-test"
 tick_interval_ms = 25
 
 [server]

@@ -11,7 +11,7 @@ use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{IngestEvent, Recorder, RecordingConnector};
 use oracle_node::keyfile;
 use oracle_node::{
-    InitOptions, NodeConfig, NodeKeys, PassphraseSource, Pipeline, Rotation, build_adapters,
+    InitOptions, NodeConfig, NodeKey, PassphraseSource, Pipeline, Rotation, build_adapters,
     candid_call,
 };
 use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
@@ -56,10 +56,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate this node's keys and print what to do with them.
+    /// Generate this node's key and print what to do with it.
     Init(InitArgs),
-    /// Generate a new signing key for an existing node and print the registry
-    /// call that swaps it in.
+    /// Generate the next key for an existing node and print the registry call
+    /// that swaps it in.
     Rotate(RotateArgs),
     /// Run the node: ingest, aggregate, sign, serve.
     Start {
@@ -78,20 +78,17 @@ enum Command {
 
 #[derive(Args)]
 struct InitArgs {
-    /// This node's identifier.
-    #[arg(long, default_value_t = InitOptions::default().node_id)]
-    node_id: String,
     /// Who runs it. Operator diversity is what makes the median mean anything.
     #[arg(long, default_value_t = InitOptions::default().operator)]
     operator: String,
     /// The WebSocket endpoint subscribers will connect to.
     #[arg(long, default_value_t = InitOptions::default().endpoint)]
     endpoint: String,
-    /// Write the keys, registry entry, and a starter config to DIR instead of
-    /// printing the secrets to the terminal. The keys are encrypted at rest.
+    /// Write the key, registry entry, and a starter config to DIR instead of
+    /// printing the secret to the terminal. The key is encrypted at rest.
     #[arg(long, value_name = "DIR")]
     out: Option<PathBuf>,
-    /// A 0600 file holding the passphrase that encrypts the keys. Without it,
+    /// A 0600 file holding the passphrase that encrypts the key. Without it,
     /// `--out` prompts at the terminal. Recorded in the starter config.
     #[arg(long, value_name = "FILE", requires = "out")]
     passphrase_file: Option<PathBuf>,
@@ -102,14 +99,14 @@ struct InitArgs {
 
 #[derive(Args)]
 struct RotateArgs {
-    /// The directory `init --out` wrote: identity.key, signing.key, config.toml.
+    /// The directory `init --out` wrote: signing.key, config.toml.
     #[arg(long, value_name = "DIR")]
     dir: PathBuf,
     /// The registry canister id. Prints the `dfx` call governance runs to swap the key.
     #[arg(long, value_name = "CANISTER_ID")]
     canister: Option<String>,
-    /// A 0600 file holding the passphrase that opens the identity key and
-    /// encrypts the new signing key. Defaults to the config's
+    /// A 0600 file holding the passphrase that opens the live key and
+    /// encrypts the next one. Defaults to the config's
     /// `signing.passphrase_file`, then to a prompt.
     #[arg(long, value_name = "FILE")]
     passphrase_file: Option<PathBuf>,
@@ -157,8 +154,7 @@ async fn start(
     let registry = config.fetch_registry().await?;
 
     info!(
-        node_id = %config.node_id,
-        signer = %signer.address(),
+        address = %signer.address(),
         feeds = resolved.feeds.len(),
         "starting"
     );
@@ -169,9 +165,9 @@ async fn start(
     // aggregating and signing perfectly well — every node-local metric reads
     // healthy — while every subscriber discards the output. Refusing to start is
     // the only version of that failure anyone notices.
-    if let Err(error) = verified.authorize(signer_address, wall_clock_unix_nanos()) {
+    if let Err(error) = verified.authorize(signer_address) {
         return Err(format!(
-            "signing key {signer_address} is not authorised by registry v{}: {error}. \
+            "node {signer_address} is not listed in registry v{}: {error}. \
              Nothing this node publishes would be accepted.",
             verified.version()
         )
@@ -208,14 +204,13 @@ async fn start(
         TransportConfig::default()
     };
     let transport = NodeTransport::new(
-        &config.node_id,
         Arc::clone(&signer),
         clients,
         limits,
         config.server.max_pending_feeds,
         unix_now(),
     );
-    let state = ServerState::new(&config.node_id, &resolved.symbols, registry, transport);
+    let state = ServerState::new(&resolved.symbols, registry, transport);
     let shutdown = CancellationToken::new();
     spawn_transport_tasks(
         Arc::clone(state.transport()),
@@ -369,72 +364,57 @@ fn spawn_transport_tasks(
     });
 }
 
-/// Generates a node identity and prints everything needed to run it.
+/// Generates a node key and prints everything needed to run it.
 fn init_command(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let options = InitOptions {
-        node_id: args.node_id,
         operator: args.operator,
         endpoint: args.endpoint,
     };
     let out = args.out;
 
-    let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
-    let keys = NodeKeys::generate(options, now)?;
-    let entry = serde_json::to_string_pretty(&keys.registry_entry())?;
+    let key = NodeKey::generate(options)?;
+    let entry = serde_json::to_string_pretty(&key.registry_entry())?;
     let add_call = args.canister.as_deref().map(|canister| {
-        let compact = serde_json::to_string(&keys.registry_entry()).expect("entry serialises");
+        let compact = serde_json::to_string(&key.registry_entry()).expect("entry serialises");
         candid_call(canister, "add_node", &[&compact])
     });
 
-    println!("Generated a new identity for `{}`.\n", keys.options.node_id);
-    println!("  identity  {}", keys.identity.address());
+    println!("Generated a new node key.\n");
+    println!("  address  {}", key.signing.address().to_checksummed());
     println!(
-        "            Long-lived. Signs certificates, never prices. Keep it out of\n\
-         \x20           the node process, encrypted at rest on this machine."
+        "           The node's id in the registry, and what its price updates\n\
+         \x20          recover to. It never expires; rotate it if you think it leaked."
     );
-    println!("  signing   {}", keys.signing.address());
-    println!(
-        "            What your price updates recover to. Lives in node memory.\n\
-         \x20           It never expires; rotate it if you think it leaked."
-    );
-    println!("  valid     from unix {}, no expiry", keys.cert.not_before);
 
     match &out {
         Some(dir) => {
             // Asked for before anything is written, so a refused prompt leaves
             // no half-initialised directory behind.
             let passphrase = PassphraseSource::from_file(args.passphrase_file.clone())
-                .read("the new key files", true)?;
-            let (identity_path, signing_path) = keys.write_keys(dir, &passphrase)?;
+                .read("the new key file", true)?;
+            let key_path = key.write_key(dir, &passphrase)?;
             let entry_path = dir.join("node-entry.json");
             let config_path = dir.join("config.toml");
             let registry_path = dir.join("registry.json");
             std::fs::write(&entry_path, format!("{entry}\n"))?;
             std::fs::write(
                 &config_path,
-                keys.config_template(
-                    &signing_path,
-                    &registry_path,
-                    args.passphrase_file.as_deref(),
-                ),
+                key.config_template(&key_path, &registry_path, args.passphrase_file.as_deref()),
             )?;
 
             println!("\nWritten");
-            println!("  {}  (age, 0600 — keep offline)", identity_path.display());
             println!(
                 "  {}  (age, 0600 — the node reads this)",
-                signing_path.display()
+                key_path.display()
             );
             println!("  {}  (send to governance)", entry_path.display());
             println!("  {}  (starter config)", config_path.display());
         }
         None => {
-            println!("\nSecret keys");
-            println!("  identity  {}", &*keys.identity.to_secret_hex());
-            println!("  signing   {}", &*keys.signing.to_secret_hex());
+            println!("\nSecret key\n  {}", &*key.signing.to_secret_hex());
             println!(
-                "\n  These are now in your terminal scrollback and shell history. Re-run\n  \
-                 with `--out DIR` to write them to 0600 files instead."
+                "\n  This is now in your terminal scrollback and shell history. Re-run\n  \
+                 with `--out DIR` to write it to a 0600 file instead."
             );
             println!("\nSend to governance\n\n{entry}");
         }
@@ -543,52 +523,46 @@ fn log_update(update: &oracle_wire::SignedUpdate) {
     );
 }
 
-/// Generates a new signing key for an existing node.
+/// Generates the next key for an existing node.
 ///
-/// Nothing on the node changes yet. The canister swaps keys atomically, so the
-/// node keeps signing with its old key until the registry lists the new one.
+/// Nothing on the node changes yet. The canister swaps addresses atomically,
+/// so the node keeps signing with its old key until the registry lists the
+/// new one.
 fn rotate_command(args: RotateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig::load(&args.dir.join("config.toml"))?;
-    // One passphrase opens the identity key and seals the new signing key, so
-    // the node's `signing.passphrase_file` keeps working after the swap.
+    // One passphrase opens the live key and seals the next one, so the node's
+    // `signing.passphrase_file` keeps working after the swap.
     let passphrase = PassphraseSource::from_file(
         args.passphrase_file
             .clone()
             .or_else(|| config.signing.passphrase_file.clone()),
     )
-    .read("identity.key", false)?;
-    let identity = keyfile::load_signer(&args.dir.join("identity.key"), Some(&passphrase))?;
+    .read("signing.key", false)?;
+    let live_path = args.dir.join("signing.key");
+    let live = keyfile::load_signer(&live_path, Some(&passphrase))?;
 
-    let now = wall_clock_unix_nanos() / oracle_types::NANOS_PER_SEC;
-    let rotation = Rotation::generate(&identity, &config.node_id, now)?;
-    let (key_path, cert_path) = rotation.write(&args.dir, &passphrase)?;
+    let rotation = Rotation::generate(live.address())?;
+    let next_path = rotation.write(&args.dir, &passphrase)?;
 
-    println!("Generated a new signing key for `{}`.\n", config.node_id);
-    println!("  new signing  {}", rotation.signing.address());
+    println!("Generated the next key for this node.\n");
+    println!("  old address  {}", rotation.old.to_checksummed());
     println!(
-        "  valid        from unix {}, no expiry",
-        rotation.cert.not_before
+        "  new address  {}",
+        rotation.signing.address().to_checksummed()
     );
     println!("\nWritten");
-    println!("  {}  (age, 0600 — not loaded yet)", key_path.display());
-    println!("  {}  (send to governance)", cert_path.display());
+    println!("  {}  (age, 0600 — not loaded yet)", next_path.display());
 
-    let call = args.canister.as_deref().map_or_else(
-        || {
-            "dfx canister call <CANISTER_ID> rotate_key '(<node-id>, <rotation-cert.json>)'"
-                .to_owned()
-        },
-        |canister| rotation.canister_call(canister),
-    );
+    let call = rotation.canister_call(args.canister.as_deref().unwrap_or("<CANISTER_ID>"));
     println!(
-        "\nNext\n\n  1. Send the certificate to governance. They swap the key in with:\n\n     \
+        "\nNext\n\n  1. Send both addresses to governance. They swap the new one in with:\n\n     \
          {call}\n\n  \
-         2. Once the call succeeds the registry lists only the new key. Move it into \
-         place and restart:\n\n     mv {key} {live}\n\n  \
-         3. Consumers pick the new key up from the first frame it signs. The old key \
+         2. Once the call succeeds the registry lists only the new address. Move the \
+         key into place and restart:\n\n     mv {next} {live}\n\n  \
+         3. Consumers follow on the first frame the new key signs. The old address \
          is retired on the canister and can never be listed again.",
-        key = key_path.display(),
-        live = args.dir.join("signing.key").display(),
+        next = next_path.display(),
+        live = live_path.display(),
     );
     Ok(())
 }

@@ -15,20 +15,10 @@
 //! Skip these and the signatures buy you nothing.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use oracle_types::{FeedId, NANOS_PER_SEC, PriceUpdate};
-use oracle_wire::{
-    Address, CompressedPublicKey, KeyHistoryEntry, UnverifiedFrame, VerifiedRegistry, VerifyError,
-};
-
-/// A node's stable identity across registry versions.
-///
-/// Registry indices are positional and signing addresses are rotated, so neither
-/// survives the events this type exists to be correct across. Reference-counted
-/// because it is cloned once per accepted frame on the hot path.
-pub type NodeId = Arc<str>;
+use oracle_wire::{Address, NodeListing, UnverifiedFrame, VerifiedRegistry, VerifyError};
 
 /// Freshness policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,17 +121,12 @@ pub enum RejectReason {
 pub struct Accepted {
     /// The update.
     pub update: PriceUpdate,
-    /// The signing key it recovered to.
-    ///
-    /// Identifies the *key*, not the node. Keys rotate; anything that outlives a
-    /// rotation must use [`Accepted::node`].
+    /// The node that signed it: the address its key recovered to.
     pub signer: Address,
-    /// Which node signed it.
-    pub node: NodeId,
     /// That node's index in the registry it was verified against.
     ///
     /// Positional, and therefore only meaningful against that exact registry
-    /// version. Use [`Accepted::node`] for anything that outlives a refresh.
+    /// version. Use [`Accepted::signer`] for anything that outlives a refresh.
     pub node_index: usize,
 }
 
@@ -151,17 +136,15 @@ pub struct Accepted {
 /// across updates — a verifier rebuilt per message provides no replay protection
 /// at all.
 ///
-/// The marks are keyed by **node**, not by signing key. Keying them by key would
-/// hand every rotation a fresh replay floor, and registry indices shift on every
-/// refresh. The node id is the one key that survives both.
+/// The marks are keyed by node address, because registry indices shift on
+/// every refresh. A rotation gives the new address a fresh floor. That is safe:
+/// the new key has never signed, and the old key's frames are
+/// [`RejectReason::RetiredKey`].
 pub struct Verifier {
     registry: VerifiedRegistry,
     config: VerifyConfig,
-    high_water: HashMap<(NodeId, FeedId), u64>,
-    /// Registry index → node id, so the hot path clones an `Arc` rather than a
-    /// `String` for every accepted frame.
-    node_ids: Vec<NodeId>,
-    /// Signing keys that a registry this verifier once trusted listed, and the
+    high_water: HashMap<(Address, FeedId), u64>,
+    /// Addresses that a registry this verifier once trusted listed, and the
     /// current one does not. Reported as [`RejectReason::RetiredKey`] rather than
     /// unknown, so the client does not go looking for a registry it already has.
     retired: HashSet<Address>,
@@ -172,7 +155,6 @@ impl Verifier {
     #[must_use]
     pub fn new(registry: VerifiedRegistry, config: VerifyConfig) -> Self {
         Self {
-            node_ids: intern_node_ids(&registry),
             registry,
             config,
             high_water: HashMap::new(),
@@ -186,20 +168,18 @@ impl Verifier {
         &self.registry
     }
 
-    /// Replaces the registry, keeping the sequence high-water marks.
-    ///
-    /// Marks are retained deliberately: a registry rotation must not reopen the
-    /// replay window for nodes that remain listed. They survive the swap because
-    /// they are keyed by node id, which is stable across versions, rather than by
-    /// registry index, which is not.
+    /// Replaces the registry, keeping the sequence high-water marks of the
+    /// nodes that stay listed, so a refresh does not reopen their replay window.
     pub fn set_registry(&mut self, registry: VerifiedRegistry) {
-        let still_listed: HashSet<Address> = signing_addresses(&registry).collect();
-        for address in signing_addresses(&self.registry) {
+        let still_listed: HashSet<Address> = addresses(&registry).collect();
+        for address in addresses(&self.registry) {
             if !still_listed.contains(&address) {
                 self.retired.insert(address);
             }
         }
-        self.node_ids = intern_node_ids(&registry);
+        // A retired address never verifies again, so its marks are dead weight.
+        self.high_water
+            .retain(|(node, _), _| still_listed.contains(node));
         self.registry = registry;
     }
 
@@ -228,11 +208,6 @@ impl Verifier {
         let update = *verified.update();
         let signer = verified.signer();
         let node_index = verified.node_index();
-        let node = self
-            .node_ids
-            .get(node_index)
-            .cloned()
-            .ok_or(VerifyError::UnknownSigner { signer })?;
 
         if update.observation_time_ns > update.publish_time_ns {
             return Err(RejectReason::IncoherentTimestamps { signer });
@@ -262,7 +237,7 @@ impl Verifier {
             }
         }
 
-        let key = (Arc::clone(&node), update.feed_id);
+        let key = (signer, update.feed_id);
         if let Some(last_seq) = self.high_water.get(&key).copied()
             && update.seq <= last_seq
         {
@@ -277,82 +252,50 @@ impl Verifier {
         Ok(Accepted {
             update,
             signer,
-            node,
             node_index,
         })
     }
 }
 
-/// Verifies a stored frame against the key that was live when it was published.
+/// Verifies a stored frame against the node that was listed when it was
+/// published.
 ///
 /// The live path never calls this. It serves audit and dispute: a frame signed
-/// last month under a key since rotated must still verify, and one signed under
-/// that key *after* it was retired must not (SPEC §3.5).
-///
-/// `identity` is the node's identity key, from any registry version that
-/// listed the node. `history` is the node's key history as the registry
-/// canister serves it. The certificate in each entry is checked against
-/// `identity`; the retirement time is the canister's word.
+/// last month by a node since rotated out must still verify, and one signed
+/// after it was removed must not (SPEC §3.5). `listing` is what the registry
+/// canister serves for the frame's signer. Its times are the canister's word.
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError::UnknownSigner`] if no entry carries the signing key,
-/// [`VerifyError::CertificateIssuerMismatch`] if its certificate was not issued
-/// by `identity`, and [`VerifyError::CertificateNotYetValid`] or
-/// [`VerifyError::CertificateExpired`] if the publish time falls outside the
-/// key's live window.
-pub fn verify_historical(
-    frame: &[u8],
-    identity: &CompressedPublicKey,
-    history: &[KeyHistoryEntry],
-) -> Result<PriceUpdate, VerifyError> {
+/// Returns [`VerifyError::UnknownSigner`] if the frame is not signed by
+/// `listing.address`, and [`VerifyError::NotListedAt`] if the publish time
+/// falls outside the listing.
+pub fn verify_historical(frame: &[u8], listing: &NodeListing) -> Result<PriceUpdate, VerifyError> {
     let parsed = UnverifiedFrame::parse(frame)?;
     let signer = parsed.recover_signer()?;
-    let entry = history
-        .iter()
-        .find(|entry| entry.cert.address == signer)
-        .ok_or(VerifyError::UnknownSigner { signer })?;
-
-    let expected = identity.address()?;
-    let issuer = entry.cert.recover_issuer()?;
-    if issuer != expected {
-        return Err(VerifyError::CertificateIssuerMismatch {
-            node_id: entry.cert.node_id.clone(),
-            address: signer,
-            issuer,
-            expected,
-        });
+    if signer != listing.address {
+        return Err(VerifyError::UnknownSigner { signer });
     }
-
     let update = parsed.decode_unverified()?;
-    entry.cert.check_covers(update.publish_time_ns)?;
-    if let Some(retired_at) = entry.retired_at
-        && update.publish_time_ns >= retired_at.saturating_mul(NANOS_PER_SEC)
-    {
-        return Err(VerifyError::CertificateExpired {
+    let published = update.publish_time_ns;
+    let after_added = published >= listing.added_at.saturating_mul(NANOS_PER_SEC);
+    let before_removed = listing
+        .removed_at
+        .is_none_or(|removed_at| published < removed_at.saturating_mul(NANOS_PER_SEC));
+    if !(after_added && before_removed) {
+        return Err(VerifyError::NotListedAt {
             signer,
-            not_after: retired_at,
-            published: update.publish_time_ns / NANOS_PER_SEC,
+            published: published / NANOS_PER_SEC,
+            added_at: listing.added_at,
+            removed_at: listing.removed_at,
         });
     }
     Ok(update)
 }
 
-/// Every signing address a registry lists.
-fn signing_addresses(registry: &VerifiedRegistry) -> impl Iterator<Item = Address> + '_ {
-    registry
-        .nodes()
-        .iter()
-        .flat_map(|node| node.signing_keys.iter().map(|cert| cert.address))
-}
-
-/// Interns the registry's node ids, positionally.
-fn intern_node_ids(registry: &VerifiedRegistry) -> Vec<NodeId> {
-    registry
-        .nodes()
-        .iter()
-        .map(|node| NodeId::from(node.node_id.as_str()))
-        .collect()
+/// Every address a registry lists.
+fn addresses(registry: &VerifiedRegistry) -> impl Iterator<Item = Address> + '_ {
+    registry.nodes().iter().map(|node| node.address)
 }
 
 /// Converts a duration to nanoseconds, saturating.
@@ -363,7 +306,7 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{NODE_ID, TestNode, registry_with, update_at};
+    use crate::testing::{TestNode, registry_with, update_at};
     use oracle_types::NANOS_PER_SEC;
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
@@ -374,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_update_from_a_registered_node_is_accepted() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let frame = node.sign(&update_at(NOW, 1));
         let accepted = verifier.accept(&frame, NOW).expect("accepted");
@@ -384,8 +327,8 @@ mod tests {
 
     #[test]
     fn an_update_from_an_unregistered_node_is_refused() {
-        let node = TestNode::new(1, NODE_ID);
-        let impostor = TestNode::new(9, "impostor");
+        let node = TestNode::new(1);
+        let impostor = TestNode::new(9);
         let mut verifier = verifier(&node);
         let frame = impostor.sign(&update_at(NOW, 1));
         assert!(matches!(
@@ -398,7 +341,7 @@ mod tests {
     /// the sequence number reveals that it has been seen before.
     #[test]
     fn a_replayed_frame_is_refused_even_though_its_signature_is_valid() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let frame = node.sign(&update_at(NOW, 5));
 
@@ -415,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_lower_sequence_number_is_refused() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         assert!(
             verifier
@@ -436,7 +379,7 @@ mod tests {
     /// advancing independently must not lock each other out.
     #[test]
     fn sequence_tracking_is_per_feed_and_per_node() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
 
         let mut first = update_at(NOW, 10);
@@ -452,7 +395,7 @@ mod tests {
     /// the local clock notices.
     #[test]
     fn a_withheld_update_goes_stale() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let frame = node.sign(&update_at(NOW, 1));
 
@@ -469,7 +412,7 @@ mod tests {
 
     #[test]
     fn an_update_from_the_future_is_refused() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let ahead = node.sign(&update_at(NOW + 5 * NANOS_PER_SEC, 1));
         assert!(matches!(
@@ -480,7 +423,7 @@ mod tests {
 
     #[test]
     fn small_clock_skew_is_tolerated() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         // 100ms ahead, inside the 500ms tolerance.
         let ahead = node.sign(&update_at(NOW + 100_000_000, 1));
@@ -489,7 +432,7 @@ mod tests {
 
     #[test]
     fn incoherent_timestamps_are_refused() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let mut update = update_at(NOW, 1);
         update.observation_time_ns = update.publish_time_ns + 1;
@@ -503,7 +446,7 @@ mod tests {
     /// could lock out the legitimate update simply by replaying it early.
     #[test]
     fn a_clock_rejected_frame_does_not_advance_the_high_water_mark() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
 
         let future = node.sign(&update_at(NOW + 5 * NANOS_PER_SEC, 7));
@@ -516,7 +459,7 @@ mod tests {
 
     #[test]
     fn a_tampered_payload_is_refused() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let mut frame = node.sign(&update_at(NOW, 1));
         // Flip a bit inside the signed region.
@@ -526,30 +469,31 @@ mod tests {
         assert!(verifier.accept(&frame, NOW).is_err());
     }
 
-    /// Replay state follows the node, not the key. After a rotation the new key
-    /// inherits the node's sequence floor rather than starting from nothing.
+    /// A rotation lists a new address. Its replay floor starts fresh, and the
+    /// old key's frames, replays included, stop at the retired check.
     #[test]
-    fn rotating_a_signing_key_does_not_reopen_the_replay_window() {
-        let mut node = TestNode::new(1, NODE_ID);
+    fn a_rotation_moves_the_replay_floor_to_the_new_address() {
+        let mut node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let update = update_at(NOW, 5);
-        assert!(verifier.accept(&node.sign(&update), NOW).is_ok());
+        let old_frame = node.sign(&update);
+        assert!(verifier.accept(&old_frame, NOW).is_ok());
 
         node.rotate();
         verifier.set_registry(registry_with(&[&node]));
 
-        // The same sequence number, re-signed under the new key, is still a replay.
-        assert!(
-            matches!(
-                verifier.accept(&node.sign(&update), NOW),
-                Err(RejectReason::Replayed {
-                    seq: 5,
-                    last_seq: 5,
-                    ..
-                })
-            ),
-            "the new key must inherit the node's sequence floor"
-        );
+        assert!(matches!(
+            verifier.accept(&old_frame, NOW),
+            Err(RejectReason::RetiredKey { .. })
+        ));
+        let accepted = verifier
+            .accept(&node.sign(&update), NOW)
+            .expect("the new key has its own floor");
+        assert_eq!(accepted.signer, node.signing_address());
+        assert!(matches!(
+            verifier.accept(&node.sign(&update), NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
     }
 
     /// One live key per node. The old key is retired on adoption, and it is
@@ -557,7 +501,7 @@ mod tests {
     /// for a newer registry it already has.
     #[test]
     fn a_rotated_out_key_is_retired_not_unknown() {
-        let mut node = TestNode::new(1, NODE_ID);
+        let mut node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let old_address = node.signing_address();
 
@@ -572,47 +516,49 @@ mod tests {
         let accepted = verifier
             .accept(&node.sign(&update_at(NOW, 2)), NOW)
             .expect("the live key verifies");
-        assert_eq!(&*accepted.node, NODE_ID);
+        assert_eq!(accepted.signer, node.signing_address());
     }
 
-    /// Stored frames verify against the key that was live when they were
-    /// published, and not after that key was retired.
+    /// Stored frames verify while their signer was listed, and not after.
     #[test]
-    fn historical_verification_follows_the_key_that_was_live() {
-        let mut node = TestNode::new(1, NODE_ID);
-        let before = node.sign(&update_at(NOW, 1));
-        let later = NOW + 10 * NANOS_PER_SEC;
-        let after_retirement = node.sign(&update_at(later, 2));
+    fn historical_verification_follows_the_listing() {
+        let node = TestNode::new(1);
+        let added_at = NOW / NANOS_PER_SEC - 60;
+        let removed_at = NOW / NANOS_PER_SEC + 5;
+        let listing = NodeListing {
+            address: node.signing_address(),
+            operator: "test".to_owned(),
+            added_at,
+            removed_at: Some(removed_at),
+        };
+        let at = |secs: u64, seq| node.sign(&update_at(secs * NANOS_PER_SEC, seq));
 
-        node.rotate();
-        let rotated_at = NOW / NANOS_PER_SEC + 5;
-        let history = node.history(rotated_at);
-        let identity = node.identity_key();
-
-        assert!(verify_historical(&before, &identity, &history).is_ok());
-        assert!(matches!(
-            verify_historical(&after_retirement, &identity, &history),
-            Err(VerifyError::CertificateExpired { not_after, .. }) if not_after == rotated_at
-        ));
+        assert!(verify_historical(&at(added_at, 1), &listing).is_ok());
+        assert!(verify_historical(&at(removed_at - 1, 2), &listing).is_ok());
+        for outside in [added_at - 1, removed_at] {
+            assert!(matches!(
+                verify_historical(&at(outside, 3), &listing),
+                Err(VerifyError::NotListedAt { published, .. }) if published == outside
+            ));
+        }
+        let still_listed = NodeListing {
+            removed_at: None,
+            ..listing.clone()
+        };
         assert!(
-            verify_historical(&node.sign(&update_at(later, 3)), &identity, &history).is_ok(),
-            "the live generation has no retirement bound"
+            verify_historical(&at(removed_at + 3_600, 4), &still_listed).is_ok(),
+            "a listed node has no end"
         );
-
-        let impostor = TestNode::new(9, "impostor");
+        let impostor = TestNode::new(9);
         assert!(matches!(
-            verify_historical(&before, &impostor.identity_key(), &history),
-            Err(VerifyError::CertificateIssuerMismatch { .. })
-        ));
-        assert!(matches!(
-            verify_historical(&impostor.sign(&update_at(NOW, 1)), &identity, &history),
+            verify_historical(&impostor.sign(&update_at(NOW, 1)), &listing),
             Err(VerifyError::UnknownSigner { .. })
         ));
     }
 
     #[test]
     fn rotating_the_registry_keeps_replay_protection() {
-        let node = TestNode::new(1, NODE_ID);
+        let node = TestNode::new(1);
         let mut verifier = verifier(&node);
         let frame = node.sign(&update_at(NOW, 4));
         assert!(verifier.accept(&frame, NOW).is_ok());

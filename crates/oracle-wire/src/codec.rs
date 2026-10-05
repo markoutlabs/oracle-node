@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn string_cap_is_enforced() {
         let mut out = Vec::new();
-        assert!(out.try_put_str("node_id", "oracle-eu-1", 64).is_ok());
+        assert!(out.try_put_str("operator", "acme", 64).is_ok());
         assert!(matches!(
-            out.try_put_str("node_id", &"x".repeat(65), 64),
+            out.try_put_str("operator", &"x".repeat(65), 64),
             Err(WireError::FieldTooLong {
                 limit: 64,
                 actual: 65,

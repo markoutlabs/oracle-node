@@ -15,17 +15,16 @@
 //! ```
 //!
 //! This stands in for the registry canister on a laptop. Rotation is not
-//! modelled here: it is a canister call (`oracle-node rotate`), and the
-//! canister is what serialises rotations and retires old keys (SPEC §3.6).
+//! modelled here: it is the canister's `replace_node`, which
+//! `oracle-node rotate` prints, and the canister retires old addresses
+//! (SPEC §3.6).
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use oracle_wire::{
-    ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer, SigningKeyCert, WireError,
-};
+use oracle_wire::{ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer, WireError};
 
-/// Far-future expiry for generated keys.
+/// Far-future expiry for the local client.
 const FOREVER: u64 = 4_102_444_800;
 
 /// Governance key seed. Signs the registry; pinned by every consumer.
@@ -33,9 +32,6 @@ const GOVERNANCE_SEED: u8 = 0x33;
 
 /// The local client's API key seed.
 const CLIENT_SEED: u8 = 0x60;
-
-/// The local client's id in the client list.
-const CLIENT_ID: &str = "local-client";
 
 /// Generates a governance-signed local registry with deterministic keys.
 ///
@@ -92,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let entry: NodeEntry = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not a node entry: {e}", path.display()))?;
-        eprintln!("# including {} from {}", entry.node_id, path.display());
+        eprintln!("# including {} from {}", entry.address, path.display());
         entries.push(entry);
     }
 
@@ -113,15 +109,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             now,
             60,
             vec![ClientEntry {
-                client_id: CLIENT_ID.to_owned(),
-                pubkey: client.public_key(),
+                address: client.address(),
                 expires_at: FOREVER,
             }],
         )?;
         std::fs::write(path, serde_json::to_string_pretty(&list)?)
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         eprintln!("# client list written to {}", path.display());
-        eprintln!("LOCAL_CLIENT_ID={CLIENT_ID}");
         eprintln!("LOCAL_CLIENT_KEY={}", hex32(CLIENT_SEED));
     }
 
@@ -129,42 +123,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("# Pin this address in every node and consumer config.");
     for index in 1..=options.nodes {
         eprintln!(
-            "{}_SIGNING_KEY={}",
-            node_id(index).to_uppercase().replace('-', "_"),
-            hex32(signing_seed(index)),
+            "ORACLE_LOCAL_{index}_SIGNING_KEY={}",
+            hex32(signing_seed(index))
         );
     }
     Ok(())
 }
 
 fn entry(index: u8, options: &Options) -> Result<NodeEntry, WireError> {
-    let id = node_id(index);
-    let identity = Signer::from_secret_bytes([identity_seed(index); 32])?;
     let signing = Signer::from_secret_bytes([signing_seed(index); 32])?;
-    let cert = SigningKeyCert::issue(&identity, &id, signing.address(), 0, FOREVER)?;
-
     Ok(NodeEntry {
-        node_id: id.clone(),
+        address: signing.address(),
         // Distinct operator names by default: five nodes under one operator is
         // one node wearing a costume (SPEC §9.2). Local runs cannot make that
         // true, but they should not encode the opposite either.
         operator: format!("local-{index}"),
-        identity_pubkey: identity.public_key(),
         endpoints: vec![format!(
             "ws://127.0.0.1:{}/v2/ws",
             options.base_port + u16::from(index) - 1
         )],
-        signing_keys: vec![cert],
         weight: 1,
     })
-}
-
-fn node_id(index: u8) -> String {
-    format!("oracle-local-{index}")
-}
-
-const fn identity_seed(index: u8) -> u8 {
-    0x10 + index
 }
 
 const fn signing_seed(index: u8) -> u8 {

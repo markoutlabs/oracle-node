@@ -52,19 +52,16 @@ fn secret_like_strings(text: &str) -> usize {
 }
 
 #[test]
-fn init_prints_both_keys_and_the_registry_entry() {
-    let output = run(&["init", "--node-id", "oracle-eu-1", "--operator", "acme"]);
+fn init_prints_the_key_and_the_registry_entry() {
+    let output = run(&["init", "--operator", "acme"]);
     assert!(output.status.success());
     let text = stdout(&output);
 
-    // Two keys, because the two-tier split is the design.
     assert_eq!(
         secret_like_strings(&text),
-        2,
-        "expected exactly the identity and signing secrets:\n{text}"
+        1,
+        "expected exactly the node's secret:\n{text}"
     );
-    assert!(text.contains("identity"), "{text}");
-    assert!(text.contains("signing"), "{text}");
 
     // The registry entry is the thing the operator has to hand onwards.
     let entry = text
@@ -79,27 +76,17 @@ fn init_prints_both_keys_and_the_registry_entry() {
         .next()
         .expect("an entry follows")
         .expect("a valid registry entry");
-    assert_eq!(parsed.node_id, "oracle-eu-1");
     assert_eq!(parsed.operator, "acme");
-    assert_eq!(parsed.signing_keys.len(), 1);
-
-    // And the certificate in it really was issued by the identity key printed.
-    let issuer = parsed
-        .signing_keys
-        .first()
-        .expect("one certificate")
-        .recover_issuer()
-        .expect("recovers");
     assert!(
-        text.contains(&issuer.to_string()),
-        "the certificate issuer must be the identity address shown"
+        text.contains(&parsed.address.to_checksummed()),
+        "the entry must list the address shown"
     );
 }
 
 /// Two runs must never produce the same node. A key-generation path that seeded
 /// itself from the clock, or from a constant, would pass every other test here.
 #[test]
-fn init_generates_a_different_identity_every_time() {
+fn init_generates_a_different_key_every_time() {
     let first = stdout(&run(&["init"]));
     let second = stdout(&run(&["init"]));
     assert_ne!(first, second);
@@ -131,55 +118,37 @@ fn init_with_out_writes_files_and_prints_no_secrets() {
         "--out must keep secrets off stdout:\n{text}"
     );
 
-    for name in [
-        "identity.key",
-        "signing.key",
-        "node-entry.json",
-        "config.toml",
-    ] {
+    for name in ["signing.key", "node-entry.json", "config.toml"] {
         assert!(dir.join(name).is_file(), "{name} was not written");
     }
+    assert!(!dir.join("identity.key").exists(), "a node has one key");
 
-    // At rest both keys are age files. The hex never touches the disk.
-    for name in ["identity.key", "signing.key"] {
-        let on_disk = std::fs::read_to_string(dir.join(name)).expect("readable");
-        assert!(
-            oracle_node::keyfile::is_encrypted(&on_disk),
-            "{name} is not encrypted"
-        );
-        assert_eq!(
-            secret_like_strings(&on_disk),
-            0,
-            "{name} holds plaintext hex"
-        );
-    }
-    // The written signing key is the one the node will load.
+    // At rest the key is an age file. The hex never touches the disk.
+    let on_disk = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
+    assert!(oracle_node::keyfile::is_encrypted(&on_disk));
+    assert_eq!(secret_like_strings(&on_disk), 0, "plaintext hex on disk");
+    // The written key is the one the node will load.
     let signer = load_key(&dir.join("signing.key"));
     let entry: oracle_wire::NodeEntry = serde_json::from_str(
         &std::fs::read_to_string(dir.join("node-entry.json")).expect("readable"),
     )
     .expect("a valid entry");
-    assert_eq!(
-        entry.signing_keys.first().expect("one certificate").address,
-        signer.address()
-    );
+    assert_eq!(entry.address, signer.address());
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        for name in ["identity.key", "signing.key"] {
-            let mode = std::fs::metadata(dir.join(name))
-                .expect("exists")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o077, 0, "{name} is readable by others");
-        }
+        let mode = std::fs::metadata(dir.join("signing.key"))
+            .expect("exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "the key is readable by others");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A rotation produces a new key beside the live one, never over it, and the
-/// printed canister call carries a certificate the identity key issued.
+/// printed canister call names the live address and the new one.
 #[test]
 fn rotate_writes_the_next_key_beside_the_live_one() {
     let dir = scratch("rotate");
@@ -205,10 +174,7 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
         0,
         "rotate must keep secrets off stdout:\n{text}"
     );
-    assert!(
-        text.contains("dfx canister call aaaaa-aa rotate_key"),
-        "{text}"
-    );
+    let live = load_key(&dir.join("signing.key"));
 
     let live_after = std::fs::read_to_string(dir.join("signing.key")).expect("readable");
     assert_eq!(
@@ -221,13 +187,12 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
         "the next key must be encrypted"
     );
     let next = load_key(&dir.join("signing.key.next"));
-    let cert: oracle_wire::SigningKeyCert = serde_json::from_str(
-        &std::fs::read_to_string(dir.join("rotation-cert.json")).expect("written"),
-    )
-    .expect("a certificate");
-    assert_eq!(cert.address, next.address());
-    let identity = load_key(&dir.join("identity.key"));
-    assert_eq!(cert.recover_issuer().expect("recovers"), identity.address());
+    let call = format!(
+        "dfx canister call aaaaa-aa replace_node '(\"{}\", \"{}\")'",
+        live.address().to_checksummed(),
+        next.address().to_checksummed()
+    );
+    assert!(text.contains(&call), "{text}");
 
     // A second rotation before the first completed must not clobber the key.
     let second = run(&["rotate", "--dir", path]);
@@ -236,8 +201,8 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Overwriting an identity key would orphan every certificate it ever issued,
-/// and the node would keep running until the registry stopped matching.
+/// Overwriting the key would drop the node out of the registry, and the node
+/// would keep running while nobody accepted what it signs.
 #[test]
 fn init_refuses_to_overwrite_existing_keys() {
     let dir = scratch("clobber");
@@ -252,7 +217,7 @@ fn init_refuses_to_overwrite_existing_keys() {
     let second = run(&["init", "--out", path, "--passphrase-file", &pass]);
     assert!(!second.status.success(), "the second init must fail");
     assert!(
-        String::from_utf8_lossy(&second.stderr).contains("identity.key"),
+        String::from_utf8_lossy(&second.stderr).contains("signing.key"),
         "the error should name the file it refused to clobber"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -309,19 +274,8 @@ fn init_with_out_needs_a_passphrase_source_when_there_is_no_terminal() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!dir.join("identity.key").exists(), "nothing may be written");
+    assert!(!dir.join("signing.key").exists(), "nothing may be written");
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn init_rejects_a_node_id_the_certificate_cannot_carry() {
-    let output = run(&["init", "--node-id", &"x".repeat(65)]);
-    assert!(!output.status.success());
-    assert_eq!(
-        secret_like_strings(&stdout(&output)),
-        0,
-        "a failed init must not print keys it is about to throw away"
-    );
 }
 
 #[test]

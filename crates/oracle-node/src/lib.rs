@@ -23,6 +23,6 @@ pub mod pipeline;
 
 pub use adapters::build_adapters;
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
-pub use init::{InitError, InitOptions, NodeKeys, Rotation, candid_call};
+pub use init::{InitError, InitOptions, NodeKey, Rotation, candid_call};
 pub use keyfile::{KeyFileError, PassphraseSource};
 pub use pipeline::{Pipeline, PipelineStats};

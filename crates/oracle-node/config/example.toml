@@ -4,8 +4,6 @@
 # separate instrument list to keep in sync. Two lists would drift, and the
 # failure mode of that drift is a feed that quietly loses a venue.
 
-node_id = "oracle-eu-1"
-
 # How often to evaluate every feed. Must be at or below the tightest feed's rate
 # cap (50ms by default), or the cap becomes the tick rate and the deviation
 # trigger never fires early.

@@ -17,13 +17,11 @@ pub const PAYLOAD_VERSION: u8 = 1;
 /// Payload kind for a price update.
 pub const KIND_PRICE_UPDATE: u8 = 0x01;
 
-/// Payload kind for a signing-key certificate.
+/// Payload kind for a node registry.
 ///
 /// Control-plane kinds have the high bit set, so a data payload can never be
-/// confused with one even though both share a digest function.
-pub const KIND_SIGNING_KEY_CERT: u8 = 0x81;
-
-/// Payload kind for a node registry.
+/// confused with one even though both share a digest function. `0x81` signed
+/// the retired signing-key certificate and is never reused.
 pub const KIND_REGISTRY: u8 = 0x82;
 
 /// Payload kind for a client's transport authentication (SPEC §6.1).
@@ -238,12 +236,12 @@ mod tests {
         );
 
         let mut bytes = encode_price_update(&sample());
-        bytes[1] = KIND_SIGNING_KEY_CERT;
+        bytes[1] = KIND_REGISTRY;
         assert_eq!(
             decode_price_update(&bytes),
             Err(WireError::UnexpectedKind {
                 expected: KIND_PRICE_UPDATE,
-                actual: KIND_SIGNING_KEY_CERT
+                actual: KIND_REGISTRY
             })
         );
     }
