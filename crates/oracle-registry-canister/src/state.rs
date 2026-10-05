@@ -7,9 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oracle_wire::{
-    Address, ClientEntry, ClientList, CompressedPublicKey, MAX_CLIENTS, MAX_ENDPOINT_LEN,
-    MAX_ENDPOINTS, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry, NodeListing, Quorum, Registry,
-    Signature, WireError,
+    Address, ClientEntry, ClientList, CompressedPublicKey, MAX_CLIENTS, MAX_NODES, NodeEntry,
+    NodeListing, Quorum, Registry, Signature, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -210,7 +209,9 @@ impl State {
         if self.nodes.len() >= MAX_NODES {
             return Err(StateError::TooManyNodes);
         }
-        validate_entry(&entry)?;
+        entry
+            .validate()
+            .map_err(|error| StateError::InvalidEntry(error.to_string()))?;
         let NodeEntry {
             address,
             operator,
@@ -313,7 +314,7 @@ impl State {
     /// # Errors
     ///
     /// Returns a wire error if the document does not encode, which means a
-    /// listed entry broke a limit that `validate_entry` should have caught.
+    /// listed entry broke a limit that `NodeEntry::validate` should have caught.
     pub fn unsigned_document(&self, now: u64) -> Result<UnsignedDocument, StateError> {
         let version = self.version.saturating_add(1);
         let nodes: Vec<NodeEntry> = self
@@ -512,37 +513,6 @@ impl State {
         }
         Ok(())
     }
-}
-
-fn validate_entry(entry: &NodeEntry) -> Result<(), StateError> {
-    if entry.operator.trim().is_empty() || entry.operator.len() > MAX_OPERATOR_LEN {
-        return Err(StateError::InvalidEntry(format!(
-            "operator must be 1..={MAX_OPERATOR_LEN} bytes"
-        )));
-    }
-    if entry.endpoints.is_empty() || entry.endpoints.len() > MAX_ENDPOINTS {
-        return Err(StateError::InvalidEntry(format!(
-            "endpoints must number 1..={MAX_ENDPOINTS}"
-        )));
-    }
-    for endpoint in &entry.endpoints {
-        if endpoint.len() > MAX_ENDPOINT_LEN {
-            return Err(StateError::InvalidEntry(format!(
-                "endpoint `{endpoint}` exceeds {MAX_ENDPOINT_LEN} bytes"
-            )));
-        }
-        if !(endpoint.starts_with("wss://") || endpoint.starts_with("ws://")) {
-            return Err(StateError::InvalidEntry(format!(
-                "endpoint `{endpoint}` is not a WebSocket URL"
-            )));
-        }
-    }
-    if entry.weight == 0 {
-        return Err(StateError::InvalidEntry(
-            "weight must be at least 1".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn check_quorum(quorum: Quorum) -> Result<(), StateError> {

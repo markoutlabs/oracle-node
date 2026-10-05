@@ -172,6 +172,12 @@ impl NodeTransport {
         self.read_clients().version()
     }
 
+    /// Returns how many clients the list in use names.
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.read_clients().clients().len()
+    }
+
     /// Returns the key sealing now, for tests and diagnostics.
     #[must_use]
     pub fn current_key(&self) -> Arc<EpochKey> {

@@ -205,7 +205,7 @@ pub async fn run(
 
     let aggregator = Aggregator::new(resolved.feeds)?;
     let mut pipeline = Pipeline::new(aggregator, std::sync::Arc::new(signer));
-    let adapters = build_adapters(resolved.binance, resolved.venues, connector, clock)?;
+    let adapters = build_adapters(resolved.binance, resolved.venues, connector, clock)?.adapters;
 
     let shutdown = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel::<IngestEvent>(1_024);

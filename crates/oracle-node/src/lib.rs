@@ -19,10 +19,15 @@ pub mod adapters;
 pub mod config;
 pub mod init;
 pub mod keyfile;
+pub mod logging;
 pub mod pipeline;
 
-pub use adapters::build_adapters;
+pub use adapters::{Adapters, build_adapters};
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
-pub use init::{InitError, InitOptions, NodeKey, Rotation, candid_call};
+pub use init::{
+    CanisterId, Endpoint, Gateway, InitError, NodeKey, NodeSetup, Operator, RegistrySource,
+    RootKey, Rotation, ServiceUnit, Unlock, Written, candid_call, generate_passphrase,
+};
 pub use keyfile::{KeyFileError, PassphraseSource};
+pub use logging::LogFormat;
 pub use pipeline::{Pipeline, PipelineStats};

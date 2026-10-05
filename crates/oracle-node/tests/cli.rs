@@ -36,6 +36,22 @@ fn passphrase_file(dir: &Path) -> String {
     path.to_str().expect("utf-8").to_owned()
 }
 
+/// A canister and its governance address, standing in for the mainnet
+/// deployment until there is one.
+const NETWORK: [&str; 4] = [
+    "--canister",
+    "uxrrr-q7777-77774-qaaaq-cai",
+    "--governance",
+    "0x5CbDd86a2FA8Dc4bDdd8a8f69dBa48572EeC07FB",
+];
+
+fn init_out(dir: &str, extra: &[&str]) -> Output {
+    let mut args = vec!["init", "--out", dir];
+    args.extend(NETWORK);
+    args.extend(extra);
+    run(&args)
+}
+
 fn passphrase() -> age::secrecy::SecretString {
     age::secrecy::SecretString::from(PASSPHRASE.to_owned())
 }
@@ -98,13 +114,7 @@ fn init_generates_a_different_key_every_time() {
 fn init_with_out_writes_files_and_prints_no_secrets() {
     let dir = scratch("out");
     let pass = passphrase_file(&dir);
-    let output = run(&[
-        "init",
-        "--out",
-        dir.to_str().expect("utf-8"),
-        "--passphrase-file",
-        &pass,
-    ]);
+    let output = init_out(dir.to_str().expect("utf-8"), &["--passphrase-file", &pass]);
     assert!(
         output.status.success(),
         "{}",
@@ -155,7 +165,7 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
     let path = dir.to_str().expect("utf-8");
     let pass = passphrase_file(&dir);
     assert!(
-        run(&["init", "--out", path, "--passphrase-file", &pass])
+        init_out(path, &["--passphrase-file", &pass])
             .status
             .success()
     );
@@ -209,12 +219,12 @@ fn init_refuses_to_overwrite_existing_keys() {
     let path = dir.to_str().expect("utf-8");
     let pass = passphrase_file(&dir);
     assert!(
-        run(&["init", "--out", path, "--passphrase-file", &pass])
+        init_out(path, &["--passphrase-file", &pass])
             .status
             .success()
     );
 
-    let second = run(&["init", "--out", path, "--passphrase-file", &pass]);
+    let second = init_out(path, &["--passphrase-file", &pass]);
     assert!(!second.status.success(), "the second init must fail");
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("signing.key"),
@@ -228,15 +238,9 @@ fn the_emitted_config_is_loadable() {
     let dir = scratch("config");
     let pass = passphrase_file(&dir);
     assert!(
-        run(&[
-            "init",
-            "--out",
-            dir.to_str().expect("utf-8"),
-            "--passphrase-file",
-            &pass
-        ])
-        .status
-        .success()
+        init_out(dir.to_str().expect("utf-8"), &["--passphrase-file", &pass])
+            .status
+            .success()
     );
     // The same call `start` makes. An init that emitted an unloadable config
     // would only fail once someone tried to run the node.
@@ -267,7 +271,7 @@ fn the_emitted_config_is_loadable() {
 #[test]
 fn init_with_out_needs_a_passphrase_source_when_there_is_no_terminal() {
     let dir = scratch("nopass");
-    let output = run(&["init", "--out", dir.to_str().expect("utf-8")]);
+    let output = init_out(dir.to_str().expect("utf-8"), &[]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("passphrase"),
@@ -348,4 +352,122 @@ fn help_succeeds_and_lists_both_commands() {
     let text = stdout(&output);
     assert!(text.contains("init"), "{text}");
     assert!(text.contains("start"), "{text}");
+}
+
+/// The canister flags fill the config, so a node made this way starts without
+/// an edit. Paths are absolute, so the config and the unit do not depend on
+/// where the node starts.
+#[test]
+fn init_flags_fill_the_config_and_the_unit() {
+    let dir = scratch("flags");
+    std::fs::create_dir_all(&dir).expect("creates");
+    let pass = passphrase_file(&dir.join("node"));
+    let governance = "0x5CbDd86a2FA8Dc4bDdd8a8f69dBa48572EeC07FB";
+    let canister = "uxrrr-q7777-77774-qaaaq-cai";
+    let output = Command::new(BINARY)
+        .current_dir(&dir)
+        .args([
+            "init",
+            "--out",
+            "node",
+            "--passphrase-file",
+            &pass,
+            "--canister",
+            canister,
+            "--gateway",
+            "http://127.0.0.1:4943/",
+            "--root-key",
+            "3082",
+            "--governance",
+            governance,
+            "--service-user",
+            "oracle",
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The child's working directory, as `getcwd` resolves it.
+    let node = dir.canonicalize().expect("exists").join("node");
+    let config = oracle_node::NodeConfig::load(&node.join("config.toml")).expect("loads");
+    assert_eq!(
+        config.registry.url.as_deref(),
+        Some(format!("http://127.0.0.1:4943/registry.json?canisterId={canister}").as_str())
+    );
+    assert_eq!(config.registry.canister_id.as_deref(), Some(canister));
+    assert_eq!(config.registry.root_key.as_deref(), Some("3082"));
+    assert_eq!(
+        config.governance().expect("set").to_checksummed(),
+        governance
+    );
+    assert_eq!(config.signing.key_file, Some(node.join("signing.key")));
+    assert!(
+        config
+            .signing
+            .passphrase_file
+            .as_deref()
+            .is_some_and(Path::is_absolute)
+    );
+
+    let unit = std::fs::read_to_string(node.join("oracle-node.service")).expect("a unit");
+    assert!(unit.lines().any(|line| line == "User=oracle"), "{unit}");
+    assert!(unit.lines().any(|line| line == "Type=notify"), "{unit}");
+    assert!(
+        unit.contains(&format!("start \"{}\"", node.join("config.toml").display())),
+        "{unit}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn values_the_registry_would_refuse_are_usage_errors() {
+    for args in [
+        vec!["init", "--endpoint", "http://node.example"],
+        vec!["init", "--operator", " "],
+        vec!["init", "--canister", "not a principal"],
+        vec!["init", "--governance", "0x12"],
+        vec!["init", "--out", "x", "--service-user", "oracle"],
+        vec!["start", "node.toml", "--log-format", "bogus"],
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let flag = args
+            .get(args.len().saturating_sub(2))
+            .copied()
+            .unwrap_or_default();
+        assert!(
+            stderr.contains(flag),
+            "{args:?} should name {flag}: {stderr}"
+        );
+        assert!(!stderr.contains("ERROR"), "{args:?}: {stderr}");
+    }
+}
+
+/// The node always fetches from the canister. Until the mainnet one exists,
+/// `init --out` needs to be told which.
+#[test]
+fn init_needs_a_canister_until_mainnet_is_deployed() {
+    let dir = scratch("mainnet");
+    let pass = passphrase_file(&dir);
+    let output = run(&[
+        "init",
+        "--out",
+        dir.to_str().expect("utf-8"),
+        "--passphrase-file",
+        &pass,
+    ]);
+    if oracle_client::mainnet::CANISTER_ID.is_none() {
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--canister and --governance"), "{stderr}");
+        assert!(!dir.exists(), "nothing may be written");
+    } else {
+        assert!(output.status.success());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

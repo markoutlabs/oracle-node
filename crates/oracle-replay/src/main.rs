@@ -52,12 +52,7 @@ async fn main() -> ExitCode {
 
 async fn replay() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    oracle_node::logging::init(oracle_node::LogFormat::Auto, "warn")?;
 
     let resolved = NodeConfig::load(&cli.config)?.resolve()?;
     let file = std::fs::File::open(&cli.recording)

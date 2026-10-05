@@ -61,6 +61,14 @@ pub enum ConfigError {
     Registry(String),
 }
 
+impl ConfigError {
+    /// Returns `true` if only an edit fixes this. A failed fetch may pass on a retry.
+    #[must_use]
+    pub const fn is_permanent(&self) -> bool {
+        !matches!(self, Self::Registry(_) | Self::Clients(_))
+    }
+}
+
 /// The whole node configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -344,12 +352,22 @@ impl NodeConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Registry`] if it does not parse.
+    /// Returns [`ConfigError::Invalid`] if it does not parse or is the zero
+    /// placeholder.
     pub fn governance(&self) -> Result<oracle_wire::Address, ConfigError> {
-        self.registry
+        let address: oracle_wire::Address = self
+            .registry
             .governance_address
             .parse()
-            .map_err(|e| ConfigError::Registry(format!("bad governance address: {e}")))
+            .map_err(|e| ConfigError::Invalid(format!("registry.governance_address: {e}")))?;
+        if address == oracle_wire::Address::default() {
+            return Err(ConfigError::Invalid(
+                "registry.governance_address is the placeholder init wrote; set it to the \
+                 address governance gave you"
+                    .to_owned(),
+            ));
+        }
+        Ok(address)
     }
 
     /// Fetches the client list, unverified, or `None` without a `[clients]`

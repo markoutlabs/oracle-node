@@ -74,6 +74,7 @@
 //! ```
 
 mod client;
+pub mod mainnet;
 pub mod quorum;
 pub mod source;
 pub mod testing;

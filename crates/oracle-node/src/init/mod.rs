@@ -4,6 +4,9 @@
 //! the node's id in the registry, and it stays encrypted at rest on the
 //! operator's machine. A rotation is a new key that governance puts in place of
 //! the old one with `replace_node`.
+//!
+//! [`NodeSetup`] decides everything `init` writes; [`NodeSetup::write`] is the
+//! only path to disk. The wizard and the flags both build one.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +15,16 @@ use oracle_wire::{Address, NodeEntry, Signer};
 
 use crate::keyfile;
 
-/// Something went wrong generating or writing the node's key.
+mod setup;
+mod starter;
+mod unit;
+
+pub use setup::{
+    CanisterId, Endpoint, Gateway, NodeSetup, Operator, RegistrySource, RootKey, ServiceUnit,
+    Unlock, Written,
+};
+
+/// Something went wrong generating or writing the node's files.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum InitError {
@@ -28,32 +40,28 @@ pub enum InitError {
         /// Why.
         reason: String,
     },
+
+    /// The setup breaks a rule.
+    #[error("{0}")]
+    Invalid(String),
 }
 
-/// Who runs the node and how it will be reached.
-#[derive(Clone, Debug)]
-pub struct InitOptions {
-    /// Who runs it. Operator diversity is what makes the median meaningful.
-    pub operator: String,
-    /// The WebSocket endpoint subscribers will connect to.
-    pub endpoint: String,
-}
-
-impl Default for InitOptions {
-    fn default() -> Self {
-        Self {
-            operator: "unset".to_owned(),
-            endpoint: "ws://127.0.0.1:8791/v2/ws".to_owned(),
-        }
-    }
+/// Makes a random passphrase for a passphrase file: 32 bytes from the OS, as hex.
+///
+/// # Errors
+///
+/// Returns [`InitError::Invalid`] if the OS entropy source cannot be read.
+pub fn generate_passphrase() -> Result<SecretString, InitError> {
+    let mut bytes = zeroize::Zeroizing::new([0_u8; 32]);
+    getrandom::fill(bytes.as_mut())
+        .map_err(|error| InitError::Invalid(format!("cannot read OS entropy: {error}")))?;
+    Ok(SecretString::from(hex::encode(bytes.as_ref())))
 }
 
 /// A freshly generated node key.
 pub struct NodeKey {
     /// The key. Its address is the node's id.
     pub signing: Signer,
-    /// The options this was generated under.
-    pub options: InitOptions,
 }
 
 impl NodeKey {
@@ -62,10 +70,9 @@ impl NodeKey {
     /// # Errors
     ///
     /// Returns [`InitError::Key`] if the OS entropy source cannot be read.
-    pub fn generate(options: InitOptions) -> Result<Self, InitError> {
+    pub fn generate() -> Result<Self, InitError> {
         Ok(Self {
             signing: Signer::generate()?,
-            options,
         })
     }
 
@@ -75,11 +82,11 @@ impl NodeKey {
     /// publishes a new version; until that happens the node's updates verify
     /// for nobody.
     #[must_use]
-    pub fn registry_entry(&self) -> NodeEntry {
+    pub fn entry(&self, operator: &Operator, endpoint: &Endpoint) -> NodeEntry {
         NodeEntry {
             address: self.signing.address(),
-            operator: self.options.operator.clone(),
-            endpoints: vec![self.options.endpoint.clone()],
+            operator: operator.to_string(),
+            endpoints: vec![endpoint.to_string()],
             weight: 1,
         }
     }
@@ -99,87 +106,6 @@ impl NodeKey {
         let path = dir.join("signing.key");
         write_encrypted(&path, &self.signing.to_secret_hex(), passphrase)?;
         Ok(path)
-    }
-
-    /// Renders a starter config file.
-    ///
-    /// `signing_key_file` is where the node will read its key from,
-    /// `registry_path` where it will read the governance-signed registry, and
-    /// `passphrase_file`, if given, where it will read the passphrase that opens
-    /// the key. Without one the node prompts at startup.
-    #[must_use]
-    pub fn config_template(
-        &self,
-        signing_key_file: &Path,
-        registry_path: &Path,
-        passphrase_file: Option<&Path>,
-    ) -> String {
-        let listen = self
-            .options
-            .endpoint
-            .parse::<axum::http::Uri>()
-            .ok()
-            .and_then(|uri| uri.port_u16())
-            .map_or_else(
-                || "0.0.0.0:8791".to_owned(),
-                |port| format!("0.0.0.0:{port}"),
-            );
-        // Quoted by the TOML serializer, so a quote or a backslash in a path
-        // cannot produce a file the node then refuses to load.
-        let quoted = |text: String| toml::Value::String(text).to_string();
-        let passphrase_line = passphrase_file.map_or_else(
-            || "# passphrase_file = \"/etc/oracle/passphrase\"".to_owned(),
-            |path| format!("passphrase_file = {}", quoted(path.display().to_string())),
-        );
-
-        format!(
-            r#"# Must be at or below the tightest feed's rate cap, or the cap becomes the tick
-# rate and the deviation trigger never fires early.
-tick_interval_ms = 25
-
-[server]
-listen = {listen}
-max_pending_feeds = 512
-
-[signing]
-# A file or an environment variable, never a command-line argument: arguments
-# are visible in `ps` to every user on the box. The key file is an `age` file;
-# the passphrase that opens it comes from a 0600 file, or from a prompt at
-# startup when this line is absent.
-key_file = {signing_key_file}
-{passphrase_line}
-
-[registry]
-path = {registry_path}
-# A deployed node fetches from the canister instead of `path`:
-# url = "https://<canister-id>.raw.icp0.io/registry.json"
-# Each fetched document must carry this canister's certificate. Set `root_key`
-# (hex) only off mainnet.
-canister_id = "<canister-id>"
-# Pinned here rather than taken from the registry itself, which would let the
-# document vouch for its own author. Ask governance for this address; do not
-# copy it out of a registry file you were sent.
-governance_address = "0x0000000000000000000000000000000000000000"
-
-# The governance-signed client list (SPEC §6.1). The node serves prices only to
-# these clients, encrypted, over /v2/ws, and refuses to start without the list.
-[clients]
-url = "https://<canister-id>.raw.icp0.io/clients.json"
-
-[[feeds]]
-symbol = "CRYPTO.BTC/USDT"
-min_sources = 2
-sources = [
-  {{ venue = "binance", market = "spot", symbol = "BTCUSDT" }},
-  {{ venue = "bybit", market = "spot", symbol = "BTCUSDT" }},
-  {{ venue = "okx", market = "spot", symbol = "BTC-USDT" }},
-]
-"#,
-            listen = quoted(listen),
-            signing_key_file = quoted(signing_key_file.display().to_string()),
-            passphrase_line = passphrase_line,
-            registry_path = quoted(registry_path.display().to_string()),
-        )
     }
 }
 
@@ -280,7 +206,7 @@ fn write_encrypted(path: &Path, secret: &str, passphrase: &SecretString) -> Resu
 }
 
 /// Writes a secret to a file only the current user can read.
-fn write_secret(path: &Path, contents: &str) -> Result<(), InitError> {
+pub(crate) fn write_secret(path: &Path, contents: &str) -> Result<(), InitError> {
     let failed = |reason: String| InitError::Write {
         path: path.to_path_buf(),
         reason,
@@ -314,17 +240,18 @@ mod tests {
 
     const NOW: u64 = 1_754_582_400;
 
-    fn options() -> InitOptions {
-        InitOptions {
-            operator: "acme".to_owned(),
-            endpoint: "wss://eu1.example/v2/ws".to_owned(),
-        }
+    fn operator() -> Operator {
+        "acme".parse().expect("valid operator")
+    }
+
+    fn endpoint() -> Endpoint {
+        "wss://eu1.example/v2/ws".parse().expect("valid endpoint")
     }
 
     #[test]
     fn two_runs_never_produce_the_same_node() {
-        let first = NodeKey::generate(options()).expect("generates");
-        let second = NodeKey::generate(options()).expect("generates");
+        let first = NodeKey::generate().expect("generates");
+        let second = NodeKey::generate().expect("generates");
         assert_ne!(first.signing.address(), second.signing.address());
     }
 
@@ -332,13 +259,13 @@ mod tests {
     /// discovers the mismatch only after governance has published.
     #[test]
     fn the_registry_entry_verifies_inside_a_signed_registry() {
-        let key = NodeKey::generate(options()).expect("generates");
+        let key = NodeKey::generate().expect("generates");
         let governance = Signer::generate().expect("generates");
         let registry = oracle_wire::Registry::sign(
             &governance,
             1,
             NOW,
-            vec![key.registry_entry()],
+            vec![key.entry(&operator(), &endpoint())],
             oracle_wire::Quorum {
                 min_nodes: 1,
                 recommended: 3,
@@ -361,7 +288,7 @@ mod tests {
     /// the canister rather than burning an address.
     #[test]
     fn a_rotation_names_the_old_and_the_new_address() {
-        let key = NodeKey::generate(options()).expect("generates");
+        let key = NodeKey::generate().expect("generates");
         let rotation = Rotation::generate(key.signing.address()).expect("rotates");
         assert_ne!(rotation.signing.address(), key.signing.address());
 
@@ -393,7 +320,7 @@ mod tests {
     fn a_written_key_is_encrypted_reloads_and_is_not_world_readable() {
         let dir = std::env::temp_dir().join(format!("oracle-init-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let key = NodeKey::generate(options()).expect("generates");
+        let key = NodeKey::generate().expect("generates");
         let path = key.write_key(&dir, &passphrase()).expect("writes");
 
         // At rest the file is an age file; the hex never touches the disk.
@@ -431,73 +358,5 @@ mod tests {
             "an unfinished rotation must not be overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn the_config_template_parses_as_a_node_config() {
-        let key = NodeKey::generate(options()).expect("generates");
-        let config = key.config_template(
-            Path::new("/etc/oracle/signing.key"),
-            Path::new("/etc/oracle/registry.json"),
-            Some(Path::new("/etc/oracle/passphrase")),
-        );
-        let parsed: crate::NodeConfig =
-            toml::from_str(&config).expect("init must emit a valid config");
-        assert_eq!(
-            parsed.signing.passphrase_file.as_deref(),
-            Some(Path::new("/etc/oracle/passphrase"))
-        );
-        parsed.resolve().expect("the emitted feeds must resolve");
-
-        // Without a passphrase file the line is a comment, and the node prompts.
-        let prompting = key.config_template(
-            Path::new("/etc/oracle/signing.key"),
-            Path::new("/etc/oracle/registry.json"),
-            None,
-        );
-        let parsed: crate::NodeConfig = toml::from_str(&prompting).expect("valid config");
-        assert!(parsed.signing.passphrase_file.is_none());
-    }
-
-    /// A backslash in a path used to produce a file the node then refused to
-    /// load.
-    #[test]
-    fn the_config_template_quotes_awkward_values() {
-        let key = NodeKey::generate(options()).expect("generates");
-        let config = key.config_template(
-            Path::new(r"C:\keys\signing.key"),
-            Path::new(r"C:\keys\registry.json"),
-            None,
-        );
-        let parsed: crate::NodeConfig = toml::from_str(&config).expect("valid TOML");
-        assert_eq!(
-            parsed.signing.key_file.as_deref(),
-            Some(Path::new(r"C:\keys\signing.key"))
-        );
-    }
-
-    /// A colon later in the URL must not be mistaken for the port.
-    #[test]
-    fn the_config_listen_port_ignores_colons_in_the_path() {
-        let options = InitOptions {
-            endpoint: "ws://127.0.0.1:9001/v2/ws?x=a:1".to_owned(),
-            ..options()
-        };
-        let key = NodeKey::generate(options).expect("generates");
-        let config =
-            key.config_template(Path::new("signing.key"), Path::new("registry.json"), None);
-        assert!(config.contains("listen = \"0.0.0.0:9001\""), "{config}");
-    }
-
-    #[test]
-    fn the_config_listen_port_follows_the_endpoint() {
-        let options = InitOptions {
-            endpoint: "ws://127.0.0.1:9001/v2/ws".to_owned(),
-            ..options()
-        };
-        let key = NodeKey::generate(options).expect("generates");
-        let config =
-            key.config_template(Path::new("signing.key"), Path::new("registry.json"), None);
-        assert!(config.contains("listen = \"0.0.0.0:9001\""), "{config}");
     }
 }

@@ -74,23 +74,13 @@ python3 -c 'import secrets; print(secrets.token_hex(16))' > "$DIR/passphrase"
 chmod 600 "$DIR/passphrase"
 $NODE init --out "$DIR/node1" --operator e2e \
   --endpoint ws://127.0.0.1:8791/v2/ws --canister "$CANISTER" \
+  --gateway "$GATEWAY" --root-key "$ROOT_KEY" --governance "$GOV" \
   --passphrase-file "$DIR/passphrase" > "$DIR/init.out"
 # The e2e identity is the controller, so it plays governance for both calls.
 eval "$(grep '^dfx canister call' "$DIR/init.out") --identity $IDENTITY" >/dev/null
-python3 - "$DIR/node1/config.toml" "$URL" "$GOV" "$CLIENTS_URL" "$CANISTER" "$ROOT_KEY" <<'PY'
-import sys, re, pathlib
-path, url, gov, clients, canister, root_key = sys.argv[1:]
-p = pathlib.Path(path); s = p.read_text()
-s = re.sub(r'^path = ".*"$', f'url = "{url}"', s, count=1, flags=re.M)
-s = re.sub(r'^governance_address = ".*"$', f'governance_address = "{gov}"', s, count=1, flags=re.M)
-assert 'canister_id = "<canister-id>"' in s, "the starter config has no canister_id"
-s = s.replace('canister_id = "<canister-id>"',
-              f'canister_id = "{canister}"\nroot_key = "{root_key}"')
-s = s.replace('url = "https://<canister-id>.raw.icp0.io/clients.json"',
-              f'url = "{clients}"\npoll_secs = 5')
-assert '[clients]\nurl' in s, "the starter config has no [clients] block"
-p.write_text(s)
-PY
+# A fast client-list poll, so a revocation lands within the test.
+perl -pi -e 's/^poll_secs = 30$/poll_secs = 5/' "$DIR/node1/config.toml"
+grep -qx 'poll_secs = 5' "$DIR/node1/config.toml" || die "the starter config has no poll_secs"
 echo "registry v$(dfx canister call oracle_registry get_version --identity "$IDENTITY" --output json | json_value)"
 
 say "client key, added by governance"
@@ -142,6 +132,7 @@ echo "registry v$(dfx canister call oracle_registry get_version --identity "$IDE
 mv "$DIR/node1/signing.key.next" "$DIR/node1/signing.key"
 pkill -f "oracle-node start $DIR/node1/config.toml"
 sleep 1
+grep -q 'shutting down signal="\?SIGTERM' "$DIR/node1.log" || die "the node did not stop cleanly on SIGTERM"
 start_node "$DIR/node1b.log"
 echo "node $(grep -o "0x[0-9a-fA-F]\{40\}" "$DIR/node1b.log" | head -1)"
 wait "$CLIENT_PID" || { cat "$DIR/client-rotation.log"; die "rotation client failed"; }
@@ -184,5 +175,12 @@ echo "old $OLD_LISTING"
 echo "new $NEW_LISTING"
 echo "$OLD_LISTING" | grep -q '"removed_at":[0-9]' || die "the old address is not retired"
 echo "$NEW_LISTING" | grep -q '"removed_at":null' || die "the new address is not listed"
+
+say "node logs"
+for log in "$DIR/node1.log" "$DIR/node1b.log"; do
+  ! grep -q "panicked" "$log" || die "$log shows a panic"
+  ! grep -q $'\x1b\\[' "$log" || die "$log has colour codes: a file must get plain lines"
+done
+echo "no panics, no colour codes"
 
 say "PASS"

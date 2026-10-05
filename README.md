@@ -258,7 +258,8 @@ aggregator before any post-reconnect quote — only means something if nothing
 downstream reorders it. Fanning events across workers would break it silently.
 
 ```sh
-oracle-node init [--out DIR] [--canister ID]   # generate this node's key
+oracle-node init                               # the wizard, at a terminal
+oracle-node init --out DIR [--canister ID ...] # the same, from flags, for scripts
 oracle-node rotate --dir DIR [--canister ID]   # generate the next key
 oracle-node start <config.toml>                # ingest, aggregate, sign, serve
 oracle-node start <config.toml> --tail         # ...and log the stream as it flows
@@ -270,13 +271,13 @@ what a venue is actually sending — normalised, but before anything is weighted
 filtered, or aggregated:
 
 ```text
-INFO tail: observation venue=deribit market=inverse_perp symbol=BTC-PERPETUAL
-           kind="book_top" price=64972.25 bid="64972" ask="64972.5"
-           bid_qty="2.292679923659" ask_qty="1.610373619608" lag_ms="49"
-INFO tail: observation venue=kraken market=linear_perp symbol=PF_XBTUSD
-           kind="mark_price" price=64971.86250214206 lag_ms="81"
-INFO tail: published status="ok" price="64971.86250214" conf="6.49718625"
-           seq=1 sources=2 venues={Kraken, Deribit}
+12:03:04  INFO observation venue=deribit market=inverse_perp symbol=BTC-PERPETUAL
+               kind="book_top" price=64972.25 bid="64972" ask="64972.5"
+               bid_qty="2.292679923659" ask_qty="1.610373619608" lag_ms="49"
+12:03:04  INFO observation venue=kraken market=linear_perp symbol=PF_XBTUSD
+               kind="mark_price" price=64971.86250214206 lag_ms="81"
+12:03:04  INFO published status="ok" price="64971.86250214" conf="6.49718625"
+               seq=1 sources=2 venues={Kraken, Deribit}
 ```
 
 That output is also the quickest demonstration of the funding caveat below:
@@ -290,10 +291,32 @@ id, and the registry entry to hand to governance. That entry carries no secret:
 the address, the operator and the endpoints. Nothing the node publishes
 verifies for anyone until governance signs it into a new registry version.
 
-The secret goes to stdout by default, which puts it in terminal scrollback and
-shell history; `--out DIR` writes it to a `0600` file instead, along with a
-starter config. It refuses to overwrite an existing key — silently replacing it
-would drop the node out of the registry while it kept running.
+At a terminal, `init` is a wizard. It asks, one question at a time:
+- where the files go;
+- the operator name and the public endpoint;
+- how the node opens its key at start: a generated passphrase in a `0600` file,
+  which systemd needs, or a passphrase typed at each start;
+- whether to write a systemd unit.
+
+It writes nothing until you confirm the summary, and Esc leaves nothing behind.
+The answers are checked with the canister's own rules, so the registry accepts
+the entry it writes.
+
+It does not ask where the registry comes from. A node always fetches from the
+registry canister, and the mainnet canister id and governance address are built
+in (`oracle_client::mainnet`, next to the mainnet root key). For another
+network, such as a local replica, pass `--canister` and `--governance`
+together, and `--gateway` and `--root-key` as well.
+
+With `--out DIR`, every value comes from flags (also `--passphrase-file` and
+`--service-user`), and the output is plain text a script can read. Without
+`--out`, and not at a terminal, the secret goes to stdout, which puts it in
+scrollback and shell history. `init` never overwrites an existing key:
+replacing it would drop the node out of the registry while it kept running. The
+config it writes holds absolute paths and needs no edit.
+
+Until the registry canister is deployed on mainnet, the built-in values are
+empty, and `init` asks for `--canister` and `--governance`.
 
 Keys come from the OS CSPRNG (`Signer::generate`). The seeded keys in the
 examples and test helpers are derived from small integers and guessable by
@@ -328,6 +351,49 @@ warning because it is otherwise the quietest way for a node to fail: it goes on
 ingesting, aggregating and signing, every node-local metric reads healthy, and
 every subscriber silently discards the output. Keys have no expiry (SPEC §3.5),
 so once a node is listed it stays so until governance replaces or removes it.
+
+#### Logs
+
+Logs go to stderr. `--log-format` picks how they look; `auto`, the default,
+picks from where stderr goes:
+
+| Format | Chosen when | Looks like |
+|---|---|---|
+| `journald` | stderr is the journal stream systemd connected | `<6> INFO status feeds=12/12 ...`: no time, no colour, a syslog priority |
+| `pretty` | stderr is a terminal | local time, colour, compact, and a banner once the node serves |
+| `plain` | anything else, such as a file | UTC time, no colour |
+| `json` | only when asked | one JSON object per line, for log shippers |
+
+`RUST_LOG` filters as usual. Once a minute the node logs a `status` line:
+feeds published, clients connected, venue connections up, and updates in the
+last minute. Under systemd the same line shows in `systemctl status`.
+
+#### Running under systemd
+
+`init` writes `oracle-node.service` when asked (`--service-user USER`, or yes in
+the wizard). The unit:
+- is `Type=notify`: `systemctl start` returns once the node serves, and
+  `systemctl status` shows what it is doing;
+- stops the node with SIGTERM, which the node handles with a clean shutdown;
+- restarts it on failure, but not on exit code 78, a config error that only an
+  edit fixes;
+- turns off core dumps and swap, because the key is in memory (SPEC §9.2);
+- sandboxes the node to what it uses: a read-only system, its port, and
+  outbound connections.
+
+```sh
+sudo install -m 0644 node1/oracle-node.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now oracle-node
+journalctl -u oracle-node -f            # add -p warning for warnings only
+```
+
+Nobody can type at a service, so it reads its passphrase from a `0600` file.
+That file protects the key against someone who copies the key file alone. For
+more, keep the passphrase encrypted with `systemd-creds encrypt`, give it to the
+unit with `LoadCredentialEncrypted=passphrase:/etc/oracle-node/passphrase.cred`,
+and set `passphrase_file = "/run/credentials/oracle-node.service/passphrase"`.
+`rotate` then needs `--passphrase-file` with the plain passphrase.
 
 #### Funding is not normalised
 
@@ -480,16 +546,13 @@ cargo run -p oracle-client --example subscribe -- node/registry.json 0x<governan
   CRYPTO.BTC/USDT --client-key client.key
 ```
 
-To run a node you generated with `init`, governance has to sign its entry in —
-`gen_local_registry` plays that part with `--entry`:
+A node made with `init` fetches from a registry canister. To run one locally,
+point it at a canister on a local replica; `scripts/e2e-dfx.sh` shows every
+step:
 
 ```sh
-cargo run -p oracle-node -- init --out node1
-cargo run -p oracle-node --example gen_local_registry -- \
-  --nodes 0 --entry node1/node-entry.json --clients node1/clients.json > node1/registry.json
-# then, in node1/config.toml, pin the printed GOVERNANCE address and replace
-# the [clients] url with: path = "node1/clients.json"
-cargo run -p oracle-node -- start node1/config.toml
+oracle-node init --canister <CANISTER_ID> --governance <GOVERNANCE> \
+  --gateway http://127.0.0.1:4943 --root-key <ROOT_KEY from dfx ping>
 ```
 
 Confirmed live against Binance: exchange → node → signed, sealed frame →

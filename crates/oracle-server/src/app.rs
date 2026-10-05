@@ -322,12 +322,15 @@ async fn serve(
             }
         }
     };
-    tokio::select! {
-        () = reader => {}
-        _ = &mut writer => {}
-    }
+    // A finished `JoinHandle` panics when polled again.
+    let writer_done = tokio::select! {
+        () = reader => false,
+        _ = &mut writer => true,
+    };
     transport.release(subscriber.id());
-    let _ = writer.await;
+    if !writer_done {
+        let _ = writer.await;
+    }
 }
 
 async fn handshake(

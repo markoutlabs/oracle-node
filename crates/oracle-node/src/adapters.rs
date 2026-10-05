@@ -12,6 +12,14 @@ use tracing::info;
 
 use crate::config::VenueConnection;
 
+/// The adapters a node runs.
+pub struct Adapters {
+    /// One per venue.
+    pub adapters: Vec<Box<dyn ExchangeAdapter>>,
+    /// The WebSocket connections they hold between them, when all are up.
+    pub connections: usize,
+}
+
 /// Builds one adapter per venue, each with its connections.
 ///
 /// `connector` opens the sockets and `clock` stamps receipt times. The node
@@ -27,20 +35,22 @@ pub fn build_adapters<C: Connector + Clone + 'static>(
     venues: Vec<(Venue, Vec<VenueConnection>)>,
     connector: C,
     clock: MonotonicClock,
-) -> Result<Vec<Box<dyn ExchangeAdapter>>, IngestError> {
+) -> Result<Adapters, IngestError> {
     let mut adapters: Vec<Box<dyn ExchangeAdapter>> = Vec::new();
+    let mut connections = 0_usize;
     if !binance.spot.is_empty() || !binance.perp.is_empty() {
         let adapter = BinanceAdapter::new(binance, connector.clone())?.with_clock(clock.clone());
         for (session, market, _) in adapter.plan()? {
             info!(venue = "binance", %market, url = %session.url, "ingest endpoint");
+            connections = connections.saturating_add(1);
         }
         adapters.push(Box::new(adapter));
     }
-    for (venue, connections) in venues {
+    for (venue, venue_connections) in venues {
         // Each connection carries its own decoder: a venue can speak different
         // protocols on different markets, and config resolution has already
         // refused any market this build cannot serve.
-        let specs = connections
+        let specs: Vec<_> = venue_connections
             .into_iter()
             .map(|connection| {
                 info!(%venue, market = %connection.spec.market, url = %connection.spec.url,
@@ -48,6 +58,7 @@ pub fn build_adapters<C: Connector + Clone + 'static>(
                 (connection.spec, connection.instruments)
             })
             .collect();
+        connections = connections.saturating_add(specs.len());
         adapters.push(Box::new(
             VenueAdapter::new(venue, specs, connector.clone())?.with_clock(clock.clone()),
         ));
@@ -57,5 +68,8 @@ pub fn build_adapters<C: Connector + Clone + 'static>(
             venue: Venue::Binance,
         });
     }
-    Ok(adapters)
+    Ok(Adapters {
+        adapters,
+        connections,
+    })
 }

@@ -72,6 +72,75 @@ pub struct NodeEntry {
     pub weight: u16,
 }
 
+impl NodeEntry {
+    /// Checks the rules a listing needs beyond the encoding's caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`EntryError`] found.
+    pub fn validate(&self) -> Result<(), EntryError> {
+        check_operator(&self.operator)?;
+        if self.endpoints.is_empty() || self.endpoints.len() > MAX_ENDPOINTS {
+            return Err(EntryError::EndpointCount);
+        }
+        for endpoint in &self.endpoints {
+            check_endpoint(endpoint)?;
+        }
+        if self.weight == 0 {
+            return Err(EntryError::Weight);
+        }
+        Ok(())
+    }
+}
+
+/// A node entry the registry cannot list.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EntryError {
+    /// The operator name is blank or too long.
+    #[error("the operator must be 1 to {MAX_OPERATOR_LEN} bytes and not blank")]
+    Operator,
+    /// There are no endpoints, or too many.
+    #[error("a node needs 1 to {MAX_ENDPOINTS} endpoints")]
+    EndpointCount,
+    /// An endpoint is too long.
+    #[error("endpoint `{0}` is longer than {MAX_ENDPOINT_LEN} bytes")]
+    EndpointTooLong(String),
+    /// An endpoint is not a WebSocket URL.
+    #[error("endpoint `{0}` is not a ws:// or wss:// URL")]
+    EndpointScheme(String),
+    /// The weight is zero.
+    #[error("the weight must be at least 1")]
+    Weight,
+}
+
+/// Checks an operator name: 1 to [`MAX_OPERATOR_LEN`] bytes, not blank.
+///
+/// # Errors
+///
+/// Returns [`EntryError::Operator`].
+pub fn check_operator(operator: &str) -> Result<(), EntryError> {
+    if operator.trim().is_empty() || operator.len() > MAX_OPERATOR_LEN {
+        return Err(EntryError::Operator);
+    }
+    Ok(())
+}
+
+/// Checks an endpoint: a `ws://` or `wss://` URL of at most [`MAX_ENDPOINT_LEN`] bytes.
+///
+/// # Errors
+///
+/// Returns [`EntryError::EndpointTooLong`] or [`EntryError::EndpointScheme`].
+pub fn check_endpoint(endpoint: &str) -> Result<(), EntryError> {
+    if endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(EntryError::EndpointTooLong(endpoint.to_owned()));
+    }
+    if !(endpoint.starts_with("wss://") || endpoint.starts_with("ws://")) {
+        return Err(EntryError::EndpointScheme(endpoint.to_owned()));
+    }
+    Ok(())
+}
+
 /// A signed list of trusted nodes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -523,6 +592,32 @@ mod tests {
             verified.accept_successor(&forged),
             Err(VerifyError::UntrustedGovernance { .. })
         ));
+    }
+
+    #[test]
+    fn entries_follow_the_listing_rules() {
+        let (good, _) = node(1);
+        assert_eq!(good.validate(), Ok(()));
+        type Mutation = fn(&mut NodeEntry);
+        let mutations: [(Mutation, EntryError); 6] = [
+            (|e| e.operator = " ".to_owned(), EntryError::Operator),
+            (|e| e.operator = "x".repeat(65), EntryError::Operator),
+            (|e| e.endpoints.clear(), EntryError::EndpointCount),
+            (
+                |e| e.endpoints = vec!["https://node.example".to_owned()],
+                EntryError::EndpointScheme("https://node.example".to_owned()),
+            ),
+            (
+                |e| e.endpoints = vec![format!("wss://{}", "x".repeat(251))],
+                EntryError::EndpointTooLong(format!("wss://{}", "x".repeat(251))),
+            ),
+            (|e| e.weight = 0, EntryError::Weight),
+        ];
+        for (mutate, expected) in mutations {
+            let mut entry = good.clone();
+            mutate(&mut entry);
+            assert_eq!(entry.validate(), Err(expected));
+        }
     }
 
     #[test]

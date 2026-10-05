@@ -36,6 +36,14 @@ pub struct PipelineStats {
     pub encode_errors: u64,
 }
 
+impl PipelineStats {
+    /// Venue connections up now. Every disconnect follows its connect.
+    #[must_use]
+    pub const fn connections_up(&self) -> u64 {
+        self.connects.saturating_sub(self.disconnects)
+    }
+}
+
 /// Owns the aggregator and the hot signing key.
 pub struct Pipeline {
     aggregator: Aggregator,

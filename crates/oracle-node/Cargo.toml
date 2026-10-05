@@ -16,18 +16,28 @@ oracle-types.workspace = true
 oracle-wire.workspace = true
 
 age.workspace = true
+anyhow.workspace = true
 axum.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 clap.workspace = true
+cliclack.workspace = true
+console.workspace = true
+ctrlc.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tokio-util.workspace = true
+time = { workspace = true, features = ["formatting", "local-offset", "macros"] }
 toml.workspace = true
 tracing.workspace = true
 rpassword.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "time", "local-time"] }
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+sd-notify.workspace = true
 
 [lints]
 workspace = true
