@@ -1,6 +1,6 @@
 //! Turning one venue's observations into one weighted quote.
 
-use oracle_types::{Fixed, Observation, Venue};
+use oracle_types::{Fixed, ObsKind, Observation, Venue};
 
 use crate::config::{FeedConfig, SourceConfig};
 
@@ -43,6 +43,14 @@ pub fn derive(
 ) -> Option<SourceQuote> {
     let max_age_ns = u64::try_from(config.max_age.as_nanos()).unwrap_or(u64::MAX);
 
+    // Depth replaces a top-of-book price, never a venue's mark or index.
+    if let Some(notional) = config.impact_notional
+        && source.kinds.contains(&ObsKind::BookTop)
+        && let Some(quote) = from_depth(source, config, latest, notional, now_ns, max_age_ns)
+    {
+        return Some(quote);
+    }
+
     for kind in &source.kinds {
         let Some(Some(observation)) = latest.get(kind.index()) else {
             continue;
@@ -78,7 +86,13 @@ pub fn derive(
             venue: observation.venue(),
             price,
             half_spread,
-            weight: weight_for(source, config, observation, price, now_ns)?,
+            weight: weight_for(
+                source,
+                config,
+                observation.age_ns(now_ns),
+                observation.spread().and_then(|s| s.to_bps_of(price)),
+                observation.depth_notional_1bp,
+            )?,
             observation_time_ns: observation.local_recv_ns,
             from_book,
             converted: source.convert_quote,
@@ -87,15 +101,75 @@ pub fn derive(
     None
 }
 
-/// Computes the aggregation weight for one observation.
+/// The latest observation of `kind` if it is fresh and not crossed.
+fn usable(
+    latest: &[Option<Observation>],
+    kind: ObsKind,
+    now_ns: u64,
+    max_age_ns: u64,
+) -> Option<&Observation> {
+    latest
+        .get(kind.index())?
+        .as_ref()
+        .filter(|observation| !observation.is_stale(now_ns, max_age_ns))
+        .filter(|observation| !observation.is_crossed())
+}
+
+/// The impact mid for `notional` from the latest depth snapshot, moved by how
+/// far the live top of book has moved since.
+///
+/// Depth sets the level, so one large order at the top cannot lean it. The top
+/// sets the timing, so the price does not wait for the next snapshot; a fake
+/// top order moves it only until that snapshot shows the order.
+fn from_depth(
+    source: &SourceConfig,
+    config: &FeedConfig,
+    latest: &[Option<Observation>],
+    notional: Fixed,
+    now_ns: u64,
+    max_age_ns: u64,
+) -> Option<SourceQuote> {
+    let depth = usable(latest, ObsKind::Depth, now_ns, max_age_ns)?;
+    let book = depth.book.as_deref()?;
+    let impact = book.impact(notional)?;
+    if impact.bid > impact.ask {
+        return None;
+    }
+    let mut price = impact.mid()?;
+    let (mut received_ns, mut age_ns) = (depth.local_recv_ns, depth.age_ns(now_ns));
+    if let Some(top) = usable(latest, ObsKind::BookTop, now_ns, max_age_ns)
+        && top.local_recv_ns > depth.local_recv_ns
+        && let (Some(now), Some(then)) = (top.mid(), depth.mid())
+    {
+        price = price.checked_add(now.checked_sub(then)?)?;
+        (received_ns, age_ns) = (top.local_recv_ns, top.age_ns(now_ns));
+    }
+    if !price.is_positive() {
+        return None;
+    }
+    let spread = impact.ask.checked_sub(impact.bid)?;
+    Some(SourceQuote {
+        venue: depth.venue(),
+        price,
+        half_spread: spread.checked_div(Fixed::from_int(2).ok()?),
+        // No depth factor yet: until every venue sends depth, weighting only some
+        // by it tilts the median toward them.
+        weight: weight_for(source, config, age_ns, spread.to_bps_of(price), None)?,
+        observation_time_ns: received_ns,
+        from_book: true,
+        converted: source.convert_quote,
+    })
+}
+
+/// Computes the aggregation weight for one quote.
 ///
 /// `trust × depth × recency × spread`, all bounded in `(0, 1]` except trust.
 fn weight_for(
     source: &SourceConfig,
     config: &FeedConfig,
-    observation: &Observation,
-    price: Fixed,
-    now_ns: u64,
+    age_ns: u64,
+    spread_bps: Option<Fixed>,
+    depth_notional: Option<Fixed>,
 ) -> Option<Fixed> {
     let mut weight = source.weight;
 
@@ -104,7 +178,6 @@ fn weight_for(
     let tau_ns = u64::try_from(config.recency_tau.as_nanos())
         .unwrap_or(u64::MAX)
         .max(1);
-    let age_ns = observation.age_ns(now_ns);
     let tau = Fixed::from_raw(i128::from(tau_ns));
     let age = Fixed::from_raw(i128::from(age_ns));
     let recency = tau.checked_div(tau.checked_add(age)?)?;
@@ -113,15 +186,15 @@ fn weight_for(
     // Tighter books count for more. Aggressive by design: a venue quoting five
     // basis points wide is not offering the same information as one quoting a
     // tenth of that.
-    if let Some(spread_bps) = observation.spread().and_then(|s| s.to_bps_of(price)) {
+    if let Some(spread_bps) = spread_bps {
         let one = Fixed::ONE;
         let denominator = one.checked_add(spread_bps.checked_abs()?)?;
         weight = weight.checked_mul(one.checked_div(denominator)?)?;
     }
 
-    // Liquidity, sub-linearly. Inert until a depth stream exists: `bookTicker`
-    // is top-of-book only, so this is currently always the neutral factor.
-    if let Some(depth) = observation.depth_notional_1bp
+    // Liquidity, sub-linearly. Only a depth snapshot carries it; a venue priced
+    // from its top of book gets the neutral factor.
+    if let Some(depth) = depth_notional
         && config.depth_reference.is_positive()
     {
         let ratio = depth.checked_div(config.depth_reference)?;
@@ -183,6 +256,7 @@ mod tests {
             exchange_time_ns: None,
             local_recv_ns: NOW - age_ns,
             seq: None,
+            book: None,
         }
     }
 
@@ -199,7 +273,137 @@ mod tests {
             exchange_time_ns: None,
             local_recv_ns: NOW - age_ns,
             seq: None,
+            book: None,
         }
+    }
+
+    fn depth(bids: &[(&str, &str)], asks: &[(&str, &str)], age_ns: u64) -> Observation {
+        let levels = |pairs: &[(&str, &str)]| -> Vec<oracle_types::Level> {
+            pairs
+                .iter()
+                .map(|(price, qty)| oracle_types::Level {
+                    price: fixed(price),
+                    qty: fixed(qty),
+                })
+                .collect()
+        };
+        let (bids, asks) = (levels(bids), levels(asks));
+        let (best_bid, best_ask) = (bids.first().copied(), asks.first().copied());
+        Observation {
+            kind: ObsKind::Depth,
+            bid: best_bid.map(|level| level.price),
+            ask: best_ask.map(|level| level.price),
+            bid_qty: best_bid.map(|level| level.qty),
+            ask_qty: best_ask.map(|level| level.qty),
+            book: Some(std::sync::Arc::new(oracle_types::BookDepth { bids, asks })),
+            ..trade("0", age_ns)
+        }
+    }
+
+    fn with_impact(notional: &str) -> FeedConfig {
+        let mut config = config();
+        config.impact_notional = Some(fixed(notional));
+        config
+    }
+
+    /// A huge bid at the top leans the microprice; the impact price for the
+    /// configured notional does not move.
+    #[test]
+    fn depth_prices_ignore_a_size_spoof_at_the_top() {
+        let mut slots = slots();
+        put(
+            &mut slots,
+            depth(&[("100", "1000")], &[("101", "1"), ("102", "100")], 10),
+        );
+        put(&mut slots, book("100", "101", "1000", "1", 20));
+        let micro = derive(&source(), &config(), &slots, NOW).expect("a quote");
+        assert!(
+            micro.price > fixed("100.9"),
+            "the spoof leans it: {}",
+            micro.price
+        );
+
+        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        assert_eq!(quote.price, fixed("100.5"));
+        assert_eq!(quote.half_spread, Some(fixed("0.5")));
+    }
+
+    /// Between snapshots the price follows the live top, so it is not as old as
+    /// the snapshot.
+    #[test]
+    fn a_newer_top_moves_the_depth_price_by_its_own_move() {
+        let mut slots = slots();
+        put(&mut slots, depth(&[("100", "10")], &[("101", "10")], 80));
+        put(&mut slots, book("100.4", "101.4", "1", "1", 5));
+        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        assert_eq!(quote.price, fixed("100.9"));
+        assert_eq!(quote.observation_time_ns, NOW - 5);
+
+        // A top older than the snapshot adds nothing.
+        put(&mut slots, book("100.4", "101.4", "1", "1", 90));
+        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        assert_eq!(quote.price, fixed("100.5"));
+    }
+
+    #[test]
+    fn a_source_that_reads_no_book_ignores_depth() {
+        let mark_only = SourceConfig::new(instrument(), vec![ObsKind::MarkPrice]);
+        let mut slots = slots();
+        put(&mut slots, depth(&[("100", "10")], &[("101", "10")], 10));
+        put(
+            &mut slots,
+            Observation {
+                kind: ObsKind::MarkPrice,
+                ..trade("100.7", 10)
+            },
+        );
+        let quote = derive(&mark_only, &with_impact("50"), &slots, NOW).expect("a quote");
+        assert_eq!(quote.price, fixed("100.7"));
+    }
+
+    #[test]
+    fn a_stale_snapshot_falls_back_to_the_top_of_book() {
+        let mut slots = slots();
+        put(
+            &mut slots,
+            depth(&[("100", "10")], &[("101", "10")], 3_000_000_000),
+        );
+        put(&mut slots, book("100", "102", "1", "1", 10));
+        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        assert_eq!(quote.price, fixed("101"));
+    }
+
+    /// A thin book reaches deeper for the notional, so its impact spread is
+    /// wider, and it counts for less.
+    #[test]
+    fn a_thin_book_weighs_less_through_its_impact_spread() {
+        let thin = {
+            let mut slots = slots();
+            put(
+                &mut slots,
+                depth(
+                    &[("99.99", "0.1"), ("99.5", "10")],
+                    &[("100.01", "0.1"), ("100.5", "10")],
+                    10,
+                ),
+            );
+            derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote")
+        };
+        let deep = {
+            let mut slots = slots();
+            put(
+                &mut slots,
+                depth(&[("99.99", "100")], &[("100.01", "100")], 10),
+            );
+            derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote")
+        };
+        assert!(
+            deep.weight > thin.weight,
+            "{} vs {}",
+            deep.weight,
+            thin.weight
+        );
+        assert!(thin.half_spread > deep.half_spread);
     }
 
     fn put(slots: &mut [Option<Observation>], observation: Observation) {

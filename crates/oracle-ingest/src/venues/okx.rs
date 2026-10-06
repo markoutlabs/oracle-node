@@ -29,6 +29,8 @@ pub const KEEPALIVE_PAYLOAD: &str = "ping";
 /// Channels subscribed per instrument.
 const SPOT_CHANNELS: [&str; 2] = ["bbo-tbt", "trades"];
 const SWAP_CHANNELS: [&str; 4] = ["bbo-tbt", "trades", "mark-price", "funding-rate"];
+/// The top five levels, pushed every 100ms when they change.
+const DEPTH_CHANNEL: &str = "books5";
 
 /// Returns `true` if an OKX instrument id names a perpetual swap.
 #[must_use]
@@ -36,17 +38,25 @@ pub fn is_swap(inst_id: &str) -> bool {
     inst_id.ends_with("-SWAP")
 }
 
-/// Builds subscribe frames for a set of OKX instrument ids.
+/// Builds subscribe frames for a set of OKX instrument ids, each with whether
+/// it wants depth snapshots.
+///
+/// Depth is spot only. A swap's sizes are contracts, and turning them into base
+/// units needs the contract value, which this build does not fetch.
 #[must_use]
-pub fn subscribe_frames<'a>(inst_ids: impl Iterator<Item = &'a str>, chunk: usize) -> Vec<String> {
+pub fn subscribe_frames<'a>(
+    instruments: impl Iterator<Item = (&'a str, bool)>,
+    chunk: usize,
+) -> Vec<String> {
     let mut args: Vec<serde_json::Value> = Vec::new();
-    for inst_id in inst_ids {
+    for (inst_id, depth) in instruments {
         let channels: &[&str] = if is_swap(inst_id) {
             &SWAP_CHANNELS
         } else {
             &SPOT_CHANNELS
         };
-        for channel in channels {
+        let depth = (depth && !is_swap(inst_id)).then_some(DEPTH_CHANNEL);
+        for channel in channels.iter().copied().chain(depth) {
             args.push(serde_json::json!({ "channel": channel, "instId": inst_id }));
         }
     }
@@ -80,6 +90,8 @@ struct Bbo<'a> {
     asks: Vec<Vec<&'a str>>,
     #[serde(borrow, default)]
     ts: Option<&'a str>,
+    #[serde(rename = "seqId", default)]
+    seq_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +157,10 @@ pub fn decode_payload(
             let inst_id = arg.inst_id.ok_or(DecodeError::MissingField("instId"))?;
             decode_bbo(data, inst_id, map, local_recv_ns, out)
         }
+        DEPTH_CHANNEL => {
+            let inst_id = arg.inst_id.ok_or(DecodeError::MissingField("instId"))?;
+            decode_books(data, inst_id, map, local_recv_ns, out)
+        }
         "trades" => decode_trades(data, map, local_recv_ns, out),
         "mark-price" => decode_mark_price(data, map, local_recv_ns, out),
         "funding-rate" => decode_funding(data, map, local_recv_ns, out),
@@ -196,8 +212,48 @@ fn decode_bbo(
             exchange_time_ns: stamp(bbo.ts),
             local_recv_ns,
             seq: None,
+            book: None,
         });
         emitted = true;
+    }
+    if emitted {
+        Ok(())
+    } else {
+        Err(DecodeError::Control)
+    }
+}
+
+fn decode_books(
+    data: &[u8],
+    inst_id: &str,
+    map: &InstrumentMap,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let entries: Vec<Bbo<'_>> =
+        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let entry = map
+        .lookup(inst_id)
+        .ok_or_else(|| DecodeError::UnknownInstrument(inst_id.to_owned()))?;
+    let side = |levels: &[Vec<&str>]| {
+        levels
+            .iter()
+            .filter_map(|level| Some(crate::depth::level(level.first()?, level.get(1)?)))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let mut emitted = false;
+    for book in entries {
+        if let Some(observation) = crate::depth::observation(
+            entry.instrument.clone(),
+            side(&book.bids)?,
+            side(&book.asks)?,
+            stamp(book.ts),
+            local_recv_ns,
+            book.seq_id,
+        ) {
+            out.push(observation);
+            emitted = true;
+        }
     }
     if emitted {
         Ok(())
@@ -231,6 +287,7 @@ fn decode_trades(
             exchange_time_ns: stamp(trade.ts),
             local_recv_ns,
             seq: None,
+            book: None,
         });
         emitted = true;
     }
@@ -266,6 +323,7 @@ fn decode_mark_price(
             exchange_time_ns: stamp(mark.ts),
             local_recv_ns,
             seq: None,
+            book: None,
         });
         emitted = true;
     }
@@ -301,6 +359,7 @@ fn decode_funding(
             exchange_time_ns: stamp(funding.ts),
             local_recv_ns,
             seq: None,
+            book: None,
         });
         emitted = true;
     }
@@ -429,16 +488,43 @@ mod tests {
 
     #[test]
     fn swaps_subscribe_to_more_channels_than_spot() {
-        let spot = subscribe_frames(["BTC-USDT"].into_iter(), 100);
+        let spot = subscribe_frames([("BTC-USDT", false)].into_iter(), 100);
         assert!(!spot[0].contains("mark-price"));
-        let swap = subscribe_frames(["BTC-USDT-SWAP"].into_iter(), 100);
+        let swap = subscribe_frames([("BTC-USDT-SWAP", false)].into_iter(), 100);
         assert!(swap[0].contains("mark-price"));
         assert!(swap[0].contains("funding-rate"));
     }
 
     #[test]
     fn subscribe_frames_are_chunked() {
-        let frames = subscribe_frames(["BTC-USDT", "ETH-USDT"].into_iter(), 2);
+        let frames = subscribe_frames([("BTC-USDT", false), ("ETH-USDT", false)].into_iter(), 2);
         assert_eq!(frames.len(), 2, "four args at two per frame");
+    }
+
+    /// A swap's depth is in contracts, so only spot subscribes to it.
+    #[test]
+    fn depth_is_subscribed_for_spot_only() {
+        let spot = subscribe_frames([("BTC-USDT", true)].into_iter(), 100);
+        assert!(spot[0].contains("books5"));
+        let swap = subscribe_frames([("BTC-USDT-SWAP", true)].into_iter(), 100);
+        assert!(!swap[0].contains("books5"));
+    }
+
+    const BOOKS5: &str = r#"{"arg":{"channel":"books5","instId":"BTC-USDT"},
+        "data":[{"asks":[["64313.0","0.5","0","3"],["64314.0","1.2","0","5"]],
+        "bids":[["64312.0","0.7","0","2"],["64311.5","2.0","0","4"]],
+        "instId":"BTC-USDT","ts":"1754582400123","seqId":123456}]}"#;
+
+    #[test]
+    fn books5_becomes_a_depth_observation() {
+        let out = decode(BOOKS5, MarketKind::Spot, "BTC-USDT");
+        assert_eq!(out.len(), 1);
+        let depth = &out[0];
+        assert_eq!(depth.kind, ObsKind::Depth);
+        assert_eq!(depth.bid, Some("64312.0".parse().expect("valid")));
+        assert_eq!(depth.ask, Some("64313.0".parse().expect("valid")));
+        assert_eq!(depth.seq, Some(123_456));
+        let book = depth.book.as_deref().expect("levels");
+        assert_eq!((book.bids.len(), book.asks.len()), (2, 2));
     }
 }

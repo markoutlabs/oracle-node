@@ -30,7 +30,7 @@ use crate::{
     InstrumentSpec, StreamId,
 };
 
-use streams::{MAX_STREAMS_PER_CONNECTION, combined_urls, stream_names};
+use streams::{MAX_STREAMS_PER_CONNECTION, StreamKind, combined_urls, stream_names};
 
 /// Binance adapter configuration.
 #[derive(Clone, Debug)]
@@ -165,7 +165,18 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
                 continue;
             }
             let map = InstrumentMap::new(Venue::Binance, market, specs)?;
-            let names = stream_names(map.venue_symbols(), market);
+            let mut names = stream_names(map.venue_symbols(), market);
+            // Only for a market this adapter serves: no streams means no connection.
+            if !names.is_empty() {
+                names.extend(map.depth_symbols().map(|symbol| {
+                    format!(
+                        "{}{}",
+                        symbol.to_ascii_lowercase(),
+                        StreamKind::Depth.suffix()
+                    )
+                }));
+                names.sort_unstable();
+            }
             let urls = combined_urls(base, &names, self.config.streams_per_connection);
             for url in urls {
                 let mut session = SessionConfig::new(StreamId::new(Venue::Binance, market), url);

@@ -194,6 +194,7 @@ fn decode_book(
         exchange_time_ns: None,
         local_recv_ns,
         seq: book.update_id,
+        book: None,
     });
     Ok(())
 }
@@ -224,6 +225,7 @@ fn decode_trades(
             exchange_time_ns: Some(millis_to_nanos(trade.time_ms)),
             local_recv_ns,
             seq: None,
+            book: None,
         });
     }
     if seen {
@@ -260,6 +262,7 @@ fn decode_ticker(
             exchange_time_ns,
             local_recv_ns,
             seq: None,
+            book: None,
         });
     };
 

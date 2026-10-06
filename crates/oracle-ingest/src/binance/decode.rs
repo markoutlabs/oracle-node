@@ -68,6 +68,22 @@ struct MarkPrice<'a> {
     funding_rate: Option<&'a str>,
 }
 
+/// Partial book depth. Spot sends `bids` and `asks` and no symbol, so the
+/// symbol comes from the stream name; futures sends `b`, `a`, `s` and `E`.
+#[derive(Deserialize)]
+struct PartialDepth<'a> {
+    #[serde(alias = "b", borrow)]
+    bids: Vec<[&'a str; 2]>,
+    #[serde(alias = "a", borrow)]
+    asks: Vec<[&'a str; 2]>,
+    #[serde(rename = "s", borrow, default)]
+    symbol: Option<&'a str>,
+    #[serde(rename = "E", default)]
+    event_time_ms: Option<u64>,
+    #[serde(rename = "lastUpdateId", alias = "u", default)]
+    update_id: Option<u64>,
+}
+
 /// Parses a decimal field.
 fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeError> {
     value.parse().map_err(|_| DecodeError::BadDecimal {
@@ -111,7 +127,42 @@ pub fn decode_payload(
         StreamKind::BookTicker => decode_book_ticker(data, map, local_recv_ns, out),
         StreamKind::AggTrade => decode_agg_trade(data, map, local_recv_ns, out),
         StreamKind::MarkPrice => decode_mark_price(data, map, local_recv_ns, out),
+        StreamKind::Depth => decode_depth(envelope.stream, data, map, local_recv_ns, out),
     }
+}
+
+fn decode_depth(
+    stream: &str,
+    data: &[u8],
+    map: &InstrumentMap,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let depth: PartialDepth<'_> =
+        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let symbol = depth
+        .symbol
+        .unwrap_or_else(|| stream.split('@').next().unwrap_or(stream));
+    let entry = map
+        .lookup(symbol)
+        .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))?;
+    let side = |levels: &[[&str; 2]]| {
+        levels
+            .iter()
+            .map(|[price, qty]| crate::depth::level(price, qty))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    if let Some(observation) = crate::depth::observation(
+        entry.instrument.clone(),
+        side(&depth.bids)?,
+        side(&depth.asks)?,
+        depth.event_time_ms.map(millis_to_nanos),
+        local_recv_ns,
+        depth.update_id,
+    ) {
+        out.push(observation);
+    }
+    Ok(())
 }
 
 /// Returns `true` if the payload is a control response rather than market data.
@@ -164,6 +215,7 @@ fn decode_book_ticker(
         exchange_time_ns: ticker.event_time_ms.map(millis_to_nanos),
         local_recv_ns,
         seq: Some(ticker.update_id),
+        book: None,
     });
     Ok(())
 }
@@ -194,6 +246,7 @@ fn decode_agg_trade(
         exchange_time_ns: Some(millis_to_nanos(trade.trade_time_ms)),
         local_recv_ns,
         seq: Some(trade.agg_id),
+        book: None,
     });
     Ok(())
 }
@@ -224,6 +277,7 @@ fn decode_mark_price(
             exchange_time_ns,
             local_recv_ns,
             seq: None,
+            book: None,
         });
     };
 
@@ -284,6 +338,49 @@ mod tests {
     const PERP_BOOK_TICKER: &str = r#"{"stream":"btcusdt@bookTicker","data":{
         "e":"bookTicker","u":400900217,"E":1754582400123,"T":1754582400120,
         "s":"BTCUSDT","b":"64311.50","B":"3.0","a":"64312.50","A":"1.0"}}"#;
+
+    /// Spot partial depth: `bids` and `asks`, no symbol, no event time.
+    const SPOT_DEPTH: &str = r#"{"stream":"btcusdt@depth20@100ms","data":{
+        "lastUpdateId":160,
+        "bids":[["64312.00","1.5"],["64311.50","2.0"]],
+        "asks":[["64313.00","0.8"],["64314.00","3.0"]]}}"#;
+
+    /// Futures partial depth: `b`, `a`, `s` and `E`, bids not best first.
+    const PERP_DEPTH: &str = r#"{"stream":"btcusdt@depth20@100ms","data":{
+        "e":"depthUpdate","E":1754582400123,"T":1754582400120,"s":"BTCUSDT",
+        "U":390497796,"u":390497878,"pu":390497794,
+        "b":[["64311.0","2.0"],["64311.5","3.0"]],
+        "a":[["64312.5","1.0"],["64313.0","4.0"]]}}"#;
+
+    #[test]
+    fn spot_depth_takes_its_symbol_from_the_stream_name() {
+        let out = decode(SPOT_DEPTH, &spot_map());
+        let [depth] = out.as_slice() else {
+            panic!("one observation: {out:?}");
+        };
+        assert_eq!(depth.kind, ObsKind::Depth);
+        assert_eq!(depth.bid, Some("64312.00".parse().expect("valid")));
+        assert_eq!(depth.ask, Some("64313.00".parse().expect("valid")));
+        assert_eq!(depth.seq, Some(160));
+        let book = depth.book.as_deref().expect("levels");
+        assert_eq!((book.bids.len(), book.asks.len()), (2, 2));
+    }
+
+    #[test]
+    fn futures_depth_is_sorted_best_first() {
+        let out = decode(PERP_DEPTH, &perp_map());
+        let [depth] = out.as_slice() else {
+            panic!("one observation: {out:?}");
+        };
+        assert_eq!(depth.bid, Some("64311.5".parse().expect("valid")));
+        assert_eq!(depth.exchange_time_ns, Some(1_754_582_400_123_000_000));
+        let book = depth.book.as_deref().expect("levels");
+        assert!(
+            book.bids
+                .windows(2)
+                .all(|pair| matches!(pair, [high, low] if high.price > low.price))
+        );
+    }
 
     const AGG_TRADE: &str = r#"{"stream":"btcusdt@aggTrade","data":{
         "e":"aggTrade","E":1754582400123,"s":"BTCUSDT","a":12345,
@@ -412,7 +509,7 @@ mod tests {
         assert!(matches!(err, DecodeError::UnknownInstrument(_)));
         assert!(err.is_benign());
 
-        let unknown_stream = r#"{"stream":"btcusdt@depth20","data":{}}"#;
+        let unknown_stream = r#"{"stream":"btcusdt@kline_1m","data":{}}"#;
         let err = decode_payload(unknown_stream.as_bytes(), &spot_map(), RECV_NS, &mut out)
             .expect_err("unhandled");
         assert!(matches!(err, DecodeError::UnhandledStream(_)));

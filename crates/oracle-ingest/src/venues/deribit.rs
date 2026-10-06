@@ -25,7 +25,7 @@
 //! BTC. Every other venue reports base units, so the amounts are converted on the
 //! way in — see [`MarketKind::InversePerp`](oracle_types::MarketKind::InversePerp).
 
-use oracle_types::{Fixed, MarketKind, ObsKind, Observation};
+use oracle_types::{Fixed, Level, MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -44,17 +44,25 @@ pub const URL: &str = "wss://www.deribit.com/ws/api/v2";
 /// threshold for a fast feed.
 pub const TICKER_INTERVAL: &str = "100ms";
 
-/// Builds the subscribe frames for a set of Deribit instrument names.
+/// The book channel: ungrouped prices, the top twenty levels, every 100ms. A
+/// grouped book sends whole snapshots, never increments.
+const BOOK_DEPTH: &str = "none.20.100ms";
+
+/// Builds the subscribe frames for a set of Deribit instrument names, each with
+/// whether it wants depth snapshots.
 ///
 /// One JSON-RPC request carrying every channel: Deribit accepts a list, and a
 /// single request means a single reply to recognise and ignore.
 #[must_use]
 pub fn subscribe_frames<'a>(
-    instrument_names: impl Iterator<Item = &'a str>,
+    instruments: impl Iterator<Item = (&'a str, bool)>,
     chunk: usize,
 ) -> Vec<String> {
-    let channels: Vec<String> = instrument_names
-        .map(|name| format!("ticker.{name}.{TICKER_INTERVAL}"))
+    let channels: Vec<String> = instruments
+        .flat_map(|(name, depth)| {
+            std::iter::once(format!("ticker.{name}.{TICKER_INTERVAL}"))
+                .chain(depth.then(|| format!("book.{name}.{BOOK_DEPTH}")))
+        })
         .collect();
     channels
         .chunks(chunk.max(1))
@@ -125,6 +133,22 @@ struct Ticker<'a> {
     funding_8h: Option<&'a RawValue>,
 }
 
+/// A grouped book snapshot. Levels are `[price, amount]`.
+#[derive(Deserialize)]
+struct Book<'a> {
+    #[serde(rename = "instrument_name", borrow)]
+    instrument_name: &'a str,
+    /// Milliseconds.
+    #[serde(default)]
+    timestamp: Option<u64>,
+    #[serde(default)]
+    change_id: Option<u64>,
+    #[serde(borrow, default)]
+    bids: Vec<[&'a RawValue; 2]>,
+    #[serde(borrow, default)]
+    asks: Vec<[&'a RawValue; 2]>,
+}
+
 /// Decodes one Deribit payload.
 ///
 /// # Errors
@@ -149,6 +173,9 @@ pub fn decode_payload(
     else {
         return Err(DecodeError::Control);
     };
+    if channel.starts_with("book.") {
+        return decode_book(data, map, local_recv_ns, out);
+    }
     if !channel.starts_with("ticker.") {
         return Err(DecodeError::UnhandledStream(channel.to_owned()));
     }
@@ -200,6 +227,7 @@ pub fn decode_payload(
                 exchange_time_ns,
                 local_recv_ns,
                 seq: None,
+                book: None,
             });
             emitted = true;
         }
@@ -224,6 +252,7 @@ pub fn decode_payload(
             exchange_time_ns,
             local_recv_ns,
             seq: None,
+            book: None,
         });
         emitted = true;
     }
@@ -232,6 +261,45 @@ pub fn decode_payload(
         Ok(())
     } else {
         Err(DecodeError::Control)
+    }
+}
+
+fn decode_book(
+    data: &RawValue,
+    map: &InstrumentMap,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let book: Book<'_> =
+        serde_json::from_str(data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let Some(entry) = map.lookup(book.instrument_name) else {
+        return Err(DecodeError::Control);
+    };
+    let inverse = entry.instrument.market == MarketKind::InversePerp;
+    let side = |levels: &[[&RawValue; 2]]| -> Result<Vec<Level>, DecodeError> {
+        let mut parsed = Vec::with_capacity(levels.len());
+        for [price, amount] in levels {
+            let price = decimal_literal("book price", price)?;
+            let amount = decimal_literal("book amount", amount)?;
+            if let Some(qty) = to_base_units(amount, price, inverse) {
+                parsed.push(Level { price, qty });
+            }
+        }
+        Ok(parsed)
+    };
+    match crate::depth::observation(
+        entry.instrument.clone(),
+        side(&book.bids)?,
+        side(&book.asks)?,
+        book.timestamp.map(millis_to_nanos),
+        local_recv_ns,
+        book.change_id,
+    ) {
+        Some(observation) => {
+            out.push(observation);
+            Ok(())
+        }
+        None => Err(DecodeError::Control),
     }
 }
 
@@ -445,15 +513,45 @@ mod tests {
 
     #[test]
     fn subscribe_frames_name_the_ticker_channel_and_chunk() {
-        let frames = subscribe_frames(["BTC-PERPETUAL"].into_iter(), 100);
+        let frames = subscribe_frames([("BTC-PERPETUAL", false)].into_iter(), 100);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].contains(r#""method":"public/subscribe""#));
         assert!(frames[0].contains("ticker.BTC-PERPETUAL.100ms"));
+        assert!(!frames[0].contains("book."));
 
-        let many = subscribe_frames(["BTC-PERPETUAL", "ETH-PERPETUAL"].into_iter(), 1);
+        let many = subscribe_frames(
+            [("BTC-PERPETUAL", false), ("ETH-PERPETUAL", false)].into_iter(),
+            1,
+        );
         assert_eq!(many.len(), 2, "two channels at one per frame");
         // Distinct request ids, so a reply can be attributed.
         assert!(many[0].contains(r#""id":1"#));
         assert!(many[1].contains(r#""id":2"#));
+    }
+
+    #[test]
+    fn depth_adds_the_grouped_book_channel() {
+        let frames = subscribe_frames([("BTC-PERPETUAL", true)].into_iter(), 100);
+        assert!(frames[0].contains("book.BTC-PERPETUAL.none.20.100ms"));
+    }
+
+    const BOOK: &str = r#"{"jsonrpc":"2.0","method":"subscription","params":{
+        "channel":"book.BTC-PERPETUAL.none.20.100ms",
+        "data":{"timestamp":1754582400123,"instrument_name":"BTC-PERPETUAL","change_id":42,
+        "bids":[[64312.0,64312.0],[64311.5,128623.0]],
+        "asks":[[64313.0,32156.5],[64313.5,64313.5]]}}}"#;
+
+    /// An inverse contract's amounts are USD, so a level of 64312 USD at a
+    /// price of 64312 is one BTC.
+    #[test]
+    fn an_inverse_book_is_converted_to_base_units() {
+        let out = decode(BOOK, MarketKind::InversePerp, "BTC-PERPETUAL");
+        assert_eq!(out.len(), 1);
+        let depth = &out[0];
+        assert_eq!(depth.kind, ObsKind::Depth);
+        assert_eq!(depth.bid_qty, Some(Fixed::ONE));
+        assert_eq!(depth.seq, Some(42));
+        let book = depth.book.as_deref().expect("levels");
+        assert_eq!(book.bids[1].qty, "2".parse().expect("valid"));
     }
 }

@@ -30,6 +30,7 @@
 pub mod backoff;
 pub mod binance;
 pub mod clock;
+mod depth;
 mod error;
 mod event;
 mod instrument;

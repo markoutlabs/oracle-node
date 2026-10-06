@@ -74,6 +74,9 @@ key_file = {key_file}
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT"
 min_sources = 2
+# Price each venue at the average fill for this many USDT, from depth snapshots
+# where the venue sends them. One large order at the top cannot lean it.
+impact_notional = "20000"
 sources = [
   {{ venue = "binance", market = "spot", symbol = "BTCUSDT" }},
   {{ venue = "bybit", market = "spot", symbol = "BTCUSDT" }},

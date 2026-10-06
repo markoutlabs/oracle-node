@@ -18,6 +18,8 @@ pub struct InstrumentSpec {
     pub market: MarketKind,
     /// The canonical feed symbol this instrument contributes to.
     pub canonical: Symbol,
+    /// Subscribe to depth snapshots as well as the top of book.
+    pub depth: bool,
 }
 
 impl InstrumentSpec {
@@ -38,7 +40,15 @@ impl InstrumentSpec {
             venue_symbol: venue_symbol.into(),
             market,
             canonical,
+            depth: false,
         })
+    }
+
+    /// Also subscribes to depth snapshots, where the venue sends them.
+    #[must_use]
+    pub const fn with_depth(mut self) -> Self {
+        self.depth = true;
+        self
     }
 }
 
@@ -49,6 +59,8 @@ pub struct InstrumentEntry {
     pub instrument: InstrumentId,
     /// The canonical feed this instrument feeds into.
     pub canonical: Symbol,
+    /// Whether depth snapshots are subscribed.
+    pub depth: bool,
 }
 
 /// Venue symbol to instrument lookup for one venue and market.
@@ -93,6 +105,7 @@ impl InstrumentMap {
             let entry = InstrumentEntry {
                 instrument: InstrumentId::new(venue, market, spec.venue_symbol.as_str()),
                 canonical: spec.canonical,
+                depth: spec.depth,
             };
             if by_symbol.insert(key, entry).is_some() {
                 return Err(IngestError::DuplicateInstrument {
@@ -135,6 +148,14 @@ impl InstrumentMap {
     /// Iterates the venue symbols, in unspecified order.
     pub fn venue_symbols(&self) -> impl Iterator<Item = &str> {
         self.by_symbol.keys().map(String::as_str)
+    }
+
+    /// Iterates the venue symbols that want depth snapshots, in unspecified order.
+    pub fn depth_symbols(&self) -> impl Iterator<Item = &str> {
+        self.by_symbol
+            .iter()
+            .filter(|(_, entry)| entry.depth)
+            .map(|(symbol, _)| symbol.as_str())
     }
 
     /// Looks up an instrument by venue symbol, case-insensitively.

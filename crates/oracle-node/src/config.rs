@@ -208,6 +208,11 @@ pub struct FeedSettings {
     /// Never publish more often than this, in milliseconds.
     #[serde(default)]
     pub min_interval_ms: Option<u64>,
+    /// Price each venue at the average fill for this notional, in quote units,
+    /// from depth snapshots, as a decimal string. Subscribes to depth where the
+    /// venue offers it.
+    #[serde(default)]
+    pub impact_notional: Option<String>,
     /// Contributing venues.
     pub sources: Vec<SourceSettings>,
 }
@@ -504,6 +509,8 @@ impl NodeConfig {
                 };
 
                 let instrument = InstrumentId::new(venue, market, source.symbol.as_str());
+                // Depth replaces a top-of-book price, so only a book source needs it.
+                let depth = feed.impact_notional.is_some() && kinds.contains(&ObsKind::BookTop);
                 let mut config = SourceConfig::new(instrument, kinds);
                 if source.converted {
                     config = config.converted();
@@ -518,10 +525,12 @@ impl NodeConfig {
 
                 instruments
                     .entry((venue, market, source.symbol.clone()))
+                    .and_modify(|spec| spec.depth |= depth)
                     .or_insert_with(|| InstrumentSpec {
                         venue_symbol: source.symbol.clone(),
                         market,
                         canonical: symbol,
+                        depth,
                     });
             }
 
@@ -544,6 +553,14 @@ impl NodeConfig {
             }
             if let Some(ms) = feed.min_interval_ms {
                 config.min_interval = Duration::from_millis(ms);
+            }
+            if let Some(text) = &feed.impact_notional {
+                config.impact_notional = Some(text.parse().map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "feed `{}`: bad impact_notional: {e}",
+                        feed.symbol
+                    ))
+                })?);
             }
             if let Some(peg) = &feed.peg {
                 let peg_symbol: Symbol = peg.parse().map_err(|e| {
@@ -664,6 +681,11 @@ fn venue_connection(
     instruments: &[InstrumentSpec],
 ) -> Result<VenueConnection, ConfigError> {
     let symbols = || instruments.iter().map(|spec| spec.venue_symbol.as_str());
+    let with_depth = || {
+        instruments
+            .iter()
+            .map(|spec| (spec.venue_symbol.as_str(), spec.depth))
+    };
 
     // Annotated so each arm's function item coerces to the shared pointer type;
     // an `as` cast per arm would do the same but reads as a reinterpretation.
@@ -677,7 +699,7 @@ fn venue_connection(
         ),
         Venue::Okx => (
             okx::URL.to_owned(),
-            okx::subscribe_frames(symbols(), VENUE_CHUNK),
+            okx::subscribe_frames(with_depth(), VENUE_CHUNK),
             Some((okx::KEEPALIVE, okx::KEEPALIVE_PAYLOAD.to_owned())),
             okx::decode_payload,
         ),
@@ -720,7 +742,7 @@ fn venue_connection(
         }
         Venue::Deribit => (
             deribit::URL.to_owned(),
-            deribit::subscribe_frames(symbols(), VENUE_CHUNK),
+            deribit::subscribe_frames(with_depth(), VENUE_CHUNK),
             // None: the ticker channel pushes every 100ms whether or not the
             // market moves, so the socket is never idle and `idle_timeout`
             // catches a half-open one. Deribit's own heartbeat needs a reply to
@@ -1021,6 +1043,8 @@ sources = [
         assert_eq!(other.deviation_bps.to_string(), "1", "the default");
 
         for (settings, why) in [
+            ("impact_notional = \"0\"", "impact_notional"),
+            ("impact_notional = \"much\"", "impact_notional"),
             ("min_interval_ms = 0", "min_interval"),
             ("heartbeat_ms = 5\nmin_interval_ms = 10", "heartbeat"),
             ("deviation_bps = \"-1\"", "deviation_bps"),
@@ -1037,6 +1061,25 @@ sources = [
             let error = error.to_string();
             assert!(error.contains(why), "{settings}: {error}");
         }
+    }
+
+    /// A feed that prices from depth subscribes to it for every instrument it
+    /// reads, and only for those.
+    #[test]
+    fn impact_notional_turns_on_depth_for_its_instruments() {
+        let text = SAMPLE.replacen(
+            "min_sources = 1\n",
+            "min_sources = 1\nimpact_notional = \"20000\"\n",
+            1,
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let feed = resolved.feeds.first().expect("a feed");
+        assert_eq!(
+            feed.impact_notional.map(|n| n.to_string()),
+            Some("20000".to_owned())
+        );
+        assert!(resolved.binance.spot.iter().all(|spec| spec.depth));
+        assert!(resolved.binance.perp.iter().all(|spec| !spec.depth));
     }
 
     #[test]

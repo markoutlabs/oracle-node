@@ -55,6 +55,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD"
+impact_notional = "20000"
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
 sources = [
@@ -67,6 +68,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USD"
+impact_notional = "20000"
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
 sources = [
@@ -79,6 +81,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.SOL/USD"
+impact_notional = "6000"
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
 sources = [
@@ -95,6 +98,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT"
+impact_notional = "20000"
 min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "BTCUSDT" },

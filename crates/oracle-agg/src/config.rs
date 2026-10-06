@@ -115,10 +115,8 @@ pub struct FeedConfig {
 
     /// Reference notional for depth weighting: `sqrt(depth / reference)`, capped.
     ///
-    /// Inert until a depth stream exists — `bookTicker` is top-of-book only, so
-    /// `depth_notional_1bp` is currently always absent and every source gets the
-    /// neutral factor. Wired now so adding depth is a config change, not a
-    /// rewrite.
+    /// Not applied yet: until every venue sends depth, weighting only some by it
+    /// tilts the median toward them. Every venue gets the neutral factor.
     pub depth_reference: Fixed,
 
     /// Ceiling on the depth factor, so one deep venue cannot dominate.
@@ -175,6 +173,10 @@ pub struct FeedConfig {
     /// and subscriber bandwidth under volatility — precisely when both are under
     /// the most stress.
     pub min_interval: Duration,
+
+    /// Price each venue at the average fill for this notional, in quote units,
+    /// from its depth snapshots. `None` keeps the top-of-book microprice.
+    pub impact_notional: Option<Fixed>,
 }
 
 impl FeedConfig {
@@ -211,6 +213,7 @@ impl FeedConfig {
             deviation_bps: Fixed::ONE,
             heartbeat: Duration::from_millis(1_000),
             min_interval: Duration::from_millis(50),
+            impact_notional: None,
         }
     }
 
@@ -283,6 +286,15 @@ impl FeedConfig {
                 symbol: self.symbol.to_string(),
                 reason: "min_interval must be above zero: it bounds signing under volatility"
                     .to_owned(),
+            });
+        }
+        if self
+            .impact_notional
+            .is_some_and(|notional| !notional.is_positive())
+        {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: "impact_notional must be above zero".to_owned(),
             });
         }
         if self.deviation_bps < Fixed::ZERO {

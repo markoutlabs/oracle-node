@@ -91,9 +91,10 @@ on Binance depending on the contract, and the message does not say which. See
 `MarketKind` now distinguishes `InversePerp` from `LinearPerp`, because the
 distinction is load-bearing: on Deribit's `BTC-PERPETUAL` the order sizes are
 quoted in **USD**, not BTC. They are divided by price on the way in so every
-venue reports base units. Nothing today would notice if that were wrong —
-`microprice` is scale-invariant within one observation and depth weighting is
-inert — which is exactly why it is a distinct market kind rather than a comment.
+venue reports base units. The microprice would not notice if that were wrong,
+being scale-invariant within one observation, but the impact price from a depth
+snapshot would — which is exactly why it is a distinct market kind rather than a
+comment.
 
 Two invariants the code enforces rather than documents:
 
@@ -127,6 +128,13 @@ A feed is evaluated when one of its inputs changes, so a move publishes when it
 arrives; a 25 ms timer catches heartbeats and stale venues. `deviation_bps` (1 by
 default), `heartbeat_ms` and `min_interval_ms` are set per feed. A move held back
 by the rate cap publishes the moment the cap expires.
+
+With `impact_notional` set on a feed, each venue that sends depth snapshots
+(Binance, OKX spot, Deribit) is priced at the average fill for that notional
+instead of its microprice, moved by the live top of book between snapshots. One
+large order at the top can lean a microprice; it cannot lean an impact price.
+SPEC §5.1 has the rule, and why Bybit, Coinbase and Kraken still price from the
+top of book.
 
 Two venues that disagree beyond the 10 bp outlier floor leave no majority to say
 which is wrong. The feed degrades, keeps the venue nearer its last price, and

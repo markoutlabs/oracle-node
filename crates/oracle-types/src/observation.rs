@@ -1,6 +1,7 @@
 //! A single venue's view of a single instrument at a single instant.
 
 use core::fmt;
+use std::sync::Arc;
 
 use crate::{Fixed, InstrumentId, Venue};
 
@@ -23,17 +24,20 @@ pub enum ObsKind {
     Funding,
     /// Open interest, in base-asset units.
     OpenInterest,
+    /// The top levels of the book, as a snapshot.
+    Depth,
 }
 
 impl ObsKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::BookTop,
         Self::Trade,
         Self::MarkPrice,
         Self::IndexPrice,
         Self::Funding,
         Self::OpenInterest,
+        Self::Depth,
     ];
 
     /// Number of kinds. Sizes the per-venue latest-observation slots.
@@ -49,13 +53,14 @@ impl ObsKind {
             Self::IndexPrice => 3,
             Self::Funding => 4,
             Self::OpenInterest => 5,
+            Self::Depth => 6,
         }
     }
 
     /// Returns `true` if this kind carries a two-sided book.
     #[must_use]
     pub const fn has_book(self) -> bool {
-        matches!(self, Self::BookTop)
+        matches!(self, Self::BookTop | Self::Depth)
     }
 
     /// Returns the canonical name, suitable as a metrics label.
@@ -68,6 +73,7 @@ impl ObsKind {
             Self::IndexPrice => "index_price",
             Self::Funding => "funding",
             Self::OpenInterest => "open_interest",
+            Self::Depth => "depth",
         }
     }
 }
@@ -87,6 +93,121 @@ impl core::str::FromStr for ObsKind {
             .find(|kind| kind.as_str() == s)
             .ok_or_else(|| ObsKindError(s.to_owned()))
     }
+}
+
+/// One price level: a price and the base-asset size resting there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Level {
+    /// The price.
+    pub price: Fixed,
+    /// The size, in base-asset units.
+    pub qty: Fixed,
+}
+
+/// The top levels of a book, best first on each side.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BookDepth {
+    /// Bids, highest first.
+    pub bids: Vec<Level>,
+    /// Asks, lowest first.
+    pub asks: Vec<Level>,
+}
+
+/// The average prices at which a set notional would fill on each side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Impact {
+    /// The average price selling the notional into the bids.
+    pub bid: Fixed,
+    /// The average price buying the notional from the asks.
+    pub ask: Fixed,
+    /// `false` if a side ran out of levels. The rest is filled at that side's
+    /// last level, so a thin book reads tighter than it is.
+    pub complete: bool,
+}
+
+impl Impact {
+    /// The midpoint of the two impact prices.
+    #[must_use]
+    pub fn mid(&self) -> Option<Fixed> {
+        self.bid
+            .checked_add(self.ask)?
+            .checked_div(Fixed::from_int(2).ok()?)
+    }
+}
+
+impl BookDepth {
+    /// The average fill prices for `notional`, in quote units, on each side.
+    ///
+    /// A single large order at the top fills the whole notional at its own price,
+    /// so it cannot lean the result the way it leans a microprice.
+    #[must_use]
+    pub fn impact(&self, notional: Fixed) -> Option<Impact> {
+        let (bid, bid_complete) = fill(&self.bids, notional)?;
+        let (ask, ask_complete) = fill(&self.asks, notional)?;
+        Some(Impact {
+            bid,
+            ask,
+            complete: bid_complete && ask_complete,
+        })
+    }
+
+    /// Notional resting within `bps` of the mid, both sides together.
+    #[must_use]
+    pub fn notional_within_bps(&self, bps: Fixed) -> Option<Fixed> {
+        let (best_bid, best_ask) = (self.bids.first()?.price, self.asks.first()?.price);
+        let mid = best_bid
+            .checked_add(best_ask)?
+            .checked_div(Fixed::from_int(2).ok()?)?;
+        let band = mid
+            .checked_mul(bps)?
+            .checked_div(Fixed::from_int(10_000).ok()?)?;
+        let (low, high) = (mid.checked_sub(band)?, mid.checked_add(band)?);
+        let mut total = Fixed::ZERO;
+        for level in self.bids.iter().take_while(|level| level.price >= low) {
+            total = total.checked_add(level.price.checked_mul(level.qty)?)?;
+        }
+        for level in self.asks.iter().take_while(|level| level.price <= high) {
+            total = total.checked_add(level.price.checked_mul(level.qty)?)?;
+        }
+        Some(total)
+    }
+}
+
+/// The volume-weighted price filling `notional` from `levels`, and whether the
+/// levels covered it. Whole levels add their exact size and only the level the
+/// fill ends in divides, so a fill at one price is that price exactly.
+fn fill(levels: &[Level], notional: Fixed) -> Option<(Fixed, bool)> {
+    if !notional.is_positive() {
+        return None;
+    }
+    let mut remaining = notional;
+    let mut qty = Fixed::ZERO;
+    let mut last = None;
+    let mut used = 0_usize;
+    for level in levels {
+        if !level.price.is_positive() || !level.qty.is_positive() {
+            continue;
+        }
+        let first = last.is_none();
+        last = Some(level.price);
+        used = used.saturating_add(1);
+        let here = level.price.checked_mul(level.qty)?;
+        if here >= remaining {
+            if first {
+                return Some((level.price, true));
+            }
+            qty = qty.checked_add(remaining.checked_div(level.price)?)?;
+            return Some((notional.checked_div(qty)?, true));
+        }
+        qty = qty.checked_add(level.qty)?;
+        remaining = remaining.checked_sub(here)?;
+    }
+    let last = last?;
+    if used == 1 {
+        return Some((last, false));
+    }
+    qty = qty.checked_add(remaining.checked_div(last)?)?;
+    Some((notional.checked_div(qty)?, false))
 }
 
 /// An unrecognised observation kind.
@@ -134,6 +255,8 @@ pub struct Observation {
     pub local_recv_ns: u64,
     /// The venue's sequence number, where it provides one, for gap detection.
     pub seq: Option<u64>,
+    /// The top levels of the book, for [`ObsKind::Depth`].
+    pub book: Option<Arc<BookDepth>>,
 }
 
 impl Observation {
@@ -249,6 +372,7 @@ mod tests {
             exchange_time_ns: Some(1_000),
             local_recv_ns: 2_000,
             seq: None,
+            book: None,
         }
     }
 
@@ -265,7 +389,7 @@ mod tests {
         for (position, kind) in ObsKind::ALL.into_iter().enumerate() {
             assert_eq!(kind.index(), position);
         }
-        assert_eq!(ObsKind::COUNT, 6);
+        assert_eq!(ObsKind::COUNT, 7);
     }
 
     #[test]
@@ -334,6 +458,75 @@ mod tests {
         assert_eq!(obs.venue_lag_ns(), None);
         // Staleness is unaffected: it never consults the venue clock.
         assert_eq!(obs.age_ns(5_000), 3_000);
+    }
+
+    fn levels(pairs: &[(&str, &str)]) -> Vec<Level> {
+        pairs
+            .iter()
+            .map(|(price, qty)| Level {
+                price: fixed(price),
+                qty: fixed(qty),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn impact_walks_the_levels() {
+        let book = BookDepth {
+            bids: levels(&[("100", "1"), ("99", "2")]),
+            asks: levels(&[("101", "1"), ("102", "2")]),
+        };
+        // 290 of notional reaches the second level on both sides.
+        let impact = book.impact(fixed("290")).expect("both sides");
+        assert!(impact.complete);
+        assert!(
+            impact.ask > fixed("101") && impact.ask < fixed("102"),
+            "{}",
+            impact.ask
+        );
+        assert!(
+            impact.bid > fixed("99") && impact.bid < fixed("100"),
+            "{}",
+            impact.bid
+        );
+        // Inside the first level the impact price is that level's price.
+        let small = book.impact(fixed("50")).expect("both sides");
+        assert_eq!((small.bid, small.ask), (fixed("100"), fixed("101")));
+    }
+
+    /// One big order at the top fills the whole notional at its price; it
+    /// cannot lean the result the way it leans a microprice.
+    #[test]
+    fn a_large_top_order_does_not_lean_the_impact_price() {
+        let spoofed = BookDepth {
+            bids: levels(&[("100", "1000")]),
+            asks: levels(&[("101", "1")]),
+        };
+        let impact = spoofed.impact(fixed("50")).expect("both sides");
+        assert_eq!(impact.mid(), Some(fixed("100.5")));
+    }
+
+    #[test]
+    fn a_thin_book_is_marked_incomplete() {
+        let book = BookDepth {
+            bids: levels(&[("100", "1")]),
+            asks: levels(&[("101", "1")]),
+        };
+        let impact = book.impact(fixed("1000")).expect("both sides");
+        assert!(!impact.complete);
+        assert_eq!((impact.bid, impact.ask), (fixed("100"), fixed("101")));
+        assert!(BookDepth::default().impact(fixed("1")).is_none());
+    }
+
+    #[test]
+    fn notional_near_the_mid_counts_both_sides() {
+        let book = BookDepth {
+            bids: levels(&[("99.995", "2"), ("99.9", "100")]),
+            asks: levels(&[("100.005", "3"), ("100.1", "100")]),
+        };
+        // 1bp of a 100 mid is 0.01: only the first level on each side.
+        let near = book.notional_within_bps(Fixed::ONE).expect("a book");
+        assert_eq!(near, fixed("500.005"));
     }
 
     #[test]

@@ -129,6 +129,7 @@ pub fn decode_payload(
                 exchange_time_ns,
                 local_recv_ns,
                 seq: None,
+                book: None,
             });
             emitted = true;
         }
@@ -146,6 +147,7 @@ pub fn decode_payload(
                 exchange_time_ns,
                 local_recv_ns,
                 seq: None,
+                book: None,
             });
             emitted = true;
         }

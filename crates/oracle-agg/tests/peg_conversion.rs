@@ -109,6 +109,7 @@ fn book(venue: Venue, venue_symbol: &str, mid: Fixed, width: &str, at: u64) -> O
         exchange_time_ns: None,
         local_recv_ns: at,
         seq: None,
+        book: None,
     }
 }
 

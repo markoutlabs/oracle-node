@@ -634,6 +634,7 @@ mod tests {
             exchange_time_ns: None,
             local_recv_ns: recv_ns,
             seq: None,
+            book: None,
         }
     }
 

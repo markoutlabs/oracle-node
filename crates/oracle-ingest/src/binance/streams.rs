@@ -25,6 +25,8 @@ pub enum StreamKind {
     AggTrade,
     /// Mark price, index price, and funding rate, once per second.
     MarkPrice,
+    /// The top twenty levels, every 100ms, for instruments that ask for depth.
+    Depth,
 }
 
 impl StreamKind {
@@ -54,6 +56,7 @@ impl StreamKind {
             Self::AggTrade => "@aggTrade",
             // The `@1s` variant; the default pushes every three seconds.
             Self::MarkPrice => "@markPrice@1s",
+            Self::Depth => "@depth20@100ms",
         }
     }
 
@@ -68,6 +71,8 @@ impl StreamKind {
             Some(Self::AggTrade)
         } else if stream.contains("@markPrice") {
             Some(Self::MarkPrice)
+        } else if stream.contains("@depth") {
+            Some(Self::Depth)
         } else {
             None
         }
@@ -124,6 +129,15 @@ pub fn combined_urls(base: &str, streams: &[String], chunk: usize) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_streams_are_recognised() {
+        assert_eq!(
+            StreamKind::from_stream_name("btcusdt@depth20@100ms"),
+            Some(StreamKind::Depth)
+        );
+        assert_eq!(StreamKind::Depth.suffix(), "@depth20@100ms");
+    }
 
     #[test]
     fn spot_and_perp_subscribe_to_different_streams() {
@@ -190,7 +204,7 @@ mod tests {
             StreamKind::from_stream_name("btcusdt@markPrice"),
             Some(StreamKind::MarkPrice)
         );
-        assert_eq!(StreamKind::from_stream_name("btcusdt@depth20"), None);
+        assert_eq!(StreamKind::from_stream_name("btcusdt@kline_1m"), None);
         assert_eq!(StreamKind::from_stream_name(""), None);
     }
 
