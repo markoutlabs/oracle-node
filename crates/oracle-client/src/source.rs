@@ -74,7 +74,7 @@ impl Certification {
     }
 
     /// A canister on another network, such as a local replica. `root_key` is
-    /// that network's DER root key in hex, from `dfx ping` or `icp network status`.
+    /// that network's DER root key in hex, from `icp network status --json`.
     ///
     /// # Errors
     ///

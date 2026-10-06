@@ -3,6 +3,4 @@
 node/registry.json
 node/*.key
 .DS_Store
-.dfx/
-.env
-e2e/
+.icp/cache/

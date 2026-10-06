@@ -82,7 +82,7 @@ impl fmt::Display for CanisterId {
     }
 }
 
-/// A network's root key, DER in hex, as `dfx ping` prints it.
+/// A network's root key, DER in hex, as `icp network status --json` prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootKey(String);
 
@@ -126,7 +126,7 @@ impl fmt::Display for Gateway {
 pub enum RegistrySource {
     /// The registry canister on mainnet.
     Mainnet(CanisterId),
-    /// The registry canister on another network, such as a local replica.
+    /// The registry canister on the local network.
     Network {
         /// The canister.
         canister: CanisterId,
@@ -153,6 +153,15 @@ impl RegistrySource {
             .parse()
             .expect("the mainnet governance address parses");
         Some((Self::Mainnet(canister), governance))
+    }
+
+    /// The icp-cli network name for calls to the canister: `ic` or `local`.
+    #[must_use]
+    pub const fn network(&self) -> &'static str {
+        match self {
+            Self::Mainnet(_) => "ic",
+            Self::Network { .. } => "local",
+        }
     }
 
     /// The canister.
@@ -367,12 +376,12 @@ mod tests {
         assert!("3082".parse::<RootKey>().is_ok());
         assert!("xyz".parse::<RootKey>().is_err());
         assert_eq!(
-            "http://127.0.0.1:4943/"
+            "http://127.0.0.1:8000/"
                 .parse::<Gateway>()
                 .map(|g| g.to_string()),
-            Ok("http://127.0.0.1:4943".to_owned())
+            Ok("http://127.0.0.1:8000".to_owned())
         );
-        for bad in ["127.0.0.1:4943", "ftp://x", "http://"] {
+        for bad in ["127.0.0.1:8000", "ftp://x", "http://"] {
             assert!(bad.parse::<Gateway>().is_err(), "{bad}");
         }
     }
@@ -395,12 +404,12 @@ mod tests {
         );
         let local = RegistrySource::Network {
             canister,
-            gateway: "http://127.0.0.1:4943".parse().expect("valid"),
+            gateway: "http://127.0.0.1:8000".parse().expect("valid"),
             root_key: "3082".parse().expect("valid"),
         };
         assert_eq!(
             local.url("clients.json"),
-            "http://127.0.0.1:4943/clients.json?canisterId=uxrrr-q7777-77774-qaaaq-cai"
+            "http://127.0.0.1:8000/clients.json?canisterId=uxrrr-q7777-77774-qaaaq-cai"
         );
     }
 

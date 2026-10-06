@@ -57,3 +57,11 @@ min_sources = 1
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["funding"] },
 ]
+
+# A venue market's endpoint in place of the built-in one: a regional host, a
+# proxy, or a local feed for tests. The node refuses one that no feed reads.
+# For binance it is the combined-stream base; the node adds the stream names.
+# [[endpoints]]
+# venue = "binance"
+# market = "spot"
+# url = "wss://data-stream.binance.vision/stream"

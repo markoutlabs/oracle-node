@@ -243,7 +243,12 @@ fn finish(setup: &NodeSetup, key: &NodeKey, written: &Written) -> io::Result<()>
     // no longer paste.
     log::info(format!(
         "Governance adds the node with:\n{}",
-        candid_call(&setup.source.canister().to_string(), "add_node", &[&entry])
+        candid_call(
+            setup.source.network(),
+            &setup.source.canister().to_string(),
+            "add_node",
+            &[&entry]
+        )
     ))?;
     for warning in ui::warnings(setup) {
         log::warning(warning)?;

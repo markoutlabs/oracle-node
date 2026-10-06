@@ -1,0 +1,25 @@
+# The registry canister (SPEC §3.6). `make help` lists the build and deploy
+# targets; the Makefile owns the build and icp-cli installs what it built.
+networks:
+  - name: local
+    mode: managed
+    # Threshold ECDSA keys live on a fiduciary subnet. Listing subnets
+    # replaces the default application subnet, so it is listed too.
+    subnets: [application, fiduciary]
+
+canisters:
+  - name: oracle_registry
+    build:
+      steps:
+        - type: script
+          commands:
+            - scripts/icp-wasm.sh
+    init_args: '(record { key_name = "dfx_test_key"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null })'
+    # post_upgrade takes no arguments.
+    upgrade_args: "()"
+
+environments:
+  - name: ic
+    network: ic
+    init_args:
+      oracle_registry: '(record { key_name = "key_1"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null })'

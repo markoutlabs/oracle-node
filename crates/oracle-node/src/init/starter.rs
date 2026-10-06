@@ -120,7 +120,7 @@ mod tests {
             RegistrySource::Mainnet(canister()),
             RegistrySource::Network {
                 canister: canister(),
-                gateway: "http://127.0.0.1:4943".parse().expect("valid"),
+                gateway: "http://127.0.0.1:8000".parse().expect("valid"),
                 root_key: "3082".parse().expect("valid"),
             },
         ]

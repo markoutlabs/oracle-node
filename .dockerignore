@@ -1,0 +1,7 @@
+# The release image needs the sources only. Keys and local state never enter it.
+target/
+.git/
+.icp/cache/
+node/*.key
+node/registry.json
+**/.DS_Store

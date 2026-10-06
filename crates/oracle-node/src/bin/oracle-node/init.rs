@@ -33,14 +33,14 @@ pub(crate) struct InitArgs {
     /// `--out` prompts at the terminal. Recorded in the starter config.
     #[arg(long, value_name = "FILE", requires = "out")]
     pub(crate) passphrase_file: Option<PathBuf>,
-    /// Another registry canister than the mainnet one, such as a local
-    /// replica's. Needs the governance address that goes with it.
+    /// Another registry canister than the mainnet one, such as one on the
+    /// local network. Needs the governance address that goes with it.
     #[arg(long, value_name = "CANISTER_ID", requires = "governance")]
     pub(crate) canister: Option<CanisterId>,
-    /// The HTTP gateway of another network, such as `http://127.0.0.1:4943`.
+    /// The local network's HTTP gateway, such as `http://127.0.0.1:8000`.
     #[arg(long, value_name = "URL", requires_all = ["canister", "root_key"])]
     pub(crate) gateway: Option<Gateway>,
-    /// That network's root key in hex, from `dfx ping`.
+    /// The local network's root key in hex, from `icp network status --json`.
     #[arg(long, value_name = "HEX", requires = "gateway")]
     pub(crate) root_key: Option<RootKey>,
     /// The governance address of `--canister`: its signing key's address.
@@ -60,7 +60,12 @@ pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
     let entry = key.entry(&args.operator, &args.endpoint);
     let add_call = network(&args).ok().map(|(source, _)| {
         let compact = serde_json::to_string(&entry).expect("entry serialises");
-        candid_call(&source.canister().to_string(), "add_node", &[&compact])
+        candid_call(
+            source.network(),
+            &source.canister().to_string(),
+            "add_node",
+            &[&compact],
+        )
     });
 
     println!("{}\n", ui::heading("Generated a new node key."));
@@ -121,7 +126,7 @@ pub(crate) fn network(args: &InitArgs) -> anyhow::Result<(RegistrySource, Addres
     }
     RegistrySource::mainnet().context(
         "the registry canister is not on mainnet yet: pass --canister and --governance, \
-         and --gateway and --root-key for a local replica",
+         and --gateway and --root-key for the local network",
     )
 }
 

@@ -150,10 +150,12 @@ impl Rotation {
         Ok(path)
     }
 
-    /// The `dfx canister call` governance runs to swap this key in.
+    /// The `icp canister call` governance runs to swap this key in, on
+    /// `network` (`ic` or `local`).
     #[must_use]
-    pub fn canister_call(&self, canister: &str) -> String {
+    pub fn canister_call(&self, network: &str, canister: &str) -> String {
         candid_call(
+            network,
             canister,
             "replace_node",
             &[
@@ -164,13 +166,14 @@ impl Rotation {
     }
 }
 
-/// Renders a `dfx canister call` with Candid text arguments.
+/// Renders an `icp canister call` with Candid text arguments, on `network`
+/// (`ic` or `local`).
 ///
 /// The arguments are JSON documents the canister parses, so they are full of
 /// quotes. Candid text literals escape `\\` and `\"` the same way JSON does,
 /// plus `\n`, `\r` and `\t`; everything else passes through.
 #[must_use]
-pub fn candid_call(canister: &str, method: &str, args: &[&str]) -> String {
+pub fn candid_call(network: &str, canister: &str, method: &str, args: &[&str]) -> String {
     let quoted: Vec<String> = args
         .iter()
         .map(|arg| {
@@ -191,7 +194,7 @@ pub fn candid_call(canister: &str, method: &str, args: &[&str]) -> String {
         })
         .collect();
     format!(
-        "dfx canister call {canister} {method} '({})'",
+        "icp canister call {canister} {method} '({})' -n {network}",
         quoted.join(", ")
     )
 }
@@ -292,11 +295,11 @@ mod tests {
         let rotation = Rotation::generate(key.signing.address()).expect("rotates");
         assert_ne!(rotation.signing.address(), key.signing.address());
 
-        let call = rotation.canister_call("aaaaa-aa");
+        let call = rotation.canister_call("ic", "aaaaa-aa");
         assert_eq!(
             call,
             format!(
-                "dfx canister call aaaaa-aa replace_node '(\"{}\", \"{}\")'",
+                "icp canister call aaaaa-aa replace_node '(\"{}\", \"{}\")' -n ic",
                 key.signing.address().to_checksummed(),
                 rotation.signing.address().to_checksummed()
             )
@@ -305,10 +308,15 @@ mod tests {
 
     #[test]
     fn candid_calls_escape_json_arguments() {
-        let call = candid_call("c", "m", &["plain", r#"{"a":"b\\c"}"#, "line\nbreak"]);
+        let call = candid_call(
+            "local",
+            "c",
+            "m",
+            &["plain", r#"{"a":"b\\c"}"#, "line\nbreak"],
+        );
         assert_eq!(
             call,
-            r#"dfx canister call c m '("plain", "{\"a\":\"b\\\\c\"}", "line\nbreak")'"#
+            r#"icp canister call c m '("plain", "{\"a\":\"b\\\\c\"}", "line\nbreak")' -n local"#
         );
     }
 

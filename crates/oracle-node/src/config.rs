@@ -5,7 +5,7 @@
 //! feed is, by definition, an instrument to stream. Two lists would drift, and
 //! the failure mode of that drift is a feed that silently loses a venue.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use oracle_ingest::venues::{
     DecodeFn, VenueSpec, bybit, coinbase, deribit, kraken, kraken_futures, okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
-use oracle_wire::feed_id;
+use oracle_wire::{check_endpoint, feed_id};
 use serde::Deserialize;
 
 /// Anything that stops the node starting.
@@ -91,6 +91,9 @@ pub struct NodeConfig {
     pub tick_interval_ms: u64,
     /// The feeds this node publishes.
     pub feeds: Vec<FeedSettings>,
+    /// Venue endpoints in place of the built-in ones.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointSettings>,
 }
 
 /// Subscriber-facing server settings.
@@ -225,6 +228,20 @@ pub struct SourceSettings {
     /// silent one, because on an ordinary day the two agree to a basis point.
     #[serde(default)]
     pub converted: bool,
+}
+
+/// One venue market's WebSocket endpoint in place of the built-in one: a
+/// regional host, a proxy, or a local feed for tests.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointSettings {
+    /// Venue name, as in `oracle_types::Venue`.
+    pub venue: String,
+    /// `spot` or `linear_perp`.
+    pub market: String,
+    /// A `ws://` or `wss://` URL. For binance it is the combined-stream base,
+    /// and the node appends `?streams=…`.
+    pub url: String,
 }
 
 const fn default_tick_ms() -> u64 {
@@ -548,6 +565,7 @@ impl NodeConfig {
             let connection = venue_connection(venue, market, &instruments)?;
             venues.entry(venue).or_default().push(connection);
         }
+        apply_endpoints(&self.endpoints, &mut binance, &mut venues)?;
 
         Ok(ResolvedConfig {
             feeds,
@@ -557,6 +575,58 @@ impl NodeConfig {
             tick_interval: Duration::from_millis(self.tick_interval_ms.max(1)),
         })
     }
+}
+
+/// Puts each configured endpoint in place of the built-in URL.
+///
+/// An endpoint that no feed reads is refused: it is a typo or a leftover, and
+/// the node would otherwise ignore it without a word.
+fn apply_endpoints(
+    endpoints: &[EndpointSettings],
+    binance: &mut BinanceConfig,
+    venues: &mut BTreeMap<Venue, Vec<VenueConnection>>,
+) -> Result<(), ConfigError> {
+    let mut seen = BTreeSet::new();
+    for endpoint in endpoints {
+        let invalid = |reason: String| {
+            ConfigError::Invalid(format!(
+                "endpoint for {} {}: {reason}",
+                endpoint.venue, endpoint.market
+            ))
+        };
+        let venue: Venue = endpoint
+            .venue
+            .parse()
+            .map_err(|e| invalid(format!("{e}")))?;
+        let market: MarketKind = endpoint
+            .market
+            .parse()
+            .map_err(|e| invalid(format!("{e}")))?;
+        // The rule the registry applies to node endpoints.
+        check_endpoint(&endpoint.url).map_err(|e| invalid(e.to_string()))?;
+        if !seen.insert((venue, market)) {
+            return Err(invalid("set more than once".to_owned()));
+        }
+        let url = match (venue, market) {
+            (Venue::Binance, MarketKind::Spot) if !binance.spot.is_empty() => {
+                Some(&mut binance.spot_base_url)
+            }
+            (Venue::Binance, MarketKind::LinearPerp) if !binance.perp.is_empty() => {
+                Some(&mut binance.perp_base_url)
+            }
+            (Venue::Binance, _) => None,
+            _ => venues
+                .get_mut(&venue)
+                .and_then(|connections| {
+                    connections
+                        .iter_mut()
+                        .find(|connection| connection.spec.market == market)
+                })
+                .map(|connection| &mut connection.spec.url),
+        };
+        *url.ok_or_else(|| invalid("no feed reads this market".to_owned()))? = endpoint.url.clone();
+    }
+    Ok(())
 }
 
 /// Builds one venue connection from its instruments.
@@ -901,6 +971,75 @@ sources = [
         let (period, payload) = spec.keepalive.clone().expect("okx needs a keepalive");
         assert_eq!(payload, "ping");
         assert!(period < Duration::from_secs(30));
+    }
+
+    fn with_endpoints(text: &str, endpoints: &str) -> Result<ResolvedConfig, ConfigError> {
+        parse(&format!("{text}\n{endpoints}")).resolve()
+    }
+
+    #[test]
+    fn an_endpoint_replaces_the_built_in_url() {
+        let resolved = with_endpoints(
+            SAMPLE,
+            r#"[[endpoints]]
+venue = "binance"
+market = "spot"
+url = "ws://127.0.0.1:9000/stream""#,
+        )
+        .expect("resolves");
+        assert_eq!(resolved.binance.spot_base_url, "ws://127.0.0.1:9000/stream");
+        assert_eq!(
+            resolved.binance.perp_base_url,
+            BinanceConfig::default().perp_base_url
+        );
+
+        let okx = SAMPLE
+            .replacen(
+                r#"venue = "binance", market = "spot""#,
+                r#"venue = "okx", market = "spot""#,
+                1,
+            )
+            .replacen(r#"symbol = "BTCUSDT" }"#, r#"symbol = "BTC-USDT" }"#, 1);
+        let resolved = with_endpoints(
+            &okx,
+            r#"[[endpoints]]
+venue = "okx"
+market = "spot"
+url = "wss://wsaws.okx.com:8443/ws/v5/public""#,
+        )
+        .expect("resolves");
+        assert_eq!(
+            spec_for(&resolved, Venue::Okx).url,
+            "wss://wsaws.okx.com:8443/ws/v5/public"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_nothing_reads_or_that_is_not_a_socket_is_refused() {
+        let endpoint = |venue: &str, market: &str, url: &str| {
+            format!("[[endpoints]]\nvenue = \"{venue}\"\nmarket = \"{market}\"\nurl = \"{url}\"\n")
+        };
+        for (endpoints, expected) in [
+            (endpoint("okx", "spot", "wss://x/ws"), "no feed reads"),
+            (
+                endpoint("binance", "spot", "https://x/stream"),
+                "not a ws://",
+            ),
+            (
+                [
+                    endpoint("binance", "spot", "ws://a/s"),
+                    endpoint("binance", "spot", "ws://b/s"),
+                ]
+                .concat(),
+                "more than once",
+            ),
+        ] {
+            let error = with_endpoints(SAMPLE, &endpoints)
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     /// Builds a config with one feed sourced from a single venue and market.

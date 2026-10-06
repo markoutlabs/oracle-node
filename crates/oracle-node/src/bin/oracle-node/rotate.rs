@@ -12,7 +12,8 @@ pub(crate) struct RotateArgs {
     /// The directory `init --out` wrote: signing.key, config.toml.
     #[arg(long, value_name = "DIR")]
     dir: PathBuf,
-    /// The registry canister id. Prints the `dfx` call governance runs to swap the key.
+    /// The registry canister id for the printed call. Defaults to the
+    /// config's `registry.canister_id`.
     #[arg(long, value_name = "CANISTER_ID")]
     canister: Option<String>,
     /// A 0600 file holding the passphrase that opens the live key and
@@ -52,7 +53,17 @@ pub(crate) fn run(args: RotateArgs) -> anyhow::Result<()> {
     println!("\n{}", ui::heading("Written"));
     println!("  {}  (age, 0600 — not loaded yet)", next_path.display());
 
-    let call = rotation.canister_call(args.canister.as_deref().unwrap_or("<CANISTER_ID>"));
+    let canister = args
+        .canister
+        .or_else(|| config.registry.canister_id.clone())
+        .unwrap_or_else(|| "<CANISTER_ID>".to_owned());
+    // Only a local network needs a root key in the config; mainnet's is built in.
+    let network = if config.registry.root_key.is_some() {
+        "local"
+    } else {
+        "ic"
+    };
+    let call = rotation.canister_call(network, &canister);
     println!(
         "\n{}\n\n  1. Send both addresses to governance. They swap the new one in with:\n\n     \
          {call}\n\n  \

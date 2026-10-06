@@ -39,5 +39,9 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 sd-notify.workspace = true
 
+[dev-dependencies]
+oracle-registry-canister = { path = "../oracle-registry-canister" }
+tokio = { workspace = true, features = ["sync"] }
+
 [lints]
 workspace = true

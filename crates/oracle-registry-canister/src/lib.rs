@@ -32,6 +32,8 @@ mod publish;
 mod runtime;
 mod signing;
 pub mod state;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod testing;
 
 use candid::CandidType;
 use ic_http_certification::utils::add_v2_certificate_header;

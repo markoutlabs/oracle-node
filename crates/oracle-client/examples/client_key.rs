@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("written {}", args.out.display());
     println!(
         "\nGovernance lists the client with:\n  \
-         dfx canister call <CANISTER_ID> add_client '(\"{address}\", <expires_at> : nat64)'"
+         icp canister call <CANISTER_ID> add_client '(\"{address}\", <expires_at> : nat64)' -n ic"
     );
     Ok(())
 }

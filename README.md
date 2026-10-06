@@ -305,7 +305,7 @@ the entry it writes.
 It does not ask where the registry comes from. A node always fetches from the
 registry canister, and the mainnet canister id and governance address are built
 in (`oracle_client::mainnet`, next to the mainnet root key). For another
-network, such as a local replica, pass `--canister` and `--governance`
+network, such as the local network, pass `--canister` and `--governance`
 together, and `--gateway` and `--root-key` as well.
 
 With `--out DIR`, every value comes from flags (also `--passphrase-file` and
@@ -344,6 +344,18 @@ URL response must carry the certificate of `registry.canister_id`, checked
 against `registry.root_key` off mainnet; `clients.url` must too. Either way the
 document is verified against the pinned `governance_address` before anything
 else happens.
+
+`[[endpoints]]` puts another WebSocket URL in place of a venue market's built-in
+one: a regional host, a proxy, or a local feed for tests. The node refuses an
+endpoint that no feed reads. For Binance the URL is the combined-stream base, and
+the node adds the stream names:
+
+```toml
+[[endpoints]]
+venue = "binance"
+market = "spot"
+url = "wss://data-stream.binance.vision/stream"
+```
 
 At startup the node checks that the registry actually lists its own address, and
 **refuses to start** if not. This is a hard failure rather than a
@@ -510,27 +522,81 @@ format, so there is one schema rather than a Candid mirror. Addresses cross as
 `0x` hex.
 
 `tests/pocket_ic.rs` runs the real wasm on PocketIC with real threshold
-signing. It needs the PocketIC server: set `POCKET_IC_BIN`, or have a `dfx`
-install whose cache bundles it. The test builds the canister wasm itself.
+signing. The `pocket-ic` crate downloads the PocketIC server it needs on the
+first run, unless `POCKET_IC_BIN` names it. The test builds the canister wasm
+itself; `oracle_registry_canister::testing` holds the harness, which the
+node's end-to-end test shares.
 
 ## Development
 
+The `Makefile` drives the build; `make help` lists every target.
+
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo fmt --all --check
+make test lint        # every test, PocketIC included; fmt and clippy
+make canister         # the canister wasm: builds it, writes its .did, bakes
+                      # the .did into the wasm as public candid:service
+make node             # the oracle-node binary for this machine
+make e2e              # the whole system on PocketIC; also part of make test
+make smoke            # the icp-cli path on a local network (below)
 
 # The two secp256k1 backends must agree byte for byte. The golden vectors
-# run under k256 here, and the wasm32 build is what the registry canister needs.
+# run under k256 here.
 cargo test -p oracle-wire --features pure-rust
-cargo clippy --target wasm32-unknown-unknown -p oracle-wire -p oracle-registry-canister \
-  --no-default-features --lib -- -D warnings
-
-# The canister wasm and its Candid interface.
-cargo build -p oracle-registry-canister --target wasm32-unknown-unknown --release
-candid-extractor target/wasm32-unknown-unknown/release/oracle_registry_canister.wasm \
-  > crates/oracle-registry-canister/oracle-registry-canister.did
 ```
+
+Tools: Rust with the `wasm32-unknown-unknown` target, [icp-cli][icp-cli] 1.6
+or newer, `ic-wasm`, `candid-extractor`, and Docker for `make release`.
+
+[icp-cli]: https://cli.internetcomputer.org/
+
+### Local network
+
+`icp.yaml` describes the canister. Its local network has a fiduciary subnet,
+which holds the threshold ECDSA key the canister signs with.
+
+```sh
+make network                          # icp network start -d, on port 8000
+make deploy IDENTITY=<icp identity>   # builds, then installs on the local network
+make governance IDENTITY=<icp identity>
+make network-stop
+```
+
+### Release
+
+`make release` builds the release artifacts in a pinned Docker image (Rust,
+`ic-wasm` and `candid-extractor` at fixed versions), so anyone can rebuild them
+and get the same bytes:
+
+```text
+target/release-artifacts/oracle_registry_canister.wasm
+target/release-artifacts/oracle-node-linux-amd64
+target/release-artifacts/SHA256SUMS
+```
+
+### Deploying the registry canister to mainnet
+
+The deploying identity becomes the canister's controller, and so its
+governance (SPEC §3.6). It must be an icp-cli identity with cycles, never
+`anonymous`:
+
+```sh
+icp cycles balance -n ic --identity <you>
+make deploy ENV=ic IDENTITY=<you>       # make release, then icp deploy -e ic
+make governance ENV=ic IDENTITY=<you>   # prints the canister id and governance address
+```
+
+Mainnet only ever gets the release build: `scripts/icp-wasm.sh` refuses a
+wasm built on your machine there. After the first deploy:
+
+1. Commit `.icp/data/mappings/ic.ids.json`, the canister id icp-cli keeps.
+2. Put both printed values into `crates/oracle-client/src/mainnet.rs`, in one
+   reviewed commit: every node and consumer that uses the defaults then trusts
+   them.
+3. Publish the first client list (`republish_clients`), or nodes refuse to
+   start.
+
+The canister signs with the `key_1` threshold key. Each signing round costs
+cycles, so keep the canister topped up.
 
 ### Running a node locally
 
@@ -547,12 +613,12 @@ cargo run -p oracle-client --example subscribe -- node/registry.json 0x<governan
 ```
 
 A node made with `init` fetches from a registry canister. To run one locally,
-point it at a canister on a local replica; `scripts/e2e-dfx.sh` shows every
-step:
+point it at the canister on the local network, as `scripts/smoke.sh` does.
+`icp network status --json` prints the gateway URL and the root key:
 
 ```sh
 oracle-node init --canister <CANISTER_ID> --governance <GOVERNANCE> \
-  --gateway http://127.0.0.1:4943 --root-key <ROOT_KEY from dfx ping>
+  --gateway http://127.0.0.1:8000 --root-key <root_key from icp network status --json>
 ```
 
 Confirmed live against Binance: exchange → node → signed, sealed frame →
@@ -610,38 +676,51 @@ The fixture is a committed twelve-second recording of Binance, Bybit, and OKX
 spot BTC/USDT, with the config it was recorded under beside it. The Binance URL
 embeds the subscribed streams, so a fixture is only valid with its own config.
 
-### End to end on a local replica
+### End to end on PocketIC
 
-`scripts/e2e-dfx.sh` runs the whole system as one command, over the
-authenticated, encrypted transport:
+`crates/oracle-node/tests/e2e.rs` (`make e2e`, also part of `make test`) runs
+the whole system in one test, over the authenticated, encrypted transport:
 
-1. Starts a clean local replica and deploys the registry canister.
-2. Generates a node with `init`, which governance adds through the canister.
-3. Generates a client key, which governance also adds.
-4. Starts the node against the canister URLs and runs the SDK client.
-5. With the client still running, rotates the node's key through
-   `replace_node` and restarts the node. It checks the client's counters: at
-   most one registry refresh, no untrusted frames, no replays.
-6. Removes the client and checks that the node closes its session and rotates
-   its broadcast key.
-7. Lists a second client for about 25 s and checks that the node closes it at
-   its deadline.
-8. Prints the canister's listings of the old and the new node address.
+1. Installs the registry canister on PocketIC, behind a live HTTP gateway.
+2. Generates a node with `oracle-node init`, which governance adds through the
+   canister. Starts the `oracle-node` binary against the canister URLs.
+3. Lists a client and runs the SDK as that client.
+4. With the client still running, rotates the node's key with `oracle-node
+   rotate` and `replace_node`, and restarts the node with SIGTERM. The client
+   must adopt the new registry with at most one refresh, no untrusted frames
+   and no replays.
+5. Removes the client. The node must close its session and rotate its
+   broadcast key, and the client must get no more prices.
+6. Lists a second client for 15 s. It must get prices, then lose its session
+   at the last epoch boundary before it expires.
+7. Checks that the canister keeps the old address as retired.
 
-```sh
-scripts/e2e-dfx.sh                 # about four minutes; stops the replica after
-KEEP_REPLICA=1 scripts/e2e-dfx.sh  # leave the replica and the node running
-```
-
-It uses a throwaway `dfx` identity named `oracle-e2e`, never your default, and
-needs internet access for the venue connections. The first run found a real bug:
-a restarted node began its sequence numbers at zero and was refused as a replay
-for every frame until it caught up, which is why `Aggregator::with_sequence_floor`
-exists.
+A local Binance-shaped feed stands in for the venues through the node's
+`[[endpoints]]`, so the test needs no internet. The node logs JSON to a file,
+and the test reads its events. The test takes about 45 s.
 
 The SDK and the node check the canister's certificate themselves, against the
-replica's root key from `dfx ping`. The local gateway passes the certificate
-headers through, as the mainnet `raw` domain does.
+network's root key. The PocketIC gateway, like the local network's gateway and
+the mainnet `raw` domain, passes the certificate headers through.
+
+The first version of this test, a shell script against live venues, found a
+real bug: a restarted node began its sequence numbers at zero and was refused as
+a replay for every frame until it caught up. That is why
+`Aggregator::with_sequence_floor` exists.
+
+### Smoke test on the local network
+
+`scripts/smoke.sh` (`make smoke`) covers what the Rust test does not: `icp.yaml`
+and its build step, `icp deploy`, `make governance`, and the `icp canister call`
+lines that `init` and `rotate` print for governance. It runs each printed line
+as it is and checks the version that the line publishes. No node runs.
+
+```sh
+scripts/smoke.sh                 # about 30 s; stops the network after
+KEEP_NETWORK=1 scripts/smoke.sh  # leave the network running
+```
+
+It uses a throwaway icp identity named `oracle-e2e`, never your default.
 
 ### Rotating a node's key
 
@@ -651,9 +730,9 @@ them atomically (SPEC §3.5):
 
 ```sh
 # 1. A new key beside the live one. Nothing on the node changes yet.
-oracle-node rotate --dir node1 --canister <CANISTER_ID>
-#    writes node1/signing.key.next and prints:
-#    dfx canister call <CANISTER_ID> replace_node '("0xOLD…", "0xNEW…")'
+oracle-node rotate --dir node1
+#    writes node1/signing.key.next and prints, for the config's canister:
+#    icp canister call <CANISTER_ID> replace_node '("0xOLD…", "0xNEW…")' -n ic
 
 # 2. Governance runs that call. The canister refuses an address it has ever
 #    seen. Stagger rotations, so a consumer never loses two seats at once.

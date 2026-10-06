@@ -23,11 +23,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
+# For `testing`, which is left out of the wasm32 build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 hex.workspace = true
-ic-response-verification.workspace = true
 oracle-client.workspace = true
 pocket-ic.workspace = true
+
+[dev-dependencies]
+ic-response-verification.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time"] }
 
 [lints]

@@ -2566,6 +2566,7 @@ dependencies = [
  "oracle-agg",
  "oracle-client",
  "oracle-ingest",
+ "oracle-registry-canister",
  "oracle-server",
  "oracle-types",
  "oracle-wire",

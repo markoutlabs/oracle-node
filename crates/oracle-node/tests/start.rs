@@ -5,19 +5,16 @@
 //! network; nothing here depends on them.
 #![cfg(unix)]
 
-use std::io::{BufRead as _, BufReader};
+mod common;
+
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use oracle_wire::{ClientEntry, ClientList, NodeEntry, Quorum, Registry, Signer};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_oracle-node");
-const READY: &str = "serving subscribers";
-const WAIT: Duration = Duration::from_secs(20);
+use common::{Node, READY, WAIT};
 
 fn key(seed: u8) -> Signer {
     Signer::from_secret_bytes([seed; 32]).expect("valid key")
@@ -25,8 +22,7 @@ fn key(seed: u8) -> Signer {
 
 /// A node directory with a signed registry, a client list, a key, and a config.
 fn fixture(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oracle-start-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = common::scratch(name);
     std::fs::create_dir_all(&dir).expect("creates");
     let governance = key(0x33);
     let node = key(0x41);
@@ -103,74 +99,28 @@ sources = [{{ venue = "binance", market = "spot", symbol = "BTCUSDT" }}]
 }
 
 fn start(dir: &Path, format: &str) -> Command {
-    let mut command = Command::new(BINARY);
-    command
-        .args(["start", "--log-format", format])
-        .arg(dir.join("config.toml"))
-        .env_remove("JOURNAL_STREAM")
-        .env_remove("NOTIFY_SOCKET")
-        .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    command
-}
-
-fn terminate(child: &Child) {
-    let status = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill runs");
-    assert!(status.success());
+    common::start(&dir.join("config.toml"), format)
 }
 
 /// Runs the node until it serves, stops it with SIGTERM, and returns its log.
-fn run_until_ready(mut command: Command) -> String {
-    let mut child = command.stderr(Stdio::piped()).spawn().expect("starts");
-    let stderr = child.stderr.take().expect("piped");
-    let (tx, rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut lines = Vec::new();
-    let deadline = Instant::now() + WAIT;
-    while !lines.iter().any(|line: &String| line.contains(READY)) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(line) => lines.push(line),
-            Err(_) => {
-                let _ = child.kill();
-                panic!("the node never served:\n{}", lines.join("\n"));
-            }
-        }
-    }
-    terminate(&child);
-    let status = child.wait().expect("exits");
-    reader.join().expect("reader ends");
-    lines.extend(rx.try_iter());
-    let log = lines.join("\n");
-    assert!(status.success(), "exit {status}:\n{log}");
-    assert!(log.contains("shutting down"), "{log}");
-    log
+fn run_until_ready(dir: &Path, format: &str) -> String {
+    let node = Node::spawn(start(dir, format), dir.join("node.log"));
+    node.wait(READY);
+    node.stop()
 }
 
 #[test]
 fn sigterm_stops_the_node_cleanly_in_every_format() {
     let dir = fixture("formats");
 
-    let plain = run_until_ready(start(&dir, "plain"));
+    let plain = run_until_ready(&dir, "plain");
     assert!(
         !plain.contains('\u{1b}'),
         "colour codes in a pipe:\n{plain}"
     );
     assert!(plain.contains("signal=\"SIGTERM\""), "{plain}");
 
-    let journald = run_until_ready(start(&dir, "journald"));
+    let journald = run_until_ready(&dir, "journald");
     for line in journald.lines() {
         assert!(
             ["<3>", "<4>", "<6>", "<7>"]
@@ -180,7 +130,7 @@ fn sigterm_stops_the_node_cleanly_in_every_format() {
         );
     }
 
-    let json = run_until_ready(start(&dir, "json"));
+    let json = run_until_ready(&dir, "json");
     for line in json.lines() {
         let value: serde_json::Value =
             serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
@@ -196,29 +146,13 @@ fn auto_picks_journald_only_for_the_journal_stream() {
     let dir = fixture("auto");
     let log_path = dir.join("node.log");
     let first_line = |journal_stream: &dyn Fn(&Path) -> String| {
-        let log = std::fs::File::create(&log_path).expect("creates");
+        // The stream id is the file's inode; `Node::spawn` truncates in place.
+        std::fs::write(&log_path, "").expect("creates");
         let mut command = start(&dir, "auto");
-        command
-            .env("JOURNAL_STREAM", journal_stream(&log_path))
-            .stderr(log);
-        let child = command.spawn().expect("starts");
-        let deadline = Instant::now() + WAIT;
-        while !std::fs::read_to_string(&log_path)
-            .unwrap_or_default()
-            .contains(READY)
-        {
-            assert!(Instant::now() < deadline, "the node never served");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        terminate(&child);
-        let mut child = child;
-        child.wait().expect("exits");
-        std::fs::read_to_string(&log_path)
-            .expect("readable")
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned()
+        command.env("JOURNAL_STREAM", journal_stream(&log_path));
+        let node = Node::spawn(command, log_path.clone());
+        node.wait(READY);
+        node.stop().lines().next().unwrap_or_default().to_owned()
     };
 
     let journal = first_line(&|path| {
@@ -245,25 +179,22 @@ fn systemd_hears_ready_and_stopping() {
     socket.set_read_timeout(Some(WAIT)).expect("sets a timeout");
 
     let mut command = start(&dir, "plain");
-    command
-        .env("NOTIFY_SOCKET", &socket_path)
-        .stderr(Stdio::null());
-    let mut child = command.spawn().expect("starts");
+    command.env("NOTIFY_SOCKET", &socket_path);
+    let node = Node::spawn(command, dir.join("node.log"));
     let mut messages = Vec::new();
     let mut buffer = [0_u8; 4096];
     while !messages.iter().any(|m: &String| m.contains("READY=1")) {
-        let Ok(len) = socket.recv(&mut buffer) else {
-            let _ = child.kill();
-            panic!("no READY=1; got {messages:?}");
-        };
+        let len = socket
+            .recv(&mut buffer)
+            .unwrap_or_else(|_| panic!("no READY=1; got {messages:?}"));
         messages.push(String::from_utf8_lossy(buffer.get(..len).unwrap_or_default()).into_owned());
     }
-    terminate(&child);
+    // The datagrams queue on the socket, so the node may stop before they are read.
+    node.stop();
     while !messages.iter().any(|m| m.contains("STOPPING=1")) {
         let len = socket.recv(&mut buffer).expect("STOPPING=1 arrives");
         messages.push(String::from_utf8_lossy(buffer.get(..len).unwrap_or_default()).into_owned());
     }
-    assert!(child.wait().expect("exits").success());
     assert!(
         messages
             .iter()

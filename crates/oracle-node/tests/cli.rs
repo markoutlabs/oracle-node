@@ -4,36 +4,15 @@
 //! things worth pinning down here are properties of the binary: what it writes
 //! to stdout, what it refuses to write to stdout, and what it exits with.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::{Command, Output};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_oracle-node");
-
-fn run(args: &[&str]) -> Output {
-    Command::new(BINARY)
-        .args(args)
-        .output()
-        .expect("the node binary runs")
-}
+use common::{BINARY, load_key, passphrase_file, run, scratch};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oracle-cli-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
-const PASSPHRASE: &str = "correct horse battery staple";
-
-/// Writes a passphrase file next to, not inside, the directory under test, so
-/// `init --out` still sees an empty target.
-fn passphrase_file(dir: &Path) -> String {
-    let path = dir.with_extension("passphrase");
-    std::fs::write(&path, format!("{PASSPHRASE}\n")).expect("writes");
-    path.to_str().expect("utf-8").to_owned()
 }
 
 /// A canister and its governance address, standing in for the mainnet
@@ -50,14 +29,6 @@ fn init_out(dir: &str, extra: &[&str]) -> Output {
     args.extend(NETWORK);
     args.extend(extra);
     run(&args)
-}
-
-fn passphrase() -> age::secrecy::SecretString {
-    age::secrecy::SecretString::from(PASSPHRASE.to_owned())
-}
-
-fn load_key(path: &Path) -> oracle_wire::Signer {
-    oracle_node::keyfile::load_signer(path, Some(&passphrase())).expect("a valid encrypted key")
 }
 
 /// Counts 64-character hex runs, which is what a leaked secret key looks like.
@@ -198,7 +169,7 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
     );
     let next = load_key(&dir.join("signing.key.next"));
     let call = format!(
-        "dfx canister call aaaaa-aa replace_node '(\"{}\", \"{}\")'",
+        "icp canister call aaaaa-aa replace_node '(\"{}\", \"{}\")' -n ic",
         live.address().to_checksummed(),
         next.address().to_checksummed()
     );
@@ -375,7 +346,7 @@ fn init_flags_fill_the_config_and_the_unit() {
             "--canister",
             canister,
             "--gateway",
-            "http://127.0.0.1:4943/",
+            "http://127.0.0.1:8000/",
             "--root-key",
             "3082",
             "--governance",
@@ -396,7 +367,7 @@ fn init_flags_fill_the_config_and_the_unit() {
     let config = oracle_node::NodeConfig::load(&node.join("config.toml")).expect("loads");
     assert_eq!(
         config.registry.url.as_deref(),
-        Some(format!("http://127.0.0.1:4943/registry.json?canisterId={canister}").as_str())
+        Some(format!("http://127.0.0.1:8000/registry.json?canisterId={canister}").as_str())
     );
     assert_eq!(config.registry.canister_id.as_deref(), Some(canister));
     assert_eq!(config.registry.root_key.as_deref(), Some("3082"));

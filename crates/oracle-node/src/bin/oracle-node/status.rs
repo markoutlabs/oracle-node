@@ -1,8 +1,5 @@
 //! What the node reports about itself: once when it starts serving, then every
 //! minute.
-//!
-//! No field name contains "error": `scripts/e2e-dfx.sh` reads any startup line
-//! with that word as a failure.
 
 use std::fmt;
 use std::net::SocketAddr;
