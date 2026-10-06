@@ -30,7 +30,9 @@ impl Reasons {
     pub const NONE: Self = Self(0);
     /// Fewer live sources than the feed requires.
     pub const INSUFFICIENT_SOURCES: Self = Self(1 << 0);
-    /// Outlier rejection would have breached the quorum, so nothing was dropped.
+    /// Sources disagree and none can be dropped: rejection would breach the
+    /// quorum, or two sources differ beyond the outlier floor with no majority to
+    /// say which is wrong.
     pub const OUTLIER_PRESSURE: Self = Self(1 << 1);
     /// The price jumped without enough venues corroborating it.
     pub const UNCORROBORATED_JUMP: Self = Self(1 << 2);
@@ -302,7 +304,14 @@ pub fn aggregate(
         .iter()
         .map(|quote| (quote.price, quote.weight))
         .collect();
-    let Some(price) = stats::weighted_median(&samples) else {
+    // Weights come from spread and freshness, which a venue controls. When the
+    // sources disagree and none can be dropped, they must not pick the winner.
+    let price = if reasons.contains(Reasons::OUTLIER_PRESSURE) {
+        contested_price(&quotes, last_price)
+    } else {
+        stats::weighted_median(&samples)
+    };
+    let Some(price) = price else {
         return Outcome::Halted {
             reasons: reasons | Reasons::INSUFFICIENT_SOURCES,
             live,
@@ -413,6 +422,24 @@ fn cap_weights(config: &FeedConfig, quotes: &mut [SourceQuote]) {
     }
 }
 
+/// The price when the sources disagree and none can be dropped.
+///
+/// Two sources leave no majority, so the one nearer the last published price
+/// stands: one moved venue widens the confidence but cannot move the price. A
+/// midpoint would hand it half the move, and can land on a level nobody quoted.
+fn contested_price(quotes: &[SourceQuote], last_price: Option<Fixed>) -> Option<Fixed> {
+    if let ([first, second], Some(last)) = (quotes, last_price) {
+        let distance =
+            |quote: &SourceQuote| quote.price.checked_sub(last).and_then(Fixed::checked_abs);
+        return Some(if distance(first) <= distance(second) {
+            first.price
+        } else {
+            second.price
+        });
+    }
+    stats::median(&mut quotes.iter().map(|quote| quote.price).collect::<Vec<_>>())
+}
+
 /// Drops quotes far from the median, returning how many were dropped.
 ///
 /// Returns `None` if rejection would breach the quorum, in which case nothing is
@@ -429,6 +456,19 @@ fn reject_outliers(config: &FeedConfig, quotes: &mut Vec<SourceQuote>) -> Option
         .checked_mul(config.outlier_floor_bps)?
         .checked_div(BPS_PER_UNIT)?;
     let threshold = sigma.checked_mul(config.mad_k)?.max(floor);
+
+    // Two quotes sit equally far from their midpoint, so the test above can
+    // never reject either: a gap past the floor is a disagreement nobody can
+    // settle.
+    if let [first, second] = quotes.as_slice()
+        && first
+            .price
+            .checked_sub(second.price)
+            .and_then(Fixed::checked_abs)
+            .is_some_and(|gap| gap > floor)
+    {
+        return None;
+    }
 
     let survivors: Vec<SourceQuote> = quotes
         .iter()
@@ -463,7 +503,11 @@ fn confidence(
     quotes: &[SourceQuote],
     price: Fixed,
 ) -> Option<Fixed> {
+    // Unweighted as well: a source holding over half the weight makes the
+    // weighted MAD zero however far the others are.
+    let values: Vec<Fixed> = samples.iter().map(|(value, _)| *value).collect();
     let dispersion = stats::weighted_mad(samples, price)
+        .max(stats::mad(&values, price))
         .and_then(|mad| mad.checked_mul(MAD_TO_SIGMA))
         .unwrap_or(Fixed::ZERO);
 
@@ -571,6 +615,58 @@ mod tests {
         assert_eq!(result.rejected, 0);
         assert!(result.flags.is_none());
         assert!(result.conf.is_positive(), "confidence must never be zero");
+    }
+
+    /// Two sources leave no majority to say which is wrong, whatever their
+    /// weights: the fresher one must not simply win.
+    #[test]
+    fn two_sources_apart_beyond_the_floor_degrade_and_keep_the_last_level() {
+        let config = config(&[Venue::Binance, Venue::Okx]);
+        let mut heavy = quote(Venue::Okx, "102.5");
+        heavy.weight = fixed("3");
+        let quotes = vec![quote(Venue::Binance, "100"), heavy];
+
+        let result = priced(aggregate(
+            &config,
+            quotes.clone(),
+            None,
+            Some(fixed("100.01")),
+            None,
+        ));
+        assert!(result.reasons.contains(Reasons::OUTLIER_PRESSURE));
+        assert!(result.flags.is_degraded());
+        assert_eq!(result.price, fixed("100"), "the moved venue cannot move it");
+        assert!(
+            result.conf >= fixed("2.5"),
+            "covers the other: {}",
+            result.conf
+        );
+
+        // With nothing published yet there is no level to keep.
+        let result = priced(aggregate(&config, quotes, None, None, None));
+        assert_eq!(result.price, fixed("101.25"));
+
+        // Inside the floor, two sources are just two sources.
+        let quotes = vec![quote(Venue::Binance, "100"), quote(Venue::Okx, "100.05")];
+        let result = priced(aggregate(&config, quotes, None, None, None));
+        assert!(result.flags.is_none());
+    }
+
+    /// A source with most of the weight made the weighted MAD zero, and the
+    /// confidence fell to its floor while the others disagreed.
+    #[test]
+    fn a_heavy_source_does_not_hide_disagreement() {
+        let config = config(&[Venue::Binance, Venue::Bybit, Venue::Okx]);
+        let mut heavy = quote(Venue::Binance, "100");
+        heavy.weight = fixed("3");
+        let quotes = vec![
+            heavy,
+            quote(Venue::Bybit, "100.06"),
+            quote(Venue::Okx, "100.08"),
+        ];
+        let result = priced(aggregate(&config, quotes, None, None, None));
+        assert_eq!(result.rejected, 0, "all inside the 10bp floor");
+        assert!(result.conf >= fixed("0.08"), "{}", result.conf);
     }
 
     #[test]
@@ -703,10 +799,10 @@ mod tests {
     #[test]
     fn an_uncorroborated_jump_degrades_and_widens() {
         let mut config = config(&ALL);
-        config.min_sources = 2;
-        // Two venues; one runs 10% while the other does not. The median moves 5%,
-        // past the 300bp jump threshold, but only one venue actually moved.
-        let quotes = vec![quote(Venue::Binance, "110"), quote(Venue::Bybit, "100")];
+        config.min_sources = 1;
+        // One venue moves 5%, past the 300bp jump threshold, and no other venue
+        // is there to corroborate it.
+        let quotes = vec![quote(Venue::Binance, "105")];
         let result = priced(aggregate(&config, quotes, None, Some(fixed("100")), None));
         assert!(result.reasons.contains(Reasons::UNCORROBORATED_JUMP));
         assert!(result.flags.is_degraded());
@@ -715,6 +811,15 @@ mod tests {
             "confidence {} must cover the distance moved",
             result.conf
         );
+
+        // Two venues where one runs 10%: no majority, so the price stays at the
+        // last level, degraded, with a confidence that covers the runner.
+        config.min_sources = 2;
+        let quotes = vec![quote(Venue::Binance, "110"), quote(Venue::Bybit, "100")];
+        let result = priced(aggregate(&config, quotes, None, Some(fixed("100")), None));
+        assert_eq!(result.price, fixed("100"));
+        assert!(result.flags.is_degraded());
+        assert!(result.conf >= fixed("10"), "{}", result.conf);
     }
 
     #[test]

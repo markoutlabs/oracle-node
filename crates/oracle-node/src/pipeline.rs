@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use oracle_agg::{AggError, Aggregator, FeedStats};
 use oracle_ingest::IngestEvent;
-use oracle_types::FeedId;
+use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::{SignedUpdate, Signer};
 
 /// Counters describing what the pipeline has done.
@@ -99,12 +99,34 @@ impl Pipeline {
         }
     }
 
-    /// Evaluates every feed and signs whatever policy says to publish.
+    /// Evaluates every feed and signs whatever policy says to publish. Run it
+    /// on a timer: heartbeats and stale sources change nothing on input.
     ///
     /// Errors are returned alongside the updates rather than short-circuiting:
     /// one misconfigured feed must not stop the others from publishing.
     pub fn tick(&mut self, now_ns: u64) -> (Vec<SignedUpdate>, Vec<AggError>) {
-        let (updates, errors) = self.aggregator.poll_all(now_ns);
+        let polled = self.aggregator.poll_all(now_ns);
+        self.sign(polled)
+    }
+
+    /// Evaluates only the feeds whose inputs changed, and those whose
+    /// rate-capped publication is due. Run it after each batch of events, so a
+    /// move publishes when it arrives.
+    pub fn flush(&mut self, now_ns: u64) -> (Vec<SignedUpdate>, Vec<AggError>) {
+        let polled = self.aggregator.poll_changed(now_ns);
+        self.sign(polled)
+    }
+
+    /// When [`Self::flush`] next has a rate-capped publication to make.
+    #[must_use]
+    pub fn next_retry_ns(&self) -> Option<u64> {
+        self.aggregator.next_retry_ns()
+    }
+
+    fn sign(
+        &mut self,
+        (updates, errors): (Vec<PriceUpdate>, Vec<AggError>),
+    ) -> (Vec<SignedUpdate>, Vec<AggError>) {
         self.stats.encode_errors = self
             .stats
             .encode_errors

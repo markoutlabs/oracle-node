@@ -34,7 +34,7 @@ use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::{Connector, Frame, IngestEvent, Record, Transport, TransportError};
 use oracle_node::{Pipeline, PipelineStats, ResolvedConfig, build_adapters};
 use oracle_types::{FeedId, PriceUpdate};
-use oracle_wire::{Signer, encode_price_update, keccak256};
+use oracle_wire::{SignedUpdate, Signer, encode_price_update, keccak256};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -249,16 +249,28 @@ pub async fn run(
         };
         // Time comes from the event, never from the shared clock: the sessions
         // may have released frames far beyond the one being applied here.
-        // Ticks fire at recorded-time boundaries, before the event that crossed
-        // them, which is how the live node orders them.
+        // Timers fire at recorded time, before the event that crossed them,
+        // which is how the live node orders them.
         if let IngestEvent::Observation(observation) = &event {
             now = now.max(observation.local_recv_ns);
         }
-        while next_tick <= now {
-            tick(&mut pipeline, next_tick, &mut outcome);
-            next_tick = next_tick.saturating_add(interval);
+        loop {
+            let retry = pipeline
+                .next_retry_ns()
+                .filter(|at| *at <= now && *at < next_tick);
+            if let Some(at) = retry {
+                flush(&mut pipeline, at, &mut outcome);
+            } else if next_tick <= now {
+                tick(&mut pipeline, next_tick, &mut outcome);
+                next_tick = next_tick.saturating_add(interval);
+            } else {
+                break;
+            }
         }
+        // The live node evaluates once per batch of queued events. Replay
+        // evaluates after each one, because batch edges depend on timing.
         pipeline.observe(&event);
+        flush(&mut pipeline, now, &mut outcome);
     }
     // One final evaluation at the end of the recording.
     tick(&mut pipeline, now.max(last), &mut outcome);
@@ -279,7 +291,16 @@ pub async fn run(
 }
 
 fn tick(pipeline: &mut Pipeline, now_ns: u64, outcome: &mut Outcome) {
-    let (signed, errors) = pipeline.tick(now_ns);
+    let polled = pipeline.tick(now_ns);
+    record(polled, outcome);
+}
+
+fn flush(pipeline: &mut Pipeline, now_ns: u64, outcome: &mut Outcome) {
+    let polled = pipeline.flush(now_ns);
+    record(polled, outcome);
+}
+
+fn record((signed, errors): (Vec<SignedUpdate>, Vec<AggError>), outcome: &mut Outcome) {
     outcome
         .updates
         .extend(signed.iter().map(|update| *update.update()));

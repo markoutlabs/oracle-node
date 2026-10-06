@@ -44,8 +44,8 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
     );
 
     format!(
-        r#"# Must be at or below the tightest feed's rate cap, or the cap becomes the tick
-# rate and the deviation trigger never fires early.
+        r#"# Heartbeats and stale venues are checked on this timer. A price move publishes
+# when it arrives.
 tick_interval_ms = 25
 
 [server]

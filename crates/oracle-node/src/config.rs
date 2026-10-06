@@ -83,10 +83,9 @@ pub struct NodeConfig {
     /// here so tools that only read the feeds, such as replay, can share configs.
     #[serde(default)]
     pub clients: Option<ClientsSettings>,
-    /// How often to evaluate every feed, in milliseconds.
-    ///
-    /// Must be at or below the tightest feed's rate cap, or the cap becomes the
-    /// tick rate and the deviation trigger never fires early.
+    /// How often every feed is re-evaluated, in milliseconds. A price move is
+    /// evaluated when it arrives; this timer catches what changes with no
+    /// input: heartbeats and stale venues.
     #[serde(default = "default_tick_ms")]
     pub tick_interval_ms: u64,
     /// The feeds this node publishes.
@@ -200,6 +199,15 @@ pub struct FeedSettings {
     /// Treat this as a slow-moving quantity: funding rates, open interest.
     #[serde(default)]
     pub slow: bool,
+    /// Publish on a move of at least this many basis points, as a decimal string.
+    #[serde(default)]
+    pub deviation_bps: Option<String>,
+    /// Publish at least this often, in milliseconds, even when nothing moves.
+    #[serde(default)]
+    pub heartbeat_ms: Option<u64>,
+    /// Never publish more often than this, in milliseconds.
+    #[serde(default)]
+    pub min_interval_ms: Option<u64>,
     /// Contributing venues.
     pub sources: Vec<SourceSettings>,
 }
@@ -280,7 +288,7 @@ pub struct ResolvedConfig {
     pub binance: BinanceConfig,
     /// Connections for the venues that subscribe over the socket.
     pub venues: Vec<(Venue, Vec<VenueConnection>)>,
-    /// How often to evaluate feeds.
+    /// How often to re-evaluate every feed for heartbeats and stale venues.
     pub tick_interval: Duration,
 }
 
@@ -516,6 +524,17 @@ impl NodeConfig {
             };
             if let Some(min_sources) = feed.min_sources {
                 config.min_sources = min_sources;
+            }
+            if let Some(text) = &feed.deviation_bps {
+                config.deviation_bps = text.parse().map_err(|e| {
+                    ConfigError::Invalid(format!("feed `{}`: bad deviation_bps: {e}", feed.symbol))
+                })?;
+            }
+            if let Some(ms) = feed.heartbeat_ms {
+                config.heartbeat = Duration::from_millis(ms);
+            }
+            if let Some(ms) = feed.min_interval_ms {
+                config.min_interval = Duration::from_millis(ms);
             }
             if let Some(peg) = &feed.peg {
                 let peg_symbol: Symbol = peg.parse().map_err(|e| {
@@ -975,6 +994,40 @@ sources = [
 
     fn with_endpoints(text: &str, endpoints: &str) -> Result<ResolvedConfig, ConfigError> {
         parse(&format!("{text}\n{endpoints}")).resolve()
+    }
+
+    #[test]
+    fn a_feed_sets_its_own_publication_policy() {
+        let text = SAMPLE.replacen(
+            "min_sources = 1\n",
+            "min_sources = 1\ndeviation_bps = \"0.5\"\nheartbeat_ms = 500\nmin_interval_ms = 10\n",
+            1,
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let feed = resolved.feeds.first().expect("a feed");
+        assert_eq!(feed.deviation_bps.to_string(), "0.5");
+        assert_eq!(feed.heartbeat, Duration::from_millis(500));
+        assert_eq!(feed.min_interval, Duration::from_millis(10));
+        let other = resolved.feeds.get(1).expect("a second feed");
+        assert_eq!(other.deviation_bps.to_string(), "1", "the default");
+
+        for (settings, why) in [
+            ("min_interval_ms = 0", "min_interval"),
+            ("heartbeat_ms = 5\nmin_interval_ms = 10", "heartbeat"),
+            ("deviation_bps = \"-1\"", "deviation_bps"),
+            ("deviation_bps = \"lots\"", "deviation_bps"),
+        ] {
+            let text = SAMPLE.replacen(
+                "min_sources = 1\n",
+                &format!("min_sources = 1\n{settings}\n"),
+                1,
+            );
+            let Err(error) = parse(&text).resolve() else {
+                panic!("{settings} must be refused");
+            };
+            let error = error.to_string();
+            assert!(error.contains(why), "{settings}: {error}");
+        }
     }
 
     #[test]

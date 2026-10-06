@@ -95,6 +95,22 @@ struct FeedRuntime {
     reference_at_ns: u64,
     seq: u64,
     stats: FeedStats,
+    /// An input changed since the last evaluation.
+    dirty: bool,
+    /// When a publication the rate cap held back becomes due.
+    retry_at_ns: Option<u64>,
+}
+
+/// What the publication policy decided for one evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decision {
+    Publish,
+    Hold,
+    /// A trigger fired inside the rate cap. Without a retry, a move that
+    /// arrives just after a publish would wait for the next input or heartbeat.
+    RateCapped {
+        until_ns: u64,
+    },
 }
 
 /// Aggregates observations from many venues into signed-ready price updates.
@@ -110,6 +126,8 @@ pub struct Aggregator {
     /// Evaluation order: pegs before the feeds that depend on them, so a
     /// conversion reads a peg from this tick rather than the previous one.
     order: Vec<usize>,
+    /// For each feed, the feeds converted through it.
+    dependents: Vec<Vec<usize>>,
 }
 
 impl Aggregator {
@@ -164,10 +182,13 @@ impl Aggregator {
                 reference_at_ns: 0,
                 seq: 0,
                 stats: FeedStats::default(),
+                dirty: false,
+                retry_at_ns: None,
             });
         }
         // Every peg must exist and must not itself need conversion.
-        for feed in &feeds {
+        let mut dependents = vec![Vec::new(); feeds.len()];
+        for (feed_index, feed) in feeds.iter().enumerate() {
             if !feed.config.needs_conversion() {
                 continue;
             }
@@ -189,6 +210,9 @@ impl Aggregator {
                     peg: peg.config.symbol.to_string(),
                 });
             }
+            if let Some(list) = dependents.get_mut(peg_index) {
+                list.push(feed_index);
+            }
         }
 
         // Pegs first. With chaining forbidden, one pass is a complete ordering.
@@ -204,7 +228,18 @@ impl Aggregator {
             routes,
             by_id,
             order,
+            dependents,
         })
+    }
+
+    /// Marks a feed for evaluation, and every feed converted through it.
+    fn mark_dirty(&mut self, index: usize) {
+        let dependents = self.dependents.get(index).cloned().unwrap_or_default();
+        for target in std::iter::once(index).chain(dependents) {
+            if let Some(feed) = self.feeds.get_mut(target) {
+                feed.dirty = true;
+            }
+        }
     }
 
     /// Returns the peg reading a feed needs, if it needs one.
@@ -246,17 +281,18 @@ impl Aggregator {
     /// Observations for unconfigured instruments are ignored, which is normal:
     /// ingest may stream more than the aggregator is asked to price.
     pub fn observe(&mut self, observation: &Observation) {
-        let Some(targets) = self.routes.get(&observation.instrument) else {
+        let Some(targets) = self.routes.get(&observation.instrument).cloned() else {
             return;
         };
         for (feed_index, source_index) in targets {
             if let Some(slots) = self
                 .feeds
-                .get_mut(*feed_index)
-                .and_then(|f| f.sources.get_mut(*source_index))
+                .get_mut(feed_index)
+                .and_then(|f| f.sources.get_mut(source_index))
             {
                 slots.store(observation);
             }
+            self.mark_dirty(feed_index);
         }
     }
 
@@ -266,15 +302,20 @@ impl Aggregator {
     /// looks live and is not: the venue may have moved while we were blind, and
     /// the staleness filter cannot help if the gap was shorter than its threshold.
     pub fn invalidate(&mut self, venue: Venue, market: MarketKind) {
-        for feed in &mut self.feeds {
+        let mut touched = Vec::new();
+        for (feed_index, feed) in self.feeds.iter_mut().enumerate() {
             for (index, source) in feed.config.sources.iter().enumerate() {
                 if source.instrument.venue == venue && source.instrument.market == market {
                     if let Some(slots) = feed.sources.get_mut(index) {
                         slots.clear();
                     }
                     feed.stats.invalidations = feed.stats.invalidations.saturating_add(1);
+                    touched.push(feed_index);
                 }
             }
+        }
+        for index in touched {
+            self.mark_dirty(index);
         }
     }
 
@@ -300,6 +341,32 @@ impl Aggregator {
     /// Errors are returned alongside the updates rather than short-circuiting: one
     /// misconfigured feed must not stop the others from publishing.
     pub fn poll_all(&mut self, now_ns: u64) -> (Vec<PriceUpdate>, Vec<AggError>) {
+        self.poll_where(now_ns, |_| true)
+    }
+
+    /// Evaluates the feeds whose inputs changed since their last evaluation,
+    /// and those whose rate-capped publication is now due.
+    ///
+    /// Call it after each batch of observations, so a move publishes when it
+    /// arrives rather than on the next tick. [`Self::poll_all`] still has to
+    /// run on a timer: heartbeats and stale sources change nothing on input.
+    pub fn poll_changed(&mut self, now_ns: u64) -> (Vec<PriceUpdate>, Vec<AggError>) {
+        self.poll_where(now_ns, |feed| {
+            feed.dirty || feed.retry_at_ns.is_some_and(|at| at <= now_ns)
+        })
+    }
+
+    /// The earliest moment a rate-capped publication becomes due.
+    #[must_use]
+    pub fn next_retry_ns(&self) -> Option<u64> {
+        self.feeds.iter().filter_map(|feed| feed.retry_at_ns).min()
+    }
+
+    fn poll_where(
+        &mut self,
+        now_ns: u64,
+        due: impl Fn(&FeedRuntime) -> bool,
+    ) -> (Vec<PriceUpdate>, Vec<AggError>) {
         let mut updates = Vec::new();
         let mut errors = Vec::new();
         // Pegs first, so a dependent feed converts against this tick's reading.
@@ -307,6 +374,9 @@ impl Aggregator {
             let Some(index) = self.order.get(position).copied() else {
                 continue;
             };
+            if !self.feeds.get(index).is_some_and(&due) {
+                continue;
+            }
             let peg = self.peg_for(index);
             let Some(feed) = self.feeds.get_mut(index) else {
                 continue;
@@ -323,6 +393,8 @@ impl Aggregator {
 
 impl FeedRuntime {
     fn poll(&mut self, now_ns: u64, peg: Option<Peg>) -> Result<Option<PriceUpdate>, AggError> {
+        self.dirty = false;
+        self.retry_at_ns = None;
         let quotes = self.quotes(now_ns);
         let outcome = aggregate::aggregate(
             &self.config,
@@ -386,9 +458,17 @@ impl FeedRuntime {
         };
 
         self.stats.last_reasons = reasons;
-        if !self.should_publish(price, flags, now_ns) {
-            self.stats.suppressed = self.stats.suppressed.saturating_add(1);
-            return Ok(None);
+        match self.decide(price, flags, now_ns) {
+            Decision::Publish => {}
+            Decision::Hold => {
+                self.stats.suppressed = self.stats.suppressed.saturating_add(1);
+                return Ok(None);
+            }
+            Decision::RateCapped { until_ns } => {
+                self.stats.suppressed = self.stats.suppressed.saturating_add(1);
+                self.retry_at_ns = Some(until_ns);
+                return Ok(None);
+            }
         }
 
         let expo = self.config.expo;
@@ -452,24 +532,27 @@ impl FeedRuntime {
     /// transition. It is what bounds signing cost and subscriber bandwidth under
     /// volatility — precisely when both are under the most stress. The cost is
     /// that a halt or degrade transition can be delayed by up to `min_interval`.
-    fn should_publish(&self, price: Fixed, flags: Flags, now_ns: u64) -> bool {
-        let Some(last) = self.last else { return true };
+    fn decide(&self, price: Fixed, flags: Flags, now_ns: u64) -> Decision {
+        let Some(last) = self.last else {
+            return Decision::Publish;
+        };
 
         let elapsed = now_ns.saturating_sub(last.publish_time_ns);
-        if elapsed < duration_ns(self.config.min_interval) {
-            return false;
+        let triggered = flags != last.flags
+            || elapsed >= duration_ns(self.config.heartbeat)
+            || price
+                .checked_sub(last.price)
+                .and_then(Fixed::checked_abs)
+                .and_then(|delta| delta.to_bps_of(last.price))
+                .is_some_and(|bps| bps >= self.config.deviation_bps);
+        let min_interval = duration_ns(self.config.min_interval);
+        match (triggered, elapsed < min_interval) {
+            (false, _) => Decision::Hold,
+            (true, false) => Decision::Publish,
+            (true, true) => Decision::RateCapped {
+                until_ns: last.publish_time_ns.saturating_add(min_interval),
+            },
         }
-        if flags != last.flags {
-            return true;
-        }
-        if elapsed >= duration_ns(self.config.heartbeat) {
-            return true;
-        }
-        price
-            .checked_sub(last.price)
-            .and_then(Fixed::checked_abs)
-            .and_then(|delta| delta.to_bps_of(last.price))
-            .is_some_and(|bps| bps >= self.config.deviation_bps)
     }
 
     /// Advances the sanity-band reference toward the published price.
@@ -658,7 +741,7 @@ mod tests {
                 .is_some()
         );
 
-        // 10bp move, well past the 5bp threshold, only 100ms later.
+        // 10bp move, well past the 1bp threshold, only 100ms later.
         let later = SECOND + 100_000_000;
         feed(
             &mut aggregator,
@@ -700,6 +783,46 @@ mod tests {
                 .expect("no error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn poll_changed_evaluates_only_feeds_with_new_input() {
+        let mut aggregator = aggregator();
+        let both = |bid, ask| [(Venue::Binance, bid, ask), (Venue::Bybit, bid, ask)];
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+
+        let later = SECOND + 100_000_000;
+        assert!(aggregator.poll_changed(later).0.is_empty());
+        assert_eq!(
+            aggregator.stats(feed_id()).map(|stats| stats.suppressed),
+            Some(0),
+            "nothing changed, so nothing was evaluated"
+        );
+
+        // 2bp, past the 1bp threshold: published when it arrives.
+        feed(&mut aggregator, later, &both("100.02", "100.04"));
+        assert_eq!(aggregator.poll_changed(later).0.len(), 1);
+    }
+
+    /// Without the retry, a move just after a publish waits for the next input
+    /// or the heartbeat.
+    #[test]
+    fn a_rate_capped_move_is_due_when_the_cap_expires() {
+        let mut aggregator = aggregator();
+        let both = |bid, ask| [(Venue::Binance, bid, ask), (Venue::Bybit, bid, ask)];
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+        assert_eq!(aggregator.next_retry_ns(), None);
+
+        let soon = SECOND + 10_000_000;
+        feed(&mut aggregator, soon, &both("101", "101.02"));
+        assert!(aggregator.poll_changed(soon).0.is_empty());
+        let due = SECOND + 50_000_000;
+        assert_eq!(aggregator.next_retry_ns(), Some(due));
+        assert!(aggregator.poll_changed(due - 1).0.is_empty(), "not due yet");
+        assert_eq!(aggregator.poll_changed(due).0.len(), 1);
+        assert_eq!(aggregator.next_retry_ns(), None);
     }
 
     #[test]

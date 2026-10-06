@@ -390,3 +390,19 @@ fn peg_concerns_are_reported_for_metrics() {
     assert!(stats.last_reasons.contains(Reasons::SYNTHETIC_QUOTE));
     assert!(stats.last_reasons.contains(Reasons::PEG_UNCERTAIN));
 }
+
+/// Only the peg's sources changed, yet every feed converted through it moved.
+#[test]
+fn a_peg_move_reaches_its_dependents_without_their_own_input() {
+    let mut aggregator = aggregator("50");
+    let first = tick(&mut aggregator, START, "1", "0.00005", "100000", "100000");
+    assert!(find(&first, &btc_symbol()).is_some());
+
+    let later = START + SECOND / 2;
+    for venue in USD_VENUES {
+        aggregator.observe(&book(venue, "USDT-USD", fixed("1.0003"), "0.00005", later));
+    }
+    let updates = aggregator.poll_changed(later).0;
+    assert!(find(&updates, &peg_symbol()).is_some(), "{updates:?}");
+    assert!(find(&updates, &btc_symbol()).is_some(), "{updates:?}");
+}

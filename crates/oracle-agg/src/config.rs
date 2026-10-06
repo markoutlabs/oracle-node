@@ -207,7 +207,8 @@ impl FeedConfig {
                 Fixed::from_raw(500_000_000_000),
                 Fixed::from_raw(2_000_000_000_000),
             ),
-            deviation_bps: Fixed::from_raw(5 * 1_000_000_000_000),
+            // One confidence floor: a smaller move is inside our own uncertainty.
+            deviation_bps: Fixed::ONE,
             heartbeat: Duration::from_millis(1_000),
             min_interval: Duration::from_millis(50),
         }
@@ -275,6 +276,19 @@ impl FeedConfig {
             return Err(ConfigError::Invalid {
                 symbol: self.symbol.to_string(),
                 reason: "min_sources must be at least 1".to_owned(),
+            });
+        }
+        if self.min_interval.is_zero() {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: "min_interval must be above zero: it bounds signing under volatility"
+                    .to_owned(),
+            });
+        }
+        if self.deviation_bps < Fixed::ZERO {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: "deviation_bps must not be negative".to_owned(),
             });
         }
         if self.heartbeat < self.min_interval {
@@ -422,7 +436,7 @@ mod tests {
     fn spot_defaults_match_the_specification() {
         let config = config();
         assert_eq!(config.max_age, Duration::from_millis(2_000));
-        assert_eq!(config.deviation_bps.to_string(), "5");
+        assert_eq!(config.deviation_bps.to_string(), "1");
         assert_eq!(config.heartbeat, Duration::from_millis(1_000));
         assert_eq!(config.min_interval, Duration::from_millis(50));
         assert_eq!(config.mad_k.to_string(), "4");

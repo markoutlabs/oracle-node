@@ -117,11 +117,20 @@ production incident becomes a unit test instead of an argument.
 observations ──▶ per-venue quote     (microprice, staleness, crossed books)
              ──▶ outlier rejection   (MAD, unweighted, never below quorum)
              ──▶ weight cap          (no source may buy the median)
-             ──▶ weighted median
+             ──▶ weighted median     (plain median when venues disagree and none can go)
              ──▶ confidence          (disagreement ∨ spread ∨ floor)
              ──▶ circuit breakers    (jump corroboration, sanity band)
              ──▶ publication policy  (rate cap, then deviation ∨ heartbeat)
 ```
+
+A feed is evaluated when one of its inputs changes, so a move publishes when it
+arrives; a 25 ms timer catches heartbeats and stale venues. `deviation_bps` (1 by
+default), `heartbeat_ms` and `min_interval_ms` are set per feed. A move held back
+by the rate cap publishes the moment the cap expires.
+
+Two venues that disagree beyond the 10 bp outlier floor leave no majority to say
+which is wrong. The feed degrades, keeps the venue nearer its last price, and
+widens the confidence to cover the other: one moved venue cannot move the price.
 
 **The governing bias: degrade loudly, halt rarely, never silently narrow.** An
 oracle that goes dark breaks its consumers; one that publishes a confident wrong
@@ -652,8 +661,8 @@ oracle-replay node.toml capture.jsonl --realtime         # sleep the recorded ga
 Two substitutions make it deterministic. The transport reads the recording
 instead of a socket, releasing frames in recorded order across every connection.
 The session clock reads the recording instead of the wall, so each observation
-carries the receipt time it really had, and the pipeline ticks at recorded-time
-boundaries. The last line `oracle-replay` prints is a digest over every published
+carries the receipt time it really had. The pipeline evaluates each changed feed
+after each observation, and runs its timers at recorded time. The last line `oracle-replay` prints is a digest over every published
 update. Two replays of one recording print the same digest, on any machine. That
 is SPEC §10's cross-node conformance check, and it is also how an incident gets
 reproduced months later and how an aggregation constant gets tuned against a real

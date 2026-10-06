@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
+use oracle_agg::AggError;
 use oracle_ingest::IngestEvent;
 use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
@@ -18,7 +19,7 @@ use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
 use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
 use oracle_types::FeedId;
-use oracle_wire::{Address, Registry, Signer, VerifiedClientList};
+use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -33,6 +34,9 @@ use crate::tail::{log_observation, log_update};
 /// growing without limit. Dropping the socket is recoverable; running out of
 /// memory is not.
 const INGEST_CAPACITY: usize = 8_192;
+/// Events applied before the changed feeds are evaluated. A burst then costs one
+/// pass over the feeds it touched, not one per event, and stays bounded.
+const BATCH_MAX: usize = 256;
 
 #[derive(Args)]
 pub(crate) struct StartArgs {
@@ -278,6 +282,30 @@ struct PipelineTask {
 }
 
 impl PipelineTask {
+    fn apply(&mut self, event: &IngestEvent) {
+        if self.tail {
+            log_observation(event);
+        }
+        self.pipeline.observe(event);
+    }
+
+    fn publish(
+        &self,
+        (signed, errors): (Vec<SignedUpdate>, Vec<AggError>),
+        published: &mut HashSet<FeedId>,
+    ) {
+        for error in errors {
+            warn!(%error, "feed could not be encoded");
+        }
+        for update in signed {
+            if self.tail {
+                log_update(&update);
+            }
+            published.insert(update.update().feed_id);
+            let _ = self.state.publish(update);
+        }
+    }
+
     async fn run(mut self) {
         let clock = MonotonicClock::new();
         let mut ticker = tokio::time::interval(self.tick);
@@ -288,28 +316,30 @@ impl PipelineTask {
         let mut published: HashSet<FeedId> = HashSet::new();
         let mut updates_before = 0;
         loop {
+            let retry = self
+                .pipeline
+                .next_retry_ns()
+                .map(|at| Duration::from_nanos(at.saturating_sub(clock.now_ns())));
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => break,
                 event = self.ingest.recv() => {
                     let Some(event) = event else { break };
-                    if self.tail {
-                        log_observation(&event);
+                    self.apply(&event);
+                    for _ in 1..BATCH_MAX {
+                        let Ok(event) = self.ingest.try_recv() else { break };
+                        self.apply(&event);
                     }
-                    self.pipeline.observe(&event);
+                    let polled = self.pipeline.flush(clock.now_ns());
+                    self.publish(polled, &mut published);
+                }
+                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
+                    let polled = self.pipeline.flush(clock.now_ns());
+                    self.publish(polled, &mut published);
                 }
                 _ = ticker.tick() => {
-                    let (signed, errors) = self.pipeline.tick(clock.now_ns());
-                    for error in errors {
-                        warn!(%error, "feed could not be encoded");
-                    }
-                    for update in signed {
-                        if self.tail {
-                            log_update(&update);
-                        }
-                        published.insert(update.update().feed_id);
-                        let _ = self.state.publish(update);
-                    }
+                    let polled = self.pipeline.tick(clock.now_ns());
+                    self.publish(polled, &mut published);
                 }
                 _ = status_ticker.tick() => {
                     let stats = self.pipeline.stats();
