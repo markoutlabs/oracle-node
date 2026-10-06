@@ -12,8 +12,8 @@ use age::secrecy::SecretString;
 use anyhow::Context as _;
 use cliclack::{confirm, input, intro, log, note, outro, outro_cancel, password, select};
 use oracle_node::{
-    Endpoint, NodeKey, NodeSetup, Operator, RegistrySource, ServiceUnit, Unlock, Written,
-    candid_call, generate_passphrase,
+    Endpoint, NodeKey, NodeSetup, RegistrySource, ServiceUnit, Unlock, Written, candid_call,
+    generate_passphrase,
 };
 use oracle_wire::Address;
 
@@ -74,10 +74,6 @@ fn ask(args: &InitArgs, source: RegistrySource, governance: Address) -> io::Resu
             }
         })
         .interact()?;
-    let operator: Operator = input("Who runs this node?")
-        .placeholder("your organisation, as governance knows it")
-        .validate(|text: &String| parses::<Operator>(text))
-        .interact()?;
     let endpoint: Endpoint = input("Which WebSocket URL will clients dial?")
         .default_input(&args.endpoint.to_string())
         .validate(|text: &String| parses::<Endpoint>(text))
@@ -88,7 +84,6 @@ fn ask(args: &InitArgs, source: RegistrySource, governance: Address) -> io::Resu
 
     let setup = NodeSetup {
         dir,
-        operator,
         endpoint,
         source,
         governance,
@@ -191,7 +186,6 @@ fn summary(setup: &NodeSetup) -> String {
     );
     let lines = [
         ("directory", setup.dir.display().to_string()),
-        ("operator", setup.operator.to_string()),
         ("endpoint", setup.endpoint.to_string()),
         ("registry", source),
         ("governance", setup.governance.to_checksummed()),
@@ -237,7 +231,7 @@ fn finish(setup: &NodeSetup, key: &NodeKey, written: &Written) -> io::Result<()>
         lines.join("\n")
     ))?;
 
-    let entry = key.entry(&setup.operator, &setup.endpoint);
+    let entry = key.entry(&setup.endpoint);
     let entry = serde_json::to_string(&entry).map_err(io::Error::other)?;
     // Log lines, not notes: a note box wraps a long command into pieces that
     // no longer paste.

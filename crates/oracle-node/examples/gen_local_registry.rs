@@ -134,10 +134,6 @@ fn entry(index: u8, options: &Options) -> Result<NodeEntry, WireError> {
     let signing = Signer::from_secret_bytes([signing_seed(index); 32])?;
     Ok(NodeEntry {
         address: signing.address(),
-        // Distinct operator names by default: five nodes under one operator is
-        // one node wearing a costume (SPEC §9.2). Local runs cannot make that
-        // true, but they should not encode the opposite either.
-        operator: format!("local-{index}"),
         endpoints: vec![format!(
             "ws://127.0.0.1:{}/v2/ws",
             options.base_port + u16::from(index) - 1

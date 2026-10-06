@@ -20,8 +20,7 @@ mod starter;
 mod unit;
 
 pub use setup::{
-    CanisterId, Endpoint, Gateway, NodeSetup, Operator, RegistrySource, RootKey, ServiceUnit,
-    Unlock, Written,
+    CanisterId, Endpoint, Gateway, NodeSetup, RegistrySource, RootKey, ServiceUnit, Unlock, Written,
 };
 
 /// Something went wrong generating or writing the node's files.
@@ -82,10 +81,9 @@ impl NodeKey {
     /// publishes a new version; until that happens the node's updates verify
     /// for nobody.
     #[must_use]
-    pub fn entry(&self, operator: &Operator, endpoint: &Endpoint) -> NodeEntry {
+    pub fn entry(&self, endpoint: &Endpoint) -> NodeEntry {
         NodeEntry {
             address: self.signing.address(),
-            operator: operator.to_string(),
             endpoints: vec![endpoint.to_string()],
             weight: 1,
         }
@@ -243,10 +241,6 @@ mod tests {
 
     const NOW: u64 = 1_754_582_400;
 
-    fn operator() -> Operator {
-        "acme".parse().expect("valid operator")
-    }
-
     fn endpoint() -> Endpoint {
         "wss://eu1.example/v2/ws".parse().expect("valid endpoint")
     }
@@ -268,7 +262,7 @@ mod tests {
             &governance,
             1,
             NOW,
-            vec![key.entry(&operator(), &endpoint())],
+            vec![key.entry(&endpoint())],
             oracle_wire::Quorum {
                 min_nodes: 1,
                 recommended: 3,

@@ -40,7 +40,6 @@ pub fn governance_key() -> Signer {
 pub fn test_registry() -> Registry {
     let node = NodeEntry {
         address: signing_key().address(),
-        operator: "test".to_owned(),
         endpoints: vec!["ws://127.0.0.1:0/v2/ws".to_owned()],
         weight: 1,
     };

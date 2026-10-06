@@ -75,7 +75,6 @@ async fn start_node() -> Node {
     let governance = oracle_server::testing::governance_key();
     let entry = oracle_wire::NodeEntry {
         address: signing_key().address(),
-        operator: "test".to_owned(),
         endpoints: vec![format!("ws://{addr}/v2/ws")],
         weight: 1,
     };

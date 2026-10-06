@@ -19,6 +19,12 @@ use zeroize::Zeroizing;
 /// The first line of an armored `age` file.
 pub const ARMOR_HEADER: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 
+// `age` sizes scrypt by timing the machine it runs on, so a key made by a fast
+// build could exceed what a slower build or server accepts. N = 2^18 is 256 MiB.
+const WORK_FACTOR: u8 = 18;
+// Above WORK_FACTOR, so keys that `age` sized on a fast machine still open.
+const MAX_WORK_FACTOR: u8 = 20;
+
 /// A key file could not be read, decrypted, or written.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -40,11 +46,30 @@ pub enum KeyFileError {
         /// Which file.
         path: PathBuf,
     },
-    /// Decryption failed.
-    #[error("cannot decrypt {path}: wrong passphrase or damaged file")]
+    /// The passphrase does not open the file.
+    #[error("cannot decrypt {path}: wrong passphrase")]
     Decrypt {
         /// Which file.
         path: PathBuf,
+    },
+    /// The file asks for more scrypt work than the node accepts.
+    #[error(
+        "cannot decrypt {path}: its scrypt work factor 2^{required} is above the limit of \
+         2^{MAX_WORK_FACTOR}"
+    )]
+    WorkFactor {
+        /// Which file.
+        path: PathBuf,
+        /// The work factor in its header.
+        required: u8,
+    },
+    /// The file is not a valid `age` file.
+    #[error("cannot decrypt {path}: damaged file: {reason}")]
+    Damaged {
+        /// Which file.
+        path: PathBuf,
+        /// What `age` reported.
+        reason: String,
     },
     /// Encryption failed.
     #[error("encryption failed: {0}")]
@@ -90,7 +115,11 @@ pub fn encrypt(secret: &str, passphrase: &SecretString) -> Result<String, KeyFil
     let mut out = Vec::new();
     let armored =
         ArmoredWriter::wrap_output(&mut out, Format::AsciiArmor).map_err(|e| failed(&e))?;
-    let mut writer = age::Encryptor::with_user_passphrase(passphrase.clone())
+    let mut recipient = age::scrypt::Recipient::new(passphrase.clone());
+    recipient.set_work_factor(WORK_FACTOR);
+    let recipients: [&dyn age::Recipient; 1] = [&recipient];
+    let mut writer = age::Encryptor::with_recipients(recipients.into_iter())
+        .map_err(|e| failed(&e))?
         .wrap_output(armored)
         .map_err(|e| failed(&e))?;
     writer
@@ -107,24 +136,37 @@ pub fn encrypt(secret: &str, passphrase: &SecretString) -> Result<String, KeyFil
 ///
 /// # Errors
 ///
-/// Returns [`KeyFileError::Decrypt`] for a wrong passphrase or a damaged file.
+/// Returns [`KeyFileError::Decrypt`] for a wrong passphrase,
+/// [`KeyFileError::WorkFactor`] for a file that asks for too much scrypt work,
+/// and [`KeyFileError::Damaged`] for anything else.
 pub fn decrypt(
     armored: &str,
     passphrase: &SecretString,
     path: &Path,
 ) -> Result<Zeroizing<String>, KeyFileError> {
-    let failed = || KeyFileError::Decrypt {
+    let damaged = |reason: &dyn std::fmt::Display| KeyFileError::Damaged {
         path: path.to_path_buf(),
+        reason: reason.to_string(),
     };
     let decryptor =
-        age::Decryptor::new(ArmoredReader::new(armored.as_bytes())).map_err(|_| failed())?;
-    let identity = age::scrypt::Identity::new(passphrase.clone());
+        age::Decryptor::new(ArmoredReader::new(armored.as_bytes())).map_err(|e| damaged(&e))?;
+    let mut identity = age::scrypt::Identity::new(passphrase.clone());
+    identity.set_max_work_factor(MAX_WORK_FACTOR);
     let identities: [&dyn age::Identity; 1] = [&identity];
     let mut reader = decryptor
         .decrypt(identities.into_iter())
-        .map_err(|_| failed())?;
+        .map_err(|error| match error {
+            age::DecryptError::DecryptionFailed => KeyFileError::Decrypt {
+                path: path.to_path_buf(),
+            },
+            age::DecryptError::ExcessiveWork { required, .. } => KeyFileError::WorkFactor {
+                path: path.to_path_buf(),
+                required,
+            },
+            other => damaged(&other),
+        })?;
     let mut plain = Zeroizing::new(String::new());
-    reader.read_to_string(&mut plain).map_err(|_| failed())?;
+    reader.read_to_string(&mut plain).map_err(|e| damaged(&e))?;
     Ok(plain)
 }
 
@@ -249,6 +291,36 @@ mod tests {
         assert!(matches!(
             decrypt(&armored, &passphrase("battery staple"), path),
             Err(KeyFileError::Decrypt { .. })
+        ));
+    }
+
+    /// A key made on a fast machine must open on a slow one, so the work
+    /// factor is fixed, and a file over the limit says so.
+    #[test]
+    fn keys_use_a_fixed_work_factor_and_too_much_work_is_named() {
+        let signer = Signer::from_secret_bytes([7_u8; 32]).expect("valid key");
+        let armored = encrypt(&signer.to_secret_hex(), &passphrase("pw")).expect("encrypts");
+        let mut bytes = Vec::new();
+        ArmoredReader::new(armored.as_bytes())
+            .read_to_end(&mut bytes)
+            .expect("armored");
+        let stanza_end = format!(" {WORK_FACTOR}\n");
+        let at = bytes
+            .windows(stanza_end.len())
+            .position(|window| window == stanza_end.as_bytes())
+            .expect("the scrypt stanza names the fixed work factor");
+
+        let over = MAX_WORK_FACTOR + 1;
+        bytes.splice(at..at + stanza_end.len(), format!(" {over}\n").into_bytes());
+        let mut tampered = Vec::new();
+        let mut writer =
+            ArmoredWriter::wrap_output(&mut tampered, Format::AsciiArmor).expect("wraps");
+        writer.write_all(&bytes).expect("writes");
+        writer.finish().expect("finishes");
+        let tampered = String::from_utf8(tampered).expect("ascii");
+        assert!(matches!(
+            decrypt(&tampered, &passphrase("pw"), Path::new("signing.key")),
+            Err(KeyFileError::WorkFactor { required, .. }) if required == over
         ));
     }
 

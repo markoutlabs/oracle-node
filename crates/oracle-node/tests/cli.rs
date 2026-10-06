@@ -40,7 +40,7 @@ fn secret_like_strings(text: &str) -> usize {
 
 #[test]
 fn init_prints_the_key_and_the_registry_entry() {
-    let output = run(&["init", "--operator", "acme"]);
+    let output = run(&["init", "--endpoint", "wss://eu1.example/v2/ws"]);
     assert!(output.status.success());
     let text = stdout(&output);
 
@@ -63,7 +63,7 @@ fn init_prints_the_key_and_the_registry_entry() {
         .next()
         .expect("an entry follows")
         .expect("a valid registry entry");
-    assert_eq!(parsed.operator, "acme");
+    assert_eq!(parsed.endpoints, ["wss://eu1.example/v2/ws"]);
     assert!(
         text.contains(&parsed.address.to_checksummed()),
         "the entry must list the address shown"
@@ -398,7 +398,6 @@ fn init_flags_fill_the_config_and_the_unit() {
 fn values_the_registry_would_refuse_are_usage_errors() {
     for args in [
         vec!["init", "--endpoint", "http://node.example"],
-        vec!["init", "--operator", " "],
         vec!["init", "--canister", "not a principal"],
         vec!["init", "--governance", "0x12"],
         vec!["init", "--out", "x", "--service-user", "oracle"],

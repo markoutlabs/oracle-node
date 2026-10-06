@@ -100,8 +100,8 @@ pub use payload::{
     PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
 };
 pub use registry::{
-    EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, MAX_OPERATOR_LEN, NodeEntry,
-    NodeListing, Quorum, Registry, VerifiedRegistry, check_endpoint, check_operator,
+    EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, NodeEntry, NodeListing, Quorum,
+    Registry, VerifiedRegistry, check_endpoint,
 };
 pub use signature::{SIGNATURE_LEN, Signature};
 pub use signer::{Signer, recover_address, recover_payload_signer};

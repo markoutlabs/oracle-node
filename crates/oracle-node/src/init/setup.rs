@@ -9,28 +9,9 @@ use std::str::FromStr;
 
 use age::secrecy::{ExposeSecret as _, SecretString};
 use oracle_client::Certification;
-use oracle_wire::{Address, EntryError, check_endpoint, check_operator};
+use oracle_wire::{Address, EntryError, check_endpoint};
 
 use super::{InitError, NodeKey, starter, unit, write_secret};
-
-/// An operator name the registry accepts.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Operator(String);
-
-impl FromStr for Operator {
-    type Err = EntryError;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        check_operator(text)?;
-        Ok(Self(text.to_owned()))
-    }
-}
-
-impl fmt::Display for Operator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// A WebSocket endpoint the registry accepts: what clients dial.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,8 +211,6 @@ pub struct ServiceUnit {
 pub struct NodeSetup {
     /// Where the files go.
     pub dir: PathBuf,
-    /// Who runs the node.
-    pub operator: Operator,
     /// What clients dial.
     pub endpoint: Endpoint,
     /// Where the registry and client list come from.
@@ -304,7 +283,7 @@ impl NodeSetup {
         };
 
         let entry_path = setup.dir.join("node-entry.json");
-        let entry = serde_json::to_string_pretty(&key.entry(&setup.operator, &setup.endpoint))
+        let entry = serde_json::to_string_pretty(&key.entry(&setup.endpoint))
             .map_err(|e| write_error(&entry_path, &e))?;
         write_file(&entry_path, &format!("{entry}\n"))?;
 
@@ -363,10 +342,6 @@ mod tests {
 
     #[test]
     fn values_parse_into_what_the_registry_accepts() {
-        assert!("acme".parse::<Operator>().is_ok());
-        for bad in ["", "  ", &"x".repeat(65)] {
-            assert!(bad.parse::<Operator>().is_err(), "{bad:?}");
-        }
         assert!("wss://eu1.example/v2/ws".parse::<Endpoint>().is_ok());
         for bad in ["http://eu1.example", &format!("wss://{}", "x".repeat(251))] {
             assert!(bad.parse::<Endpoint>().is_err(), "{bad}");

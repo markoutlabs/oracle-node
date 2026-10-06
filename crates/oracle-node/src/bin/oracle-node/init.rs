@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Args;
 use oracle_node::{
-    CanisterId, Endpoint, Gateway, NodeKey, NodeSetup, Operator, PassphraseSource, RegistrySource,
-    RootKey, ServiceUnit, Unlock, Written, candid_call,
+    CanisterId, Endpoint, Gateway, NodeKey, NodeSetup, PassphraseSource, RegistrySource, RootKey,
+    ServiceUnit, Unlock, Written, candid_call,
 };
 use oracle_wire::Address;
 
@@ -19,9 +19,6 @@ use crate::{ui, wizard};
 
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// Who runs it. Operator diversity is what makes the median mean anything.
-    #[arg(long, default_value = "unset")]
-    pub(crate) operator: Operator,
     /// The WebSocket endpoint subscribers will connect to.
     #[arg(long, default_value = "ws://127.0.0.1:8791/v2/ws")]
     pub(crate) endpoint: Endpoint,
@@ -57,7 +54,7 @@ pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
         return wizard::run(&args);
     }
     let key = NodeKey::generate()?;
-    let entry = key.entry(&args.operator, &args.endpoint);
+    let entry = key.entry(&args.endpoint);
     let add_call = network(&args).ok().map(|(source, _)| {
         let compact = serde_json::to_string(&entry).expect("entry serialises");
         candid_call(
@@ -141,7 +138,6 @@ fn setup(args: InitArgs, dir: PathBuf) -> anyhow::Result<NodeSetup> {
     };
     Ok(NodeSetup {
         dir,
-        operator: args.operator,
         endpoint: args.endpoint,
         source,
         governance,

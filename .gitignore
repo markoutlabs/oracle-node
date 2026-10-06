@@ -1,6 +1,9 @@
 /target
 **/*.rs.bk
 node/registry.json
-node/*.key
+# Node and client keys, wherever a script or `init` wrote them.
+*.key
 .DS_Store
 .icp/cache/
+# `oracle-node init` run from the repo root writes a key here.
+/oracle-node/

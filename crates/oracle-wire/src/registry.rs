@@ -24,8 +24,6 @@ use crate::{Address, Signature, Signer, VerifyError, WireError, signer};
 
 /// Maximum nodes in one registry.
 pub const MAX_NODES: usize = 256;
-/// Maximum length of an operator name, in bytes.
-pub const MAX_OPERATOR_LEN: usize = 64;
 /// Maximum length of an endpoint URL, in bytes.
 pub const MAX_ENDPOINT_LEN: usize = 256;
 /// Maximum endpoints per node.
@@ -50,8 +48,6 @@ pub struct Quorum {
 pub struct NodeListing {
     /// The node's signing address.
     pub address: Address,
-    /// Who ran it.
-    pub operator: String,
     /// When the address was listed, unix seconds.
     pub added_at: u64,
     /// When it stopped being listed, unix seconds. `None` while listed.
@@ -64,8 +60,6 @@ pub struct NodeListing {
 pub struct NodeEntry {
     /// The node's signing address. It is also the node's id.
     pub address: Address,
-    /// Who runs it. Operator diversity is what makes the median meaningful.
-    pub operator: String,
     /// WebSocket endpoints.
     pub endpoints: Vec<String>,
     /// Relative weight hint for consumers that weight rather than plain-median.
@@ -79,7 +73,6 @@ impl NodeEntry {
     ///
     /// Returns the first [`EntryError`] found.
     pub fn validate(&self) -> Result<(), EntryError> {
-        check_operator(&self.operator)?;
         if self.endpoints.is_empty() || self.endpoints.len() > MAX_ENDPOINTS {
             return Err(EntryError::EndpointCount);
         }
@@ -97,9 +90,6 @@ impl NodeEntry {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum EntryError {
-    /// The operator name is blank or too long.
-    #[error("the operator must be 1 to {MAX_OPERATOR_LEN} bytes and not blank")]
-    Operator,
     /// There are no endpoints, or too many.
     #[error("a node needs 1 to {MAX_ENDPOINTS} endpoints")]
     EndpointCount,
@@ -112,18 +102,6 @@ pub enum EntryError {
     /// The weight is zero.
     #[error("the weight must be at least 1")]
     Weight,
-}
-
-/// Checks an operator name: 1 to [`MAX_OPERATOR_LEN`] bytes, not blank.
-///
-/// # Errors
-///
-/// Returns [`EntryError::Operator`].
-pub fn check_operator(operator: &str) -> Result<(), EntryError> {
-    if operator.trim().is_empty() || operator.len() > MAX_OPERATOR_LEN {
-        return Err(EntryError::Operator);
-    }
-    Ok(())
 }
 
 /// Checks an endpoint: a `ws://` or `wss://` URL of at most [`MAX_ENDPOINT_LEN`] bytes.
@@ -197,7 +175,6 @@ impl Registry {
 
         for node in ordered {
             out.put_bytes(node.address.as_bytes());
-            out.try_put_str("operator", &node.operator, MAX_OPERATOR_LEN)?;
             out.put_u16(node.weight);
 
             let too_many_endpoints = || WireError::FieldTooLong {
@@ -402,7 +379,6 @@ mod tests {
         (
             NodeEntry {
                 address: key.address(),
-                operator: format!("operator-{index}"),
                 endpoints: vec![format!("wss://node{index}.example/v2/ws")],
                 weight: 1,
             },
@@ -472,15 +448,10 @@ mod tests {
     fn rejects_tampering_with_any_node_field() {
         let now = 1_000_000;
         let expected = governance().address();
-        let mutations: [fn(&mut Registry); 8] = [
+        let mutations: [fn(&mut Registry); 7] = [
             |r| {
                 if let Some(node) = r.nodes.first_mut() {
                     node.weight = 99;
-                }
-            },
-            |r| {
-                if let Some(node) = r.nodes.first_mut() {
-                    node.operator = "attacker".to_owned();
                 }
             },
             |r| {
@@ -599,9 +570,7 @@ mod tests {
         let (good, _) = node(1);
         assert_eq!(good.validate(), Ok(()));
         type Mutation = fn(&mut NodeEntry);
-        let mutations: [(Mutation, EntryError); 6] = [
-            (|e| e.operator = " ".to_owned(), EntryError::Operator),
-            (|e| e.operator = "x".repeat(65), EntryError::Operator),
+        let mutations: [(Mutation, EntryError); 4] = [
             (|e| e.endpoints.clear(), EntryError::EndpointCount),
             (
                 |e| e.endpoints = vec!["https://node.example".to_owned()],

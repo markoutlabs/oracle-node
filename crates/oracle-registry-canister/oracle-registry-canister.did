@@ -153,7 +153,7 @@ service : (InitArgs) -> {
   // Governance de-lists a node. Returns the new version.
   remove_node : (text) -> (Result);
   // Governance rotates a node's key: the `new` address takes the place of
-  // `old`, with the same operator, endpoints and weight. Returns the new version.
+  // `old`, with the same endpoints and weight. Returns the new version.
   replace_node : (text, text) -> (Result);
   // Governance re-signs the registry with no change. Returns the new version.
   republish : () -> (Result);

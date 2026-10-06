@@ -115,7 +115,6 @@ impl TestNode {
     pub fn entry(&self) -> NodeEntry {
         NodeEntry {
             address: self.signing.address(),
-            operator: "test".to_owned(),
             endpoints: vec![format!("wss://node-{}.test/v2/ws", self.seed)],
             weight: 1,
         }

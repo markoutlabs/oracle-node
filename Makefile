@@ -5,10 +5,12 @@
 #   make network deploy              # the canister on the local network
 #   make release                     # reproducible wasm and Linux node binary, in Docker
 #   make deploy ENV=ic IDENTITY=me   # the release wasm on mainnet, controlled by `me`
+#   make deploy ENV=ic IDENTITY=me REPRODUCIBLE=0   # the same, built here without Docker
 
 ENV ?= local
 IDENTITY ?=
 MODE ?= auto
+REPRODUCIBLE ?= 1
 
 CANISTER := oracle_registry
 PACKAGE := oracle-registry-canister
@@ -62,11 +64,14 @@ network: ## Start the local network in the background
 network-stop: ## Stop the local network
 	icp network stop
 
-# Mainnet takes only the reproducible release build; scripts/icp-wasm.sh enforces it.
-deploy: check-identity ## Deploy the canister to ENV (local or ic)
+# Mainnet takes the reproducible release build unless REPRODUCIBLE=0; scripts/icp-wasm.sh
+# enforces it.
+deploy: check-identity ## Deploy the canister to ENV (local or ic); REPRODUCIBLE=0 skips Docker
 ifeq ($(ENV),ic)
+ifneq ($(REPRODUCIBLE),0)
 	$(MAKE) --no-print-directory release
-	icp deploy $(CANISTER) -e ic --mode $(MODE) --identity $(IDENTITY)
+endif
+	REPRODUCIBLE=$(REPRODUCIBLE) icp deploy $(CANISTER) -e ic --mode $(MODE) --identity $(IDENTITY)
 else
 	icp deploy $(CANISTER) -e $(ENV) --mode $(MODE) $(if $(IDENTITY),--identity $(IDENTITY),)
 endif

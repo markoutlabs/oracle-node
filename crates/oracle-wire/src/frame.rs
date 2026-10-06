@@ -318,7 +318,6 @@ mod tests {
     fn verified_registry() -> VerifiedRegistry {
         let node = NodeEntry {
             address: hot().address(),
-            operator: "acme".to_owned(),
             endpoints: vec!["wss://eu1.example/v2/ws".to_owned()],
             weight: 1,
         };

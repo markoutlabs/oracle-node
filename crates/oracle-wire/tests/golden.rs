@@ -266,7 +266,6 @@ fn build() -> GoldenFile {
         BASE_TIME_NS / NANOS_PER_SEC,
         vec![NodeEntry {
             address: node.address(),
-            operator: "acme".to_owned(),
             endpoints: vec!["wss://eu1.oracle.example/v2/ws".to_owned()],
             weight: 1,
         }],

@@ -86,7 +86,6 @@ fn key(seed: u8) -> Signer {
 fn node(seed: u8) -> NodeEntry {
     NodeEntry {
         address: key(seed).address(),
-        operator: format!("op-{seed}"),
         endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
         weight: 1,
     }

@@ -113,7 +113,7 @@ async fn add_node(entry_json: String) -> Result<u64, String> {
 }
 
 /// Governance rotates a node's key: the `new` address takes the place of
-/// `old`, with the same operator, endpoints and weight. Returns the new version.
+/// `old`, with the same endpoints and weight. Returns the new version.
 #[ic_cdk::update(guard = "governance_only")]
 async fn replace_node(old: String, new: String) -> Result<u64, String> {
     let (old, new) = (address(&old)?, address(&new)?);

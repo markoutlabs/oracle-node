@@ -37,7 +37,6 @@ fn fixture(name: &str) -> PathBuf {
         now,
         vec![NodeEntry {
             address: node.address(),
-            operator: "test".to_owned(),
             endpoints: vec!["ws://127.0.0.1:1/v2/ws".to_owned()],
             weight: 1,
         }],

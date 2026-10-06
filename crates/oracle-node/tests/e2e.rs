@@ -54,7 +54,6 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
         .arg("--out")
         .arg(&node_dir)
         .args(["--passphrase-file", &passphrase_file])
-        .args(["--operator", "e2e"])
         .args(["--endpoint", &format!("ws://127.0.0.1:{port}/v2/ws")])
         .args(["--canister", &canister.canister.to_text()])
         .args(["--gateway", &gateway])

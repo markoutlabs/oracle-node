@@ -76,8 +76,6 @@ pub const DEFAULT_EPOCH_SECS: u64 = 60;
 /// A listed node. Its address is the map key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
-    /// Who runs it.
-    pub operator: String,
     /// WebSocket endpoints.
     pub endpoints: Vec<String>,
     /// Relative weight hint.
@@ -90,7 +88,6 @@ impl NodeRecord {
     fn entry(&self, address: Address) -> NodeEntry {
         NodeEntry {
             address,
-            operator: self.operator.clone(),
             endpoints: self.endpoints.clone(),
             weight: self.weight,
         }
@@ -101,8 +98,6 @@ impl NodeRecord {
 /// listed again, and for stored-frame verification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredNode {
-    /// Who ran it.
-    pub operator: String,
     /// When governance listed it, unix seconds.
     pub added_at: u64,
     /// When governance replaced or removed it, unix seconds.
@@ -214,14 +209,12 @@ impl State {
             .map_err(|error| StateError::InvalidEntry(error.to_string()))?;
         let NodeEntry {
             address,
-            operator,
             endpoints,
             weight,
         } = entry;
         self.nodes.insert(
             address,
             NodeRecord {
-                operator,
                 endpoints,
                 weight,
                 added_at: now,
@@ -231,7 +224,7 @@ impl State {
     }
 
     /// Governance rotates a node's key: `new` takes the place of `old`, with
-    /// the same operator, endpoints and weight. Bumps the document.
+    /// the same endpoints and weight. Bumps the document.
     ///
     /// One version for both changes, so consumers never see the node twice
     /// or not at all, and the node count does not change.
@@ -285,7 +278,6 @@ impl State {
         self.retired.insert(
             address,
             RetiredNode {
-                operator: record.operator.clone(),
                 added_at: record.added_at,
                 removed_at: now,
             },
@@ -485,14 +477,12 @@ impl State {
         if let Some(node) = self.nodes.get(&address) {
             return Some(NodeListing {
                 address,
-                operator: node.operator.clone(),
                 added_at: node.added_at,
                 removed_at: None,
             });
         }
         self.retired.get(&address).map(|node| NodeListing {
             address,
-            operator: node.operator.clone(),
             added_at: node.added_at,
             removed_at: Some(node.removed_at),
         })
@@ -564,7 +554,6 @@ mod tests {
     fn entry(seed: u8) -> NodeEntry {
         NodeEntry {
             address: address(seed),
-            operator: format!("op-{seed}"),
             endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
             weight: 1,
         }
@@ -613,8 +602,7 @@ mod tests {
     #[test]
     fn invalid_entries_are_refused() {
         let mut state = State::new(config(), quorum(1)).expect("valid");
-        let mutations: [fn(&mut NodeEntry); 4] = [
-            |e| e.operator = " ".to_owned(),
+        let mutations: [fn(&mut NodeEntry); 3] = [
             |e| e.endpoints.clear(),
             |e| e.endpoints = vec!["https://node.example".to_owned()],
             |e| e.weight = 0,
@@ -646,7 +634,6 @@ mod tests {
             .iter()
             .find(|n| n.address == address(50))
             .expect("the new address is listed");
-        assert_eq!(replaced.operator, "op-1");
         assert_eq!(replaced.endpoints, entry(1).endpoints);
         assert!(registry.nodes.iter().all(|n| n.address != address(1)));
 
@@ -654,7 +641,6 @@ mod tests {
             state.node_listing(address(1)),
             Some(NodeListing {
                 address: address(1),
-                operator: "op-1".to_owned(),
                 added_at: NOW,
                 removed_at: Some(later),
             })

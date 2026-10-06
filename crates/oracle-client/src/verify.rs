@@ -527,7 +527,6 @@ mod tests {
         let removed_at = NOW / NANOS_PER_SEC + 5;
         let listing = NodeListing {
             address: node.signing_address(),
-            operator: "test".to_owned(),
             added_at,
             removed_at: Some(removed_at),
         };

@@ -53,7 +53,7 @@ echo "$GOVERNANCE"
 say "init prints add_node"
 rm -rf "$DIR" && mkdir -p "$DIR"
 echo "smoke" > "$DIR/passphrase"
-$NODE init --out "$DIR/node" --operator smoke --canister "$CANISTER" \
+$NODE init --out "$DIR/node" --canister "$CANISTER" \
   --gateway "$GATEWAY" --root-key "$ROOT_KEY" --governance "$GOV" \
   --passphrase-file "$DIR/passphrase" > "$DIR/init.out"
 run_printed "$DIR/init.out" 1

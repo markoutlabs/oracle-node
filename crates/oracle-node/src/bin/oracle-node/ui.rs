@@ -118,7 +118,6 @@ mod tests {
     fn setup(service: Option<ServiceUnit>) -> NodeSetup {
         NodeSetup {
             dir: PathBuf::from("/srv/oracle"),
-            operator: "acme".parse().expect("valid"),
             endpoint: "ws://127.0.0.1:443/v2/ws".parse().expect("valid"),
             source: RegistrySource::Mainnet("uxrrr-q7777-77774-qaaaq-cai".parse().expect("valid")),
             governance: oracle_wire::Address::from_bytes([0x11; 20]),

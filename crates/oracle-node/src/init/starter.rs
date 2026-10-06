@@ -102,7 +102,6 @@ mod tests {
     fn setup(source: RegistrySource) -> NodeSetup {
         NodeSetup {
             dir: PathBuf::from("/etc/oracle"),
-            operator: "acme".parse().expect("valid"),
             endpoint: "ws://127.0.0.1:9001/v2/ws".parse().expect("valid"),
             source,
             governance: governance(),

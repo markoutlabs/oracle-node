@@ -199,8 +199,10 @@ The SDK runs the handshake on each connection and checks that the node's
 `auth_ok` is signed by the address it dialled. Only after that does it send the
 subscription. Every opened frame then goes through the same `Verifier` as
 before. Decryption proves nothing, because every listed client holds the
-broadcast key. `examples/client_key.rs` makes a key and prints its address and
-the `add_client` call for governance.
+broadcast key. `scripts/client-key.sh --out client.key` makes a key with
+`examples/client_key.rs` and prints its address. Governance registers it with
+`scripts/add-client.sh --identity <controller> --address 0x… --expires
+2027-01-01`.
 
 #### How a rotation reaches the consumer
 
@@ -288,12 +290,12 @@ staleness is always measured with our own clock, never the venue's.
 
 `init` generates the node's one key and prints its address, which is the node's
 id, and the registry entry to hand to governance. That entry carries no secret:
-the address, the operator and the endpoints. Nothing the node publishes
-verifies for anyone until governance signs it into a new registry version.
+the address and the endpoints. Nothing the node publishes verifies for anyone
+until governance signs it into a new registry version.
 
 At a terminal, `init` is a wizard. It asks, one question at a time:
 - where the files go;
-- the operator name and the public endpoint;
+- the public endpoint;
 - how the node opens its key at start: a generated passphrase in a `0600` file,
   which systemd needs, or a passphrase typed at each start;
 - whether to write a systemd unit.
@@ -333,7 +335,9 @@ command-line argument: arguments are visible in `ps` to every user on the box.
 encrypted with a passphrase from `--passphrase-file` or a terminal prompt, and
 record the passphrase file in the starter config as `signing.passphrase_file`.
 At startup the node opens the key with that file, or prompts when the line is
-absent, and refuses to start when it has neither and no terminal. Plaintext hex
+absent, and refuses to start when it has neither and no terminal. The scrypt
+work factor is fixed at 2^18 (256 MiB, about a second), so a key made on a fast
+machine opens on a slow server; a key file may ask for up to 2^20. Plaintext hex
 is still accepted in a key file or `key_env` so the local playground can hand a
 seeded key to the node; a real key never goes there. There is no KMS and no HSM
 by design (SPEC §9.2): a cloud key service is a third party in the signing path.
@@ -510,7 +514,11 @@ were before.
 - **Governance is the controller set, and the only caller.** Nodes never call
   the canister. An operator sends `node-entry.json`, or the two addresses
   `oracle-node rotate` prints, to governance, which runs `add_node` or
-  `replace_node`. `inspect_message` drops
+  `replace_node`. `scripts/add-node.sh --identity <controller> --json
+  node-entry.json` runs `add_node`; `--json` also takes the entry inline.
+  `scripts/add-client.sh` runs `add_client`. Both target mainnet, ask before
+  they publish, and take `ENV=local` for the local network.
+  `inspect_message` drops
   every other principal's ingress, so spam costs the canister nothing. A
   single-controller canister is a single governance key with extra steps; put
   it under a multisig or an SNS with timelocked upgrades.
@@ -582,11 +590,13 @@ governance (SPEC §3.6). It must be an icp-cli identity with cycles, never
 ```sh
 icp cycles balance -n ic --identity <you>
 make deploy ENV=ic IDENTITY=<you>       # make release, then icp deploy -e ic
+make deploy ENV=ic IDENTITY=<you> REPRODUCIBLE=0   # build here, no Docker
 make governance ENV=ic IDENTITY=<you>   # prints the canister id and governance address
 ```
 
-Mainnet only ever gets the release build: `scripts/icp-wasm.sh` refuses a
-wasm built on your machine there. After the first deploy:
+Mainnet gets the release build: `scripts/icp-wasm.sh` refuses a wasm built
+on your machine there, unless you set `REPRODUCIBLE=0`. Then nobody can
+rebuild the installed module and get its hash. After the first deploy:
 
 1. Commit `.icp/data/mappings/ic.ids.json`, the canister id icp-cli keeps.
 2. Put both printed values into `crates/oracle-client/src/mainnet.rs`, in one
