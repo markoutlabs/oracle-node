@@ -21,6 +21,7 @@ pub mod init;
 pub mod keyfile;
 pub mod logging;
 pub mod pipeline;
+pub mod seed;
 
 pub use adapters::{Adapters, build_adapters};
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
@@ -31,3 +32,4 @@ pub use init::{
 pub use keyfile::{KeyFileError, PassphraseSource};
 pub use logging::LogFormat;
 pub use pipeline::{Pipeline, PipelineStats};
+pub use seed::{NodeKeys, Seed, SeedError};

@@ -309,13 +309,22 @@ impl NodeConfig {
         })
     }
 
-    /// Loads the signing key from the configured source.
+    /// Loads the secp256k1 signing key from the configured source.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_node_keys`].
+    pub fn load_signing_key(&self) -> Result<oracle_wire::Signer, ConfigError> {
+        self.load_node_keys().map(|keys| keys.signing)
+    }
+
+    /// Loads the node's keys from the configured source.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::SigningKey`] if no source is configured, the source
-    /// cannot be read, or the value is not a valid key.
-    pub fn load_signing_key(&self) -> Result<oracle_wire::Signer, ConfigError> {
+    /// cannot be read, or the value is not a seed or a key.
+    pub fn load_node_keys(&self) -> Result<crate::NodeKeys, ConfigError> {
         let failed = |e: &dyn std::fmt::Display| ConfigError::SigningKey(e.to_string());
         match (&self.signing.key_file, &self.signing.key_env) {
             (Some(path), _) => {
@@ -334,15 +343,15 @@ impl NodeConfig {
                     } else {
                         None
                     };
-                crate::keyfile::load_signer(path, passphrase.as_ref()).map_err(|e| failed(&e))
+                crate::keyfile::load_keys(path, passphrase.as_ref()).map_err(|e| failed(&e))
             }
             (None, Some(var)) => {
-                // Wiped on drop. The hex string is the key.
-                let hex = zeroize::Zeroizing::new(
+                // Wiped on drop. The value is a seed or a bare key.
+                let text = zeroize::Zeroizing::new(
                     std::env::var(var)
                         .map_err(|_| ConfigError::SigningKey(format!("${var} is not set")))?,
                 );
-                oracle_wire::Signer::from_hex(hex.trim()).map_err(|e| failed(&e))
+                crate::NodeKeys::from_text(&text).map_err(|e| failed(&e))
             }
             (None, None) => Err(ConfigError::SigningKey(
                 "set either signing.key_file or signing.key_env".to_owned(),

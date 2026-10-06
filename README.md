@@ -215,7 +215,8 @@ broadcast key. `scripts/client-key.sh --out client.key` makes a key with
 
 #### How a rotation reaches the consumer
 
-A node has one key, and its address is the node's id (SPEC §3.5). A rotation is
+A node has one secret seed, and the address of its secp256k1 key is the node's
+id (SPEC §3.5). A rotation is
 governance's `replace_node`: in one registry version the new address takes the
 old one's place, at the same endpoint. The consumer finds out from the first
 frame it cannot verify, or from a handshake challenge that names the new
@@ -297,10 +298,12 @@ same contract at the same instant, because one is an 8h rate and the other is
 hourly. `lag_ms` is `local_recv − exchange_time` and is diagnostic only —
 staleness is always measured with our own clock, never the venue's.
 
-`init` generates the node's one key and prints its address, which is the node's
-id, and the registry entry to hand to governance. That entry carries no secret:
-the address and the endpoints. Nothing the node publishes verifies for anyone
-until governance signs it into a new registry version.
+`init` generates the node's secret seed and prints the two public keys it
+derives (SPEC §3.5): the secp256k1 address, which is the node's id, and the
+ed25519 key for venues that verify ed25519, such as tapray-perps. It also prints
+the registry entry to hand to governance. That entry carries no secret: the
+address and the endpoints. Nothing the node publishes verifies for anyone until
+governance signs it into a new registry version.
 
 At a terminal, `init` is a wizard. It asks, one question at a time:
 - where the files go;
@@ -346,9 +349,10 @@ record the passphrase file in the starter config as `signing.passphrase_file`.
 At startup the node opens the key with that file, or prompts when the line is
 absent, and refuses to start when it has neither and no terminal. The scrypt
 work factor is fixed at 2^18 (256 MiB, about a second), so a key made on a fast
-machine opens on a slow server; a key file may ask for up to 2^20. Plaintext hex
-is still accepted in a key file or `key_env` so the local playground can hand a
-seeded key to the node; a real key never goes there. There is no KMS and no HSM
+machine opens on a slow server; a key file may ask for up to 2^20. A key file
+holds the seed as `oracle-node-seed-v1:<hex>`. Bare hex is still accepted, as a
+secp256k1 key with no ed25519 key, so the local playground can hand a seeded key
+to the node; a real key never goes there. There is no KMS and no HSM
 by design (SPEC §9.2): a cloud key service is a third party in the signing path.
 
 The registry comes from `registry.path`, a file, or `registry.url`, the

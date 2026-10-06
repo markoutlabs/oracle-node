@@ -244,6 +244,10 @@ fn finish(setup: &NodeSetup, key: &NodeKey, written: &Written) -> io::Result<()>
             &[&entry]
         )
     ))?;
+    log::info(format!(
+        "The ed25519 publisher key, for venues that verify ed25519 such as tapray-perps:\n{}",
+        key.publisher_hex()
+    ))?;
     for warning in ui::warnings(setup) {
         log::warning(warning)?;
     }

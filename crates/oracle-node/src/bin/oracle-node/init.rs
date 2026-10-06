@@ -77,12 +77,20 @@ pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
              \x20          recover to. It never expires; rotate it if you think it leaked."
         )
     );
+    println!("  ed25519  {}", key.publisher_hex());
+    println!(
+        "{}",
+        ui::dim(
+            "           The publisher key for venues that verify ed25519, such as\n\
+             \x20          tapray-perps. The same secret seed derives both keys."
+        )
+    );
 
     let Some(dir) = args.out.clone() else {
         println!(
             "\n{}\n  {}",
-            ui::heading("Secret key"),
-            &*key.signing.to_secret_hex()
+            ui::heading("Secret seed"),
+            &*key.secret_text()
         );
         println!(
             "\n  This is now in your terminal scrollback and shell history. Re-run\n  \

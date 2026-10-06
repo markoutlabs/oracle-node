@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret as _, SecretString};
 use oracle_wire::Signer;
+
+use crate::seed::NodeKeys;
 use zeroize::Zeroizing;
 
 /// The first line of an armored `age` file.
@@ -86,6 +88,9 @@ pub enum KeyFileError {
     /// The decrypted bytes are not a key.
     #[error(transparent)]
     Key(#[from] oracle_wire::WireError),
+    /// The decrypted text is not a seed or a key.
+    #[error(transparent)]
+    Seed(#[from] crate::seed::SeedError),
 }
 
 /// Returns `true` if `text` is an armored `age` file.
@@ -170,23 +175,33 @@ pub fn decrypt(
     Ok(plain)
 }
 
-/// Loads a signer from a key file, encrypted or plaintext hex.
+/// Loads a node's keys from a key file, encrypted or plaintext, holding a seed
+/// or a bare secp256k1 key in hex.
 ///
 /// # Errors
 ///
 /// Returns [`KeyFileError::NeedsPassphrase`] for an encrypted file with no
 /// passphrase, [`KeyFileError::Decrypt`] for a wrong one, and
-/// [`KeyFileError::Key`] if the contents are not a valid key.
-pub fn load_signer(path: &Path, passphrase: Option<&SecretString>) -> Result<Signer, KeyFileError> {
+/// [`KeyFileError::Seed`] if the contents are not a seed or a key.
+pub fn load_keys(path: &Path, passphrase: Option<&SecretString>) -> Result<NodeKeys, KeyFileError> {
     let text = Zeroizing::new(read(path)?);
     if !is_encrypted(&text) {
-        return Ok(Signer::from_hex(text.trim())?);
+        return Ok(NodeKeys::from_text(&text)?);
     }
     let passphrase = passphrase.ok_or_else(|| KeyFileError::NeedsPassphrase {
         path: path.to_path_buf(),
     })?;
-    let hex = decrypt(&text, passphrase, path)?;
-    Ok(Signer::from_hex(hex.trim())?)
+    let plain = decrypt(&text, passphrase, path)?;
+    Ok(NodeKeys::from_text(&plain)?)
+}
+
+/// Loads the secp256k1 key from a key file, as [`load_keys`] reads it.
+///
+/// # Errors
+///
+/// As [`load_keys`].
+pub fn load_signer(path: &Path, passphrase: Option<&SecretString>) -> Result<Signer, KeyFileError> {
+    load_keys(path, passphrase).map(|keys| keys.signing)
 }
 
 /// Where a passphrase comes from.

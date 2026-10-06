@@ -9,7 +9,7 @@ mod common;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use common::{BINARY, load_key, passphrase_file, run, scratch};
+use common::{BINARY, load_key, passphrase, passphrase_file, run, scratch};
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -31,11 +31,23 @@ fn init_out(dir: &str, extra: &[&str]) -> Output {
     run(&args)
 }
 
-/// Counts 64-character hex runs, which is what a leaked secret key looks like.
+/// Counts 64-character hex runs, which is what a leaked secret looks like. The
+/// ed25519 line holds a public key of the same shape, so it is left out.
 fn secret_like_strings(text: &str) -> usize {
-    text.split(|c: char| !c.is_ascii_hexdigit())
+    text.lines()
+        .filter(|line| !line.contains("ed25519"))
+        .flat_map(|line| line.split(|c: char| !c.is_ascii_hexdigit()))
         .filter(|word| word.len() == 64)
         .count()
+}
+
+/// The ed25519 public key the seed in `path` derives.
+fn publisher_of(path: &std::path::Path) -> String {
+    let keys = oracle_node::keyfile::load_keys(path, Some(&passphrase())).expect("loads");
+    keys.publisher
+        .as_ref()
+        .map(oracle_node::seed::publisher_hex)
+        .expect("a seed derives an ed25519 key")
 }
 
 #[test]
@@ -115,6 +127,11 @@ fn init_with_out_writes_files_and_prints_no_secrets() {
     )
     .expect("a valid entry");
     assert_eq!(entry.address, signer.address());
+    let publisher = publisher_of(&dir.join("signing.key"));
+    assert!(
+        text.contains(&publisher),
+        "init prints the ed25519 key it wrote:\n{text}"
+    );
 
     #[cfg(unix)]
     {
@@ -154,6 +171,11 @@ fn rotate_writes_the_next_key_beside_the_live_one() {
         secret_like_strings(&text),
         0,
         "rotate must keep secrets off stdout:\n{text}"
+    );
+    let publisher = publisher_of(&dir.join("signing.key.next"));
+    assert!(
+        text.contains(&publisher),
+        "rotate prints the new ed25519 key:\n{text}"
     );
     let live = load_key(&dir.join("signing.key"));
 

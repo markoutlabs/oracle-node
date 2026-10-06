@@ -19,7 +19,10 @@ age.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 getrandom.workspace = true
+ed25519-dalek.workspace = true
 hex.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
 clap.workspace = true
 cliclack.workspace = true
 console.workspace = true
@@ -40,6 +43,7 @@ zeroize.workspace = true
 sd-notify.workspace = true
 
 [dev-dependencies]
+ed25519-zebra.workspace = true
 oracle-registry-canister = { path = "../oracle-registry-canister" }
 tokio = { workspace = true, features = ["sync"] }
 

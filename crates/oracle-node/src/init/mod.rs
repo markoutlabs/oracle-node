@@ -1,9 +1,10 @@
 //! `oracle-node init`: generate a node's key and everything needed to run it.
 //!
-//! A node has one key (SPEC §3.5). It signs every `PriceUpdate`, its address is
-//! the node's id in the registry, and it stays encrypted at rest on the
-//! operator's machine. A rotation is a new key that governance puts in place of
-//! the old one with `replace_node`.
+//! A node has one secret seed (SPEC §3.5), encrypted at rest on the operator's
+//! machine. Its secp256k1 key signs every `PriceUpdate`, and that key's address
+//! is the node's id in the registry. Its ed25519 key signs for venues that
+//! verify ed25519. A rotation is a new seed that governance puts in place of the
+//! old one with `replace_node`.
 //!
 //! [`NodeSetup`] decides everything `init` writes; [`NodeSetup::write`] is the
 //! only path to disk. The wizard and the flags both build one.
@@ -12,8 +13,10 @@ use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
 use oracle_wire::{Address, NodeEntry, Signer};
+use zeroize::Zeroizing;
 
 use crate::keyfile;
+use crate::seed::{self, NodeKeys, Seed, SeedError};
 
 mod setup;
 mod starter;
@@ -30,6 +33,10 @@ pub enum InitError {
     /// A key could not be generated.
     #[error("cannot generate a key: {0}")]
     Key(#[from] oracle_wire::WireError),
+
+    /// A seed could not be generated, or a key derived from it.
+    #[error("cannot generate a key: {0}")]
+    Seed(#[from] SeedError),
 
     /// A file could not be written.
     #[error("cannot write {path}: {reason}")]
@@ -57,22 +64,43 @@ pub fn generate_passphrase() -> Result<SecretString, InitError> {
     Ok(SecretString::from(hex::encode(bytes.as_ref())))
 }
 
-/// A freshly generated node key.
+/// A freshly generated node: its seed and the keys derived from it.
 pub struct NodeKey {
-    /// The key. Its address is the node's id.
+    seed: Seed,
+    /// Signs price updates. Its address is the node's id.
     pub signing: Signer,
+    /// Signs samples for venues that verify ed25519.
+    pub publisher: ed25519_dalek::SigningKey,
 }
 
 impl NodeKey {
-    /// Generates the key.
+    /// Generates a seed and derives both keys.
     ///
     /// # Errors
     ///
-    /// Returns [`InitError::Key`] if the OS entropy source cannot be read.
+    /// Returns [`InitError::Seed`] if the OS entropy source cannot be read.
     pub fn generate() -> Result<Self, InitError> {
+        let seed = Seed::generate()?;
+        let NodeKeys { signing, publisher } = NodeKeys::from_seed(&seed)?;
+        let publisher = publisher
+            .ok_or_else(|| InitError::Invalid("a seed always derives an ed25519 key".to_owned()))?;
         Ok(Self {
-            signing: Signer::generate()?,
+            seed,
+            signing,
+            publisher,
         })
+    }
+
+    /// The secret as a key file holds it.
+    #[must_use]
+    pub fn secret_text(&self) -> Zeroizing<String> {
+        self.seed.to_text()
+    }
+
+    /// The ed25519 public key in hex, for a publisher slot.
+    #[must_use]
+    pub fn publisher_hex(&self) -> String {
+        seed::publisher_hex(&self.publisher)
     }
 
     /// Builds the registry entry to hand to governance.
@@ -102,7 +130,7 @@ impl NodeKey {
             reason: e.to_string(),
         })?;
         let path = dir.join("signing.key");
-        write_encrypted(&path, &self.signing.to_secret_hex(), passphrase)?;
+        write_encrypted(&path, &self.secret_text(), passphrase)?;
         Ok(path)
     }
 }
@@ -117,20 +145,20 @@ impl NodeKey {
 pub struct Rotation {
     /// The live key's address, which the new one replaces.
     pub old: Address,
-    /// The new key.
-    pub signing: Signer,
+    /// The new seed and its keys.
+    pub next: NodeKey,
 }
 
 impl Rotation {
-    /// Generates the key that replaces `old`.
+    /// Generates the seed that replaces `old`.
     ///
     /// # Errors
     ///
-    /// Returns [`InitError::Key`] if the OS entropy source cannot be read.
+    /// Returns [`InitError::Seed`] if the OS entropy source cannot be read.
     pub fn generate(old: Address) -> Result<Self, InitError> {
         Ok(Self {
             old,
-            signing: Signer::generate()?,
+            next: NodeKey::generate()?,
         })
     }
 
@@ -144,7 +172,7 @@ impl Rotation {
     /// and overwriting it would lose a key the canister may already list.
     pub fn write(&self, dir: &Path, passphrase: &SecretString) -> Result<PathBuf, InitError> {
         let path = dir.join("signing.key.next");
-        write_encrypted(&path, &self.signing.to_secret_hex(), passphrase)?;
+        write_encrypted(&path, &self.next.secret_text(), passphrase)?;
         Ok(path)
     }
 
@@ -158,7 +186,7 @@ impl Rotation {
             "replace_node",
             &[
                 &self.old.to_checksummed(),
-                &self.signing.address().to_checksummed(),
+                &self.next.signing.address().to_checksummed(),
             ],
         )
     }
@@ -287,7 +315,7 @@ mod tests {
     fn a_rotation_names_the_old_and_the_new_address() {
         let key = NodeKey::generate().expect("generates");
         let rotation = Rotation::generate(key.signing.address()).expect("rotates");
-        assert_ne!(rotation.signing.address(), key.signing.address());
+        assert_ne!(rotation.next.signing.address(), key.signing.address());
 
         let call = rotation.canister_call("ic", "aaaaa-aa");
         assert_eq!(
@@ -295,7 +323,7 @@ mod tests {
             format!(
                 "icp canister call aaaaa-aa replace_node '(\"{}\", \"{}\")' -n ic",
                 key.signing.address().to_checksummed(),
-                rotation.signing.address().to_checksummed()
+                rotation.next.signing.address().to_checksummed()
             )
         );
     }
@@ -328,11 +356,16 @@ mod tests {
         // At rest the file is an age file; the hex never touches the disk.
         let on_disk = std::fs::read_to_string(&path).expect("readable");
         assert!(keyfile::is_encrypted(&on_disk), "{on_disk}");
+        assert!(!on_disk.contains(&*key.secret_text()));
         assert!(!on_disk.contains(&*key.signing.to_secret_hex()));
 
-        // The node loads its key with exactly this call.
-        let reloaded = keyfile::load_signer(&path, Some(&passphrase())).expect("valid key");
-        assert_eq!(reloaded.address(), key.signing.address());
+        // The node loads its keys with exactly this call, and gets both back.
+        let reloaded = keyfile::load_keys(&path, Some(&passphrase())).expect("valid key");
+        assert_eq!(reloaded.signing.address(), key.signing.address());
+        assert_eq!(
+            reloaded.publisher.as_ref().map(seed::publisher_hex),
+            Some(key.publisher_hex())
+        );
         assert!(
             keyfile::load_signer(&path, None).is_err(),
             "an encrypted key must not open without the passphrase"

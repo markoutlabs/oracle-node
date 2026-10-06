@@ -48,8 +48,9 @@ pub(crate) fn run(args: RotateArgs) -> anyhow::Result<()> {
     println!("  old address  {}", rotation.old.to_checksummed());
     println!(
         "  new address  {}",
-        ui::strong(rotation.signing.address().to_checksummed())
+        ui::strong(rotation.next.signing.address().to_checksummed())
     );
+    println!("  new ed25519  {}", rotation.next.publisher_hex());
     println!("\n{}", ui::heading("Written"));
     println!("  {}  (age, 0600 — not loaded yet)", next_path.display());
 
@@ -70,7 +71,9 @@ pub(crate) fn run(args: RotateArgs) -> anyhow::Result<()> {
          2. Once the call succeeds the registry lists only the new address. Move the \
          key into place and restart:\n\n     mv {next} {live}\n\n  \
          3. Consumers follow on the first frame the new key signs. The old address \
-         is retired on the canister and can never be listed again.",
+         is retired on the canister and can never be listed again.\n\n  \
+         A venue that verifies ed25519, such as tapray-perps, may delay a new \
+         publisher key by a day. Register the new ed25519 key there before step 2.",
         ui::heading("Next"),
         next = next_path.display(),
         live = live_path.display(),

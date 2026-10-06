@@ -68,6 +68,12 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "x2551
 aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "alloc"] }
 hkdf = "0.12"
 sha2 = "0.10"
+# Signs for venues that verify ed25519. Not ed25519-zebra, whose SigningKey is
+# Copy and so cannot be wiped; signing is deterministic, so either crate's
+# signatures pass tapray-perps' ZIP-215 check.
+ed25519-dalek = "2"
+# Test-only: the verifier tapray-perps runs.
+ed25519-zebra = "4.0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
