@@ -14,7 +14,9 @@
 //!   [`InstrumentMap`] for one market, which is what keeps a perpetual mark from
 //!   being mistaken for a spot quote.
 
+mod book;
 pub mod decode;
+pub mod snapshot;
 pub mod streams;
 
 use std::time::Duration;
@@ -43,6 +45,10 @@ pub struct BinanceConfig {
     pub spot_base_url: String,
     /// Override the futures endpoint.
     pub perp_base_url: String,
+    /// The REST endpoint spot depth snapshots come from.
+    pub spot_rest_url: String,
+    /// The REST endpoint futures depth snapshots come from.
+    pub perp_rest_url: String,
     /// Reconnect if nothing arrives for this long.
     ///
     /// Binance sends a protocol ping roughly every 20 seconds, and a quiet
@@ -55,6 +61,18 @@ pub struct BinanceConfig {
     pub streams_per_connection: usize,
 }
 
+impl BinanceConfig {
+    /// Each socket base URL with the REST endpoint its depth snapshots come
+    /// from, for [`snapshot::SnapshotConnector`].
+    #[must_use]
+    pub fn snapshot_routes(&self) -> Vec<(String, String)> {
+        vec![
+            (self.spot_base_url.clone(), self.spot_rest_url.clone()),
+            (self.perp_base_url.clone(), self.perp_rest_url.clone()),
+        ]
+    }
+}
+
 impl Default for BinanceConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +80,8 @@ impl Default for BinanceConfig {
             perp: Vec::new(),
             spot_base_url: streams::SPOT_BASE.to_owned(),
             perp_base_url: streams::FUTURES_BASE.to_owned(),
+            spot_rest_url: snapshot::SPOT_REST.to_owned(),
+            perp_rest_url: snapshot::FUTURES_REST.to_owned(),
             idle_timeout: Duration::from_secs(60),
             max_session: Duration::from_secs(23 * 3_600),
             streams_per_connection: MAX_STREAMS_PER_CONNECTION,
@@ -75,13 +95,17 @@ impl Default for BinanceConfig {
 /// keeps `BTCUSDT` the perpetual from being confused with `BTCUSDT` the spot pair.
 pub struct BinanceHandler {
     map: InstrumentMap,
+    books: book::BinanceBooks,
 }
 
 impl BinanceHandler {
     /// Builds a handler for the market its map serves.
     #[must_use]
-    pub const fn new(map: InstrumentMap) -> Self {
-        Self { map }
+    pub fn new(map: InstrumentMap) -> Self {
+        Self {
+            map,
+            books: book::BinanceBooks::default(),
+        }
     }
 }
 
@@ -92,7 +116,11 @@ impl MessageHandler for BinanceHandler {
         local_recv_ns: u64,
         out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError> {
-        decode::decode_payload(payload, &self.map, local_recv_ns, out)
+        decode::decode(payload, &self.map, &mut self.books, local_recv_ns, out)
+    }
+
+    fn on_connect(&mut self) {
+        self.books.clear();
     }
 }
 

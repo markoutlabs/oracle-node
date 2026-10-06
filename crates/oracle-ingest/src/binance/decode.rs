@@ -4,21 +4,144 @@
 //! no async. That is what lets the tests below run against captured payloads
 //! rather than a live exchange.
 
-use oracle_types::{Fixed, ObsKind, Observation};
+use oracle_types::{Fixed, Level, MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
+use super::book::{Applied, BinanceBooks, Diff};
 use super::streams::StreamKind;
 
 /// The combined-stream envelope: `{"stream":"btcusdt@bookTicker","data":{…}}`.
+/// A snapshot that could not be fetched carries `error` instead of `data`.
 #[derive(Deserialize)]
 struct Envelope<'a> {
     #[serde(borrow)]
     stream: &'a str,
-    data: &'a RawValue,
+    #[serde(borrow, default)]
+    data: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    error: Option<&'a str>,
+}
+
+/// A diff-depth event. Futures add `pu`.
+#[derive(Deserialize)]
+struct DepthDiff<'a> {
+    #[serde(rename = "s", borrow)]
+    symbol: &'a str,
+    #[serde(rename = "U")]
+    first: u64,
+    #[serde(rename = "u")]
+    last: u64,
+    #[serde(rename = "pu", default)]
+    previous: Option<u64>,
+    #[serde(rename = "E", default)]
+    event_time_ms: Option<u64>,
+    #[serde(rename = "b", borrow)]
+    bids: Vec<[&'a str; 2]>,
+    #[serde(rename = "a", borrow)]
+    asks: Vec<[&'a str; 2]>,
+}
+
+/// The REST snapshot, as `super::snapshot` delivers it.
+#[derive(Deserialize)]
+struct DepthSnapshot<'a> {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: u64,
+    #[serde(borrow)]
+    bids: Vec<[&'a str; 2]>,
+    #[serde(borrow)]
+    asks: Vec<[&'a str; 2]>,
+}
+
+fn levels(raw: &[[&str; 2]]) -> Result<Vec<Level>, DecodeError> {
+    raw.iter()
+        .map(|[price, qty]| crate::depth::level(price, qty))
+        .collect()
+}
+
+/// The session's entry point: depth streams are kept in `books`; every other
+/// stream goes to [`decode_payload`].
+///
+/// # Errors
+///
+/// As [`decode_payload`], and [`DecodeError::Resync`] when a diff does not
+/// follow the book, or its snapshot could not be fetched.
+pub(crate) fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: &mut BinanceBooks,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(payload) else {
+        return decode_payload(payload, map, local_recv_ns, out);
+    };
+    let kind = StreamKind::from_stream_name(envelope.stream);
+    if !matches!(kind, Some(StreamKind::Depth | StreamKind::DepthSnapshot)) {
+        return decode_payload(payload, map, local_recv_ns, out);
+    }
+    if let Some(error) = envelope.error {
+        return Err(DecodeError::Resync(format!(
+            "{}: snapshot failed: {error}",
+            envelope.stream
+        )));
+    }
+    let data = envelope
+        .data
+        .ok_or(DecodeError::MissingField("data"))?
+        .get()
+        .as_bytes();
+    let futures = map.market() != MarketKind::Spot;
+    let (symbol, exchange_time_ns, applied) = if kind == Some(StreamKind::Depth) {
+        let diff: DepthDiff<'_> =
+            serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        let symbol = diff.symbol.to_ascii_uppercase();
+        let applied = books.on_diff(
+            &symbol,
+            futures,
+            Diff {
+                first: diff.first,
+                last: diff.last,
+                previous: diff.previous,
+                bids: levels(&diff.bids)?,
+                asks: levels(&diff.asks)?,
+            },
+        )?;
+        (symbol, diff.event_time_ms.map(millis_to_nanos), applied)
+    } else {
+        let snapshot: DepthSnapshot<'_> =
+            serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        let symbol = envelope
+            .stream
+            .split('@')
+            .next()
+            .unwrap_or(envelope.stream)
+            .to_ascii_uppercase();
+        let applied = books.on_snapshot(
+            &symbol,
+            futures,
+            snapshot.last_update_id,
+            levels(&snapshot.bids)?,
+            levels(&snapshot.asks)?,
+        )?;
+        (symbol, None, applied)
+    };
+    let entry = map
+        .lookup(&symbol)
+        .ok_or_else(|| DecodeError::UnknownInstrument(symbol.clone()))?;
+    if applied == Applied::Changed {
+        books.books.emit(
+            &symbol,
+            entry.instrument.clone(),
+            exchange_time_ns,
+            local_recv_ns,
+            out,
+        )?;
+    }
+    Ok(())
 }
 
 /// `bookTicker`. Spot omits every timestamp; futures adds `E` and `T`.
@@ -68,22 +191,6 @@ struct MarkPrice<'a> {
     funding_rate: Option<&'a str>,
 }
 
-/// Partial book depth. Spot sends `bids` and `asks` and no symbol, so the
-/// symbol comes from the stream name; futures sends `b`, `a`, `s` and `E`.
-#[derive(Deserialize)]
-struct PartialDepth<'a> {
-    #[serde(alias = "b", borrow)]
-    bids: Vec<[&'a str; 2]>,
-    #[serde(alias = "a", borrow)]
-    asks: Vec<[&'a str; 2]>,
-    #[serde(rename = "s", borrow, default)]
-    symbol: Option<&'a str>,
-    #[serde(rename = "E", default)]
-    event_time_ms: Option<u64>,
-    #[serde(rename = "lastUpdateId", alias = "u", default)]
-    update_id: Option<u64>,
-}
-
 /// Parses a decimal field.
 fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeError> {
     value.parse().map_err(|_| DecodeError::BadDecimal {
@@ -121,48 +228,22 @@ pub fn decode_payload(
 
     let kind = StreamKind::from_stream_name(envelope.stream)
         .ok_or_else(|| DecodeError::UnhandledStream(envelope.stream.to_owned()))?;
-    let data = envelope.data.get().as_bytes();
+    // Only a snapshot frame carries `error`, and `decode` handles those.
+    let data = envelope
+        .data
+        .ok_or(DecodeError::MissingField("data"))?
+        .get()
+        .as_bytes();
 
     match kind {
         StreamKind::BookTicker => decode_book_ticker(data, map, local_recv_ns, out),
         StreamKind::AggTrade => decode_agg_trade(data, map, local_recv_ns, out),
         StreamKind::MarkPrice => decode_mark_price(data, map, local_recv_ns, out),
-        StreamKind::Depth => decode_depth(envelope.stream, data, map, local_recv_ns, out),
+        // Book streams need the connection's books; see `decode`.
+        StreamKind::Depth | StreamKind::DepthSnapshot => {
+            Err(DecodeError::UnhandledStream(envelope.stream.to_owned()))
+        }
     }
-}
-
-fn decode_depth(
-    stream: &str,
-    data: &[u8],
-    map: &InstrumentMap,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let depth: PartialDepth<'_> =
-        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let symbol = depth
-        .symbol
-        .unwrap_or_else(|| stream.split('@').next().unwrap_or(stream));
-    let entry = map
-        .lookup(symbol)
-        .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))?;
-    let side = |levels: &[[&str; 2]]| {
-        levels
-            .iter()
-            .map(|[price, qty]| crate::depth::level(price, qty))
-            .collect::<Result<Vec<_>, _>>()
-    };
-    if let Some(observation) = crate::depth::observation(
-        entry.instrument.clone(),
-        side(&depth.bids)?,
-        side(&depth.asks)?,
-        depth.event_time_ms.map(millis_to_nanos),
-        local_recv_ns,
-        depth.update_id,
-    ) {
-        out.push(observation);
-    }
-    Ok(())
 }
 
 /// Returns `true` if the payload is a control response rather than market data.
@@ -339,47 +420,51 @@ mod tests {
         "e":"bookTicker","u":400900217,"E":1754582400123,"T":1754582400120,
         "s":"BTCUSDT","b":"64311.50","B":"3.0","a":"64312.50","A":"1.0"}}"#;
 
-    /// Spot partial depth: `bids` and `asks`, no symbol, no event time.
-    const SPOT_DEPTH: &str = r#"{"stream":"btcusdt@depth20@100ms","data":{
-        "lastUpdateId":160,
-        "bids":[["64312.00","1.5"],["64311.50","2.0"]],
-        "asks":[["64313.00","0.8"],["64314.00","3.0"]]}}"#;
+    /// Recorded from Binance spot on 2026-10-06, in the order the snapshot
+    /// connector delivers it: five diffs, the REST snapshot, then 25 more.
+    const RECORDED_DEPTH: &str = include_str!("../../tests/fixtures/binance-depth.jsonl");
 
-    /// Futures partial depth: `b`, `a`, `s` and `E`, bids not best first.
-    const PERP_DEPTH: &str = r#"{"stream":"btcusdt@depth20@100ms","data":{
-        "e":"depthUpdate","E":1754582400123,"T":1754582400120,"s":"BTCUSDT",
-        "U":390497796,"u":390497878,"pu":390497794,
-        "b":[["64311.0","2.0"],["64311.5","3.0"]],
-        "a":[["64312.5","1.0"],["64313.0","4.0"]]}}"#;
+    fn depth_map() -> InstrumentMap {
+        let specs = vec![
+            InstrumentSpec::new("BTCUSDT", MarketKind::Spot, "CRYPTO.BTC/USDT")
+                .expect("valid")
+                .with_depth(),
+        ];
+        InstrumentMap::new(Venue::Binance, MarketKind::Spot, &specs).expect("valid")
+    }
 
+    /// The diffs before the snapshot wait for it, and every one after it
+    /// follows the last.
     #[test]
-    fn spot_depth_takes_its_symbol_from_the_stream_name() {
-        let out = decode(SPOT_DEPTH, &spot_map());
-        let [depth] = out.as_slice() else {
-            panic!("one observation: {out:?}");
-        };
-        assert_eq!(depth.kind, ObsKind::Depth);
-        assert_eq!(depth.bid, Some("64312.00".parse().expect("valid")));
-        assert_eq!(depth.ask, Some("64313.00".parse().expect("valid")));
-        assert_eq!(depth.seq, Some(160));
-        let book = depth.book.as_deref().expect("levels");
-        assert_eq!((book.bids.len(), book.asks.len()), (2, 2));
+    fn a_recorded_book_joins_snapshot_and_diffs() {
+        let map = depth_map();
+        let mut books = BinanceBooks::default();
+        let mut depths = Vec::new();
+        for line in RECORDED_DEPTH.lines() {
+            let mut out = Vec::new();
+            super::decode(line.as_bytes(), &map, &mut books, RECV_NS, &mut out)
+                .unwrap_or_else(|error| panic!("{error}: {line}"));
+            depths.extend(out);
+        }
+        assert!(depths.len() >= 25, "{}", depths.len());
+        assert!(depths.iter().all(|o| o.kind == ObsKind::Depth));
+        let last = depths.last().expect("a depth observation");
+        assert!(last.bid < last.ask);
     }
 
     #[test]
-    fn futures_depth_is_sorted_best_first() {
-        let out = decode(PERP_DEPTH, &perp_map());
-        let [depth] = out.as_slice() else {
-            panic!("one observation: {out:?}");
-        };
-        assert_eq!(depth.bid, Some("64311.5".parse().expect("valid")));
-        assert_eq!(depth.exchange_time_ns, Some(1_754_582_400_123_000_000));
-        let book = depth.book.as_deref().expect("levels");
-        assert!(
-            book.bids
-                .windows(2)
-                .all(|pair| matches!(pair, [high, low] if high.price > low.price))
-        );
+    fn a_failed_snapshot_asks_for_a_resync() {
+        let failed = r#"{"stream":"btcusdt@depthSnapshot","error":"HTTP status 429"}"#;
+        assert!(matches!(
+            super::decode(
+                failed.as_bytes(),
+                &depth_map(),
+                &mut BinanceBooks::default(),
+                RECV_NS,
+                &mut Vec::new()
+            ),
+            Err(DecodeError::Resync(_))
+        ));
     }
 
     const AGG_TRADE: &str = r#"{"stream":"btcusdt@aggTrade","data":{

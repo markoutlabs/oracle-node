@@ -25,8 +25,11 @@ pub enum StreamKind {
     AggTrade,
     /// Mark price, index price, and funding rate, once per second.
     MarkPrice,
-    /// The top twenty levels, every 100ms, for instruments that ask for depth.
+    /// Book changes every 100ms, for instruments that ask for depth. They apply
+    /// to a REST snapshot; see `super::snapshot`.
     Depth,
+    /// The REST snapshot, delivered as a frame. Not a stream Binance serves.
+    DepthSnapshot,
 }
 
 impl StreamKind {
@@ -56,7 +59,8 @@ impl StreamKind {
             Self::AggTrade => "@aggTrade",
             // The `@1s` variant; the default pushes every three seconds.
             Self::MarkPrice => "@markPrice@1s",
-            Self::Depth => "@depth20@100ms",
+            Self::Depth => "@depth@100ms",
+            Self::DepthSnapshot => "@depthSnapshot",
         }
     }
 
@@ -71,6 +75,8 @@ impl StreamKind {
             Some(Self::AggTrade)
         } else if stream.contains("@markPrice") {
             Some(Self::MarkPrice)
+        } else if stream.ends_with("@depthSnapshot") {
+            Some(Self::DepthSnapshot)
         } else if stream.contains("@depth") {
             Some(Self::Depth)
         } else {
@@ -133,10 +139,13 @@ mod tests {
     #[test]
     fn depth_streams_are_recognised() {
         assert_eq!(
-            StreamKind::from_stream_name("btcusdt@depth20@100ms"),
+            StreamKind::from_stream_name("btcusdt@depth@100ms"),
             Some(StreamKind::Depth)
         );
-        assert_eq!(StreamKind::Depth.suffix(), "@depth20@100ms");
+        assert_eq!(
+            StreamKind::from_stream_name("btcusdt@depthSnapshot"),
+            Some(StreamKind::DepthSnapshot)
+        );
     }
 
     #[test]

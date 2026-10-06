@@ -21,6 +21,9 @@ pub struct SourceQuote {
     pub from_book: bool,
     /// `true` if this price is quoted in the peg asset and needs conversion.
     pub converted: bool,
+    /// Notional resting within one basis point of the mid, from the venue's
+    /// book. Weighs in only when every source has it.
+    pub depth_notional: Option<Fixed>,
 }
 
 /// Derives a quote from the freshest usable observation for one source.
@@ -91,11 +94,11 @@ pub fn derive(
                 config,
                 observation.age_ns(now_ns),
                 observation.spread().and_then(|s| s.to_bps_of(price)),
-                observation.depth_notional_1bp,
             )?,
             observation_time_ns: observation.local_recv_ns,
             from_book,
             converted: source.convert_quote,
+            depth_notional: observation.depth_notional_1bp,
         });
     }
     None
@@ -152,24 +155,23 @@ fn from_depth(
         venue: depth.venue(),
         price,
         half_spread: spread.checked_div(Fixed::from_int(2).ok()?),
-        // No depth factor yet: until every venue sends depth, weighting only some
-        // by it tilts the median toward them.
-        weight: weight_for(source, config, age_ns, spread.to_bps_of(price), None)?,
+        weight: weight_for(source, config, age_ns, spread.to_bps_of(price))?,
         observation_time_ns: received_ns,
         from_book: true,
         converted: source.convert_quote,
+        depth_notional: book.notional_within_bps(Fixed::ONE),
     })
 }
 
-/// Computes the aggregation weight for one quote.
+/// Computes the aggregation weight for one quote, before depth.
 ///
-/// `trust × depth × recency × spread`, all bounded in `(0, 1]` except trust.
+/// `trust × recency × spread`, bounded in `(0, 1]` except trust. Depth is
+/// applied across all quotes at once; see [`depth_factor`].
 fn weight_for(
     source: &SourceConfig,
     config: &FeedConfig,
     age_ns: u64,
     spread_bps: Option<Fixed>,
-    depth_notional: Option<Fixed>,
 ) -> Option<Fixed> {
     let mut weight = source.weight;
 
@@ -192,19 +194,21 @@ fn weight_for(
         weight = weight.checked_mul(one.checked_div(denominator)?)?;
     }
 
-    // Liquidity, sub-linearly. Only a depth snapshot carries it; a venue priced
-    // from its top of book gets the neutral factor.
-    if let Some(depth) = depth_notional
-        && config.depth_reference.is_positive()
-    {
-        let ratio = depth.checked_div(config.depth_reference)?;
-        let factor = ratio.sqrt()?.min(config.depth_cap);
-        if factor.is_positive() {
-            weight = weight.checked_mul(factor)?;
-        }
-    }
-
     Some(weight)
+}
+
+/// Liquidity, sub-linearly: `sqrt(depth / reference)`, capped. `None` when
+/// there is no depth or no reference.
+pub(crate) fn depth_factor(config: &FeedConfig, depth: Option<Fixed>) -> Option<Fixed> {
+    let depth = depth?;
+    if !config.depth_reference.is_positive() {
+        return None;
+    }
+    let factor = depth
+        .checked_div(config.depth_reference)?
+        .sqrt()?
+        .min(config.depth_cap);
+    factor.is_positive().then_some(factor)
 }
 
 #[cfg(test)]
@@ -543,26 +547,20 @@ mod tests {
     }
 
     #[test]
-    fn depth_weighting_applies_sub_linearly_when_present() {
-        let mut shallow = slots();
-        let mut deep = slots();
-        let mut a = book("100", "102", "5", "5", 0);
-        let mut b = book("100", "102", "5", "5", 0);
-        a.depth_notional_1bp = Some(fixed("25000"));
-        b.depth_notional_1bp = Some(fixed("100000"));
-        put(&mut shallow, a);
-        put(&mut deep, b);
-
-        let shallow = derive(&source(), &config(), &shallow, NOW).expect("usable");
-        let deep = derive(&source(), &config(), &deep, NOW).expect("usable");
-        // Four times the depth for twice the weight: sqrt, not linear. Exact to
-        // within the last place of the fixed-point scale.
-        let ratio = deep.weight.checked_div(shallow.weight).expect("in range");
+    fn the_depth_factor_is_sub_linear_and_capped() {
+        let config = config();
+        let factor = |depth: &str| depth_factor(&config, Some(fixed(depth))).expect("a factor");
+        // Four times the depth for twice the factor: sqrt, not linear.
+        let ratio = factor("100000")
+            .checked_div(factor("25000"))
+            .expect("in range");
         let error = ratio
             .checked_sub(fixed("2"))
             .and_then(Fixed::checked_abs)
             .expect("in range");
         assert!(error <= fixed("0.000000001"), "ratio was {ratio}");
+        assert_eq!(factor("100000000"), config.depth_cap);
+        assert_eq!(depth_factor(&config, None), None);
     }
 
     #[test]

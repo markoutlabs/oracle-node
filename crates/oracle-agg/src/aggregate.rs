@@ -15,7 +15,7 @@
 use oracle_types::{Fixed, Flags, VenueSet};
 
 use crate::config::FeedConfig;
-use crate::quote::SourceQuote;
+use crate::quote::{self, SourceQuote};
 use crate::stats::{self, MAD_TO_SIGMA};
 
 /// Basis points in one whole unit.
@@ -298,6 +298,18 @@ pub fn aggregate(
         }
     };
 
+    // Depth compares like with like: a source without a book would read as
+    // shallow, so depth weighs in only when every source has one.
+    if quotes.iter().all(|quote| quote.depth_notional.is_some()) {
+        for quote in &mut quotes {
+            if let Some(factor) = quote::depth_factor(config, quote.depth_notional)
+                && let Some(weight) = quote.weight.checked_mul(factor)
+            {
+                quote.weight = weight;
+            }
+        }
+    }
+
     cap_weights(config, &mut quotes);
 
     let samples: Vec<(Fixed, Fixed)> = quotes
@@ -579,6 +591,7 @@ mod tests {
             observation_time_ns: 1_000,
             from_book: true,
             converted: false,
+            depth_notional: None,
         }
     }
 
@@ -667,6 +680,31 @@ mod tests {
         let result = priced(aggregate(&config, quotes, None, None, None));
         assert_eq!(result.rejected, 0, "all inside the 10bp floor");
         assert!(result.conf >= fixed("0.08"), "{}", result.conf);
+    }
+
+    /// A deep venue counts for more, but only when every venue reports depth:
+    /// a venue without a book is not a shallow one.
+    #[test]
+    fn depth_weighs_in_only_when_every_source_has_it() {
+        let config = config(&[Venue::Binance, Venue::Bybit, Venue::Okx]);
+        let with_depth = |venue, price, depth: &str| SourceQuote {
+            depth_notional: Some(fixed(depth)),
+            ..quote(venue, price)
+        };
+        let quotes = vec![
+            with_depth(Venue::Binance, "100", "1000000"),
+            with_depth(Venue::Bybit, "100.05", "10000"),
+            with_depth(Venue::Okx, "100.06", "10000"),
+        ];
+        let result = priced(aggregate(&config, quotes.clone(), None, None, None));
+        assert_eq!(result.price, fixed("100"), "the deep venue leads");
+
+        let mut partial = quotes;
+        if let Some(okx) = partial.get_mut(2) {
+            okx.depth_notional = None;
+        }
+        let result = priced(aggregate(&config, partial, None, None, None));
+        assert_eq!(result.price, fixed("100.05"), "no depth factor for anyone");
     }
 
     #[test]

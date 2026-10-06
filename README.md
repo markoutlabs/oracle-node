@@ -675,7 +675,9 @@ Two substitutions make it deterministic. The transport reads the recording
 instead of a socket, releasing frames in recorded order across every connection.
 The session clock reads the recording instead of the wall, so each observation
 carries the receipt time it really had. The pipeline evaluates each changed feed
-after each observation, and runs its timers at recorded time. The last line `oracle-replay` prints is a digest over every published
+after each observation, and runs its timers at recorded time. Binance's REST book
+snapshots are recorded as frames too, so a replay rebuilds every book without
+calling a venue. The last line `oracle-replay` prints is a digest over every published
 update. Two replays of one recording print the same digest, on any machine. That
 is SPEC §10's cross-node conformance check, and it is also how an incident gets
 reproduced months later and how an aggregation constant gets tuned against a real

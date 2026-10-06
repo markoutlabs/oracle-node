@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use clap::Args;
 use oracle_agg::AggError;
 use oracle_ingest::IngestEvent;
+use oracle_ingest::binance::snapshot::SnapshotConnector;
 use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
@@ -240,14 +241,17 @@ fn spawn_ingest(
     record: Option<&Path>,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<(mpsc::Receiver<IngestEvent>, usize)> {
-    // The same adapters either way; `--record` only wraps the transport.
+    // The same adapters either way; `--record` only wraps the transport. The
+    // snapshot connector sits under the recorder, so a recording holds Binance's
+    // REST snapshots and a replay never calls REST.
+    let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?;
     let adapters = match record {
         Some(path) => {
             info!(path = %path.display(), "recording raw venue frames");
-            let connector = RecordingConnector::new(WebSocketConnector, Recorder::to_file(path)?);
+            let connector = RecordingConnector::new(snapshots, Recorder::to_file(path)?);
             build_adapters(binance, venues, connector, MonotonicClock::new())?
         }
-        None => build_adapters(binance, venues, WebSocketConnector, MonotonicClock::new())?,
+        None => build_adapters(binance, venues, snapshots, MonotonicClock::new())?,
     };
 
     let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);

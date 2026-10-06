@@ -115,8 +115,8 @@ pub struct FeedConfig {
 
     /// Reference notional for depth weighting: `sqrt(depth / reference)`, capped.
     ///
-    /// Not applied yet: until every venue sends depth, weighting only some by it
-    /// tilts the median toward them. Every venue gets the neutral factor.
+    /// Applied only when every surviving source has a book: a source without one
+    /// would read as shallow and tilt the median toward the others.
     pub depth_reference: Fixed,
 
     /// Ceiling on the depth factor, so one deep venue cannot dominate.
