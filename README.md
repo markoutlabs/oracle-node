@@ -129,12 +129,13 @@ arrives; a 25 ms timer catches heartbeats and stale venues. `deviation_bps` (1 b
 default), `heartbeat_ms` and `min_interval_ms` are set per feed. A move held back
 by the rate cap publishes the moment the cap expires.
 
-With `impact_notional` set on a feed, each venue that sends depth snapshots
-(Binance, OKX spot, Deribit) is priced at the average fill for that notional
-instead of its microprice, moved by the live top of book between snapshots. One
-large order at the top can lean a microprice; it cannot lean an impact price.
-SPEC §5.1 has the rule, and why Bybit, Coinbase and Kraken still price from the
-top of book.
+With `impact_notional` set on a feed, each venue is priced at the average fill
+for that notional instead of its microprice, moved by the live top of book
+between book updates. One large order at the top can lean a microprice; it
+cannot lean an impact price. The node keeps each venue's book from a snapshot
+and the changes after it, and proves continuity with the venue's checksum or
+sequence numbers. A failed proof drops the connection for a fresh snapshot.
+SPEC §5.1 lists each venue's stream and proof.
 
 Two venues that disagree beyond the 10 bp outlier floor leave no majority to say
 which is wrong. The feed degrades, keeps the venue nearer its last price, and

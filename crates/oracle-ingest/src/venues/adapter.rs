@@ -12,6 +12,7 @@ use oracle_types::{MarketKind, Observation, Venue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::book::Books;
 use crate::clock::MonotonicClock;
 use crate::session::{MessageHandler, Session, SessionConfig, SessionStats};
 use crate::{
@@ -47,19 +48,25 @@ pub struct VenueSpec {
 
 /// Decodes one venue's payloads.
 pub type DecodeFn =
-    fn(&[u8], &InstrumentMap, u64, &mut Vec<Observation>) -> Result<(), DecodeError>;
+    fn(&[u8], &InstrumentMap, &mut Books, u64, &mut Vec<Observation>) -> Result<(), DecodeError>;
 
-/// A handler that dispatches to a venue's decode function.
+/// A handler that dispatches to a venue's decode function, and keeps the
+/// connection's local books.
 pub struct VenueHandler {
     map: InstrumentMap,
     decode: DecodeFn,
+    books: Books,
 }
 
 impl VenueHandler {
     /// Builds a handler.
     #[must_use]
-    pub const fn new(map: InstrumentMap, decode: DecodeFn) -> Self {
-        Self { map, decode }
+    pub fn new(map: InstrumentMap, decode: DecodeFn) -> Self {
+        Self {
+            map,
+            decode,
+            books: Books::default(),
+        }
     }
 }
 
@@ -70,7 +77,11 @@ impl MessageHandler for VenueHandler {
         local_recv_ns: u64,
         out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError> {
-        (self.decode)(payload, &self.map, local_recv_ns, out)
+        (self.decode)(payload, &self.map, &mut self.books, local_recv_ns, out)
+    }
+
+    fn on_connect(&mut self) {
+        self.books.clear();
     }
 }
 
@@ -232,6 +243,7 @@ mod tests {
     fn decode(
         _payload: &[u8],
         _map: &InstrumentMap,
+        _books: &mut Books,
         _now: u64,
         _out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError> {

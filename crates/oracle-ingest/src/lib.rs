@@ -29,6 +29,7 @@
 
 pub mod backoff;
 pub mod binance;
+pub mod book;
 pub mod clock;
 mod depth;
 mod error;

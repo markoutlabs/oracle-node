@@ -12,6 +12,7 @@ use std::time::Duration;
 use oracle_types::{Fixed, ObsKind, Observation};
 use serde::Deserialize;
 
+use crate::book::{Books, LocalBook, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
@@ -29,8 +30,14 @@ pub const KEEPALIVE_PAYLOAD: &str = "ping";
 /// Channels subscribed per instrument.
 const SPOT_CHANNELS: [&str; 2] = ["bbo-tbt", "trades"];
 const SWAP_CHANNELS: [&str; 4] = ["bbo-tbt", "trades", "mark-price", "funding-rate"];
-/// The top five levels, pushed every 100ms when they change.
-const DEPTH_CHANNEL: &str = "books5";
+/// The book: a 400-level snapshot, then the changes every 100ms.
+const DEPTH_CHANNEL: &str = "books";
+
+/// Levels kept per side, the depth OKX publishes.
+pub const BOOK_DEPTH: usize = 400;
+
+/// Levels per side a non-zero checksum covers.
+const CHECKSUM_LEVELS: usize = 25;
 
 /// Returns `true` if an OKX instrument id names a perpetual swap.
 #[must_use]
@@ -90,8 +97,35 @@ struct Bbo<'a> {
     asks: Vec<Vec<&'a str>>,
     #[serde(borrow, default)]
     ts: Option<&'a str>,
-    #[serde(rename = "seqId", default)]
-    seq_id: Option<u64>,
+}
+
+/// A `books` message: a snapshot, or the levels that changed.
+#[derive(Deserialize)]
+struct BooksMessage<'a> {
+    #[serde(borrow)]
+    arg: Arg<'a>,
+    #[serde(borrow)]
+    action: &'a str,
+    #[serde(borrow)]
+    data: Vec<BooksData<'a>>,
+}
+
+/// Levels are `[price, size, liquidated_orders, order_count]`.
+#[derive(Deserialize)]
+struct BooksData<'a> {
+    #[serde(borrow, default)]
+    bids: Vec<Vec<&'a str>>,
+    #[serde(borrow, default)]
+    asks: Vec<Vec<&'a str>>,
+    #[serde(borrow, default)]
+    ts: Option<&'a str>,
+    /// Zero on the public channel since OKX stopped computing it.
+    #[serde(default)]
+    checksum: i64,
+    #[serde(rename = "seqId")]
+    seq_id: i64,
+    #[serde(rename = "prevSeqId")]
+    prev_seq_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +163,90 @@ fn stamp(ts: Option<&str>) -> Option<u64> {
     ts?.parse::<u64>().ok().map(millis_to_nanos)
 }
 
+/// The session's entry point: the `books` channel is kept in `books`; every
+/// other channel goes to [`decode_payload`].
+///
+/// # Errors
+///
+/// As [`decode_payload`], and [`DecodeError::Resync`] when an update does not
+/// follow the last one, or a non-zero checksum fails.
+pub fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: &mut Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    if payload == b"pong" {
+        return Err(DecodeError::Control);
+    }
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let is_books = envelope.arg.is_some_and(|arg| arg.channel == DEPTH_CHANNEL);
+    if !is_books || envelope.data.is_none() {
+        return decode_payload(payload, map, local_recv_ns, out);
+    }
+    let message: BooksMessage<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let inst_id = message
+        .arg
+        .inst_id
+        .ok_or(DecodeError::MissingField("instId"))?;
+    let entry = map
+        .lookup(inst_id)
+        .ok_or_else(|| DecodeError::UnknownInstrument(inst_id.to_owned()))?;
+    for data in message.data {
+        let book = books.book(inst_id);
+        if message.action == "snapshot" {
+            book.clear();
+        } else if u64::try_from(data.prev_seq_id).ok() != book.last_id {
+            return Err(DecodeError::Resync(format!(
+                "{inst_id}: update follows {} but the book is at {:?}",
+                data.prev_seq_id, book.last_id
+            )));
+        }
+        book.last_id = u64::try_from(data.seq_id).ok();
+        for (side, levels) in [(Side::Bid, &data.bids), (Side::Ask, &data.asks)] {
+            for level in levels {
+                let (Some(price), Some(size)) = (level.first(), level.get(1)) else {
+                    continue;
+                };
+                let parsed = crate::depth::level(price, size)?;
+                book.set_with_text(side, parsed.price, parsed.qty, Some((price, size)));
+            }
+        }
+        book.truncate(BOOK_DEPTH);
+        if data.checksum != 0 && checksum(book) != Some(data.checksum) {
+            return Err(DecodeError::Resync(format!("{inst_id}: checksum mismatch")));
+        }
+        books.emit(
+            inst_id,
+            entry.instrument.clone(),
+            stamp(data.ts),
+            local_recv_ns,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// OKX's CRC32, as a signed 32-bit number, over the top 25 levels interleaved
+/// bid then ask, each as `price:size` exactly as sent.
+fn checksum(book: &LocalBook) -> Option<i64> {
+    let bids = book.top_text(Side::Bid, CHECKSUM_LEVELS)?;
+    let asks = book.top_text(Side::Ask, CHECKSUM_LEVELS)?;
+    let mut parts = Vec::with_capacity(CHECKSUM_LEVELS * 2);
+    for index in 0..bids.len().max(asks.len()) {
+        for side in [&bids, &asks] {
+            if let Some((price, size)) = side.get(index) {
+                parts.push(format!("{price}:{size}"));
+            }
+        }
+    }
+    let hash = crc32fast::hash(parts.join(":").as_bytes());
+    Some(i64::from(i32::from_ne_bytes(hash.to_ne_bytes())))
+}
+
 /// Decodes one OKX payload.
 ///
 /// # Errors
@@ -156,10 +274,6 @@ pub fn decode_payload(
         "bbo-tbt" => {
             let inst_id = arg.inst_id.ok_or(DecodeError::MissingField("instId"))?;
             decode_bbo(data, inst_id, map, local_recv_ns, out)
-        }
-        DEPTH_CHANNEL => {
-            let inst_id = arg.inst_id.ok_or(DecodeError::MissingField("instId"))?;
-            decode_books(data, inst_id, map, local_recv_ns, out)
         }
         "trades" => decode_trades(data, map, local_recv_ns, out),
         "mark-price" => decode_mark_price(data, map, local_recv_ns, out),
@@ -215,45 +329,6 @@ fn decode_bbo(
             book: None,
         });
         emitted = true;
-    }
-    if emitted {
-        Ok(())
-    } else {
-        Err(DecodeError::Control)
-    }
-}
-
-fn decode_books(
-    data: &[u8],
-    inst_id: &str,
-    map: &InstrumentMap,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let entries: Vec<Bbo<'_>> =
-        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let entry = map
-        .lookup(inst_id)
-        .ok_or_else(|| DecodeError::UnknownInstrument(inst_id.to_owned()))?;
-    let side = |levels: &[Vec<&str>]| {
-        levels
-            .iter()
-            .filter_map(|level| Some(crate::depth::level(level.first()?, level.get(1)?)))
-            .collect::<Result<Vec<_>, _>>()
-    };
-    let mut emitted = false;
-    for book in entries {
-        if let Some(observation) = crate::depth::observation(
-            entry.instrument.clone(),
-            side(&book.bids)?,
-            side(&book.asks)?,
-            stamp(book.ts),
-            local_recv_ns,
-            book.seq_id,
-        ) {
-            out.push(observation);
-            emitted = true;
-        }
     }
     if emitted {
         Ok(())
@@ -505,26 +580,59 @@ mod tests {
     #[test]
     fn depth_is_subscribed_for_spot_only() {
         let spot = subscribe_frames([("BTC-USDT", true)].into_iter(), 100);
-        assert!(spot[0].contains("books5"));
+        assert!(spot[0].contains(r#""channel":"books""#));
         let swap = subscribe_frames([("BTC-USDT-SWAP", true)].into_iter(), 100);
-        assert!(!swap[0].contains("books5"));
+        assert!(!swap[0].contains(r#""channel":"books""#));
     }
 
-    const BOOKS5: &str = r#"{"arg":{"channel":"books5","instId":"BTC-USDT"},
-        "data":[{"asks":[["64313.0","0.5","0","3"],["64314.0","1.2","0","5"]],
-        "bids":[["64312.0","0.7","0","2"],["64311.5","2.0","0","4"]],
-        "instId":"BTC-USDT","ts":"1754582400123","seqId":123456}]}"#;
+    /// Recorded from OKX on 2026-10-06: the subscribe reply, a 400-level
+    /// snapshot, and the updates after it.
+    const RECORDED_BOOKS: &str = include_str!("../../tests/fixtures/okx-books.jsonl");
+
+    fn book_map() -> InstrumentMap {
+        let specs = vec![
+            InstrumentSpec::new("BTC-USDT", MarketKind::Spot, "CRYPTO.BTC/USDT")
+                .expect("valid")
+                .with_depth(),
+        ];
+        InstrumentMap::new(Venue::Okx, MarketKind::Spot, &specs).expect("valid")
+    }
 
     #[test]
-    fn books5_becomes_a_depth_observation() {
-        let out = decode(BOOKS5, MarketKind::Spot, "BTC-USDT");
-        assert_eq!(out.len(), 1);
-        let depth = &out[0];
-        assert_eq!(depth.kind, ObsKind::Depth);
-        assert_eq!(depth.bid, Some("64312.0".parse().expect("valid")));
-        assert_eq!(depth.ask, Some("64313.0".parse().expect("valid")));
-        assert_eq!(depth.seq, Some(123_456));
-        let book = depth.book.as_deref().expect("levels");
-        assert_eq!((book.bids.len(), book.asks.len()), (2, 2));
+    fn a_recorded_book_follows_its_sequence() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut depths = 0;
+        for line in RECORDED_BOOKS.lines() {
+            let mut out = Vec::new();
+            match super::decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+            depths += out.iter().filter(|o| o.kind == ObsKind::Depth).count();
+        }
+        assert!(depths >= 14, "{depths}");
+        let book = books.book("BTC-USDT");
+        assert!(book.top(Side::Bid, 1)[0].price < book.top(Side::Ask, 1)[0].price);
+        assert_eq!(book.top(Side::Bid, 500).len(), BOOK_DEPTH);
+    }
+
+    /// An update that does not follow the last one means a missed message.
+    #[test]
+    fn a_sequence_gap_asks_for_a_resync() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut lines = RECORDED_BOOKS
+            .lines()
+            .filter(|line| line.contains(r#""action":"#));
+        let snapshot = lines.next().expect("a snapshot");
+        super::decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
+        let _skipped = lines.next().expect("an update");
+        let after = lines.next().expect("a later update");
+        assert!(matches!(
+            super::decode(after.as_bytes(), &map, &mut books, RECV, &mut Vec::new()),
+            Err(DecodeError::Resync(_))
+        ));
     }
 }

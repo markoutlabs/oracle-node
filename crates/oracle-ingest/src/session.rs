@@ -21,13 +21,18 @@ pub trait MessageHandler: Send {
     ///
     /// Returns [`DecodeError`] for malformed or unrecognised payloads. These are
     /// never fatal — one bad frame must not drop a connection carrying hundreds
-    /// of good ones.
+    /// of good ones. [`DecodeError::Resync`] is the exception: it ends the
+    /// connection, because only a fresh snapshot can repair a book.
     fn on_payload(
         &mut self,
         payload: &[u8],
         local_recv_ns: u64,
         out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError>;
+
+    /// Called when a connection opens, before subscribing. State carried from
+    /// the previous connection must not survive the gap.
+    fn on_connect(&mut self) {}
 }
 
 /// Session tuning.
@@ -159,6 +164,7 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
 
             self.stats.connects = self.stats.connects.saturating_add(1);
             info!(%stream, url = %self.config.url, "connected");
+            self.handler.on_connect();
             send(&out, IngestEvent::Connected { stream }).await?;
 
             let started = Instant::now();
@@ -261,6 +267,11 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                 Err(err) if err.is_benign() => {
                     self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
                     continue;
+                }
+                Err(err @ DecodeError::Resync(_)) => {
+                    // Observations decoded before the failure are dropped with it.
+                    warn!(%stream, error = %err, "resyncing");
+                    return Ok(err.to_string());
                 }
                 Err(err) => {
                     self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
@@ -399,6 +410,76 @@ mod tests {
             });
             Ok(())
         }
+    }
+
+    /// Asks for a resync on `resync`, and counts connects.
+    struct ResyncingHandler {
+        connects: Arc<AtomicUsize>,
+    }
+
+    impl MessageHandler for ResyncingHandler {
+        fn on_payload(
+            &mut self,
+            payload: &[u8],
+            local_recv_ns: u64,
+            out: &mut Vec<Observation>,
+        ) -> Result<(), DecodeError> {
+            if payload == b"resync" {
+                return Err(DecodeError::Resync("checksum".to_owned()));
+            }
+            CountingHandler.on_payload(payload, local_recv_ns, out)
+        }
+
+        fn on_connect(&mut self) {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Only a fresh snapshot repairs a book, so a resync ends the connection
+    /// and the next one starts clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_resync_drops_the_connection_and_the_next_one_starts_clean() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connector = MockConnector {
+            fail_first: 0,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            script: Arc::new(std::sync::Mutex::new(vec![
+                vec![text("100.5"), text("resync"), text("999")],
+                vec![text("101.5")],
+            ])),
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let handler = ResyncingHandler {
+            connects: Arc::clone(&connects),
+        };
+        let session = Session::new(config(), connector, handler, MonotonicClock::anchored_at(1));
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+
+        let mut seen = Vec::new();
+        while seen.len() < 5 {
+            match rx.recv().await.expect("an event") {
+                IngestEvent::Connected { .. } => seen.push("connected".to_owned()),
+                IngestEvent::Disconnected { reason, .. } => seen.push(reason),
+                event => seen.push(
+                    event
+                        .as_observation()
+                        .map(|o| o.price.to_string())
+                        .unwrap_or_default(),
+                ),
+            }
+        }
+        let [connected, first, reason, reconnected, second] = seen.as_slice() else {
+            panic!("{seen:?}");
+        };
+        assert_eq!((connected.as_str(), first.as_str()), ("connected", "100.5"));
+        assert!(reason.contains("book out of sync"), "{seen:?}");
+        assert_eq!(reconnected, "connected");
+        assert_eq!(second, "101.5", "the frame after the resync is never read");
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     fn config() -> SessionConfig {

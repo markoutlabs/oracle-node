@@ -13,6 +13,7 @@ use std::time::Duration;
 use oracle_types::{MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 
+use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
@@ -44,18 +45,25 @@ pub const fn url(market: MarketKind) -> &'static str {
     }
 }
 
-/// Builds the subscribe frames for a market's instruments.
+/// Book levels kept per side: Bybit's `orderbook.50`.
+pub const BOOK_DEPTH: usize = 50;
+
+/// Builds the subscribe frames for a market's instruments, each with whether it
+/// wants the book.
 ///
 /// Chunked because Bybit caps arguments per request; separate frames on one
 /// connection are cheaper than separate connections.
 #[must_use]
 pub fn subscribe_frames<'a>(
-    symbols: impl Iterator<Item = &'a str>,
+    instruments: impl Iterator<Item = (&'a str, bool)>,
     market: MarketKind,
     chunk: usize,
 ) -> Vec<String> {
     let mut topics: Vec<String> = Vec::new();
-    for symbol in symbols {
+    for (symbol, depth) in instruments {
+        if depth {
+            topics.push(format!("orderbook.{BOOK_DEPTH}.{symbol}"));
+        }
         topics.push(format!("orderbook.1.{symbol}"));
         topics.push(format!("publicTrade.{symbol}"));
         // `tickers` is where mark, index and funding live, and only perpetuals
@@ -75,6 +83,9 @@ pub fn subscribe_frames<'a>(
 struct Envelope<'a> {
     #[serde(borrow, default)]
     topic: Option<&'a str>,
+    /// `snapshot` or `delta`, on book topics.
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<&'a str>,
     #[serde(default)]
     ts: Option<u64>,
     #[serde(borrow, default)]
@@ -114,6 +125,64 @@ struct Ticker<'a> {
     index_price: Option<&'a str>,
     #[serde(rename = "fundingRate", borrow, default)]
     funding_rate: Option<&'a str>,
+}
+
+/// The session's entry point: `orderbook.50` is kept in `books`; every other
+/// topic goes to [`decode_payload`].
+///
+/// # Errors
+///
+/// As [`decode_payload`], and [`DecodeError::Resync`] when an update id skips.
+pub fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: &mut Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let book_topic = format!("orderbook.{BOOK_DEPTH}.");
+    let (Some(topic), Some(data)) = (envelope.topic, envelope.data) else {
+        return decode_payload(payload, map, local_recv_ns, out);
+    };
+    if !topic.starts_with(&book_topic) {
+        return decode_payload(payload, map, local_recv_ns, out);
+    }
+    let message: OrderBook<'_> =
+        serde_json::from_str(data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let entry = map
+        .lookup(message.symbol)
+        .ok_or_else(|| DecodeError::UnknownInstrument(message.symbol.to_owned()))?;
+    let update_id = message.update_id.ok_or(DecodeError::MissingField("u"))?;
+    let book = books.book(message.symbol);
+    // An update id of 1 is Bybit restarting the book: a snapshot by another name.
+    if envelope.kind == Some("snapshot") || update_id == 1 {
+        book.clear();
+    } else if book.last_id.and_then(|last| last.checked_add(1)) != Some(update_id) {
+        return Err(DecodeError::Resync(format!(
+            "{}: update {update_id} does not follow {:?}",
+            message.symbol, book.last_id
+        )));
+    }
+    book.last_id = Some(update_id);
+    for (side, levels) in [(Side::Bid, &message.bids), (Side::Ask, &message.asks)] {
+        for level in levels {
+            let (Some(price), Some(size)) = (level.first(), level.get(1)) else {
+                continue;
+            };
+            let parsed = crate::depth::level(price, size)?;
+            book.set(side, parsed.price, parsed.qty);
+        }
+    }
+    book.truncate(BOOK_DEPTH);
+    books.emit(
+        message.symbol,
+        entry.instrument.clone(),
+        envelope.ts.map(millis_to_nanos),
+        local_recv_ns,
+        out,
+    )
 }
 
 /// Decodes one Bybit payload.
@@ -418,19 +487,23 @@ mod tests {
 
     #[test]
     fn subscribe_frames_cover_the_right_topics() {
-        let spot = subscribe_frames(["BTCUSDT"].into_iter(), MarketKind::Spot, 10);
+        let spot = subscribe_frames([("BTCUSDT", false)].into_iter(), MarketKind::Spot, 10);
         assert_eq!(spot.len(), 1);
         assert!(spot[0].contains("orderbook.1.BTCUSDT"));
         assert!(spot[0].contains("publicTrade.BTCUSDT"));
         assert!(!spot[0].contains("tickers"), "spot has no mark price");
 
-        let perp = subscribe_frames(["BTCUSDT"].into_iter(), MarketKind::LinearPerp, 10);
+        let perp = subscribe_frames([("BTCUSDT", false)].into_iter(), MarketKind::LinearPerp, 10);
         assert!(perp[0].contains("tickers.BTCUSDT"));
+        assert!(!perp[0].contains("orderbook.50"));
+
+        let depth = subscribe_frames([("BTCUSDT", true)].into_iter(), MarketKind::Spot, 10);
+        assert!(depth[0].contains("orderbook.50.BTCUSDT"));
     }
 
     #[test]
     fn subscribe_frames_are_chunked() {
-        let symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+        let symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"].map(|symbol| (symbol, false));
         let frames = subscribe_frames(symbols.into_iter(), MarketKind::Spot, 2);
         assert_eq!(frames.len(), 3, "six topics at two per frame");
     }
@@ -438,5 +511,57 @@ mod tests {
     #[test]
     fn spot_and_linear_use_different_hosts() {
         assert_ne!(url(MarketKind::Spot), url(MarketKind::LinearPerp));
+    }
+
+    /// Recorded from Bybit spot on 2026-10-06: the subscribe reply, a snapshot,
+    /// and the deltas after it.
+    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/bybit-book.jsonl");
+
+    fn book_map() -> InstrumentMap {
+        let specs = vec![
+            InstrumentSpec::new("BTCUSDT", MarketKind::Spot, "CRYPTO.BTC/USDT")
+                .expect("valid")
+                .with_depth(),
+        ];
+        InstrumentMap::new(Venue::Bybit, MarketKind::Spot, &specs).expect("valid")
+    }
+
+    #[test]
+    fn a_recorded_book_follows_its_update_ids() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut depths = 0;
+        for line in RECORDED_BOOK.lines() {
+            let mut out = Vec::new();
+            match super::decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+            depths += out.iter().filter(|o| o.kind == ObsKind::Depth).count();
+        }
+        assert!(depths >= 12, "{depths}");
+        let book = books.book("BTCUSDT");
+        assert!(
+            book.top(crate::book::Side::Bid, 1)[0].price
+                < book.top(crate::book::Side::Ask, 1)[0].price
+        );
+    }
+
+    #[test]
+    fn a_skipped_update_asks_for_a_resync() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut lines = RECORDED_BOOK
+            .lines()
+            .filter(|line| line.contains(r#""type":"#));
+        let snapshot = lines.next().expect("a snapshot");
+        super::decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
+        let _skipped = lines.next().expect("a delta");
+        let after = lines.next().expect("a later delta");
+        assert!(matches!(
+            super::decode(after.as_bytes(), &map, &mut books, RECV, &mut Vec::new()),
+            Err(DecodeError::Resync(_))
+        ));
     }
 }

@@ -89,6 +89,21 @@ struct Ticker<'a> {
     suspended: Option<bool>,
 }
 
+/// The session's entry point: [`decode_payload`], with the connection's books.
+///
+/// # Errors
+///
+/// As [`decode_payload`].
+pub fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    _books: &mut crate::book::Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    decode_payload(payload, map, local_recv_ns, out)
+}
+
 /// Decodes one Kraken Futures payload.
 ///
 /// # Errors

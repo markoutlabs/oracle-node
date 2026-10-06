@@ -609,6 +609,9 @@ impl NodeConfig {
         for ((venue, market), instruments) in by_venue {
             let connection = venue_connection(venue, market, &instruments)?;
             venues.entry(venue).or_default().push(connection);
+            if let Some(book) = book_connection(venue, market, &instruments) {
+                venues.entry(venue).or_default().push(book);
+            }
         }
         apply_endpoints(&self.endpoints, &mut binance, &mut venues)?;
 
@@ -674,6 +677,40 @@ fn apply_endpoints(
     Ok(())
 }
 
+/// A second connection for venues whose book lives on another endpoint:
+/// Coinbase's, on Advanced Trade. Only the instruments that want depth.
+fn book_connection(
+    venue: Venue,
+    market: MarketKind,
+    instruments: &[InstrumentSpec],
+) -> Option<VenueConnection> {
+    if venue != Venue::Coinbase {
+        return None;
+    }
+    let books: Vec<InstrumentSpec> = instruments
+        .iter()
+        .filter(|spec| spec.depth)
+        .cloned()
+        .collect();
+    if books.is_empty() {
+        return None;
+    }
+    let product_ids = books.iter().map(|spec| spec.venue_symbol.as_str());
+    Some(VenueConnection {
+        spec: VenueSpec {
+            venue,
+            market,
+            url: coinbase::BOOK_URL.to_owned(),
+            subscribe: coinbase::book_subscribe_frames(product_ids),
+            keepalive: None,
+            idle_timeout: VENUE_IDLE_TIMEOUT,
+            max_session: VENUE_MAX_SESSION,
+            decode: coinbase::decode_book,
+        },
+        instruments: books,
+    })
+}
+
 /// Builds one venue connection from its instruments.
 fn venue_connection(
     venue: Venue,
@@ -693,15 +730,15 @@ fn venue_connection(
     let (url, subscribe, keepalive, decode): Connection = match venue {
         Venue::Bybit => (
             bybit::url(market).to_owned(),
-            bybit::subscribe_frames(symbols(), market, VENUE_CHUNK),
+            bybit::subscribe_frames(with_depth(), market, VENUE_CHUNK),
             Some((bybit::KEEPALIVE, bybit::KEEPALIVE_PAYLOAD.to_owned())),
-            bybit::decode_payload,
+            bybit::decode,
         ),
         Venue::Okx => (
             okx::URL.to_owned(),
             okx::subscribe_frames(with_depth(), VENUE_CHUNK),
             Some((okx::KEEPALIVE, okx::KEEPALIVE_PAYLOAD.to_owned())),
-            okx::decode_payload,
+            okx::decode,
         ),
         // Coinbase's public feed is spot only. Its perpetuals live on Coinbase
         // International, whose market-data socket authenticates every
@@ -717,20 +754,20 @@ fn venue_connection(
             coinbase::URL.to_owned(),
             vec![coinbase::subscribe_frame(symbols())],
             None,
-            coinbase::decode_payload,
+            coinbase::decode,
         ),
         // Kraken spot and Kraken Futures share a brand and nothing else.
         Venue::Kraken if market.is_perp() => (
             kraken_futures::URL.to_owned(),
             vec![kraken_futures::subscribe_frame(symbols())],
             None,
-            kraken_futures::decode_payload,
+            kraken_futures::decode,
         ),
         Venue::Kraken => (
             kraken::URL.to_owned(),
-            vec![kraken::subscribe_frame(symbols())],
+            kraken::subscribe_frames(with_depth()),
             None,
-            kraken::decode_payload,
+            kraken::decode,
         ),
         // Deribit is a derivatives venue; its spot book is not worth pricing from.
         Venue::Deribit if !market.is_perp() => {
@@ -748,7 +785,7 @@ fn venue_connection(
             // catches a half-open one. Deribit's own heartbeat needs a reply to
             // each `test_request`, which this transport has no way to send.
             None,
-            deribit::decode_payload,
+            deribit::decode,
         ),
         Venue::Binance => {
             return Err(ConfigError::Invalid(

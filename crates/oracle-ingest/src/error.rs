@@ -71,6 +71,12 @@ pub enum DecodeError {
     /// Not an error condition; callers skip these silently.
     #[error("control message")]
     Control,
+
+    /// A local book can no longer be trusted: a checksum failed or an update was
+    /// missed. The session drops the connection, and the reconnect brings a
+    /// fresh snapshot.
+    #[error("book out of sync: {0}")]
+    Resync(String),
 }
 
 impl DecodeError {

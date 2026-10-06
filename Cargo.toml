@@ -67,6 +67,8 @@ getrandom = "0.3"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "x25519", "hkdfsha2", "aes"] }
 aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "alloc"] }
 hkdf = "0.12"
+# Book checksums (Kraken, OKX).
+crc32fast = "1"
 sha2 = "0.10"
 # Signs for venues that verify ed25519. Not ed25519-zebra, whose SigningKey is
 # Copy and so cannot be wiped; signing is deterministic, so either crate's

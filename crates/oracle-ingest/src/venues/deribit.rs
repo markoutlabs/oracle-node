@@ -25,10 +25,11 @@
 //! BTC. Every other venue reports base units, so the amounts are converted on the
 //! way in — see [`MarketKind::InversePerp`](oracle_types::MarketKind::InversePerp).
 
-use oracle_types::{Fixed, Level, MarketKind, ObsKind, Observation};
+use oracle_types::{Fixed, MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
@@ -44,9 +45,9 @@ pub const URL: &str = "wss://www.deribit.com/ws/api/v2";
 /// threshold for a fast feed.
 pub const TICKER_INTERVAL: &str = "100ms";
 
-/// The book channel: ungrouped prices, the top twenty levels, every 100ms. A
-/// grouped book sends whole snapshots, never increments.
-const BOOK_DEPTH: &str = "none.20.100ms";
+/// The book channel: a full snapshot, then the changes every 100ms, each
+/// naming the change before it.
+const BOOK_INTERVAL: &str = "100ms";
 
 /// Builds the subscribe frames for a set of Deribit instrument names, each with
 /// whether it wants depth snapshots.
@@ -61,7 +62,7 @@ pub fn subscribe_frames<'a>(
     let channels: Vec<String> = instruments
         .flat_map(|(name, depth)| {
             std::iter::once(format!("ticker.{name}.{TICKER_INTERVAL}"))
-                .chain(depth.then(|| format!("book.{name}.{BOOK_DEPTH}")))
+                .chain(depth.then(|| format!("book.{name}.{BOOK_INTERVAL}")))
         })
         .collect();
     channels
@@ -133,20 +134,85 @@ struct Ticker<'a> {
     funding_8h: Option<&'a RawValue>,
 }
 
-/// A grouped book snapshot. Levels are `[price, amount]`.
+/// A book message: a snapshot, or the levels that changed. Entries are
+/// `[action, price, amount]`, the action `new`, `change` or `delete`.
 #[derive(Deserialize)]
 struct Book<'a> {
     #[serde(rename = "instrument_name", borrow)]
     instrument_name: &'a str,
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
     /// Milliseconds.
     #[serde(default)]
     timestamp: Option<u64>,
+    change_id: u64,
     #[serde(default)]
-    change_id: Option<u64>,
+    prev_change_id: Option<u64>,
     #[serde(borrow, default)]
-    bids: Vec<[&'a RawValue; 2]>,
+    bids: Vec<(&'a str, &'a RawValue, &'a RawValue)>,
     #[serde(borrow, default)]
-    asks: Vec<[&'a RawValue; 2]>,
+    asks: Vec<(&'a str, &'a RawValue, &'a RawValue)>,
+}
+
+/// The session's entry point: the book channel is kept in `books`; every other
+/// channel goes to [`decode_payload`].
+///
+/// # Errors
+///
+/// As [`decode_payload`], and [`DecodeError::Resync`] when a change does not
+/// follow the last one.
+pub fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: &mut Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let book_data = match envelope.params {
+        Some(Params {
+            channel: Some(channel),
+            data: Some(data),
+        }) if envelope.method == Some("subscription") && channel.starts_with("book.") => data,
+        _ => return decode_payload(payload, map, local_recv_ns, out),
+    };
+    let message: Book<'_> =
+        serde_json::from_str(book_data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let name = message.instrument_name;
+    let Some(entry) = map.lookup(name) else {
+        return Err(DecodeError::Control);
+    };
+    let inverse = entry.instrument.market == MarketKind::InversePerp;
+    let book = books.book(name);
+    if message.kind == "snapshot" {
+        book.clear();
+    } else if message.prev_change_id != book.last_id {
+        return Err(DecodeError::Resync(format!(
+            "{name}: change follows {:?} but the book is at {:?}",
+            message.prev_change_id, book.last_id
+        )));
+    }
+    book.last_id = Some(message.change_id);
+    for (side, levels) in [(Side::Bid, &message.bids), (Side::Ask, &message.asks)] {
+        for (action, price, amount) in levels {
+            let price = decimal_literal("book price", price)?;
+            let qty = if *action == "delete" {
+                Fixed::ZERO
+            } else {
+                let amount = decimal_literal("book amount", amount)?;
+                to_base_units(amount, price, inverse).unwrap_or(Fixed::ZERO)
+            };
+            book.set(side, price, qty);
+        }
+    }
+    books.emit(
+        name,
+        entry.instrument.clone(),
+        message.timestamp.map(millis_to_nanos),
+        local_recv_ns,
+        out,
+    )
 }
 
 /// Decodes one Deribit payload.
@@ -173,9 +239,6 @@ pub fn decode_payload(
     else {
         return Err(DecodeError::Control);
     };
-    if channel.starts_with("book.") {
-        return decode_book(data, map, local_recv_ns, out);
-    }
     if !channel.starts_with("ticker.") {
         return Err(DecodeError::UnhandledStream(channel.to_owned()));
     }
@@ -261,45 +324,6 @@ pub fn decode_payload(
         Ok(())
     } else {
         Err(DecodeError::Control)
-    }
-}
-
-fn decode_book(
-    data: &RawValue,
-    map: &InstrumentMap,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let book: Book<'_> =
-        serde_json::from_str(data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let Some(entry) = map.lookup(book.instrument_name) else {
-        return Err(DecodeError::Control);
-    };
-    let inverse = entry.instrument.market == MarketKind::InversePerp;
-    let side = |levels: &[[&RawValue; 2]]| -> Result<Vec<Level>, DecodeError> {
-        let mut parsed = Vec::with_capacity(levels.len());
-        for [price, amount] in levels {
-            let price = decimal_literal("book price", price)?;
-            let amount = decimal_literal("book amount", amount)?;
-            if let Some(qty) = to_base_units(amount, price, inverse) {
-                parsed.push(Level { price, qty });
-            }
-        }
-        Ok(parsed)
-    };
-    match crate::depth::observation(
-        entry.instrument.clone(),
-        side(&book.bids)?,
-        side(&book.asks)?,
-        book.timestamp.map(millis_to_nanos),
-        local_recv_ns,
-        book.change_id,
-    ) {
-        Some(observation) => {
-            out.push(observation);
-            Ok(())
-        }
-        None => Err(DecodeError::Control),
     }
 }
 
@@ -532,26 +556,62 @@ mod tests {
     #[test]
     fn depth_adds_the_grouped_book_channel() {
         let frames = subscribe_frames([("BTC-PERPETUAL", true)].into_iter(), 100);
-        assert!(frames[0].contains("book.BTC-PERPETUAL.none.20.100ms"));
+        assert!(frames[0].contains("book.BTC-PERPETUAL.100ms"));
     }
 
-    const BOOK: &str = r#"{"jsonrpc":"2.0","method":"subscription","params":{
-        "channel":"book.BTC-PERPETUAL.none.20.100ms",
-        "data":{"timestamp":1754582400123,"instrument_name":"BTC-PERPETUAL","change_id":42,
-        "bids":[[64312.0,64312.0],[64311.5,128623.0]],
-        "asks":[[64313.0,32156.5],[64313.5,64313.5]]}}}"#;
+    /// Recorded from Deribit on 2026-10-06: the subscribe reply, a full
+    /// snapshot, and the changes after it.
+    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/deribit-book.jsonl");
 
-    /// An inverse contract's amounts are USD, so a level of 64312 USD at a
-    /// price of 64312 is one BTC.
+    fn book_map() -> InstrumentMap {
+        let specs = vec![
+            InstrumentSpec::new(
+                "BTC-PERPETUAL",
+                MarketKind::InversePerp,
+                "CRYPTO.BTC/USD.PERP_MARK",
+            )
+            .expect("valid")
+            .with_depth(),
+        ];
+        InstrumentMap::new(Venue::Deribit, MarketKind::InversePerp, &specs).expect("valid")
+    }
+
     #[test]
-    fn an_inverse_book_is_converted_to_base_units() {
-        let out = decode(BOOK, MarketKind::InversePerp, "BTC-PERPETUAL");
-        assert_eq!(out.len(), 1);
-        let depth = &out[0];
+    fn a_recorded_book_follows_its_changes_in_base_units() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut last = None;
+        for line in RECORDED_BOOK.lines() {
+            let mut out = Vec::new();
+            match super::decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+            last = out.pop().or(last);
+        }
+        let depth = last.expect("a depth observation");
         assert_eq!(depth.kind, ObsKind::Depth);
-        assert_eq!(depth.bid_qty, Some(Fixed::ONE));
-        assert_eq!(depth.seq, Some(42));
+        // USD amounts become BTC: a level is worth well under 1000 BTC.
         let book = depth.book.as_deref().expect("levels");
-        assert_eq!(book.bids[1].qty, "2".parse().expect("valid"));
+        assert!(book.bids[0].qty < "1000".parse().expect("valid"));
+        assert!(book.bids[0].price < book.asks[0].price);
+    }
+
+    #[test]
+    fn a_change_that_skips_one_asks_for_a_resync() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut lines = RECORDED_BOOK
+            .lines()
+            .filter(|line| line.contains(r#""type":"#));
+        let snapshot = lines.next().expect("a snapshot");
+        super::decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
+        let _skipped = lines.next().expect("a change");
+        let after = lines.next().expect("a later change");
+        assert!(matches!(
+            super::decode(after.as_bytes(), &map, &mut books, RECV, &mut Vec::new()),
+            Err(DecodeError::Resync(_))
+        ));
     }
 }

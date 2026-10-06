@@ -12,6 +12,7 @@ oracle-types.workspace = true
 
 async-trait.workspace = true
 backon.workspace = true
+crc32fast.workspace = true
 futures-util.workspace = true
 serde = { workspace = true }
 rustls.workspace = true

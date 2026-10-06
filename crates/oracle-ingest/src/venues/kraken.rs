@@ -17,6 +17,7 @@ use oracle_types::{Fixed, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::book::{Books, LocalBook, Side};
 use crate::{DecodeError, InstrumentMap};
 
 use super::{decimal_literal, rfc3339_to_unix_nanos};
@@ -24,7 +25,39 @@ use super::{decimal_literal, rfc3339_to_unix_nanos};
 /// The v2 public endpoint. The protocol differs substantially from v1.
 pub const URL: &str = "wss://ws.kraken.com/v2";
 
-/// Builds the subscribe frame for a set of Kraken symbols such as `BTC/USD`.
+/// Book levels kept per side. Kraken stops sending levels that fall out of the
+/// subscribed depth, so the local book is cut to it after every update.
+pub const BOOK_DEPTH: usize = 100;
+
+/// Levels per side the checksum covers.
+const CHECKSUM_LEVELS: usize = 10;
+
+/// Builds the subscribe frames for a set of Kraken symbols such as `BTC/USD`,
+/// each with whether it wants the book.
+#[must_use]
+pub fn subscribe_frames<'a>(instruments: impl Iterator<Item = (&'a str, bool)>) -> Vec<String> {
+    let instruments: Vec<(&str, bool)> = instruments.collect();
+    let mut frames = vec![subscribe_frame(
+        instruments.iter().map(|(symbol, _)| *symbol),
+    )];
+    let books: Vec<&str> = instruments
+        .iter()
+        .filter(|(_, depth)| *depth)
+        .map(|(symbol, _)| *symbol)
+        .collect();
+    if !books.is_empty() {
+        frames.push(
+            serde_json::json!({
+                "method": "subscribe",
+                "params": { "channel": "book", "symbol": books, "depth": BOOK_DEPTH },
+            })
+            .to_string(),
+        );
+    }
+    frames
+}
+
+/// Builds the ticker subscribe frame for a set of Kraken symbols.
 ///
 /// # Why `event_trigger: "bbo"`
 ///
@@ -76,6 +109,104 @@ struct Ticker<'a> {
     /// RFC 3339, present on snapshots and trade-triggered updates.
     #[serde(borrow, default)]
     timestamp: Option<&'a str>,
+}
+
+/// A `book` message: a snapshot, or the levels that changed.
+#[derive(Deserialize)]
+struct BookMessage<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    #[serde(borrow)]
+    data: Vec<BookData<'a>>,
+}
+
+#[derive(Deserialize)]
+struct BookData<'a> {
+    #[serde(borrow)]
+    symbol: &'a str,
+    #[serde(borrow, default)]
+    bids: Vec<BookLevel<'a>>,
+    #[serde(borrow, default)]
+    asks: Vec<BookLevel<'a>>,
+    checksum: u32,
+    #[serde(borrow, default)]
+    timestamp: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct BookLevel<'a> {
+    #[serde(borrow)]
+    price: &'a RawValue,
+    #[serde(borrow)]
+    qty: &'a RawValue,
+}
+
+/// The session's entry point: the book channel is kept in `books`; every other
+/// channel goes to [`decode_payload`].
+///
+/// # Errors
+///
+/// As [`decode_payload`], and [`DecodeError::Resync`] when a book's checksum
+/// fails.
+pub fn decode(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: &mut Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let envelope: Envelope<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    if envelope.channel != Some("book") {
+        return decode_payload(payload, map, local_recv_ns, out);
+    }
+    let message: BookMessage<'_> =
+        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    for data in message.data {
+        let Some(entry) = map.lookup(data.symbol) else {
+            continue;
+        };
+        let book = books.book(data.symbol);
+        if message.kind == "snapshot" {
+            book.clear();
+        }
+        for (side, levels) in [(Side::Bid, &data.bids), (Side::Ask, &data.asks)] {
+            for level in levels {
+                let (price, qty) = (level.price.get(), level.qty.get());
+                let parsed = crate::depth::level(price, qty)?;
+                book.set_with_text(side, parsed.price, parsed.qty, Some((price, qty)));
+            }
+        }
+        book.truncate(BOOK_DEPTH);
+        if checksum(book) != Some(data.checksum) {
+            return Err(DecodeError::Resync(format!(
+                "{}: checksum mismatch",
+                data.symbol
+            )));
+        }
+        books.emit(
+            data.symbol,
+            entry.instrument.clone(),
+            data.timestamp.and_then(rfc3339_to_unix_nanos),
+            local_recv_ns,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// Kraken's CRC32 over the top ten asks, then the top ten bids: each price and
+/// size as sent, without the decimal point and leading zeros.
+fn checksum(book: &LocalBook) -> Option<u32> {
+    let mut text = String::with_capacity(CHECKSUM_LEVELS * 2 * 24);
+    for side in [Side::Ask, Side::Bid] {
+        for (price, qty) in book.top_text(side, CHECKSUM_LEVELS)? {
+            for part in [price, qty] {
+                text.extend(part.chars().filter(|c| *c != '.').skip_while(|c| *c == '0'));
+            }
+        }
+    }
+    Some(crc32fast::hash(text.as_bytes()))
 }
 
 /// Decodes one Kraken v2 payload.
@@ -277,5 +408,77 @@ mod tests {
         assert!(frame.contains("BTC/USD"));
         // Without this the venue pushes only on trades and goes stale between them.
         assert!(frame.contains(r#""event_trigger":"bbo""#));
+    }
+
+    #[test]
+    fn depth_adds_a_book_subscription_at_the_kept_depth() {
+        let frames = subscribe_frames([("BTC/USD", true), ("ETH/USD", false)].into_iter());
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1].contains(r#""channel":"book""#));
+        assert!(frames[1].contains(r#""depth":100"#));
+        assert!(!frames[1].contains("ETH/USD"));
+        assert_eq!(subscribe_frames([("BTC/USD", false)].into_iter()).len(), 1);
+    }
+
+    /// Recorded from Kraken on 2026-10-06 at depth 100: the subscribe reply, the
+    /// snapshot, and the updates after it.
+    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/kraken-book.jsonl");
+
+    fn book_map() -> InstrumentMap {
+        let specs = vec![
+            InstrumentSpec::new("BTC/USD", MarketKind::Spot, "CRYPTO.BTC/USD")
+                .expect("valid")
+                .with_depth(),
+        ];
+        InstrumentMap::new(Venue::Kraken, MarketKind::Spot, &specs).expect("valid")
+    }
+
+    /// Every real update must keep the book on Kraken's checksum, and each one
+    /// emits the book's top levels.
+    #[test]
+    fn a_recorded_book_keeps_its_checksum() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut depths = 0;
+        for line in RECORDED_BOOK.lines() {
+            let mut out = Vec::new();
+            match super::decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+            depths += out.iter().filter(|o| o.kind == ObsKind::Depth).count();
+        }
+        assert!(depths >= 25, "{depths}");
+        let last = books.book("BTC/USD");
+        assert!(last.top(Side::Bid, 1)[0].price < last.top(Side::Ask, 1)[0].price);
+    }
+
+    /// One wrong checksum means a missed or misapplied update: nothing the book
+    /// says can be trusted until a fresh snapshot.
+    #[test]
+    fn a_checksum_mismatch_asks_for_a_resync() {
+        let map = book_map();
+        let mut books = Books::default();
+        let mut lines = RECORDED_BOOK
+            .lines()
+            .filter(|line| line.contains(r#""type":"#));
+        let snapshot = lines.next().expect("a snapshot");
+        assert!(snapshot.contains(r#""type":"snapshot""#));
+        super::decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
+
+        let update = lines.next().expect("an update");
+        let at = update.find(r#""checksum":"#).expect("a checksum") + 11;
+        let end = at
+            + update[at..]
+                .find(|c: char| !c.is_ascii_digit())
+                .expect("digits end");
+        let tampered = format!("{}0{}", &update[..at], &update[end..]);
+        let mut out = Vec::new();
+        assert!(matches!(
+            super::decode(tampered.as_bytes(), &map, &mut books, RECV, &mut out),
+            Err(DecodeError::Resync(_))
+        ));
+        assert!(out.is_empty());
     }
 }
