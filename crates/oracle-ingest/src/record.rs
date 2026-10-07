@@ -98,6 +98,13 @@ impl Recorder {
         }
     }
 
+    /// Stamps records with `clock`, so a recording shares the node's clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: MonotonicClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Records into a file, created or truncated.
     ///
     /// # Errors
@@ -202,8 +209,8 @@ impl<T: Transport> Transport for RecordingConn<T> {
     async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
         let received = self.inner.recv().await;
         // Stamped here, a few instructions before the session stamps the
-        // observation with its own clock. Close enough that a replay reproduces
-        // the staleness decisions the live node made.
+        // observation. The node gives both the same clock, so a replay
+        // reproduces the staleness decisions the live node made.
         let t = self.recorder.now_ns();
         let url = self.url.clone();
         match &received {

@@ -14,7 +14,7 @@ use clap::Args;
 use oracle_agg::AggError;
 use oracle_ingest::IngestEvent;
 use oracle_ingest::binance::snapshot::SnapshotConnector;
-use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
+use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
@@ -38,6 +38,11 @@ const INGEST_CAPACITY: usize = 8_192;
 /// Events applied before the changed feeds are evaluated. A burst then costs one
 /// pass over the feeds it touched, not one per event, and stays bounded.
 const BATCH_MAX: usize = 256;
+/// How often the node clock re-anchors to wall time.
+const CLOCK_SYNC_EVERY: Duration = Duration::from_secs(1);
+/// Normal drift is microseconds a second. A correction this large means the host
+/// clock stepped.
+const CLOCK_STEP_WARNING: u64 = 100_000_000;
 
 #[derive(Args)]
 pub(crate) struct StartArgs {
@@ -127,10 +132,14 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         shutdown.clone(),
     );
 
+    // One clock for receipt times and publish times, so a resync moves both.
+    let clock = MonotonicClock::new();
+    spawn_clock_sync(clock.clone(), shutdown.clone());
     let (ingest, connections) = spawn_ingest(
         resolved.binance,
         resolved.venues,
         args.record.as_deref(),
+        &clock,
         &shutdown,
     )?;
     let pipeline_task = tokio::spawn(
@@ -144,6 +153,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
             symbols,
             connections,
             latency: NodeLatency::default(),
+            clock,
             shutdown: shutdown.clone(),
         }
         .run(),
@@ -246,6 +256,7 @@ fn spawn_ingest(
         Vec<oracle_node::config::VenueConnection>,
     )>,
     record: Option<&Path>,
+    clock: &MonotonicClock,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<(mpsc::Receiver<IngestEvent>, usize)> {
     // The same adapters either way; `--record` only wraps the transport. The
@@ -255,10 +266,11 @@ fn spawn_ingest(
     let adapters = match record {
         Some(path) => {
             info!(path = %path.display(), "recording raw venue frames");
-            let connector = RecordingConnector::new(snapshots, Recorder::to_file(path)?);
-            build_adapters(binance, venues, connector, MonotonicClock::new())?
+            let recorder = Recorder::to_file(path)?.with_clock(clock.clone());
+            let connector = RecordingConnector::new(snapshots, recorder);
+            build_adapters(binance, venues, connector, clock.clone())?
         }
-        None => build_adapters(binance, venues, snapshots, MonotonicClock::new())?,
+        None => build_adapters(binance, venues, snapshots, clock.clone())?,
     };
 
     let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
@@ -292,6 +304,7 @@ struct PipelineTask {
     symbols: HashMap<FeedId, Symbol>,
     connections: usize,
     latency: NodeLatency,
+    clock: MonotonicClock,
     shutdown: CancellationToken,
 }
 
@@ -335,7 +348,7 @@ impl PipelineTask {
     }
 
     async fn run(mut self) {
-        let clock = MonotonicClock::new();
+        let clock = self.clock.clone();
         let mut ticker = tokio::time::interval(self.tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // `interval` fires at once; the first status is due after a full interval.
@@ -423,6 +436,29 @@ async fn shutdown_signal() -> std::io::Result<&'static str> {
 
 /// Runs the transport's clock: key rotation and deadlines every second, and a
 /// client-list poll when it comes from a URL.
+/// Keeps the node clock on wall time. A consumer compares publish times with its
+/// own clock.
+fn spawn_clock_sync(clock: MonotonicClock, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CLOCK_SYNC_EVERY);
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                _ = ticker.tick() => match clock.resync() {
+                    Resync::Stepped(step) if step > CLOCK_STEP_WARNING => {
+                        warn!(step_ms = step / 1_000_000, "the wall clock stepped forward; the node clock followed");
+                    }
+                    Resync::Slewing(lead) if lead > CLOCK_STEP_WARNING => {
+                        warn!(lead_ms = lead / 1_000_000, "the wall clock stepped back; the node clock runs slow until it matches");
+                    }
+                    Resync::Stepped(_) | Resync::Slewing(_) => {}
+                },
+            }
+        }
+    });
+}
+
 fn spawn_transport_tasks(
     transport: Arc<NodeTransport>,
     config: NodeConfig,

@@ -770,11 +770,11 @@ serves every feed in `node/all-feeds.toml` from the live venues. After a 15 s
 warm-up, it measures for `LATENCY_SECS` (default 60) and prints:
 
 ```text
-venue to node (venue clocks)  p50/p99 "binance 111.9/325.9 ms, bybit 82.4/95.0 ms, ..."
-venue data to signed (node)   p50 0.113 ms, p99 188.671 ms
-signed to SDK (delivery)      p50 1.33 ms, p90 1.82 ms, p99 28.66 ms, max 110.91 ms (n=971)
-venue data to SDK (data age)  p50 1.96 ms, p90 188.16 ms, p99 1258.49 ms, max 1655.81 ms (n=816)
-SDK processing                p50 0.09 ms, p90 0.27 ms, p99 4.00 ms, max 173.44 ms (n=971)
+venue to node (venue clocks)  p50/p99 "binance 132.1/384.5 ms, bybit 102.3/110.0 ms, ..."
+venue data to signed (node)   p50 0.123 ms, p99 193.151 ms
+signed to SDK (delivery)      p50 0.23 ms, p90 0.42 ms, p99 3.53 ms, max 8.31 ms (n=988)
+venue data to SDK (data age)  p50 0.36 ms, p90 174.97 ms, p99 1040.38 ms, max 1941.50 ms (n=919)
+SDK processing                p50 0.10 ms, p90 0.16 ms, p99 0.96 ms, max 6.42 ms (n=988)
 ```
 
 The node rows come from the node's second `status` and `venue lag` lines,
