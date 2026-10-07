@@ -26,13 +26,21 @@
 //! - `signature_matches_foundry` below checks a full signature against
 //!   `cast wallet sign`, confirming the `r ‖ s ‖ v` layout and the `v` offset of
 //!   27 are byte-identical to Ethereum's.
+//! - `layout_matches_an_independent_encoder` runs `vectors/check_layout.py`. It
+//!   builds every payload again from its JSON with Python's `struct`, from the
+//!   SPEC tables, and hashes with `cast keccak`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol, Venue};
+use oracle_types::{
+    BookLevel, BookUpdate, FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus,
+    Symbol, Venue, VenueEntry, VenueReport,
+};
 use oracle_wire::{
-    NodeEntry, Quorum, Registry, Signer, UnverifiedFrame, domain, encode_price_update, feed_id,
+    NodeEntry, Quorum, Registry, Signer, UnverifiedBookFrame, UnverifiedFrame,
+    UnverifiedVenueFrame, decode_book_update, decode_venue_report, domain, encode_book_update,
+    encode_price_update, encode_venue_report, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +63,32 @@ struct GoldenFile {
     feed_ids: Vec<FeedIdVector>,
     price_updates: Vec<UpdateVector>,
     registry: RegistryVector,
+    venue_reports: Vec<VenueReportVector>,
+    book_updates: Vec<BookUpdateVector>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct VenueReportVector {
+    name: String,
+    secret_key: String,
+    signer: String,
+    report: VenueReport,
+    payload: String,
+    digest: String,
+    signature: String,
+    frame: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct BookUpdateVector {
+    name: String,
+    secret_key: String,
+    signer: String,
+    update: BookUpdate,
+    payload: String,
+    digest: String,
+    signature: String,
+    frame: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -216,6 +250,162 @@ fn sample_updates() -> Vec<(&'static str, u8, PriceUpdate)> {
     ]
 }
 
+fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
+    VenueEntry {
+        venue,
+        market,
+        status,
+        weight_bps: 0,
+        bid: None,
+        ask: None,
+        bid_qty: None,
+        ask_qty: None,
+        impact_bid: None,
+        impact_ask: None,
+        mark: None,
+        index: None,
+        funding: None,
+        exchange_time_ns: None,
+        local_recv_ns: 0,
+    }
+}
+
+fn sample_venue_reports() -> Vec<(&'static str, VenueReport)> {
+    let usdt: Symbol = "CRYPTO.BTC/USDT".parse().expect("valid symbol");
+    let every_status = SourceStatus::ALL
+        .into_iter()
+        .zip(Venue::ALL.into_iter().cycle())
+        .map(|(status, venue)| VenueEntry {
+            weight_bps: 10_000,
+            bid: Some(i64::MAX),
+            ask: Some(i64::MIN),
+            bid_qty: Some(u64::MAX),
+            ask_qty: Some(0),
+            impact_bid: Some(-1),
+            impact_ask: Some(1),
+            mark: Some(i64::MAX),
+            index: Some(i64::MIN),
+            funding: Some(i64::MIN),
+            exchange_time_ns: Some(u64::MAX),
+            local_recv_ns: u64::MAX,
+            ..entry(venue, MarketKind::LinearPerp, status)
+        })
+        .collect();
+    vec![
+        (
+            "btc_usdt_three_venues",
+            VenueReport {
+                feed_id: feed_id(&usdt),
+                publish_time_ns: BASE_TIME_NS,
+                seq: 1_754_582_400_000,
+                expo: -8,
+                entries: vec![
+                    VenueEntry {
+                        weight_bps: 6_000,
+                        bid: Some(6_431_250_000_000),
+                        ask: Some(6_431_251_000_000),
+                        bid_qty: Some(107_005_000),
+                        ask_qty: Some(466_373_000),
+                        impact_bid: Some(6_431_240_000_000),
+                        impact_ask: Some(6_431_262_000_000),
+                        exchange_time_ns: Some(BASE_TIME_NS - 40_000_000),
+                        local_recv_ns: BASE_TIME_NS - 2_000_000,
+                        ..entry(Venue::Binance, MarketKind::Spot, SourceStatus::Used)
+                    },
+                    VenueEntry {
+                        mark: Some(6_432_000_000_000),
+                        index: Some(6_431_900_000_000),
+                        funding: Some(-12_500),
+                        local_recv_ns: BASE_TIME_NS - 3_000_000_000,
+                        ..entry(Venue::Deribit, MarketKind::InversePerp, SourceStatus::Stale)
+                    },
+                    entry(Venue::Kraken, MarketKind::Spot, SourceStatus::NoData),
+                ],
+            },
+        ),
+        (
+            "boundary_extremes",
+            VenueReport {
+                feed_id: FeedId::from_bytes([0xFF; 32]),
+                publish_time_ns: u64::MAX,
+                seq: u64::MAX,
+                expo: i32::MIN,
+                entries: every_status,
+            },
+        ),
+        (
+            "no_entries",
+            VenueReport {
+                feed_id: feed_id(&usdt),
+                publish_time_ns: BASE_TIME_NS,
+                seq: 1,
+                expo: -8,
+                entries: Vec::new(),
+            },
+        ),
+    ]
+}
+
+fn sample_book_updates() -> Vec<(&'static str, BookUpdate)> {
+    let level = |price, qty| BookLevel { price, qty };
+    vec![
+        (
+            "binance_snapshot",
+            BookUpdate {
+                venue: Venue::Binance,
+                market: MarketKind::Spot,
+                symbol: "BTCUSDT".to_owned(),
+                publish_time_ns: BASE_TIME_NS,
+                seq: 1_754_582_400_001,
+                snapshot: true,
+                exchange_time_ns: Some(BASE_TIME_NS - 40_000_000),
+                local_recv_ns: BASE_TIME_NS - 1_000_000,
+                bids: vec![
+                    level(8_377_800_000_000, 494_541_000),
+                    level(8_377_790_000_000, 12_000_000),
+                ],
+                asks: vec![
+                    level(8_377_801_000_000, 842_661_000),
+                    level(8_377_850_000_000, 3_000_000),
+                ],
+            },
+        ),
+        (
+            "okx_swap_delta",
+            BookUpdate {
+                venue: Venue::Okx,
+                market: MarketKind::LinearPerp,
+                symbol: "BTC-USDT-SWAP".to_owned(),
+                publish_time_ns: BASE_TIME_NS + 50_000_000,
+                seq: 1_754_582_400_002,
+                snapshot: false,
+                exchange_time_ns: None,
+                local_recv_ns: BASE_TIME_NS + 49_000_000,
+                bids: vec![level(8_378_000_000_000, 0)],
+                asks: vec![
+                    level(8_378_010_000_000, 158_930_282),
+                    level(8_378_100_000_000, 0),
+                ],
+            },
+        ),
+        (
+            "boundary_extremes",
+            BookUpdate {
+                venue: Venue::Deribit,
+                market: MarketKind::InversePerp,
+                symbol: "X".repeat(oracle_types::MAX_BOOK_SYMBOL),
+                publish_time_ns: u64::MAX,
+                seq: u64::MAX,
+                snapshot: false,
+                exchange_time_ns: Some(u64::MAX),
+                local_recv_ns: u64::MAX,
+                bids: vec![level(i64::MAX, u64::MAX), level(i64::MIN, 0)],
+                asks: vec![level(i64::MIN, 0), level(i64::MAX, u64::MAX)],
+            },
+        ),
+    ]
+}
+
 fn build() -> GoldenFile {
     let feed_ids = [
         "CRYPTO.BTC/USD",
@@ -277,6 +467,41 @@ fn build() -> GoldenFile {
     .expect("signs");
     let registry_bytes = registry.to_signing_bytes().expect("encodes");
 
+    // The registry's node signs these too, so stored frames verify against it.
+    let (node_secret, node) = signer_from(0x11);
+    let venue_reports = sample_venue_reports()
+        .into_iter()
+        .map(|(name, report)| {
+            let signed = node.sign_venue_report(&report).expect("encodes");
+            VenueReportVector {
+                name: name.to_owned(),
+                secret_key: hex0x(&node_secret),
+                signer: node.address().to_string(),
+                report,
+                payload: hex0x(signed.payload()),
+                digest: hex0x(&domain::digest(signed.payload())),
+                signature: signed.signature().to_string(),
+                frame: hex0x(&signed.encode_frame()),
+            }
+        })
+        .collect();
+    let book_updates = sample_book_updates()
+        .into_iter()
+        .map(|(name, update)| {
+            let signed = node.sign_book_update(&update).expect("encodes");
+            BookUpdateVector {
+                name: name.to_owned(),
+                secret_key: hex0x(&node_secret),
+                signer: node.address().to_string(),
+                update,
+                payload: hex0x(signed.payload()),
+                digest: hex0x(&domain::digest(signed.payload())),
+                signature: signed.signature().to_string(),
+                frame: hex0x(&signed.encode_frame()),
+            }
+        })
+        .collect();
+
     GoldenFile {
         note: "Frozen protocol vectors. A diff here means the wire format changed \
                and previously-issued signatures no longer verify."
@@ -296,6 +521,8 @@ fn build() -> GoldenFile {
             digest: hex0x(&domain::digest(&registry_bytes)),
             registry,
         },
+        venue_reports,
+        book_updates,
     }
 }
 
@@ -386,6 +613,14 @@ fn golden_vectors_are_unchanged() {
         generated.registry, expected.registry,
         "registry encoding changed"
     );
+    assert_eq!(
+        generated.venue_reports, expected.venue_reports,
+        "venue report encoding changed"
+    );
+    assert_eq!(
+        generated.book_updates, expected.book_updates,
+        "book update encoding changed"
+    );
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.
@@ -415,6 +650,23 @@ fn stored_frames_verify_against_the_stored_registry() {
 
     assert_eq!(verified.update(), &vector.update);
     assert_eq!(verified.signer().to_string(), vector.signer);
+
+    for vector in &file.venue_reports {
+        let frame = hex::decode(vector.frame.trim_start_matches("0x")).expect("valid hex");
+        let verified = UnverifiedVenueFrame::parse(&frame)
+            .expect("frame parses")
+            .verify(&registry)
+            .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
+        assert_eq!(verified.report(), &vector.report);
+    }
+    for vector in &file.book_updates {
+        let frame = hex::decode(vector.frame.trim_start_matches("0x")).expect("valid hex");
+        let verified = UnverifiedBookFrame::parse(&frame)
+            .expect("frame parses")
+            .verify(&registry)
+            .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
+        assert_eq!(verified.update(), &vector.update);
+    }
 }
 
 /// Decoding the stored payload must reproduce the stored logical update, and
@@ -432,6 +684,29 @@ fn stored_payloads_round_trip() {
         );
         assert_eq!(
             hex0x(&encode_price_update(&decoded)),
+            vector.payload,
+            "`{}` did not re-encode identically",
+            vector.name
+        );
+    }
+    let file = load();
+    for vector in file.venue_reports {
+        let bytes = hex::decode(vector.payload.trim_start_matches("0x")).expect("valid hex");
+        let decoded = decode_venue_report(&bytes).expect("decodes");
+        assert_eq!(decoded, vector.report, "`{}`", vector.name);
+        assert_eq!(
+            hex0x(&encode_venue_report(&decoded).expect("encodes")),
+            vector.payload,
+            "`{}` did not re-encode identically",
+            vector.name
+        );
+    }
+    for vector in file.book_updates {
+        let bytes = hex::decode(vector.payload.trim_start_matches("0x")).expect("valid hex");
+        let decoded = decode_book_update(&bytes).expect("decodes");
+        assert_eq!(decoded, vector.update, "`{}`", vector.name);
+        assert_eq!(
+            hex0x(&encode_book_update(&decoded).expect("encodes")),
             vector.payload,
             "`{}` did not re-encode identically",
             vector.name
@@ -456,33 +731,73 @@ fn signature_matches_foundry() {
     };
 
     let file = load();
-    for vector in &file.price_updates {
+    let signed = file
+        .price_updates
+        .iter()
+        .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature))
+        .chain(
+            file.venue_reports
+                .iter()
+                .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature)),
+        )
+        .chain(
+            file.book_updates
+                .iter()
+                .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature)),
+        );
+    for (name, digest, secret_key, signature) in signed {
         let output = std::process::Command::new(&cast)
             .args([
                 "wallet",
                 "sign",
                 "--no-hash",
-                &vector.digest,
+                digest,
                 "--private-key",
-                &vector.secret_key,
+                secret_key,
             ])
             .output()
             .expect("runs cast");
         assert!(
             output.status.success(),
-            "cast failed for `{}`: {}",
-            vector.name,
+            "cast failed for `{name}`: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let produced = String::from_utf8_lossy(&output.stdout)
             .trim()
             .to_lowercase();
         assert_eq!(
-            produced, vector.signature,
-            "`{}`: our signature bytes differ from foundry's",
-            vector.name
+            &produced, signature,
+            "`{name}`: our signature bytes differ from foundry's"
         );
     }
+}
+
+/// Builds every stored payload again in Python, from its JSON and the SPEC
+/// tables, and hashes it with `cast keccak`: neither the layout nor the hash
+/// comes from this crate.
+///
+/// Skipped when `python3` or `cast` is not installed.
+#[test]
+fn layout_matches_an_independent_encoder() {
+    if which_cast().is_err() {
+        eprintln!("skipping: `cast` not found on PATH");
+        return;
+    }
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/check_layout.py");
+    let Ok(output) = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(vectors_path())
+        .output()
+    else {
+        eprintln!("skipping: `python3` not found");
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn which_cast() -> Result<String, ()> {

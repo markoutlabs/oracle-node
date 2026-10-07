@@ -122,7 +122,11 @@ impl BookPublisher {
     }
 
     /// Returns the frames that are due.
-    pub fn poll(&mut self, now_ns: u64) -> Vec<BookUpdate> {
+    ///
+    /// Snapshots go out whether or not anyone `wanted` the book, so the server
+    /// always has one for the next subscriber. A delta nobody wants is not
+    /// built and takes no `seq`: the next one builds on the last frame sent.
+    pub fn poll(&mut self, now_ns: u64, wanted: impl Fn(&InstrumentId) -> bool) -> Vec<BookUpdate> {
         let min_interval = nanos(MIN_INTERVAL);
         let snapshot_every = nanos(SNAPSHOT_EVERY);
         let mut updates = Vec::new();
@@ -137,7 +141,7 @@ impl BookPublisher {
                 || state
                     .last_snapshot_ns
                     .is_none_or(|last| now_ns.saturating_sub(last) >= snapshot_every);
-            if !snapshot && !state.dirty {
+            if !snapshot && (!state.dirty || !wanted(instrument)) {
                 continue;
             }
             let current = Levels::of(state.current.as_deref());
@@ -287,7 +291,7 @@ mod tests {
     fn a_book_starts_with_a_snapshot_then_sends_only_what_changed() {
         let mut publisher = BookPublisher::new(100);
         publisher.observe(&depth(&[("100", "1"), ("99", "2")], &[("101", "1")], START));
-        let first = publisher.poll(START);
+        let first = publisher.poll(START, |_| true);
         let [snapshot] = first.as_slice() else {
             panic!("one book, one frame: {first:?}");
         };
@@ -301,7 +305,7 @@ mod tests {
             &[("101", "1"), ("102", "4")],
             later,
         ));
-        let second = publisher.poll(later);
+        let second = publisher.poll(later, |_| true);
         let [delta] = second.as_slice() else {
             panic!("one delta: {second:?}");
         };
@@ -339,32 +343,59 @@ mod tests {
     fn frames_follow_the_cap_and_the_snapshot_interval() {
         let mut publisher = BookPublisher::new(0);
         publisher.observe(&depth(&[("100", "1")], &[("101", "1")], START));
-        assert_eq!(publisher.poll(START).len(), 1);
+        assert_eq!(publisher.poll(START, |_| true).len(), 1);
 
         let soon = START + 10_000_000;
         publisher.observe(&depth(&[("100", "2")], &[("101", "1")], soon));
-        assert!(publisher.poll(soon).is_empty(), "inside the cap");
+        assert!(publisher.poll(soon, |_| true).is_empty(), "inside the cap");
         assert_eq!(
-            publisher.poll(START + 50_000_000).len(),
+            publisher.poll(START + 50_000_000, |_| true).len(),
             1,
             "the cap expired"
         );
         assert!(
-            publisher.poll(START + 500_000_000).is_empty(),
+            publisher.poll(START + 500_000_000, |_| true).is_empty(),
             "nothing changed"
         );
-        let refreshed = publisher.poll(START + SECOND);
+        let refreshed = publisher.poll(START + SECOND, |_| true);
         assert!(refreshed.first().is_some_and(|update| update.snapshot));
+    }
+
+    #[test]
+    fn a_book_nobody_wants_sends_only_snapshots_and_stays_contiguous() {
+        let mut publisher = BookPublisher::new(0);
+        publisher.observe(&depth(&[("100", "1")], &[("101", "1")], START));
+        let snapshot = publisher.poll(START, |_| false);
+        assert!(
+            snapshot
+                .first()
+                .is_some_and(|update| update.snapshot && update.seq == 1)
+        );
+
+        let later = START + 100_000_000;
+        publisher.observe(&depth(&[("100", "2")], &[("101", "1")], later));
+        assert!(
+            publisher.poll(later, |_| false).is_empty(),
+            "no delta for nobody"
+        );
+
+        let joined = later + 100_000_000;
+        let delta = publisher.poll(joined, |_| true);
+        let [delta] = delta.as_slice() else {
+            panic!("one delta: {delta:?}");
+        };
+        assert_eq!(delta.seq, 2, "no seq was spent on the skipped delta");
+        assert_eq!(delta.bids, vec![level("100", "2")]);
     }
 
     #[test]
     fn a_dropped_connection_sends_an_empty_snapshot() {
         let mut publisher = BookPublisher::new(0);
         publisher.observe(&depth(&[("100", "1")], &[("101", "1")], START));
-        let _ = publisher.poll(START);
+        let _ = publisher.poll(START, |_| true);
         publisher.reset(Venue::Binance, MarketKind::Spot);
         let after = START + 100_000_000;
-        let frames = publisher.poll(after);
+        let frames = publisher.poll(after, |_| true);
         let [empty] = frames.as_slice() else {
             panic!("one frame: {frames:?}");
         };

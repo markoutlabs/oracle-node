@@ -226,6 +226,18 @@ impl SignedBookUpdate {
         self.signer
     }
 
+    /// Returns the canonical signed bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Returns the signature.
+    #[must_use]
+    pub const fn signature(&self) -> Signature {
+        self.signature
+    }
+
     /// Encodes the wire frame.
     #[must_use]
     pub fn encode_frame(&self) -> Vec<u8> {

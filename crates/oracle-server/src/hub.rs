@@ -515,6 +515,27 @@ impl Hub {
         }
     }
 
+    /// Returns `true` if an open subscriber wants `feed_id` on `channel`. The
+    /// node skips signing what nobody wants.
+    #[must_use]
+    pub fn has_subscriber(&self, channel: Channel, feed_id: FeedId) -> bool {
+        self.subscribers.lock().is_ok_and(|subscribers| {
+            subscribers
+                .values()
+                .any(|subscriber| !subscriber.is_closed() && subscriber.wants(channel, feed_id))
+        })
+    }
+
+    /// Returns `true` if an open subscriber wants `book`.
+    #[must_use]
+    pub fn has_book_subscriber(&self, book: &InstrumentId) -> bool {
+        self.subscribers.lock().is_ok_and(|subscribers| {
+            subscribers
+                .values()
+                .any(|subscriber| !subscriber.is_closed() && subscriber.wants_book(book))
+        })
+    }
+
     /// Returns the current subscriber count.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {

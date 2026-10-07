@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
-use oracle_types::{FeedId, PriceUpdate};
+use oracle_types::{FeedId, InstrumentId, PriceUpdate};
 use oracle_wire::{SignedBookUpdate, SignedUpdate, SignedVenueReport, Signer, WireError};
 
 use crate::books::BookPublisher;
@@ -131,12 +131,17 @@ impl Pipeline {
         self.sign(polled)
     }
 
-    /// Signs the venue reports that are due. Call it after [`Self::flush`] or
-    /// [`Self::tick`], so that each report carries that evaluation's statuses.
-    pub fn venue_reports(&mut self, now_ns: u64) -> (Vec<SignedVenueReport>, Vec<WireError>) {
+    /// Signs the venue reports that are due for the feeds that `wanted` takes.
+    /// Call it after [`Self::flush`] or [`Self::tick`], so that each report
+    /// carries that evaluation's statuses.
+    pub fn venue_reports(
+        &mut self,
+        now_ns: u64,
+        wanted: impl Fn(FeedId) -> bool,
+    ) -> (Vec<SignedVenueReport>, Vec<WireError>) {
         let mut signed = Vec::new();
         let mut errors = Vec::new();
-        for report in self.aggregator.poll_venues(now_ns) {
+        for report in self.aggregator.poll_venues(now_ns, wanted) {
             match self.signer.sign_venue_report(&report) {
                 Ok(report) => signed.push(report),
                 Err(error) => errors.push(error),
@@ -145,11 +150,16 @@ impl Pipeline {
         (signed, errors)
     }
 
-    /// Signs the book frames that are due.
-    pub fn book_updates(&mut self, now_ns: u64) -> (Vec<SignedBookUpdate>, Vec<WireError>) {
+    /// Signs the book frames that are due. Deltas only for the books that
+    /// `wanted` takes; see [`BookPublisher::poll`].
+    pub fn book_updates(
+        &mut self,
+        now_ns: u64,
+        wanted: impl Fn(&InstrumentId) -> bool,
+    ) -> (Vec<SignedBookUpdate>, Vec<WireError>) {
         let mut signed = Vec::new();
         let mut errors = Vec::new();
-        for update in self.books.poll(now_ns) {
+        for update in self.books.poll(now_ns, wanted) {
             match self.signer.sign_book_update(&update) {
                 Ok(update) => signed.push(update),
                 Err(error) => errors.push(error),
@@ -294,7 +304,7 @@ mod tests {
         pipeline.observe(&book(Venue::Binance, "64000", START));
         pipeline.observe(&book(Venue::Bybit, "64000", START));
         let _ = pipeline.tick(START);
-        let (reports, errors) = pipeline.venue_reports(START);
+        let (reports, errors) = pipeline.venue_reports(START, |_| true);
         assert!(errors.is_empty(), "{errors:?}");
 
         let report = reports.first().expect("one report");
@@ -310,7 +320,7 @@ mod tests {
             "{decoded:?}"
         );
         assert!(
-            pipeline.venue_reports(START).0.is_empty(),
+            pipeline.venue_reports(START, |_| true).0.is_empty(),
             "nothing new, no report"
         );
     }

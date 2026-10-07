@@ -18,7 +18,7 @@ use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
-use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
+use oracle_server::{Channel, NodeTransport, ServerState, TransportConfig, router, unix_now};
 use oracle_types::{FeedId, InstrumentId, Symbol};
 use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList};
 use tokio::sync::mpsc;
@@ -359,14 +359,19 @@ impl PipelineTask {
 
     /// Venue reports and book frames go out after each evaluation.
     fn publish_venues(&mut self, now_ns: u64) {
-        let (reports, errors) = self.pipeline.venue_reports(now_ns);
+        let hub = Arc::clone(self.state.hub());
+        let (reports, errors) = self
+            .pipeline
+            .venue_reports(now_ns, |feed| hub.has_subscriber(Channel::Venues, feed));
         for error in errors {
             warn!(%error, "venue report could not be encoded");
         }
         for report in reports {
             let _ = self.state.publish_venues(report);
         }
-        let (books, errors) = self.pipeline.book_updates(now_ns);
+        let (books, errors) = self
+            .pipeline
+            .book_updates(now_ns, |book| hub.has_book_subscriber(book));
         for error in errors {
             warn!(%error, "book update could not be encoded");
         }

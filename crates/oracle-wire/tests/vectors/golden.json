@@ -188,5 +188,342 @@
     },
     "signing_bytes": "0x01820000000000000001000000006894cd80000300050000000119e7e376e7c213b7e7e7e46cc70a5dd086daff2a00010001001e7773733a2f2f6575312e6f7261636c652e6578616d706c652f76322f7773",
     "digest": "0xc245f51e70fb4a10ffb35ac2cf68025da7e1f24014ab9ae6a00851220997f8f1"
-  }
+  },
+  "venue_reports": [
+    {
+      "name": "btc_usdt_three_venues",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "report": {
+        "feed_id": "0xf8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b52",
+        "publish_time_ns": "1754582400000000000",
+        "seq": "1754582400000",
+        "expo": -8,
+        "entries": [
+          {
+            "venue": "binance",
+            "market": "spot",
+            "status": "used",
+            "weight_bps": 6000,
+            "bid": "6431250000000",
+            "ask": "6431251000000",
+            "bid_qty": "107005000",
+            "ask_qty": "466373000",
+            "impact_bid": "6431240000000",
+            "impact_ask": "6431262000000",
+            "mark": null,
+            "index": null,
+            "funding": null,
+            "exchange_time_ns": "1754582399960000000",
+            "local_recv_ns": "1754582399998000000"
+          },
+          {
+            "venue": "deribit",
+            "market": "inverse_perp",
+            "status": "stale",
+            "weight_bps": 0,
+            "bid": null,
+            "ask": null,
+            "bid_qty": null,
+            "ask_qty": null,
+            "impact_bid": null,
+            "impact_ask": null,
+            "mark": "6432000000000",
+            "index": "6431900000000",
+            "funding": "-12500",
+            "exchange_time_ns": null,
+            "local_recv_ns": "1754582397000000000"
+          },
+          {
+            "venue": "kraken",
+            "market": "spot",
+            "status": "no_data",
+            "weight_bps": 0,
+            "bid": null,
+            "ask": null,
+            "bid_qty": null,
+            "ask_qty": null,
+            "impact_bid": null,
+            "impact_ask": null,
+            "mark": null,
+            "index": null,
+            "funding": null,
+            "exchange_time_ns": null,
+            "local_recv_ns": "0"
+          }
+        ]
+      },
+      "payload": "0x0103f8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b521859876589270000000001988542bc00fffffff803000000023f1770000005d9645f2880000005d9646e6ac0000000000660c448000000001bcc4988000005d963c69200000005d9651643800000000000000000000000000000000000000000000000001859876586c4a6001859876589087b8005020201c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005d991134000000005d98b1d5f00ffffffffffffcf2c000000000000000018598764d656a2000400040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "digest": "0x3c0bd217dc36854836a97de125d3dcd886d5ad91360bcadcf636ee4a820ed190",
+      "signature": "0x24f14101e61218000d51a471c5ed7c92882b0cb6aba956a2371bd92b197f6f0f46eeafa3aab015159ef02180e6c462f5b94369e63f9a232813fe5c7d43542aff1b",
+      "frame": "0x0219e7e376e7c213b7e7e7e46cc70a5dd086daff2a0103f8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b521859876589270000000001988542bc00fffffff803000000023f1770000005d9645f2880000005d9646e6ac0000000000660c448000000001bcc4988000005d963c69200000005d9651643800000000000000000000000000000000000000000000000001859876586c4a6001859876589087b8005020201c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005d991134000000005d98b1d5f00ffffffffffffcf2c000000000000000018598764d656a200040004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000024f14101e61218000d51a471c5ed7c92882b0cb6aba956a2371bd92b197f6f0f46eeafa3aab015159ef02180e6c462f5b94369e63f9a232813fe5c7d43542aff1b"
+    },
+    {
+      "name": "boundary_extremes",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "report": {
+        "feed_id": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "publish_time_ns": "18446744073709551615",
+        "seq": "18446744073709551615",
+        "expo": -2147483648,
+        "entries": [
+          {
+            "venue": "binance",
+            "market": "linear_perp",
+            "status": "used",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "bybit",
+            "market": "linear_perp",
+            "status": "outlier",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "okx",
+            "market": "linear_perp",
+            "status": "stale",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "coinbase",
+            "market": "linear_perp",
+            "status": "crossed",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "kraken",
+            "market": "linear_perp",
+            "status": "no_data",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "deribit",
+            "market": "linear_perp",
+            "status": "invalid",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          },
+          {
+            "venue": "binance",
+            "market": "linear_perp",
+            "status": "feed_halted",
+            "weight_bps": 10000,
+            "bid": "9223372036854775807",
+            "ask": "-9223372036854775808",
+            "bid_qty": "18446744073709551615",
+            "ask_qty": "0",
+            "impact_bid": "-1",
+            "impact_ask": "1",
+            "mark": "9223372036854775807",
+            "index": "-9223372036854775808",
+            "funding": "-9223372036854775808",
+            "exchange_time_ns": "18446744073709551615",
+            "local_recv_ns": "18446744073709551615"
+          }
+        ]
+      },
+      "payload": "0x0103ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff800000000700010003ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff01010103ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff02010203ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff03010303ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff04010403ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff05010503ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff00010603ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff",
+      "digest": "0x2e517ef1eb6b3ff4f38780b649f982abcb689aee34df76f4f9e92f7b9b65264b",
+      "signature": "0x7152d618bea65b777ffb4fb3cf00481f96aedffc6b6db7c5e2f0946eadd94489169cd75f8e0e88f09424b91a2777a5056118d57281a28b8dfedf78bd140af7d91b",
+      "frame": "0x0219e7e376e7c213b7e7e7e46cc70a5dd086daff2a0103ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff800000000700010003ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff01010103ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff02010203ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff03010303ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff04010403ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff05010503ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff00010603ff27107fffffffffffffff8000000000000000ffffffffffffffff0000000000000000ffffffffffffffff00000000000000017fffffffffffffff80000000000000008000000000000000ffffffffffffffffffffffffffffffff7152d618bea65b777ffb4fb3cf00481f96aedffc6b6db7c5e2f0946eadd94489169cd75f8e0e88f09424b91a2777a5056118d57281a28b8dfedf78bd140af7d91b"
+    },
+    {
+      "name": "no_entries",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "report": {
+        "feed_id": "0xf8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b52",
+        "publish_time_ns": "1754582400000000000",
+        "seq": "1",
+        "expo": -8,
+        "entries": []
+      },
+      "payload": "0x0103f8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b5218598765892700000000000000000001fffffff800",
+      "digest": "0xc3fe12f822044ca67ecce61a650df1ea32ab407faed05c45ae3a5d61c474adbd",
+      "signature": "0x948e9993c0303de54aa122dd1322022d4077f449df1a9ad09b635a3561a3463e02bf3dd6a2f45d0a84718f95ce548ba75c8420166d65e4b05e880d5ab8650ce51b",
+      "frame": "0x0219e7e376e7c213b7e7e7e46cc70a5dd086daff2a0103f8e0c6b396a831650eced3ac35b166f564b62a172ce533ce8671d8629ceb6b5218598765892700000000000000000001fffffff800948e9993c0303de54aa122dd1322022d4077f449df1a9ad09b635a3561a3463e02bf3dd6a2f45d0a84718f95ce548ba75c8420166d65e4b05e880d5ab8650ce51b"
+    }
+  ],
+  "book_updates": [
+    {
+      "name": "binance_snapshot",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "update": {
+        "venue": "binance",
+        "market": "spot",
+        "symbol": "BTCUSDT",
+        "publish_time_ns": "1754582400000000000",
+        "seq": "1754582400001",
+        "snapshot": true,
+        "exchange_time_ns": "1754582399960000000",
+        "local_recv_ns": "1754582399999000000",
+        "bids": [
+          {
+            "price": "8377800000000",
+            "qty": "494541000"
+          },
+          {
+            "price": "8377790000000",
+            "qty": "12000000"
+          }
+        ],
+        "asks": [
+          {
+            "price": "8377801000000",
+            "qty": "842661000"
+          },
+          {
+            "price": "8377850000000",
+            "qty": "3000000"
+          }
+        ]
+      },
+      "payload": "0x0104000007425443555344541859876589270000000001988542bc0101fffffff8fffffff81859876586c4a600185987658917bdc002020000079e9bcb0200000000001d7a18c80000079e9b326b800000000000b71b000000079e9bda4440000000003239fc880000079e9ec5f28000000000002dc6c0",
+      "digest": "0x94e83f8e06720da85917732a24bf45946db48b16762e43052ed05219b82aa6e3",
+      "signature": "0xf2f0089618bd7f504ee94b36d769a559e0bbdbb56185d0efca56d688ce9638805a036e00a8b6f55536effe2a579b235afaac98ad6c4911ad49add51fa0293b941b",
+      "frame": "0x0319e7e376e7c213b7e7e7e46cc70a5dd086daff2a0104000007425443555344541859876589270000000001988542bc0101fffffff8fffffff81859876586c4a600185987658917bdc002020000079e9bcb0200000000001d7a18c80000079e9b326b800000000000b71b000000079e9bda4440000000003239fc880000079e9ec5f28000000000002dc6c0f2f0089618bd7f504ee94b36d769a559e0bbdbb56185d0efca56d688ce9638805a036e00a8b6f55536effe2a579b235afaac98ad6c4911ad49add51fa0293b941b"
+    },
+    {
+      "name": "okx_swap_delta",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "update": {
+        "venue": "okx",
+        "market": "linear_perp",
+        "symbol": "BTC-USDT-SWAP",
+        "publish_time_ns": "1754582400050000000",
+        "seq": "1754582400002",
+        "snapshot": false,
+        "exchange_time_ns": null,
+        "local_recv_ns": "1754582400049000000",
+        "bids": [
+          {
+            "price": "8378000000000",
+            "qty": "0"
+          }
+        ],
+        "asks": [
+          {
+            "price": "8378010000000",
+            "qty": "158930282"
+          },
+          {
+            "price": "8378100000000",
+            "qty": "0"
+          }
+        ]
+      },
+      "payload": "0x010402010d4254432d555344542d53574150185987658c21f080000001988542bc0200fffffff8fffffff80000000000000000185987658c12ae4001020000079ea7b6c40000000000000000000000079ea84f5a80000000000979156a0000079eadaca5000000000000000000",
+      "digest": "0x8348a534d0f1b90c0113da79f0c270fea6985453bb7e6f2c3a572facb2f7cc23",
+      "signature": "0xdd5fa35aca1c0b97d655ab3c66a427b07a72f53a19c5f2a075cf2d0cb5caecd5450d6173bca1e43db43a5d0891b28cbb2ac3aed86336a2379c89a294c0b6e4151b",
+      "frame": "0x0319e7e376e7c213b7e7e7e46cc70a5dd086daff2a010402010d4254432d555344542d53574150185987658c21f080000001988542bc0200fffffff8fffffff80000000000000000185987658c12ae4001020000079ea7b6c40000000000000000000000079ea84f5a80000000000979156a0000079eadaca5000000000000000000dd5fa35aca1c0b97d655ab3c66a427b07a72f53a19c5f2a075cf2d0cb5caecd5450d6173bca1e43db43a5d0891b28cbb2ac3aed86336a2379c89a294c0b6e4151b"
+    },
+    {
+      "name": "boundary_extremes",
+      "secret_key": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+      "update": {
+        "venue": "deribit",
+        "market": "inverse_perp",
+        "symbol": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "publish_time_ns": "18446744073709551615",
+        "seq": "18446744073709551615",
+        "snapshot": false,
+        "exchange_time_ns": "18446744073709551615",
+        "local_recv_ns": "18446744073709551615",
+        "bids": [
+          {
+            "price": "9223372036854775807",
+            "qty": "18446744073709551615"
+          },
+          {
+            "price": "-9223372036854775808",
+            "qty": "0"
+          }
+        ],
+        "asks": [
+          {
+            "price": "-9223372036854775808",
+            "qty": "0"
+          },
+          {
+            "price": "9223372036854775807",
+            "qty": "18446744073709551615"
+          }
+        ]
+      },
+      "payload": "0x01040502205858585858585858585858585858585858585858585858585858585858585858ffffffffffffffffffffffffffffffff00fffffff8fffffff8ffffffffffffffffffffffffffffffff02027fffffffffffffffffffffffffffffff80000000000000000000000000000000800000000000000000000000000000007fffffffffffffffffffffffffffffff",
+      "digest": "0x7c0d8a8dcbcf34ddc0a3374ebfe71303f4b1e297ab3fdf399509df55449e3da0",
+      "signature": "0xc6b2cc51b7b6491e5dc374192aad820c92e948c5ddaef1fbb44c1a60116681fa48d078f1877ddb6da7da0f9dffd513ea5e9940c8dc7456ad8d16661153e44f911c",
+      "frame": "0x0319e7e376e7c213b7e7e7e46cc70a5dd086daff2a01040502205858585858585858585858585858585858585858585858585858585858585858ffffffffffffffffffffffffffffffff00fffffff8fffffff8ffffffffffffffffffffffffffffffff02027fffffffffffffffffffffffffffffff80000000000000000000000000000000800000000000000000000000000000007fffffffffffffffffffffffffffffffc6b2cc51b7b6491e5dc374192aad820c92e948c5ddaef1fbb44c1a60116681fa48d078f1877ddb6da7da0f9dffd513ea5e9940c8dc7456ad8d16661153e44f911c"
+    }
+  ]
 }

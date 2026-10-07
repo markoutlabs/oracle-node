@@ -258,6 +258,12 @@ impl SignedVenueReport {
         self.signer
     }
 
+    /// Returns the signature.
+    #[must_use]
+    pub const fn signature(&self) -> Signature {
+        self.signature
+    }
+
     /// Encodes the wire frame.
     #[must_use]
     pub fn encode_frame(&self) -> Vec<u8> {

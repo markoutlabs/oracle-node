@@ -934,7 +934,7 @@ on perpetual feeds. Everything else — spot `bookTicker` and `aggTrade`, future
 
 ### Golden vectors
 
-`crates/oracle-wire/tests/vectors/golden.json` freezes the protocol: payload bytes, digests, signatures, frames, feed IDs, and the registry encoding. A diff there means the wire format changed and previously-issued signatures no longer verify.
+`crates/oracle-wire/tests/vectors/golden.json` freezes the protocol: payload bytes, digests, signatures, frames, feed IDs, the registry encoding, venue reports and book updates. A diff there means the wire format changed and previously-issued signatures no longer verify.
 
 Regenerate deliberately, and read the diff:
 
@@ -947,6 +947,7 @@ Self-generated vectors only prove behaviour has not drifted, not that it was eve
 - published Keccak-256 vectors, distinguishing Keccak-256 from SHA3-256 (they differ only in padding);
 - the canonical Ethereum address for secret key `1`;
 - the domain separator, recomputed by `foundry` from the EIP-712 definition alone;
-- full signatures cross-checked against `cast wallet sign --no-hash`, confirming the `r ‖ s ‖ v` layout is byte-identical to Ethereum's.
+- full signatures cross-checked against `cast wallet sign --no-hash`, confirming the `r ‖ s ‖ v` layout is byte-identical to Ethereum's;
+- every payload built again by `tests/vectors/check_layout.py`, a second implementation in Python. It packs each payload from its JSON fields with `struct`, from the SPEC tables, and hashes with `cast keccak`. Thus neither the layout nor the hash comes from the Rust encoder.
 
-The `foundry` cross-check skips itself when `cast` is not on `PATH`, so a clean checkout still passes.
+The `foundry` and Python checks skip themselves when `cast` or `python3` is not on `PATH`, so a clean checkout still passes.

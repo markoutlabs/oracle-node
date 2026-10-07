@@ -424,10 +424,16 @@ impl Aggregator {
     /// `min_interval`, and at the heartbeat.
     ///
     /// Call it after the price poll, so that each report carries the statuses of
-    /// that evaluation.
-    pub fn poll_venues(&mut self, now_ns: u64) -> Vec<VenueReport> {
+    /// that evaluation. A feed that `wanted` refuses is skipped and keeps its
+    /// state, so its report goes out as soon as someone wants it.
+    pub fn poll_venues(
+        &mut self,
+        now_ns: u64,
+        wanted: impl Fn(FeedId) -> bool,
+    ) -> Vec<VenueReport> {
         self.feeds
             .iter_mut()
+            .filter(|feed| wanted(feed.config.feed_id))
             .filter_map(|feed| feed.poll_venues(now_ns))
             .collect()
     }
@@ -1128,7 +1134,7 @@ mod tests {
         let mut aggregator = aggregator();
         feed(&mut aggregator, SECOND, &both("100", "100.02"));
         assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
-        let reports = aggregator.poll_venues(SECOND);
+        let reports = aggregator.poll_venues(SECOND, |_| true);
         let [report] = reports.as_slice() else {
             panic!("one feed, one report: {reports:?}");
         };
@@ -1158,15 +1164,26 @@ mod tests {
             ],
         );
         let _ = aggregator.poll_changed(SECOND);
-        let report = aggregator.poll_venues(SECOND).remove(0);
+        let report = aggregator.poll_venues(SECOND, |_| true).remove(0);
         assert_eq!(entry(&report, Venue::Okx).status, SourceStatus::Outlier);
         assert_eq!(entry(&report, Venue::Okx).weight_bps, 0);
         assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Used);
 
         let later = SECOND + 3 * SECOND;
         let _ = aggregator.poll_all(later);
-        let report = aggregator.poll_venues(later).remove(0);
+        let report = aggregator.poll_venues(later, |_| true).remove(0);
         assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Stale);
+    }
+
+    #[test]
+    fn an_unwanted_report_is_not_built_and_goes_out_once_wanted() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        let _ = aggregator.poll_changed(SECOND);
+        assert!(aggregator.poll_venues(SECOND, |_| false).is_empty());
+        assert_eq!(aggregator.next_retry_ns(), None, "nothing waits on a retry");
+        let wanted = SECOND + 1_000_000;
+        assert_eq!(aggregator.poll_venues(wanted, |_| true).len(), 1);
     }
 
     #[test]
@@ -1174,23 +1191,32 @@ mod tests {
         let mut aggregator = aggregator();
         feed(&mut aggregator, SECOND, &both("100", "100.02"));
         let _ = aggregator.poll_changed(SECOND);
-        assert_eq!(aggregator.poll_venues(SECOND).len(), 1);
+        assert_eq!(aggregator.poll_venues(SECOND, |_| true).len(), 1);
 
         let soon = SECOND + 10_000_000;
         feed(&mut aggregator, soon, &both("100", "100.02"));
         let _ = aggregator.poll_changed(soon);
-        assert!(aggregator.poll_venues(soon).is_empty(), "inside the cap");
+        assert!(
+            aggregator.poll_venues(soon, |_| true).is_empty(),
+            "inside the cap"
+        );
         let due = SECOND + 50_000_000;
         assert_eq!(aggregator.next_retry_ns(), Some(due));
-        let reports = aggregator.poll_venues(due);
+        let reports = aggregator.poll_venues(due, |_| true);
         assert_eq!(reports.first().map(|report| report.seq), Some(2));
 
         assert!(
-            aggregator.poll_venues(due + 500_000_000).is_empty(),
+            aggregator
+                .poll_venues(due + 500_000_000, |_| true)
+                .is_empty(),
             "nothing new"
         );
         let beat = due + SECOND;
-        assert_eq!(aggregator.poll_venues(beat).len(), 1, "the heartbeat");
+        assert_eq!(
+            aggregator.poll_venues(beat, |_| true).len(),
+            1,
+            "the heartbeat"
+        );
     }
 
     #[test]
