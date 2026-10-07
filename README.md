@@ -201,6 +201,20 @@ Two pure, synchronous halves with a thin async layer on top:
 signatures from one node confirms who is talking and nothing else, and that is
 the mistake most likely to be made during integration and then never revisited.
 
+`OracleClient::latency` reports p50, p90, p99 and max for three spans of each
+accepted update. The client stamps each frame when it arrives, before it
+decrypts the frame.
+
+| Span | From | To |
+|---|---|---|
+| `delivery` | the node signs | the client receives |
+| `data_age` | the node receives the newest venue data | the client receives |
+| `processing` | the client receives | `next()` returns the resolved price |
+
+`delivery` compares two clocks, so it is exact only on one machine or with
+clocks in sync. `data_age` includes heartbeats, which send old data on purpose.
+`reset_latency` starts the report again after a warm-up.
+
 #### Client auth
 
 Nodes serve prices only to listed clients, over `/v2/ws`, encrypted (SPEC
@@ -403,8 +417,12 @@ picks from where stderr goes:
 | `json` | only when asked | one JSON object per line, for log shippers |
 
 `RUST_LOG` filters as usual. Once a minute the node logs a `status` line:
-feeds published, clients connected, venue connections up, and updates in the
-last minute. Under systemd the same line shows in `systemctl status`.
+feeds published, clients connected, venue connections up, updates in the last
+minute, and p50 and p99 from venue data to signed update. Only updates that new
+data caused count; a heartbeat repeats old data. Under systemd the same line
+shows in `systemctl status`. A `venue lag` line follows: p50 and p99 from each
+venue's own timestamp to our receipt. It also holds the offset between the
+venue clock and ours.
 
 #### Running under systemd
 
@@ -567,6 +585,7 @@ make canister         # the canister wasm: builds it, writes its .did, bakes
                       # the .did into the wasm as public candid:service
 make node             # the oracle-node binary for this machine
 make e2e              # the whole system on PocketIC; also part of make test
+make latency          # live latency from the venues to the SDK (below)
 make smoke            # the icp-cli path on a local network (below)
 
 # The two secp256k1 backends must agree byte for byte. The golden vectors
@@ -741,6 +760,25 @@ The first version of this test, a shell script against live venues, found a
 real bug: a restarted node began its sequence numbers at zero and was refused as
 a replay for every frame until it caught up. That is why
 `Aggregator::with_sequence_floor` exists.
+
+### Live latency
+
+`crates/oracle-node/tests/latency.rs` (`make latency`) measures the latency
+from the venues to the SDK on this machine. It needs the internet, so `make
+test` skips it. It sets up the system as the end-to-end test does, but the node
+serves every feed in `node/all-feeds.toml` from the live venues. After a 15 s
+warm-up, it measures for `LATENCY_SECS` (default 60) and prints:
+
+```text
+venue to node (venue clocks)  p50/p99 "binance 111.9/325.9 ms, bybit 82.4/95.0 ms, ..."
+venue data to signed (node)   p50 0.113 ms, p99 188.671 ms
+signed to SDK (delivery)      p50 1.33 ms, p90 1.82 ms, p99 28.66 ms, max 110.91 ms (n=971)
+venue data to SDK (data age)  p50 1.96 ms, p90 188.16 ms, p99 1258.49 ms, max 1655.81 ms (n=816)
+SDK processing                p50 0.09 ms, p90 0.27 ms, p99 4.00 ms, max 173.44 ms (n=971)
+```
+
+The node rows come from the node's second `status` and `venue lag` lines,
+because the first one includes the startup. SPEC §9.1 explains each row.
 
 ### Smoke test on the local network
 

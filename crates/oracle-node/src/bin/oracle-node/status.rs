@@ -1,11 +1,14 @@
 //! What the node reports about itself: once when it starts serving, then every
 //! minute.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use console::style;
+use oracle_client::{LatencyHistogram, Percentiles};
+use oracle_types::{Observation, Venue};
 use oracle_wire::Address;
 use tracing::info;
 
@@ -86,6 +89,8 @@ pub(crate) struct NodeStatus {
     pub(crate) connections: usize,
     pub(crate) updates: u64,
     pub(crate) client_list_version: u64,
+    /// From the venue data that moved a price to the signed update.
+    pub(crate) signed: Percentiles,
 }
 
 impl NodeStatus {
@@ -96,9 +101,76 @@ impl NodeStatus {
             connections = %format_args!("{}/{}", self.connections_up, self.connections),
             updates = self.updates,
             client_list = self.client_list_version,
+            signed_p50_ms = millis(self.signed.p50),
+            signed_p99_ms = millis(self.signed.p99),
             "status"
         );
     }
+}
+
+fn millis(value: Duration) -> f64 {
+    value.as_secs_f64() * 1_000.0
+}
+
+/// The node's own share of the latency, over one status interval.
+#[derive(Default)]
+pub(crate) struct NodeLatency {
+    signed: LatencyHistogram,
+    venues: BTreeMap<Venue, LatencyHistogram>,
+}
+
+impl NodeLatency {
+    /// The venue timestamp is the venue's claim. Thus the lag also holds the
+    /// offset between the venue clock and ours.
+    pub(crate) fn observed(&mut self, observation: &Observation) {
+        if let Some(sent_ns) = observation.exchange_time_ns {
+            self.venues
+                .entry(observation.venue())
+                .or_default()
+                .record_between(sent_ns, observation.local_recv_ns);
+        }
+    }
+
+    pub(crate) fn signed(&mut self, observed_ns: u64, now_ns: u64) {
+        self.signed.record_between(observed_ns, now_ns);
+    }
+
+    /// Returns the figures for the interval, and starts the next one.
+    pub(crate) fn take(&mut self) -> (Percentiles, Vec<(Venue, Percentiles)>) {
+        let signed = self.signed.percentiles();
+        self.signed.reset();
+        let venues = self
+            .venues
+            .iter_mut()
+            .map(|(venue, histogram)| {
+                let percentiles = histogram.percentiles();
+                histogram.reset();
+                (*venue, percentiles)
+            })
+            .filter(|(_, percentiles)| percentiles.count > 0)
+            .collect();
+        (signed, venues)
+    }
+}
+
+/// Logs the venue lag: p50 and p99 for each venue, in one line.
+pub(crate) fn log_venue_lag(venues: &[(Venue, Percentiles)]) {
+    if venues.is_empty() {
+        return;
+    }
+    let text = venues
+        .iter()
+        .map(|(venue, lag)| {
+            format!(
+                "{} {:.1}/{:.1} ms",
+                venue.as_str(),
+                millis(lag.p50),
+                millis(lag.p99)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(p50_p99 = %text, "venue lag");
 }
 
 /// One line, because systemd shows `STATUS=` as one line.
@@ -107,7 +179,8 @@ impl fmt::Display for NodeStatus {
         write!(
             f,
             "{}/{} feeds published, {} clients, {}/{} venue connections up, \
-             {} updates in the last minute, client list v{}",
+             {} updates in the last minute, client list v{}, \
+             venue data to signed p50 {:.2} ms p99 {:.2} ms",
             self.feeds_published,
             self.feeds,
             self.clients,
@@ -115,6 +188,8 @@ impl fmt::Display for NodeStatus {
             self.connections,
             self.updates,
             self.client_list_version,
+            millis(self.signed.p50),
+            millis(self.signed.p99),
         )
     }
 }
@@ -133,6 +208,7 @@ mod tests {
             connections: 8,
             updates: 2_400,
             client_list_version: 4,
+            signed: Percentiles::default(),
         };
         let text = status.to_string();
         assert!(!text.contains('\n'), "{text}");

@@ -127,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.accepted,
         client.registry_version()
     );
+    let latency = client.latency();
+    println!("delivery    {}", latency.delivery);
+    println!("data age    {}", latency.data_age);
+    println!("processing  {}", latency.processing);
     if stats.accepted == 0 {
         return Err("no updates verified".into());
     }

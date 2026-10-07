@@ -16,6 +16,7 @@ oracle-wire.workspace = true
 backon.workspace = true
 candid.workspace = true
 futures-util.workspace = true
+hdrhistogram.workspace = true
 hex.workspace = true
 ic-http-certification.workspace = true
 ic-response-verification.workspace = true

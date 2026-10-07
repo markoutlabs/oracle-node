@@ -18,7 +18,7 @@ WASM := target/wasm32-unknown-unknown/release/oracle_registry_canister.wasm
 DID := crates/oracle-registry-canister/oracle-registry-canister.did
 RELEASE_DIR := target/release-artifacts
 
-.PHONY: help build canister extract_did bake_candid_metadata node test lint e2e smoke \
+.PHONY: help build canister extract_did bake_candid_metadata node test lint e2e latency smoke \
 	release network network-stop deploy governance check-identity
 
 help: ## List the targets
@@ -51,6 +51,9 @@ lint: ## Formatting, then clippy for the workspace and the canister's wasm32 bui
 
 e2e: ## The whole system on PocketIC: canister, node binary, SDK client
 	cargo test -p oracle-node --locked --test e2e
+
+latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SECS (default 60)
+	cargo test --release -p oracle-node --locked --test latency -- --ignored --nocapture
 
 smoke: ## The icp-cli path on a local network: deploy, and the calls init and rotate print
 	scripts/smoke.sh

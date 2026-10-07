@@ -27,7 +27,7 @@ use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::watch;
 
-use common::{BINARY, Node, READY, WAIT};
+use common::{BINARY, Node, READY, WAIT, fields_of, free_port};
 
 const FEED: &str = "CRYPTO.BTC/USDT";
 /// Short broadcast-key epochs, so a client's deadline falls inside the test.
@@ -227,14 +227,6 @@ url = "{venue}"
     std::fs::write(config, toml::to_string(&table).expect("serialises")).expect("writes");
 }
 
-/// The fields of one JSON log line.
-fn fields_of(line: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(line)
-        .ok()?
-        .get_mut("fields")
-        .map(Value::take)
-}
-
 /// The events in a log with this message.
 fn events<'a>(log: &'a str, message: &'a str) -> impl Iterator<Item = Value> + 'a {
     log.lines()
@@ -349,11 +341,4 @@ fn run(command: &mut Command) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("a free port")
-        .port()
 }

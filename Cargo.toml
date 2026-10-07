@@ -53,6 +53,8 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+# Latency percentiles in the SDK and the node.
+hdrhistogram = { version = "7", default-features = false }
 # `rustls-no-provider`, not `rustls`: the workspace already pins rustls to the
 # `ring` provider through tokio-tungstenite, and a second provider makes
 # `ClientConfig::builder()` refuse to pick one at runtime.

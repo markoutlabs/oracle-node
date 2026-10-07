@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use age::secrecy::SecretString;
 use oracle_wire::Signer;
+use serde_json::Value;
 
 pub const BINARY: &str = env!("CARGO_BIN_EXE_oracle-node");
 /// The line the node logs once it serves.
@@ -123,4 +124,19 @@ impl Drop for Node {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The fields of one JSON log line.
+pub fn fields_of(line: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get_mut("fields")
+        .map(Value::take)
+}
+
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port()
 }

@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::notify;
-use crate::status::{NodeStatus, STATUS_EVERY, Summary};
+use crate::status::{NodeLatency, NodeStatus, STATUS_EVERY, Summary, log_venue_lag};
 use crate::tail::{log_observation, log_update};
 
 /// Bound on the ingest queue.
@@ -143,6 +143,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
             feeds,
             symbols,
             connections,
+            latency: NodeLatency::default(),
             shutdown: shutdown.clone(),
         }
         .run(),
@@ -290,6 +291,7 @@ struct PipelineTask {
     /// Names each feed id in the tail.
     symbols: HashMap<FeedId, Symbol>,
     connections: usize,
+    latency: NodeLatency,
     shutdown: CancellationToken,
 }
 
@@ -298,13 +300,19 @@ impl PipelineTask {
         if self.tail {
             log_observation(event);
         }
+        if let IngestEvent::Observation(observation) = event {
+            self.latency.observed(observation);
+        }
         self.pipeline.observe(event);
     }
 
+    /// `timed` is `Some` for updates that new input caused. A heartbeat
+    /// repeats old data and a halt carries none, so neither delay is latency.
     fn publish(
-        &self,
+        &mut self,
         (signed, errors): (Vec<SignedUpdate>, Vec<AggError>),
         published: &mut HashSet<FeedId>,
+        timed: Option<&MonotonicClock>,
     ) {
         for error in errors {
             warn!(%error, "feed could not be encoded");
@@ -313,8 +321,16 @@ impl PipelineTask {
             if self.tail {
                 log_update(&update, self.symbols.get(&update.update().feed_id));
             }
-            published.insert(update.update().feed_id);
+            let (feed_id, observed_ns) =
+                (update.update().feed_id, update.update().observation_time_ns);
+            let halted = update.update().flags.is_halted();
+            published.insert(feed_id);
             let _ = self.state.publish(update);
+            if let Some(clock) = timed
+                && !halted
+            {
+                self.latency.signed(observed_ns, clock.now_ns());
+            }
         }
     }
 
@@ -343,18 +359,19 @@ impl PipelineTask {
                         self.apply(&event);
                     }
                     let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published);
+                    self.publish(polled, &mut published, Some(&clock));
                 }
                 () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
                     let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published);
+                    self.publish(polled, &mut published, Some(&clock));
                 }
                 _ = ticker.tick() => {
                     let polled = self.pipeline.tick(clock.now_ns());
-                    self.publish(polled, &mut published);
+                    self.publish(polled, &mut published, None);
                 }
                 _ = status_ticker.tick() => {
                     let stats = self.pipeline.stats();
+                    let (signed, venues) = self.latency.take();
                     let status = NodeStatus {
                         feeds_published: published.len(),
                         feeds: self.feeds,
@@ -363,8 +380,10 @@ impl PipelineTask {
                         connections: self.connections,
                         updates: stats.published.saturating_sub(updates_before),
                         client_list_version: self.state.transport().clients_version(),
+                        signed,
                     };
                     status.log();
+                    log_venue_lag(&venues);
                     notify::status(&status.to_string());
                     published.clear();
                     updates_before = stats.published;

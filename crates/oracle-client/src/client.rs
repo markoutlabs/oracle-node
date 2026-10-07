@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::latency::{Latency, LatencyReport};
 use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
 use crate::verify::{RejectReason, Verifier, VerifyConfig};
@@ -242,6 +243,7 @@ impl OracleClientBuilder {
             inbound_rx: rx,
             shutdown: CancellationToken::new(),
             stats: ClientStats::default(),
+            latency: Latency::default(),
             source: self.source,
             refresh_interval: self.refresh_interval,
             poll_interval: self.poll_interval,
@@ -297,7 +299,11 @@ impl ClientStats {
 }
 
 enum Inbound {
-    Frame(Vec<u8>),
+    Frame {
+        frame: Vec<u8>,
+        /// Stamped as the message arrives, before decryption.
+        received_ns: u64,
+    },
     Polled(Result<Registry, FetchError>),
     /// A node's endpoint now serves another address: the node probably
     /// rotated. The handshake twin of an unknown signer on a frame.
@@ -323,6 +329,7 @@ pub struct OracleClient {
     inbound_rx: mpsc::Receiver<Inbound>,
     shutdown: CancellationToken,
     stats: ClientStats,
+    latency: Latency,
     source: Option<Arc<dyn RegistrySource>>,
     refresh_interval: Duration,
     poll_interval: Duration,
@@ -380,6 +387,18 @@ impl OracleClient {
     #[must_use]
     pub const fn stats(&self) -> ClientStats {
         self.stats
+    }
+
+    /// Returns the latency of the updates accepted since the start, or since
+    /// [`Self::reset_latency`].
+    #[must_use]
+    pub fn latency(&self) -> LatencyReport {
+        self.latency.report()
+    }
+
+    /// Starts the latency report again, for example after a warm-up.
+    pub fn reset_latency(&mut self) {
+        self.latency.reset();
     }
 
     /// Returns the registry version currently trusted.
@@ -617,7 +636,7 @@ impl OracleClient {
     ///
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
-        let outcome = self.try_ingest(frame, now_ns);
+        let outcome = self.try_ingest(frame, now_ns, now_ns);
         self.record(&outcome);
         outcome
     }
@@ -638,7 +657,16 @@ impl OracleClient {
         frame: &[u8],
         now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
-        let mut outcome = self.try_ingest(frame, now_ns);
+        self.ingest_received(frame, now_ns, now_ns).await
+    }
+
+    async fn ingest_received(
+        &mut self,
+        frame: &[u8],
+        received_ns: u64,
+        now_ns: u64,
+    ) -> Result<Resolved, RejectReason> {
+        let mut outcome = self.try_ingest(frame, received_ns, now_ns);
         if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { signer })) = &outcome
             && self.refresh_due(now_ns)
         {
@@ -648,14 +676,20 @@ impl OracleClient {
                 Ok(None) => debug!(%signer, "registry unchanged; signer stays unknown"),
                 Err(error) => warn!(%signer, %error, "registry refresh failed"),
             }
-            outcome = self.try_ingest(frame, now_ns);
+            outcome = self.try_ingest(frame, received_ns, now_ns);
         }
         self.record(&outcome);
         outcome
     }
 
-    fn try_ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
+    fn try_ingest(
+        &mut self,
+        frame: &[u8],
+        received_ns: u64,
+        now_ns: u64,
+    ) -> Result<Resolved, RejectReason> {
         let accepted = self.verifier.accept(frame, now_ns)?;
+        self.latency.arrived(&accepted.update, received_ns);
         let feed = accepted.update.feed_id;
         let view = self
             .views
@@ -700,8 +734,8 @@ impl OracleClient {
     /// Scheduled registry fetches are adopted here, so keep calling it.
     pub async fn next(&mut self) -> Option<Resolved> {
         loop {
-            let frame = match self.inbound_rx.recv().await? {
-                Inbound::Frame(frame) => frame,
+            let (frame, received_ns) = match self.inbound_rx.recv().await? {
+                Inbound::Frame { frame, received_ns } => (frame, received_ns),
                 Inbound::Polled(fetched) => {
                     self.stats.polls = self.stats.polls.saturating_add(1);
                     match self.adopt_fetched(fetched) {
@@ -725,8 +759,11 @@ impl OracleClient {
                 }
             };
             let now_ns = now_unix_nanos();
-            match self.ingest_with_refresh(&frame, now_ns).await {
-                Ok(resolved) => return Some(resolved),
+            match self.ingest_received(&frame, received_ns, now_ns).await {
+                Ok(resolved) => {
+                    self.latency.resolved(received_ns, now_unix_nanos());
+                    return Some(resolved);
+                }
                 Err(reason) => {
                     debug!(%reason, "rejected an update");
                 }
@@ -896,14 +933,19 @@ async fn pump(
             Message::Text(_) => return Err("plaintext after the handshake".to_owned()),
             Message::Close(_) => return Ok(()),
         };
-        let now = now_unix_nanos() / NANOS_PER_SEC;
+        let received_ns = now_unix_nanos();
+        let now = received_ns / NANOS_PER_SEC;
         match bytes.get(1).copied() {
             Some(TYPE_FRAME) => {
                 session.keys.prune(now);
                 match session.keys.open(&bytes) {
                     Ok(frame) => {
                         missing_since = None;
-                        if tx.send(Inbound::Frame(frame)).await.is_err() {
+                        if tx
+                            .send(Inbound::Frame { frame, received_ns })
+                            .await
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
