@@ -23,7 +23,8 @@ mod starter;
 mod unit;
 
 pub use setup::{
-    CanisterId, Endpoint, Gateway, NodeSetup, RegistrySource, RootKey, ServiceUnit, Unlock, Written,
+    CanisterId, Endpoint, Gateway, NodeSetup, RegistrySource, RootKey, ServiceUnit, Unlock,
+    Written, resolve_path,
 };
 
 /// Something went wrong generating or writing the node's files.

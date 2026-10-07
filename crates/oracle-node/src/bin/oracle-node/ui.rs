@@ -5,7 +5,7 @@ use std::fmt::Display;
 use std::io::IsTerminal as _;
 
 use console::{StyledObject, style};
-use oracle_node::{NodeSetup, Written};
+use oracle_node::{Endpoint, NodeSetup, RegistrySource, Written};
 
 /// `true` when a person can answer prompts. cliclack draws on stderr, and a
 /// redirected stdout means a script is reading.
@@ -70,8 +70,20 @@ pub(crate) fn next_steps(written: &Written) -> Vec<Step> {
 }
 
 /// Things in the setup that work but need a hand before production.
+/// A mainnet node that registers a loopback endpoint cannot serve anyone.
+pub(crate) fn loopback_warning(source: &RegistrySource, endpoint: &Endpoint) -> Option<String> {
+    (matches!(source, RegistrySource::Mainnet(_)) && endpoint.is_loopback()).then(|| {
+        format!(
+            "{endpoint} names this machine, but mainnet lists it for every client. \
+             Clients elsewhere cannot dial it; use the node's public wss:// URL."
+        )
+    })
+}
+
 pub(crate) fn warnings(setup: &NodeSetup) -> Vec<String> {
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = loopback_warning(&setup.source, &setup.endpoint)
+        .into_iter()
+        .collect();
     if let Some(service) = &setup.service {
         if service
             .exe
@@ -152,6 +164,21 @@ mod tests {
             "{with}"
         );
         let warned = warnings(&setup(Some(service)));
-        assert_eq!(warned.len(), 2, "{warned:?}");
+        assert_eq!(warned.len(), 3, "{warned:?}");
+        assert!(
+            warned.iter().any(|w| w.contains("names this machine")),
+            "{warned:?}"
+        );
+    }
+
+    #[test]
+    fn a_loopback_endpoint_warns_only_on_mainnet() {
+        let mainnet = setup(None);
+        assert_eq!(warnings(&mainnet).len(), 1, "the loopback endpoint");
+        let public = NodeSetup {
+            endpoint: "wss://node.example.com/v2/ws".parse().expect("valid"),
+            ..setup(None)
+        };
+        assert!(warnings(&public).is_empty());
     }
 }

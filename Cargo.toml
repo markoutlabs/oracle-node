@@ -63,6 +63,8 @@ hdrhistogram = { version = "7", default-features = false }
 # `ClientConfig::builder()` refuse to pick one at runtime.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 rpassword = "7"
+# A leading `~` in a path typed at the init wizard.
+shellexpand = "3"
 sd-notify = "0.5"
 secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

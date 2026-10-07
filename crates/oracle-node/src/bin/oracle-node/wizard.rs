@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use cliclack::{confirm, input, intro, log, note, outro, outro_cancel, password, select};
 use oracle_node::{
     Endpoint, NodeKey, NodeSetup, RegistrySource, ServiceUnit, Unlock, Written, candid_call,
-    generate_passphrase,
+    generate_passphrase, resolve_path,
 };
 use oracle_wire::Address;
 
@@ -59,25 +59,37 @@ fn ask(args: &InitArgs, source: RegistrySource, governance: Address) -> io::Resu
     intro(ui::heading(" oracle-node init "))?;
     note(
         "A new node",
-        "This makes the node's key, its registry entry for governance, and a\n\
-         starter config, and a systemd unit if you want one.\n\
-         Nothing is written until you confirm at the end.",
+        format!(
+            "This makes the node's key, its registry entry for governance, and a\n\
+             starter config, and a systemd unit if you want one.\n\
+             The node registers with {}\n\
+             governed by {}.\n\
+             Nothing is written until you confirm at the end.",
+            registry(&source),
+            governance.to_checksummed()
+        ),
     )?;
 
+    // Absolute, so the person sees where the files go, not where `.` is.
+    let default_dir = resolve_path(Path::new("oracle-node"))?;
     let dir: PathBuf = input("Where should the node's files go?")
-        .default_input("./oracle-node")
-        .validate(|text: &String| {
-            if Path::new(text).join("signing.key").exists() {
-                Err("this directory already holds a node key")
-            } else {
-                Ok(())
+        .default_input(&default_dir.display().to_string())
+        .validate(|text: &String| match resolve_path(Path::new(text.trim())) {
+            Ok(dir) if dir.join("signing.key").exists() => {
+                Err("this directory already holds a node key".to_owned())
             }
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
         })
         .interact()?;
+    let dir = resolve_path(&dir)?;
     let endpoint: Endpoint = input("Which WebSocket URL will clients dial?")
         .default_input(&args.endpoint.to_string())
         .validate(|text: &String| parses::<Endpoint>(text))
         .interact()?;
+    if let Some(warning) = ui::loopback_warning(&source, &endpoint) {
+        log::warning(warning)?;
+    }
 
     let (unlock, passphrase) = unlock(&dir)?;
     let service = service(&unlock)?;
@@ -173,13 +185,18 @@ fn service(unlock: &Unlock) -> io::Result<Option<ServiceUnit>> {
     Ok(Some(ServiceUnit { user, exe }))
 }
 
-fn summary(setup: &NodeSetup) -> String {
-    let source = match &setup.source {
+/// The registry canister, and where it runs.
+fn registry(source: &RegistrySource) -> String {
+    match source {
         RegistrySource::Mainnet(canister) => format!("canister {canister} on mainnet"),
         RegistrySource::Network {
             canister, gateway, ..
         } => format!("canister {canister} through {gateway}"),
-    };
+    }
+}
+
+fn summary(setup: &NodeSetup) -> String {
+    let source = registry(&setup.source);
     let unlock = setup.unlock.file().map_or_else(
         || "a passphrase typed at each start".to_owned(),
         |file| format!("a passphrase in {}", file.display()),

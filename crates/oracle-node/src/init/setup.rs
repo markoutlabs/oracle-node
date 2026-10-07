@@ -33,6 +33,23 @@ impl fmt::Display for Endpoint {
 }
 
 impl Endpoint {
+    /// Returns `true` if the URL names this machine. The registry lists the
+    /// endpoint for every client, and no client elsewhere can dial it.
+    #[must_use]
+    pub fn is_loopback(&self) -> bool {
+        let Some(uri) = self.0.parse::<axum::http::Uri>().ok() else {
+            return false;
+        };
+        let Some(host) = uri.host() else {
+            return false;
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    }
+
     /// The port the URL names, which the node listens on.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
@@ -41,6 +58,23 @@ impl Endpoint {
             .ok()
             .and_then(|uri| uri.port_u16())
     }
+}
+
+/// Expands a leading `~` to the home directory, and makes the path absolute.
+///
+/// A shell expands `~` in an argument, but not in a wizard answer or after
+/// `--out=`. Without this, `~/node` makes a directory named `~`.
+///
+/// # Errors
+///
+/// Returns the error of [`std::path::absolute`], such as a missing current
+/// directory.
+pub fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    let expanded = path.to_str().map_or_else(
+        || path.to_owned(),
+        |text| PathBuf::from(shellexpand::tilde(text).as_ref()),
+    );
+    std::path::absolute(expanded)
 }
 
 /// A registry canister id.
@@ -310,7 +344,7 @@ impl NodeSetup {
     }
 
     fn absolute(&self) -> Result<Self, InitError> {
-        let absolute = |path: &Path| std::path::absolute(path).map_err(|e| write_error(path, &e));
+        let absolute = |path: &Path| resolve_path(path).map_err(|e| write_error(path, &e));
         let mut setup = self.clone();
         setup.dir = absolute(&self.dir)?;
         setup.unlock = match &self.unlock {
@@ -339,6 +373,39 @@ fn write_error(path: &Path, error: &dyn std::error::Error) -> InitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_endpoints_are_recognised() {
+        for local in [
+            "ws://127.0.0.1:8791/v2/ws",
+            "ws://localhost:8791/v2/ws",
+            "ws://LOCALHOST/v2/ws",
+            "ws://[::1]:8791/v2/ws",
+            "ws://127.9.9.9/v2/ws",
+        ] {
+            let endpoint: Endpoint = local.parse().expect("valid");
+            assert!(endpoint.is_loopback(), "{local}");
+        }
+        for public in ["wss://node.example.com/v2/ws", "ws://10.0.0.5:8791/v2/ws"] {
+            let endpoint: Endpoint = public.parse().expect("valid");
+            assert!(!endpoint.is_loopback(), "{public}");
+        }
+    }
+
+    #[test]
+    fn a_path_is_absolute_and_a_tilde_is_the_home_directory() {
+        let relative = resolve_path(Path::new("oracle-node")).expect("absolute");
+        assert_eq!(
+            relative,
+            std::env::current_dir().expect("a cwd").join("oracle-node")
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            let tilde = resolve_path(Path::new("~/oracle-node")).expect("absolute");
+            assert_eq!(tilde, Path::new(&home).join("oracle-node"));
+        }
+        let elsewhere = resolve_path(Path::new("/srv/~node")).expect("absolute");
+        assert_eq!(elsewhere, Path::new("/srv/~node"), "only a leading tilde");
+    }
 
     #[test]
     fn values_parse_into_what_the_registry_accepts() {

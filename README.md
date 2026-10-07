@@ -422,16 +422,19 @@ the registry entry to hand to governance. That entry carries no secret: the
 address and the endpoints. Nothing the node publishes verifies for anyone until
 governance signs it into a new registry version.
 
-At a terminal, `init` is a wizard. It asks, one question at a time:
-- where the files go;
-- the public endpoint;
+At a terminal, `init` is a wizard. Its first note names the registry canister
+and the governance address. Then it asks, one question at a time:
+- where the files go: the default is shown as an absolute path, and a leading
+  `~` is your home directory;
+- the public endpoint: on mainnet, a loopback address such as `127.0.0.1` gets a
+  warning at once, because no client elsewhere can dial it;
 - how the node opens its key at start: a generated passphrase in a `0600` file,
   which systemd needs, or a passphrase typed at each start;
 - whether to write a systemd unit.
 
 It writes nothing until you confirm the summary, and Esc leaves nothing behind.
 The answers are checked with the canister's own rules, so the registry accepts
-the entry it writes.
+the entry it writes. `--out` and `--passphrase-file` also expand a leading `~`.
 
 It does not ask where the registry comes from. A node always fetches from the
 registry canister, and the mainnet canister id and governance address are built
