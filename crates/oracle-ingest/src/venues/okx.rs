@@ -46,10 +46,8 @@ pub fn is_swap(inst_id: &str) -> bool {
 }
 
 /// Builds subscribe frames for a set of OKX instrument ids, each with whether
-/// it wants depth snapshots.
-///
-/// Depth is spot only. A swap's sizes are contracts, and turning them into base
-/// units needs the contract value, which this build does not fetch.
+/// it wants the book. A swap's book is in contracts, so it needs the
+/// instrument's contract size; the node config refuses one without it.
 #[must_use]
 pub fn subscribe_frames<'a>(
     instruments: impl Iterator<Item = (&'a str, bool)>,
@@ -62,7 +60,7 @@ pub fn subscribe_frames<'a>(
         } else {
             &SPOT_CHANNELS
         };
-        let depth = (depth && !is_swap(inst_id)).then_some(DEPTH_CHANNEL);
+        let depth = depth.then_some(DEPTH_CHANNEL);
         for channel in channels.iter().copied().chain(depth) {
             args.push(serde_json::json!({ "channel": channel, "instId": inst_id }));
         }
@@ -158,6 +156,14 @@ struct FundingRate<'a> {
     ts: Option<&'a str>,
 }
 
+/// A size in base units: contracts times the contract size on a swap, as sent
+/// on spot.
+fn base_units(size: Fixed, contract_size: Option<Fixed>) -> Fixed {
+    contract_size
+        .and_then(|contract| size.checked_mul(contract))
+        .unwrap_or(size)
+}
+
 /// OKX sends timestamps as millisecond counts inside strings.
 fn stamp(ts: Option<&str>) -> Option<u64> {
     ts?.parse::<u64>().ok().map(millis_to_nanos)
@@ -212,7 +218,8 @@ pub fn decode(
                     continue;
                 };
                 let parsed = crate::depth::level(price, size)?;
-                book.set_with_text(side, parsed.price, parsed.qty, Some((price, size)));
+                let qty = base_units(parsed.qty, entry.contract_size);
+                book.set_with_text(side, parsed.price, qty, Some((price, size)));
             }
         }
         book.truncate(BOOK_DEPTH);
@@ -320,8 +327,14 @@ fn decode_bbo(
             price: mid,
             bid: Some(bid),
             ask: Some(ask),
-            bid_qty: Some(decimal("bid_qty", bid_qty)?),
-            ask_qty: Some(decimal("ask_qty", ask_qty)?),
+            bid_qty: Some(base_units(
+                decimal("bid_qty", bid_qty)?,
+                entry.contract_size,
+            )),
+            ask_qty: Some(base_units(
+                decimal("ask_qty", ask_qty)?,
+                entry.contract_size,
+            )),
             depth_notional_1bp: None,
             exchange_time_ns: stamp(bbo.ts),
             local_recv_ns,
@@ -576,13 +589,22 @@ mod tests {
         assert_eq!(frames.len(), 2, "four args at two per frame");
     }
 
-    /// A swap's depth is in contracts, so only spot subscribes to it.
     #[test]
-    fn depth_is_subscribed_for_spot_only() {
+    fn depth_subscribes_the_book_channel() {
         let spot = subscribe_frames([("BTC-USDT", true)].into_iter(), 100);
         assert!(spot[0].contains(r#""channel":"books""#));
-        let swap = subscribe_frames([("BTC-USDT-SWAP", true)].into_iter(), 100);
+        let swap = subscribe_frames([("BTC-USDT-SWAP", false)].into_iter(), 100);
         assert!(!swap[0].contains(r#""channel":"books""#));
+    }
+
+    /// 50 contracts of 0.01 BTC are half a bitcoin.
+    #[test]
+    fn swap_sizes_become_base_units() {
+        let half: Fixed = "0.5".parse().expect("valid");
+        let contracts: Fixed = "50".parse().expect("valid");
+        let contract: Fixed = "0.01".parse().expect("valid");
+        assert_eq!(base_units(contracts, Some(contract)), half);
+        assert_eq!(base_units(contracts, None), contracts);
     }
 
     /// Recorded from OKX on 2026-10-06: the subscribe reply, a 400-level

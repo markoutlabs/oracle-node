@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use oracle_types::{InstrumentId, MarketKind, Symbol, Venue};
+use oracle_types::{Fixed, InstrumentId, MarketKind, Symbol, Venue};
 
 use crate::IngestError;
 
@@ -20,6 +20,8 @@ pub struct InstrumentSpec {
     pub canonical: Symbol,
     /// Subscribe to depth snapshots as well as the top of book.
     pub depth: bool,
+    /// Base units per contract, for venues that size orders in contracts.
+    pub contract_size: Option<Fixed>,
 }
 
 impl InstrumentSpec {
@@ -41,6 +43,7 @@ impl InstrumentSpec {
             market,
             canonical,
             depth: false,
+            contract_size: None,
         })
     }
 
@@ -61,6 +64,8 @@ pub struct InstrumentEntry {
     pub canonical: Symbol,
     /// Whether depth snapshots are subscribed.
     pub depth: bool,
+    /// Base units per contract, where the venue sizes in contracts.
+    pub contract_size: Option<Fixed>,
 }
 
 /// Venue symbol to instrument lookup for one venue and market.
@@ -106,6 +111,7 @@ impl InstrumentMap {
                 instrument: InstrumentId::new(venue, market, spec.venue_symbol.as_str()),
                 canonical: spec.canonical,
                 depth: spec.depth,
+                contract_size: spec.contract_size,
             };
             if by_symbol.insert(key, entry).is_some() {
                 return Err(IngestError::DuplicateInstrument {

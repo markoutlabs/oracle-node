@@ -162,6 +162,32 @@ sources = [
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"] },
 ]
 
+# -------------------------------------------------- perpetual mid, USDT
+#
+# Where the perps actually trade, from their own books and through the same
+# median as spot. A mark is each venue's own formula; this is the market's level.
+# OKX swap sizes are contracts: `contract_size` is `ctVal` on OKX's instruments
+# endpoint (0.01 BTC, 0.1 ETH).
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MID"
+min_sources = 2
+impact_notional = "20000"
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "BTCUSDT" },
+  { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT" },
+  { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", contract_size = "0.01" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USDT.PERP_MID"
+min_sources = 2
+impact_notional = "20000"
+sources = [
+  { venue = "binance", market = "linear_perp", symbol = "ETHUSDT" },
+  { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT" },
+  { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", contract_size = "0.1" },
+]
+
 # --------------------------------------------------------------- funding
 #
 # DELIBERATELY SINGLE-SOURCE. `FUNDING_8H` promises a rate normalised to eight

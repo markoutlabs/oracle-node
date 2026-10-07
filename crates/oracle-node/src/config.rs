@@ -241,6 +241,10 @@ pub struct SourceSettings {
     /// silent one, because on an ordinary day the two agree to a basis point.
     #[serde(default)]
     pub converted: bool,
+    /// Base units per contract, as a decimal string, for a venue that sizes in
+    /// contracts: OKX swaps (`ctVal` on OKX's instruments endpoint).
+    #[serde(default)]
+    pub contract_size: Option<String>,
 }
 
 /// One venue market's WebSocket endpoint in place of the built-in one: a
@@ -511,6 +515,30 @@ impl NodeConfig {
                 let instrument = InstrumentId::new(venue, market, source.symbol.as_str());
                 // Depth replaces a top-of-book price, so only a book source needs it.
                 let depth = feed.impact_notional.is_some() && kinds.contains(&ObsKind::BookTop);
+                let contract_size = match &source.contract_size {
+                    Some(text) => Some(text.parse::<Fixed>().map_err(|e| {
+                        ConfigError::Invalid(format!(
+                            "feed `{}`: bad contract_size: {e}",
+                            feed.symbol
+                        ))
+                    })?),
+                    None => None,
+                };
+                if contract_size.is_some_and(|size| !size.is_positive()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "feed `{}`: contract_size must be above zero",
+                        feed.symbol
+                    )));
+                }
+                // An OKX swap's book is in contracts: priced without the size,
+                // its depth would read a hundred times too deep or too thin.
+                if depth && venue == Venue::Okx && market.is_perp() && contract_size.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "feed `{}`: OKX swap {} needs contract_size (`ctVal` on OKX's \
+                         instruments endpoint) to read its book",
+                        feed.symbol, source.symbol
+                    )));
+                }
                 let mut config = SourceConfig::new(instrument, kinds);
                 if source.converted {
                     config = config.converted();
@@ -525,12 +553,16 @@ impl NodeConfig {
 
                 instruments
                     .entry((venue, market, source.symbol.clone()))
-                    .and_modify(|spec| spec.depth |= depth)
+                    .and_modify(|spec| {
+                        spec.depth |= depth;
+                        spec.contract_size = spec.contract_size.or(contract_size);
+                    })
                     .or_insert_with(|| InstrumentSpec {
                         venue_symbol: source.symbol.clone(),
                         market,
                         canonical: symbol,
                         depth,
+                        contract_size,
                     });
             }
 
@@ -851,6 +883,22 @@ sources = [
         toml::from_str(text).expect("parses")
     }
 
+    /// The playground config shows every feed kind this build serves; it must
+    /// keep resolving.
+    #[test]
+    fn the_all_feeds_playground_resolves() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node/all-feeds.toml");
+        let text = std::fs::read_to_string(path).expect("node/all-feeds.toml");
+        let resolved = parse(&text).resolve().expect("resolves");
+        let perp_mid = resolved
+            .feeds
+            .iter()
+            .find(|feed| feed.symbol.to_string() == "CRYPTO.BTC/USDT.PERP_MID")
+            .expect("a perp mid feed");
+        assert!(perp_mid.impact_notional.is_some());
+        assert!(resolved.binance.perp.iter().any(|spec| spec.depth));
+    }
+
     #[test]
     fn a_complete_config_resolves() {
         let resolved = parse(SAMPLE).resolve().expect("resolves");
@@ -1117,6 +1165,34 @@ sources = [
         );
         assert!(resolved.binance.spot.iter().all(|spec| spec.depth));
         assert!(resolved.binance.perp.iter().all(|spec| !spec.depth));
+    }
+
+    /// An OKX swap's book is in contracts; without the contract size its depth
+    /// would be wrong by the contract's factor, so the config is refused.
+    #[test]
+    fn an_okx_swap_book_needs_its_contract_size() {
+        let feed = |extra: &str| {
+            format!(
+                r#"{SAMPLE}
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MID"
+min_sources = 1
+impact_notional = "20000"
+sources = [
+  {{ venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP"{extra} }},
+]
+"#
+            )
+        };
+        let Err(error) = parse(&feed("")).resolve() else {
+            panic!("a swap book without a contract size must be refused");
+        };
+        assert!(error.to_string().contains("contract_size"), "{error}");
+        assert!(
+            parse(&feed(r#", contract_size = "0.01""#))
+                .resolve()
+                .is_ok()
+        );
     }
 
     #[test]

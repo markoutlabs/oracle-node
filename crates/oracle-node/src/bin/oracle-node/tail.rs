@@ -1,6 +1,7 @@
 //! `start --tail`: every observation in and every signed update out.
 
 use oracle_ingest::IngestEvent;
+use oracle_types::Symbol;
 use tracing::{info, warn};
 
 /// Logs one decoded observation on its way into the aggregator.
@@ -52,8 +53,8 @@ pub(crate) fn log_observation(event: &IngestEvent) {
     }
 }
 
-/// Logs one signed update on its way out to subscribers.
-pub(crate) fn log_update(update: &oracle_wire::SignedUpdate) {
+/// Logs one signed update on its way out to subscribers, named by its feed.
+pub(crate) fn log_update(update: &oracle_wire::SignedUpdate, symbol: Option<&Symbol>) {
     let payload = update.update();
     let status = if payload.flags.is_halted() {
         "HALTED"
@@ -64,6 +65,7 @@ pub(crate) fn log_update(update: &oracle_wire::SignedUpdate) {
     };
     info!(
         target: "tail",
+        feed = symbol.map(ToString::to_string).unwrap_or_default(),
         status,
         price = payload.price_fixed().map(|p| p.to_string()).unwrap_or_default(),
         conf = payload.conf_fixed().map(|c| c.to_string()).unwrap_or_default(),

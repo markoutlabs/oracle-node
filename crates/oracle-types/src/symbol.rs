@@ -161,6 +161,9 @@ pub enum FeedKind {
     PerpMark,
     /// Composite perpetual index price.
     PerpIndex,
+    /// Composite perpetual mid, priced from the perps' own books. A mark is each
+    /// venue's own formula; this is where the perps actually trade.
+    PerpMid,
     /// Funding rate, normalised to an 8-hour interval, as a fraction.
     Funding8h,
     /// Aggregate open interest, in base-asset units.
@@ -176,6 +179,7 @@ impl FeedKind {
             Self::Price => None,
             Self::PerpMark => Some("PERP_MARK"),
             Self::PerpIndex => Some("PERP_INDEX"),
+            Self::PerpMid => Some("PERP_MID"),
             Self::Funding8h => Some("FUNDING_8H"),
             Self::OpenInterest => Some("OPEN_INTEREST"),
         }
@@ -189,7 +193,9 @@ impl FeedKind {
     #[must_use]
     pub const fn default_expo(self) -> i32 {
         match self {
-            Self::Price | Self::PerpMark | Self::PerpIndex | Self::OpenInterest => -8,
+            Self::Price | Self::PerpMark | Self::PerpIndex | Self::PerpMid | Self::OpenInterest => {
+                -8
+            }
             Self::Funding8h => -9,
         }
     }
@@ -202,6 +208,7 @@ impl FromStr for FeedKind {
         match s {
             "PERP_MARK" => Ok(Self::PerpMark),
             "PERP_INDEX" => Ok(Self::PerpIndex),
+            "PERP_MID" => Ok(Self::PerpMid),
             "FUNDING_8H" => Ok(Self::Funding8h),
             "OPEN_INTEREST" => Ok(Self::OpenInterest),
             other => Err(SymbolError::UnknownKind(other.to_owned())),
@@ -483,6 +490,7 @@ mod tests {
             "CRYPTO.BTC/USD",
             "CRYPTO.ETH/USD.PERP_MARK",
             "CRYPTO.1000PEPE/USDT.PERP_INDEX",
+            "CRYPTO.BTC/USDT.PERP_MID",
             "CRYPTO.USDT/USD",
             "CRYPTO.SOL/USD.OPEN_INTEREST",
         ] {

@@ -4,7 +4,7 @@
 //! the port: the key opens, the registry lists this node, the client list
 //! verifies. Then it serves until SIGTERM or SIGINT.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +19,7 @@ use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
 use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
-use oracle_types::FeedId;
+use oracle_types::{FeedId, Symbol};
 use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -89,6 +89,11 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     let address = signer.address();
     let registry_version = registry.version;
     let feeds = resolved.symbols.len();
+    let symbols: HashMap<FeedId, Symbol> = resolved
+        .symbols
+        .iter()
+        .map(|symbol| (oracle_wire::feed_id(symbol), *symbol))
+        .collect();
 
     // Sequence numbers must never go backwards for this node, including across
     // restarts. Milliseconds since the epoch outrun any publish counter.
@@ -136,6 +141,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
             tick: resolved.tick_interval,
             tail: args.tail,
             feeds,
+            symbols,
             connections,
             shutdown: shutdown.clone(),
         }
@@ -281,6 +287,8 @@ struct PipelineTask {
     tick: Duration,
     tail: bool,
     feeds: usize,
+    /// Names each feed id in the tail.
+    symbols: HashMap<FeedId, Symbol>,
     connections: usize,
     shutdown: CancellationToken,
 }
@@ -303,7 +311,7 @@ impl PipelineTask {
         }
         for update in signed {
             if self.tail {
-                log_update(&update);
+                log_update(&update, self.symbols.get(&update.update().feed_id));
             }
             published.insert(update.update().feed_id);
             let _ = self.state.publish(update);
