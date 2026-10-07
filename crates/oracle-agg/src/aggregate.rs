@@ -128,7 +128,7 @@ impl core::fmt::Debug for Reasons {
 }
 
 /// A formed price.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aggregation {
     /// The aggregate price.
     pub price: Fixed,
@@ -146,6 +146,9 @@ pub struct Aggregation {
     pub rejected: u32,
     /// Freshest contributing observation, on our clock.
     pub observation_time_ns: u64,
+    /// Each contributing source, by its position in the configuration, with
+    /// its final weight.
+    pub weights: Vec<(usize, Fixed)>,
 }
 
 /// The result of trying to form a price.
@@ -388,6 +391,10 @@ pub fn aggregate(
     }
 
     let sources: VenueSet = quotes.iter().map(|quote| quote.venue).collect();
+    let weights = quotes
+        .iter()
+        .map(|quote| (quote.source, quote.weight))
+        .collect();
     let observation_time_ns = quotes
         .iter()
         .map(|quote| quote.observation_time_ns)
@@ -403,6 +410,7 @@ pub fn aggregate(
         num_sources: sources.len(),
         rejected,
         observation_time_ns,
+        weights,
     }))
 }
 
@@ -584,6 +592,7 @@ mod tests {
 
     fn quote(venue: Venue, price: &str) -> SourceQuote {
         SourceQuote {
+            source: 0,
             venue,
             price: fixed(price),
             half_spread: Some(fixed("0.01")),

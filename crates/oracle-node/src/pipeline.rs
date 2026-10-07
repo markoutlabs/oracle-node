@@ -19,7 +19,7 @@ use std::sync::Arc;
 use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
 use oracle_types::{FeedId, PriceUpdate};
-use oracle_wire::{SignedUpdate, Signer};
+use oracle_wire::{SignedUpdate, SignedVenueReport, Signer, WireError};
 
 /// Counters describing what the pipeline has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,6 +115,20 @@ impl Pipeline {
     pub fn flush(&mut self, now_ns: u64) -> (Vec<SignedUpdate>, Vec<AggError>) {
         let polled = self.aggregator.poll_changed(now_ns);
         self.sign(polled)
+    }
+
+    /// Signs the venue reports that are due. Call it after [`Self::flush`] or
+    /// [`Self::tick`], so that each report carries that evaluation's statuses.
+    pub fn venue_reports(&mut self, now_ns: u64) -> (Vec<SignedVenueReport>, Vec<WireError>) {
+        let mut signed = Vec::new();
+        let mut errors = Vec::new();
+        for report in self.aggregator.poll_venues(now_ns) {
+            match self.signer.sign_venue_report(&report) {
+                Ok(report) => signed.push(report),
+                Err(error) => errors.push(error),
+            }
+        }
+        (signed, errors)
     }
 
     /// Returns why a feed last published.
@@ -244,6 +258,33 @@ mod tests {
         assert_eq!(
             &parsed.decode_unverified().expect("decodes"),
             update.update()
+        );
+    }
+
+    #[test]
+    fn venue_reports_sign_after_the_evaluation() {
+        let mut pipeline = pipeline(&[Venue::Binance, Venue::Bybit]);
+        pipeline.observe(&book(Venue::Binance, "64000", START));
+        pipeline.observe(&book(Venue::Bybit, "64000", START));
+        let _ = pipeline.tick(START);
+        let (reports, errors) = pipeline.venue_reports(START);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let report = reports.first().expect("one report");
+        let parsed =
+            oracle_wire::UnverifiedVenueFrame::parse(&report.encode_frame()).expect("parses");
+        let decoded = parsed.decode_unverified().expect("decodes");
+        assert_eq!(&decoded, report.report());
+        assert!(
+            decoded
+                .entries
+                .iter()
+                .all(|entry| entry.status == oracle_types::SourceStatus::Used),
+            "{decoded:?}"
+        );
+        assert!(
+            pipeline.venue_reports(START).0.is_empty(),
+            "nothing new, no report"
         );
     }
 

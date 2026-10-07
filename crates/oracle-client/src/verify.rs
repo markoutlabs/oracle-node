@@ -17,8 +17,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use oracle_types::{FeedId, NANOS_PER_SEC, PriceUpdate};
-use oracle_wire::{Address, NodeListing, UnverifiedFrame, VerifiedRegistry, VerifyError};
+use oracle_types::{FeedId, NANOS_PER_SEC, PriceUpdate, VenueReport};
+use oracle_wire::{
+    Address, NodeListing, UnverifiedFrame, UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
+};
 
 /// Freshness policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +118,17 @@ pub enum RejectReason {
     },
 }
 
+/// A venue report that passed every check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedVenues {
+    /// The report.
+    pub report: VenueReport,
+    /// The node that signed it.
+    pub signer: Address,
+    /// That node's index in the registry it was verified against.
+    pub node_index: usize,
+}
+
 /// An update that passed every check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Accepted {
@@ -144,6 +157,8 @@ pub struct Verifier {
     registry: VerifiedRegistry,
     config: VerifyConfig,
     high_water: HashMap<(Address, FeedId), u64>,
+    /// Venue reports count their own sequence, apart from prices.
+    venue_high_water: HashMap<(Address, FeedId), u64>,
     /// Addresses that a registry this verifier once trusted listed, and the
     /// current one does not. Reported as [`RejectReason::RetiredKey`] rather than
     /// unknown, so the client does not go looking for a registry it already has.
@@ -158,6 +173,7 @@ impl Verifier {
             registry,
             config,
             high_water: HashMap::new(),
+            venue_high_water: HashMap::new(),
             retired: HashSet::new(),
         }
     }
@@ -179,6 +195,8 @@ impl Verifier {
         }
         // A retired address never verifies again, so its marks are dead weight.
         self.high_water
+            .retain(|(node, _), _| still_listed.contains(node));
+        self.venue_high_water
             .retain(|(node, _), _| still_listed.contains(node));
         self.registry = registry;
     }
@@ -212,11 +230,67 @@ impl Verifier {
         if update.observation_time_ns > update.publish_time_ns {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-
         // Clock checks before the sequence update, so a rejected frame cannot
         // advance the high-water mark and lock out the legitimate one behind it.
-        if update.publish_time_ns > now_ns {
-            let skew = update.publish_time_ns - now_ns;
+        self.check_clock(signer, update.publish_time_ns, now_ns)?;
+        advance(
+            &mut self.high_water,
+            (signer, update.feed_id),
+            update.seq,
+            signer,
+        )?;
+        Ok(Accepted {
+            update,
+            signer,
+            node_index,
+        })
+    }
+
+    /// Verifies one venue report frame, with the same checks as a price frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_venues(
+        &mut self,
+        frame: &[u8],
+        now_ns: u64,
+    ) -> Result<AcceptedVenues, RejectReason> {
+        let parsed = UnverifiedVenueFrame::parse(frame).map_err(VerifyError::from)?;
+        let verified = match parsed.verify(&self.registry) {
+            Ok(verified) => verified,
+            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
+                return Err(RejectReason::RetiredKey { signer });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (signer, node_index) = (verified.signer(), verified.node_index());
+        let report = verified.into_report();
+        if !report.timestamps_coherent() {
+            return Err(RejectReason::IncoherentTimestamps { signer });
+        }
+        self.check_clock(signer, report.publish_time_ns, now_ns)?;
+        advance(
+            &mut self.venue_high_water,
+            (signer, report.feed_id),
+            report.seq,
+            signer,
+        )?;
+        Ok(AcceptedVenues {
+            report,
+            signer,
+            node_index,
+        })
+    }
+
+    fn check_clock(
+        &self,
+        signer: Address,
+        publish_time_ns: u64,
+        now_ns: u64,
+    ) -> Result<(), RejectReason> {
+        if publish_time_ns > now_ns {
+            let skew = publish_time_ns - now_ns;
             let limit = nanos(self.config.max_skew);
             if skew > limit {
                 return Err(RejectReason::FromTheFuture {
@@ -226,7 +300,7 @@ impl Verifier {
                 });
             }
         } else {
-            let age = now_ns - update.publish_time_ns;
+            let age = now_ns - publish_time_ns;
             let limit = nanos(self.config.max_age);
             if age > limit {
                 return Err(RejectReason::TooOld {
@@ -236,25 +310,29 @@ impl Verifier {
                 });
             }
         }
-
-        let key = (signer, update.feed_id);
-        if let Some(last_seq) = self.high_water.get(&key).copied()
-            && update.seq <= last_seq
-        {
-            return Err(RejectReason::Replayed {
-                signer,
-                seq: update.seq,
-                last_seq,
-            });
-        }
-        self.high_water.insert(key, update.seq);
-
-        Ok(Accepted {
-            update,
-            signer,
-            node_index,
-        })
+        Ok(())
     }
+}
+
+/// Raises the high-water mark for `key`, or refuses a sequence that does not
+/// advance.
+fn advance(
+    marks: &mut HashMap<(Address, FeedId), u64>,
+    key: (Address, FeedId),
+    seq: u64,
+    signer: Address,
+) -> Result<(), RejectReason> {
+    if let Some(last_seq) = marks.get(&key).copied()
+        && seq <= last_seq
+    {
+        return Err(RejectReason::Replayed {
+            signer,
+            seq,
+            last_seq,
+        });
+    }
+    marks.insert(key, seq);
+    Ok(())
 }
 
 /// Verifies a stored frame against the node that was listed when it was
@@ -306,7 +384,7 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{TestNode, registry_with, update_at};
+    use crate::testing::{TestNode, registry_with, update_at, venues_at};
     use oracle_types::NANOS_PER_SEC;
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
@@ -323,6 +401,48 @@ mod tests {
         let accepted = verifier.accept(&frame, NOW).expect("accepted");
         assert_eq!(accepted.signer, node.signing_address());
         assert_eq!(accepted.update.seq, 1);
+    }
+
+    #[test]
+    fn a_venue_report_has_its_own_sequence() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let price = node.sign(&update_at(NOW, 5));
+        assert!(verifier.accept(&price, NOW).is_ok());
+        let report = node.sign_venues(&venues_at(NOW, 1));
+        let accepted = verifier
+            .accept_venues(&report, NOW)
+            .expect("a price seq of 5 does not block venue seq 1");
+        assert_eq!(accepted.signer, node.signing_address());
+        assert!(matches!(
+            verifier.accept_venues(&report, NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stale_or_incoherent_venue_report_is_refused() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let old = node.sign_venues(&venues_at(NOW - 5 * NANOS_PER_SEC, 1));
+        assert!(matches!(
+            verifier.accept_venues(&old, NOW),
+            Err(RejectReason::TooOld { .. })
+        ));
+        let mut report = venues_at(NOW, 2);
+        if let Some(entry) = report.entries.first_mut() {
+            entry.local_recv_ns = NOW + 1;
+        }
+        assert!(matches!(
+            verifier.accept_venues(&node.sign_venues(&report), NOW),
+            Err(RejectReason::IncoherentTimestamps { .. })
+        ));
+        assert!(
+            verifier
+                .accept(&node.sign_venues(&venues_at(NOW, 3)), NOW)
+                .is_err(),
+            "a venue frame is not a price frame"
+        );
     }
 
     #[test]

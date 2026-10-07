@@ -170,6 +170,8 @@ Fanout is **conflating** — one slot per feed per subscriber, newer replaces
 pending older. A stale price delivered from behind a backlog is worse than no
 price, because the consumer acts on it as though it were current. Frames are
 signed, encoded and sealed once and shared as `Bytes` across every subscriber.
+Venue reports (SPEC §3.3.1) have their own subscription and their own slot per
+feed, so a report never replaces a price.
 
 The consequence consumers must internalise: **you observe state, not
 transitions.** A sub-second halt can be conflated away. Every frame carries
@@ -214,6 +216,31 @@ decrypts the frame.
 `delivery` compares two clocks, so it is exact only on one machine or with
 clocks in sync. `data_age` includes heartbeats, which send old data on purpose.
 `reset_latency` starts the report again after a warm-up.
+
+#### Venue reports
+
+A venue report (SPEC §3.3.1) shows what one node saw for each source of a
+feed, signed with the node key:
+
+- the best bid and ask, with their sizes;
+- the impact prices for the feed's `impact_notional`;
+- the mark, the index and the funding rate, when the venue sends them;
+- the status in the price (used, outlier, stale, crossed, no data, invalid or
+  feed halted) and the weight.
+
+```rust
+client.subscribe_venues(&["CRYPTO.BTC/USDT"]).await?;
+while let Some(event) = client.next_event().await {
+    match event {
+        Event::Price(resolved) => { /* as from next() */ }
+        Event::Venues(report) => { /* report.signer, report.report.entries */ }
+    }
+}
+```
+
+The SDK verifies each report like a price: the signature, the registry, its
+own `seq`, and the clock. It does not combine reports across nodes, because
+each node reports what it saw. `next()` skips reports.
 
 #### Client auth
 

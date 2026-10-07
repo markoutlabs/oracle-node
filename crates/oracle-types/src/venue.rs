@@ -287,6 +287,28 @@ impl MarketKind {
     pub const fn is_perp(self) -> bool {
         matches!(self, Self::LinearPerp | Self::InversePerp)
     }
+
+    /// Returns the wire-stable index. Never renumber: signed venue reports
+    /// carry it.
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::Spot => 0,
+            Self::LinearPerp => 1,
+            Self::InversePerp => 2,
+        }
+    }
+
+    /// Returns the market kind for a wire-stable index.
+    #[must_use]
+    pub const fn from_index(index: u8) -> Option<Self> {
+        match index {
+            0 => Some(Self::Spot),
+            1 => Some(Self::LinearPerp),
+            2 => Some(Self::InversePerp),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for MarketKind {
@@ -354,6 +376,21 @@ impl serde::Serialize for Venue {
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Venue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for MarketKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for MarketKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
         text.parse().map_err(serde::de::Error::custom)

@@ -348,6 +348,16 @@ impl PipelineTask {
         }
     }
 
+    fn publish_venues(&mut self, now_ns: u64) {
+        let (reports, errors) = self.pipeline.venue_reports(now_ns);
+        for error in errors {
+            warn!(%error, "venue report could not be encoded");
+        }
+        for report in reports {
+            let _ = self.state.publish_venues(report);
+        }
+    }
+
     async fn run(mut self) {
         let clock = self.clock.clone();
         let mut ticker = tokio::time::interval(self.tick);
@@ -374,14 +384,17 @@ impl PipelineTask {
                     }
                     let polled = self.pipeline.flush(clock.now_ns());
                     self.publish(polled, &mut published, Some(&clock));
+                    self.publish_venues(clock.now_ns());
                 }
                 () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
                     let polled = self.pipeline.flush(clock.now_ns());
                     self.publish(polled, &mut published, Some(&clock));
+                    self.publish_venues(clock.now_ns());
                 }
                 _ = ticker.tick() => {
                     let polled = self.pipeline.tick(clock.now_ns());
                     self.publish(polled, &mut published, None);
+                    self.publish_venues(clock.now_ns());
                 }
                 _ = status_ticker.tick() => {
                     let stats = self.pipeline.stats();

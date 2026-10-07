@@ -11,7 +11,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Venue, VenueSet};
+use oracle_types::{
+    FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus, Venue, VenueEntry,
+    VenueReport, VenueSet,
+};
 use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, VerifiedRegistry};
 
 use crate::source::{FetchError, RegistryFuture, RegistrySource};
@@ -92,6 +95,19 @@ impl TestNode {
     #[must_use]
     pub fn sign(&self, update: &PriceUpdate) -> Vec<u8> {
         self.signing.sign_update(update).encode_frame().to_vec()
+    }
+
+    /// Signs a venue report with the current key and returns the wire frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the report cannot be encoded.
+    #[must_use]
+    pub fn sign_venues(&self, report: &VenueReport) -> Vec<u8> {
+        self.signing
+            .sign_venue_report(report)
+            .expect("an encodable report")
+            .encode_frame()
     }
 
     /// Signs an update with the pre-rotation key.
@@ -211,6 +227,34 @@ pub fn forged_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
     };
     Registry::sign(&impostor, version, REGISTRY_ISSUED_AT, entries, quorum)
         .expect("test registry encodes")
+}
+
+/// Builds a venue report with one used Binance entry.
+#[must_use]
+pub fn venues_at(publish_time_ns: u64, seq: u64) -> VenueReport {
+    VenueReport {
+        feed_id: FeedId::from_bytes([7; 32]),
+        publish_time_ns,
+        seq,
+        expo: -8,
+        entries: vec![VenueEntry {
+            venue: Venue::Binance,
+            market: MarketKind::Spot,
+            status: SourceStatus::Used,
+            weight_bps: 10_000,
+            bid: Some(6_399_990_000_000),
+            ask: Some(6_400_010_000_000),
+            bid_qty: Some(100_000_000),
+            ask_qty: Some(100_000_000),
+            impact_bid: None,
+            impact_ask: None,
+            mark: None,
+            index: None,
+            funding: None,
+            exchange_time_ns: None,
+            local_recv_ns: publish_time_ns.saturating_sub(1_000_000),
+        }],
+    }
 }
 
 /// Builds a plain healthy price update.

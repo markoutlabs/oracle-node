@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use oracle_types::{
     FeedId, Fixed, FixedError, Flags, InstrumentId, MarketKind, ObsKind, Observation, PriceUpdate,
-    Venue,
+    QTY_EXPO, RATE_EXPO, SourceStatus, Venue, VenueEntry, VenueReport,
 };
 
 use crate::aggregate::{self, Outcome, Peg, Reasons};
-use crate::config::{ConfigError, FeedConfig};
+use crate::config::{ConfigError, FeedConfig, SourceConfig};
 use crate::quote::{self, SourceQuote};
 
 /// A failure forming a publishable update.
@@ -125,6 +125,15 @@ struct FeedRuntime {
     /// The trigger the rate cap is holding back.
     held: Option<Trigger>,
     last_trigger: Option<Trigger>,
+    /// How each source counted in the last evaluation, with its share of the
+    /// weight in basis points.
+    statuses: Vec<(SourceStatus, u16)>,
+    /// The venue report follows the price policy: new input, the rate cap and
+    /// the heartbeat.
+    venue_dirty: bool,
+    venue_last_ns: Option<u64>,
+    venue_retry_at_ns: Option<u64>,
+    venue_seq: u64,
 }
 
 /// What the publication policy decided for one evaluation.
@@ -173,6 +182,7 @@ impl Aggregator {
     pub fn with_sequence_floor(mut self, floor: u64) -> Self {
         for feed in &mut self.feeds {
             feed.seq = floor;
+            feed.venue_seq = floor;
         }
         self
     }
@@ -213,6 +223,11 @@ impl Aggregator {
                 retry_at_ns: None,
                 held: None,
                 last_trigger: None,
+                statuses: Vec::new(),
+                venue_dirty: false,
+                venue_last_ns: None,
+                venue_retry_at_ns: None,
+                venue_seq: 0,
             });
         }
         // Every peg must exist and must not itself need conversion.
@@ -267,6 +282,7 @@ impl Aggregator {
         for target in std::iter::once(index).chain(dependents) {
             if let Some(feed) = self.feeds.get_mut(target) {
                 feed.dirty = true;
+                feed.venue_dirty = true;
             }
         }
     }
@@ -394,10 +410,26 @@ impl Aggregator {
         })
     }
 
-    /// The earliest moment a rate-capped publication becomes due.
+    /// The earliest moment a rate-capped publication or venue report becomes due.
     #[must_use]
     pub fn next_retry_ns(&self) -> Option<u64> {
-        self.feeds.iter().filter_map(|feed| feed.retry_at_ns).min()
+        self.feeds
+            .iter()
+            .flat_map(|feed| [feed.retry_at_ns, feed.venue_retry_at_ns])
+            .flatten()
+            .min()
+    }
+
+    /// Builds the venue reports that are due: after new input, at most one per
+    /// `min_interval`, and at the heartbeat.
+    ///
+    /// Call it after the price poll, so that each report carries the statuses of
+    /// that evaluation.
+    pub fn poll_venues(&mut self, now_ns: u64) -> Vec<VenueReport> {
+        self.feeds
+            .iter_mut()
+            .filter_map(|feed| feed.poll_venues(now_ns))
+            .collect()
     }
 
     fn poll_where(
@@ -433,7 +465,8 @@ impl FeedRuntime {
     fn poll(&mut self, now_ns: u64, peg: Option<Peg>) -> Result<Option<PriceUpdate>, AggError> {
         self.dirty = false;
         self.retry_at_ns = None;
-        let quotes = self.quotes(now_ns);
+        let derived = self.derive_all(now_ns);
+        let quotes = derived.iter().filter_map(|quote| quote.ok()).collect();
         let outcome = aggregate::aggregate(
             &self.config,
             quotes,
@@ -441,6 +474,7 @@ impl FeedRuntime {
             self.last.map(|l| l.price),
             peg,
         );
+        self.statuses = statuses(&derived, &outcome);
 
         let (price, conf, flags, reasons, sources, num_sources, observation_time_ns) = match outcome
         {
@@ -559,16 +593,57 @@ impl FeedRuntime {
         }))
     }
 
-    fn quotes(&self, now_ns: u64) -> Vec<SourceQuote> {
+    /// One quote or reason per configured source, in configuration order.
+    fn derive_all(&self, now_ns: u64) -> Vec<Result<SourceQuote, SourceStatus>> {
         self.config
             .sources
             .iter()
             .enumerate()
-            .filter_map(|(index, source)| {
-                let slots = self.sources.get(index)?;
-                quote::derive(source, &self.config, &slots.latest, now_ns)
+            .map(|(index, source)| {
+                let slots = self.sources.get(index).ok_or(SourceStatus::NoData)?;
+                quote::derive(index, source, &self.config, &slots.latest, now_ns)
             })
             .collect()
+    }
+
+    fn poll_venues(&mut self, now_ns: u64) -> Option<VenueReport> {
+        let min_interval = duration_ns(self.config.min_interval);
+        if let Some(last) = self.venue_last_ns {
+            let elapsed = now_ns.saturating_sub(last);
+            if !self.venue_dirty && elapsed < duration_ns(self.config.heartbeat) {
+                return None;
+            }
+            if elapsed < min_interval {
+                self.venue_retry_at_ns = Some(last.saturating_add(min_interval));
+                return None;
+            }
+        }
+        self.venue_dirty = false;
+        self.venue_retry_at_ns = None;
+        self.venue_last_ns = Some(now_ns);
+        self.venue_seq = self.venue_seq.saturating_add(1);
+        let entries = self
+            .config
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let latest = self.sources.get(index).map_or(&[][..], |s| &s.latest[..]);
+                let (status, weight_bps) = self
+                    .statuses
+                    .get(index)
+                    .copied()
+                    .unwrap_or((SourceStatus::NoData, 0));
+                venue_entry(source, &self.config, latest, status, weight_bps)
+            })
+            .collect();
+        Some(VenueReport {
+            feed_id: self.config.feed_id,
+            publish_time_ns: now_ns,
+            seq: self.venue_seq,
+            expo: self.config.expo,
+            entries,
+        })
     }
 
     /// Applies the publication policy from SPEC.md §5.6.
@@ -645,6 +720,87 @@ impl FeedRuntime {
 /// Converts a duration to nanoseconds, saturating.
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// How each source counted, with its share of the weight in basis points.
+fn statuses(
+    derived: &[Result<SourceQuote, SourceStatus>],
+    outcome: &Outcome,
+) -> Vec<(SourceStatus, u16)> {
+    let weights = match outcome {
+        Outcome::Priced(aggregation) => Some(&aggregation.weights),
+        Outcome::Halted { .. } => None,
+    };
+    let total = weights.map_or(Fixed::ZERO, |weights| {
+        weights
+            .iter()
+            .fold(Fixed::ZERO, |sum, (_, weight)| sum.saturating_add(*weight))
+    });
+    derived
+        .iter()
+        .map(|derived| match (derived, weights) {
+            (Err(status), _) => (*status, 0),
+            (Ok(_), None) => (SourceStatus::FeedHalted, 0),
+            (Ok(quote), Some(weights)) => weights
+                .iter()
+                .find(|(source, _)| *source == quote.source)
+                .map_or((SourceStatus::Outlier, 0), |(_, weight)| {
+                    let share = weight
+                        .to_bps_of(total)
+                        .and_then(|bps| bps.to_scaled_unsigned(0).ok())
+                        .and_then(|bps| u16::try_from(bps).ok())
+                        .unwrap_or(0);
+                    (SourceStatus::Used, share.min(10_000))
+                }),
+        })
+        .collect()
+}
+
+/// One source's entry in a venue report, from its latest observations.
+///
+/// Prices are the venue's own, before any peg conversion. An impact price
+/// that ran out of levels is left out, because it would read tighter than the
+/// book is.
+fn venue_entry(
+    source: &SourceConfig,
+    config: &FeedConfig,
+    latest: &[Option<Observation>],
+    status: SourceStatus,
+    weight_bps: u16,
+) -> VenueEntry {
+    let slot = |kind: ObsKind| latest.get(kind.index()).and_then(Option::as_ref);
+    let price = |value: Fixed| value.to_scaled(config.expo).ok();
+    let qty = |value: Fixed| value.to_scaled_unsigned(QTY_EXPO).ok();
+    let top = [slot(ObsKind::BookTop), slot(ObsKind::Depth)]
+        .into_iter()
+        .flatten()
+        .max_by_key(|observation| observation.local_recv_ns);
+    let impact = config
+        .impact_notional
+        .zip(slot(ObsKind::Depth))
+        .and_then(|(notional, depth)| depth.book.as_deref()?.impact(notional))
+        .filter(|impact| impact.complete);
+    let newest = latest
+        .iter()
+        .flatten()
+        .max_by_key(|observation| observation.local_recv_ns);
+    VenueEntry {
+        venue: source.instrument.venue,
+        market: source.instrument.market,
+        status,
+        weight_bps,
+        bid: top.and_then(|o| o.bid).and_then(price),
+        ask: top.and_then(|o| o.ask).and_then(price),
+        bid_qty: top.and_then(|o| o.bid_qty).and_then(qty),
+        ask_qty: top.and_then(|o| o.ask_qty).and_then(qty),
+        impact_bid: impact.and_then(|impact| price(impact.bid)),
+        impact_ask: impact.and_then(|impact| price(impact.ask)),
+        mark: slot(ObsKind::MarkPrice).and_then(|o| price(o.price)),
+        index: slot(ObsKind::IndexPrice).and_then(|o| price(o.price)),
+        funding: slot(ObsKind::Funding).and_then(|o| o.price.to_scaled(RATE_EXPO).ok()),
+        exchange_time_ns: newest.and_then(|o| o.exchange_time_ns),
+        local_recv_ns: newest.map_or(0, |o| o.local_recv_ns),
+    }
 }
 
 #[cfg(test)]
@@ -957,6 +1113,84 @@ mod tests {
             aggregator.last_trigger(feed_id()),
             trigger(Cause::Moved, later)
         );
+    }
+
+    fn entry(report: &VenueReport, venue: Venue) -> VenueEntry {
+        *report
+            .entries
+            .iter()
+            .find(|entry| entry.venue == venue)
+            .expect("an entry for each source")
+    }
+
+    #[test]
+    fn a_venue_report_shows_each_source_and_how_it_counted() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+        let reports = aggregator.poll_venues(SECOND);
+        let [report] = reports.as_slice() else {
+            panic!("one feed, one report: {reports:?}");
+        };
+        assert_eq!(report.entries.len(), 3, "one entry per configured source");
+        let binance = entry(report, Venue::Binance);
+        assert_eq!(binance.status, SourceStatus::Used);
+        assert_eq!(binance.weight_bps, 5_000);
+        assert_eq!(binance.bid, Some(10_000_000_000));
+        assert_eq!(binance.ask, Some(10_002_000_000));
+        assert_eq!(binance.bid_qty, Some(100_000_000), "one unit at -8");
+        assert_eq!(binance.local_recv_ns, SECOND);
+        let okx = entry(report, Venue::Okx);
+        assert_eq!((okx.status, okx.bid), (SourceStatus::NoData, None));
+        assert!(report.timestamps_coherent());
+    }
+
+    #[test]
+    fn an_outlier_and_a_stale_source_say_so() {
+        let mut aggregator = aggregator();
+        feed(
+            &mut aggregator,
+            SECOND,
+            &[
+                (Venue::Binance, "100", "100.02"),
+                (Venue::Bybit, "100.01", "100.03"),
+                (Venue::Okx, "120", "120.02"),
+            ],
+        );
+        let _ = aggregator.poll_changed(SECOND);
+        let report = aggregator.poll_venues(SECOND).remove(0);
+        assert_eq!(entry(&report, Venue::Okx).status, SourceStatus::Outlier);
+        assert_eq!(entry(&report, Venue::Okx).weight_bps, 0);
+        assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Used);
+
+        let later = SECOND + 3 * SECOND;
+        let _ = aggregator.poll_all(later);
+        let report = aggregator.poll_venues(later).remove(0);
+        assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Stale);
+    }
+
+    #[test]
+    fn venue_reports_follow_the_rate_cap_and_the_heartbeat() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        let _ = aggregator.poll_changed(SECOND);
+        assert_eq!(aggregator.poll_venues(SECOND).len(), 1);
+
+        let soon = SECOND + 10_000_000;
+        feed(&mut aggregator, soon, &both("100", "100.02"));
+        let _ = aggregator.poll_changed(soon);
+        assert!(aggregator.poll_venues(soon).is_empty(), "inside the cap");
+        let due = SECOND + 50_000_000;
+        assert_eq!(aggregator.next_retry_ns(), Some(due));
+        let reports = aggregator.poll_venues(due);
+        assert_eq!(reports.first().map(|report| report.seq), Some(2));
+
+        assert!(
+            aggregator.poll_venues(due + 500_000_000).is_empty(),
+            "nothing new"
+        );
+        let beat = due + SECOND;
+        assert_eq!(aggregator.poll_venues(beat).len(), 1, "the heartbeat");
     }
 
     #[test]

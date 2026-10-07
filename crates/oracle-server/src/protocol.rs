@@ -10,15 +10,23 @@ pub const FIREHOSE: &str = "*";
 #[serde(tag = "op", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ClientMessage {
-    /// Subscribe to feeds. `["*"]` requests the firehose.
+    /// Subscribe to feeds. `["*"]` requests the firehose of prices.
     Subscribe {
-        /// Canonical symbols.
+        /// Canonical symbols whose prices to send.
+        #[serde(default)]
         feeds: Vec<String>,
+        /// Canonical symbols whose venue reports to send. No firehose.
+        #[serde(default)]
+        venues: Vec<String>,
     },
     /// Stop receiving the listed feeds.
     Unsubscribe {
-        /// Canonical symbols.
+        /// Canonical symbols whose prices to stop.
+        #[serde(default)]
         feeds: Vec<String>,
+        /// Canonical symbols whose venue reports to stop.
+        #[serde(default)]
+        venues: Vec<String>,
     },
     /// Liveness check.
     Ping {
@@ -35,15 +43,21 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// Subscription result. `unknown` lists symbols this node does not serve.
     SubscribeAck {
-        /// Accepted symbols.
+        /// Accepted price symbols.
         feeds: Vec<String>,
+        /// Accepted venue report symbols.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        venues: Vec<String>,
         /// Symbols this node does not serve.
         unknown: Vec<String>,
     },
     /// Unsubscription result.
     UnsubscribeAck {
-        /// Removed symbols.
+        /// Removed price symbols.
         feeds: Vec<String>,
+        /// Removed venue report symbols.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        venues: Vec<String>,
     },
     /// Reply to a ping.
     Pong {
@@ -83,6 +97,17 @@ mod tests {
             parsed,
             ClientMessage::Subscribe {
                 feeds: vec!["CRYPTO.BTC/USD".to_owned()],
+                venues: Vec::new(),
+            }
+        );
+        let venues: ClientMessage =
+            serde_json::from_str(r#"{"op":"subscribe","venues":["CRYPTO.BTC/USD"]}"#)
+                .expect("parses");
+        assert_eq!(
+            venues,
+            ClientMessage::Subscribe {
+                feeds: Vec::new(),
+                venues: vec!["CRYPTO.BTC/USD".to_owned()],
             }
         );
     }
@@ -93,7 +118,8 @@ mod tests {
             serde_json::from_str::<ClientMessage>(r#"{"op":"unsubscribe","feeds":["A.B/C"]}"#)
                 .expect("parses"),
             ClientMessage::Unsubscribe {
-                feeds: vec!["A.B/C".to_owned()]
+                feeds: vec!["A.B/C".to_owned()],
+                venues: Vec::new(),
             }
         );
         assert_eq!(
@@ -116,6 +142,7 @@ mod tests {
     fn server_messages_serialize_with_an_op_tag() {
         let ack = ServerMessage::SubscribeAck {
             feeds: vec!["CRYPTO.BTC/USD".to_owned()],
+            venues: vec![],
             unknown: vec![],
         };
         let json = serde_json::to_string(&ack).expect("serializes");

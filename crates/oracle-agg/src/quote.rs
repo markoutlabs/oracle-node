@@ -1,12 +1,14 @@
 //! Turning one venue's observations into one weighted quote.
 
-use oracle_types::{Fixed, ObsKind, Observation, Venue};
+use oracle_types::{Fixed, ObsKind, Observation, SourceStatus, Venue};
 
 use crate::config::{FeedConfig, SourceConfig};
 
 /// One venue's contribution to a feed, after normalization and weighting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceQuote {
+    /// The source's position in the feed's configuration.
+    pub source: usize,
     /// Which venue.
     pub venue: Venue,
     /// The venue's price for this feed.
@@ -37,28 +39,35 @@ pub struct SourceQuote {
 /// thin side, which is where the next print is more likely to land — the mid
 /// quietly becomes fiction exactly when a venue is under stress, which is the
 /// moment the number matters most.
-#[must_use]
+///
+/// # Errors
+///
+/// With no usable kind, returns why, for the venue report: crossed, invalid,
+/// stale or no data, in that order.
 pub fn derive(
+    index: usize,
     source: &SourceConfig,
     config: &FeedConfig,
     latest: &[Option<Observation>],
     now_ns: u64,
-) -> Option<SourceQuote> {
+) -> Result<SourceQuote, SourceStatus> {
     let max_age_ns = u64::try_from(config.max_age.as_nanos()).unwrap_or(u64::MAX);
 
     // Depth replaces a top-of-book price, never a venue's mark or index.
     if let Some(notional) = config.impact_notional
         && source.kinds.contains(&ObsKind::BookTop)
-        && let Some(quote) = from_depth(source, config, latest, notional, now_ns, max_age_ns)
+        && let Some(quote) = from_depth(index, source, config, latest, notional, now_ns, max_age_ns)
     {
-        return Some(quote);
+        return Ok(quote);
     }
 
+    let mut status = SourceStatus::NoData;
     for kind in &source.kinds {
         let Some(Some(observation)) = latest.get(kind.index()) else {
             continue;
         };
         if observation.is_stale(now_ns, max_age_ns) {
+            status = worse(status, SourceStatus::Stale);
             continue;
         }
 
@@ -66,9 +75,11 @@ pub fn derive(
             if observation.is_crossed() {
                 // A crossed top-of-book means the venue's feed is inconsistent.
                 // Drop it; never repair it.
+                status = worse(status, SourceStatus::Crossed);
                 continue;
             }
             let Some(price) = observation.microprice().or_else(|| observation.mid()) else {
+                status = worse(status, SourceStatus::Invalid);
                 continue;
             };
             let half_spread = observation
@@ -82,10 +93,12 @@ pub fn derive(
         if !price.is_positive() && kind.has_book() {
             // A non-positive book price is nonsense. Non-book kinds may legitimately
             // be zero or negative — funding rates cross zero constantly.
+            status = worse(status, SourceStatus::Invalid);
             continue;
         }
 
-        return Some(SourceQuote {
+        return Ok(SourceQuote {
+            source: index,
             venue: observation.venue(),
             price,
             half_spread,
@@ -94,14 +107,30 @@ pub fn derive(
                 config,
                 observation.age_ns(now_ns),
                 observation.spread().and_then(|s| s.to_bps_of(price)),
-            )?,
+            )
+            .ok_or(SourceStatus::Invalid)?,
             observation_time_ns: observation.local_recv_ns,
             from_book,
             converted: source.convert_quote,
             depth_notional: observation.depth_notional_1bp,
         });
     }
-    None
+    Err(status)
+}
+
+/// The more specific of two reasons a source has no quote.
+fn worse(current: SourceStatus, found: SourceStatus) -> SourceStatus {
+    let rank = |status| match status {
+        SourceStatus::Crossed => 3,
+        SourceStatus::Invalid => 2,
+        SourceStatus::Stale => 1,
+        _ => 0,
+    };
+    if rank(found) > rank(current) {
+        found
+    } else {
+        current
+    }
 }
 
 /// The latest observation of `kind` if it is fresh and not crossed.
@@ -125,6 +154,7 @@ fn usable(
 /// sets the timing, so the price does not wait for the next snapshot; a fake
 /// top order moves it only until that snapshot shows the order.
 fn from_depth(
+    index: usize,
     source: &SourceConfig,
     config: &FeedConfig,
     latest: &[Option<Observation>],
@@ -152,6 +182,7 @@ fn from_depth(
     }
     let spread = impact.ask.checked_sub(impact.bid)?;
     Some(SourceQuote {
+        source: index,
         venue: depth.venue(),
         price,
         half_spread: spread.checked_div(Fixed::from_int(2).ok()?),
@@ -320,14 +351,14 @@ mod tests {
             depth(&[("100", "1000")], &[("101", "1"), ("102", "100")], 10),
         );
         put(&mut slots, book("100", "101", "1000", "1", 20));
-        let micro = derive(&source(), &config(), &slots, NOW).expect("a quote");
+        let micro = derive(0, &source(), &config(), &slots, NOW).expect("a quote");
         assert!(
             micro.price > fixed("100.9"),
             "the spoof leans it: {}",
             micro.price
         );
 
-        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        let quote = derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote");
         assert_eq!(quote.price, fixed("100.5"));
         assert_eq!(quote.half_spread, Some(fixed("0.5")));
     }
@@ -339,13 +370,13 @@ mod tests {
         let mut slots = slots();
         put(&mut slots, depth(&[("100", "10")], &[("101", "10")], 80));
         put(&mut slots, book("100.4", "101.4", "1", "1", 5));
-        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        let quote = derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote");
         assert_eq!(quote.price, fixed("100.9"));
         assert_eq!(quote.observation_time_ns, NOW - 5);
 
         // A top older than the snapshot adds nothing.
         put(&mut slots, book("100.4", "101.4", "1", "1", 90));
-        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        let quote = derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote");
         assert_eq!(quote.price, fixed("100.5"));
     }
 
@@ -361,7 +392,7 @@ mod tests {
                 ..trade("100.7", 10)
             },
         );
-        let quote = derive(&mark_only, &with_impact("50"), &slots, NOW).expect("a quote");
+        let quote = derive(0, &mark_only, &with_impact("50"), &slots, NOW).expect("a quote");
         assert_eq!(quote.price, fixed("100.7"));
     }
 
@@ -373,7 +404,7 @@ mod tests {
             depth(&[("100", "10")], &[("101", "10")], 3_000_000_000),
         );
         put(&mut slots, book("100", "102", "1", "1", 10));
-        let quote = derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote");
+        let quote = derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote");
         assert_eq!(quote.price, fixed("101"));
     }
 
@@ -391,7 +422,7 @@ mod tests {
                     10,
                 ),
             );
-            derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote")
+            derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote")
         };
         let deep = {
             let mut slots = slots();
@@ -399,7 +430,7 @@ mod tests {
                 &mut slots,
                 depth(&[("99.99", "100")], &[("100.01", "100")], 10),
             );
-            derive(&source(), &with_impact("50"), &slots, NOW).expect("a quote")
+            derive(0, &source(), &with_impact("50"), &slots, NOW).expect("a quote")
         };
         assert!(
             deep.weight > thin.weight,
@@ -420,7 +451,7 @@ mod tests {
     fn a_balanced_book_yields_the_mid() {
         let mut slots = slots();
         put(&mut slots, book("100", "102", "5", "5", 0));
-        let quote = derive(&source(), &config(), &slots, NOW).expect("usable");
+        let quote = derive(0, &source(), &config(), &slots, NOW).expect("usable");
         assert_eq!(quote.price, fixed("101"));
         assert_eq!(quote.half_spread, Some(fixed("1")));
         assert!(quote.from_book);
@@ -430,7 +461,7 @@ mod tests {
     fn an_unbalanced_book_leans_toward_the_thin_side() {
         let mut slots = slots();
         put(&mut slots, book("100", "102", "9", "1", 0));
-        let quote = derive(&source(), &config(), &slots, NOW).expect("usable");
+        let quote = derive(0, &source(), &config(), &slots, NOW).expect("usable");
         assert_eq!(quote.price, fixed("101.8"));
     }
 
@@ -440,7 +471,7 @@ mod tests {
         // Book is three seconds old; the 2s threshold rejects it.
         put(&mut slots, book("100", "102", "5", "5", 3_000_000_000));
         put(&mut slots, trade("101.5", 0));
-        let quote = derive(&source(), &config(), &slots, NOW).expect("usable");
+        let quote = derive(0, &source(), &config(), &slots, NOW).expect("usable");
         assert_eq!(quote.price, fixed("101.5"));
         assert!(
             !quote.from_book,
@@ -454,7 +485,29 @@ mod tests {
         let mut slots = slots();
         put(&mut slots, book("100", "102", "5", "5", 3_000_000_000));
         put(&mut slots, trade("101.5", 3_000_000_000));
-        assert_eq!(derive(&source(), &config(), &slots, NOW), None);
+        assert_eq!(
+            derive(0, &source(), &config(), &slots, NOW),
+            Err(SourceStatus::Stale)
+        );
+    }
+
+    #[test]
+    fn no_observation_at_all_is_no_data() {
+        assert_eq!(
+            derive(0, &source(), &config(), &slots(), NOW),
+            Err(SourceStatus::NoData)
+        );
+    }
+
+    #[test]
+    fn a_crossed_book_outranks_a_stale_trade() {
+        let mut slots = slots();
+        put(&mut slots, book("102", "100", "5", "5", 0));
+        put(&mut slots, trade("101.5", 3_000_000_000));
+        assert_eq!(
+            derive(0, &source(), &config(), &slots, NOW),
+            Err(SourceStatus::Crossed)
+        );
     }
 
     #[test]
@@ -462,7 +515,7 @@ mod tests {
         let mut slots = slots();
         put(&mut slots, book("102", "100", "5", "5", 0));
         put(&mut slots, trade("101", 0));
-        let quote = derive(&source(), &config(), &slots, NOW).expect("falls back");
+        let quote = derive(0, &source(), &config(), &slots, NOW).expect("falls back");
         assert_eq!(
             quote.price,
             fixed("101"),
@@ -478,8 +531,8 @@ mod tests {
         let mut old = slots();
         put(&mut old, book("99.999", "100.001", "5", "5", 1_000_000_000));
 
-        let fresh = derive(&source(), &config(), &fresh, NOW).expect("usable");
-        let old = derive(&source(), &config(), &old, NOW).expect("usable");
+        let fresh = derive(0, &source(), &config(), &fresh, NOW).expect("usable");
+        let old = derive(0, &source(), &config(), &old, NOW).expect("usable");
         // tau = 500ms, so a one-second-old quote carries a third of the weight.
         let ratio = fresh.weight.checked_div(old.weight).expect("in range");
         let error = ratio
@@ -497,8 +550,8 @@ mod tests {
         put(&mut tight, book("99.999", "100.001", "5", "5", 0));
         let mut wide = slots();
         put(&mut wide, book("99", "101", "5", "5", 0));
-        let tight = derive(&source(), &config(), &tight, NOW).expect("usable");
-        let wide = derive(&source(), &config(), &wide, NOW).expect("usable");
+        let tight = derive(0, &source(), &config(), &tight, NOW).expect("usable");
+        let wide = derive(0, &source(), &config(), &wide, NOW).expect("usable");
         // A book 0.2bp wide already gives up a sixth of its weight; one 200bp
         // wide keeps half a percent. Relative ordering is what matters, but the
         // steepness is worth seeing.
@@ -513,8 +566,8 @@ mod tests {
         let mut wide = slots();
         put(&mut wide, book("99", "101", "5", "5", 0));
 
-        let tight = derive(&source(), &config(), &tight, NOW).expect("usable");
-        let wide = derive(&source(), &config(), &wide, NOW).expect("usable");
+        let tight = derive(0, &source(), &config(), &tight, NOW).expect("usable");
+        let wide = derive(0, &source(), &config(), &wide, NOW).expect("usable");
         assert!(
             tight.weight > wide.weight,
             "{} should exceed {}",
@@ -528,8 +581,8 @@ mod tests {
         let mut slots = slots();
         put(&mut slots, book("100", "102", "5", "5", 0));
         let trusted = source().with_weight(fixed("3"));
-        let plain = derive(&source(), &config(), &slots, NOW).expect("usable");
-        let boosted = derive(&trusted, &config(), &slots, NOW).expect("usable");
+        let plain = derive(0, &source(), &config(), &slots, NOW).expect("usable");
+        let boosted = derive(0, &trusted, &config(), &slots, NOW).expect("usable");
         assert_eq!(
             boosted.weight,
             plain.weight.checked_mul(fixed("3")).expect("in range")
@@ -542,7 +595,7 @@ mod tests {
         // neutral factor rather than a silently-zero weight.
         let mut slots = slots();
         put(&mut slots, book("100", "102", "5", "5", 0));
-        let quote = derive(&source(), &config(), &slots, NOW).expect("usable");
+        let quote = derive(0, &source(), &config(), &slots, NOW).expect("usable");
         assert!(quote.weight.is_positive());
     }
 
@@ -570,7 +623,7 @@ mod tests {
         let mut observation = trade("-0.000125", 0);
         observation.kind = ObsKind::Funding;
         put(&mut slots, observation);
-        let quote = derive(&funding_source, &config(), &slots, NOW).expect("usable");
+        let quote = derive(0, &funding_source, &config(), &slots, NOW).expect("usable");
         assert_eq!(quote.price, fixed("-0.000125"));
     }
 }

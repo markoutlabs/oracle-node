@@ -14,12 +14,12 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_transport::{CloseReason, Control, HandshakeMessage, KeyGrant};
 use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Address, Registry, SignedUpdate, feed_id};
+use oracle_wire::{Address, Registry, SignedUpdate, SignedVenueReport, feed_id};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
-use crate::hub::{Hub, PreparedUpdate};
+use crate::hub::{Hub, PreparedUpdate, PreparedVenues};
 use crate::protocol::{ClientMessage, FIREHOSE, ServerMessage};
 use crate::transport::{Established, NodeTransport, Outbound, unix_now};
 
@@ -88,6 +88,13 @@ impl ServerState {
     pub fn publish(&self, signed: SignedUpdate) -> Option<Arc<PreparedUpdate>> {
         let symbol = *self.catalog.get(&signed.update().feed_id)?;
         Some(self.hub.publish(symbol, signed))
+    }
+
+    /// Publishes a signed venue report to the subscribers that asked for it.
+    #[must_use]
+    pub fn publish_venues(&self, signed: SignedVenueReport) -> Option<Arc<PreparedVenues>> {
+        let symbol = *self.catalog.get(&signed.report().feed_id)?;
+        Some(self.hub.publish_venues(symbol, signed))
     }
 
     /// Resolves a symbol to a feed id.
@@ -172,39 +179,59 @@ fn handle_control(
     };
 
     match parsed {
-        ClientMessage::Subscribe { feeds } => {
+        ClientMessage::Subscribe { feeds, venues } => {
+            let mut unknown = Vec::new();
+            let (venues, venue_ids) = known(state, venues, &mut unknown);
+            subscriber.add_venues(venue_ids);
             if feeds.iter().any(|feed| feed == FIREHOSE) {
                 subscriber.select_firehose();
                 return ServerMessage::SubscribeAck {
                     feeds: vec![FIREHOSE.to_owned()],
-                    unknown: Vec::new(),
+                    venues,
+                    unknown,
                 };
             }
-            let mut known = Vec::new();
-            let mut unknown = Vec::new();
-            let mut ids = Vec::new();
-            for feed in feeds {
-                match state.lookup(&feed) {
-                    Some(id) => {
-                        ids.push(id);
-                        known.push(feed);
-                    }
-                    None => unknown.push(feed),
-                }
-            }
+            let (feeds, ids) = known(state, feeds, &mut unknown);
             subscriber.add(ids);
             ServerMessage::SubscribeAck {
-                feeds: known,
+                feeds,
+                venues,
                 unknown,
             }
         }
-        ClientMessage::Unsubscribe { feeds } => {
-            let ids: Vec<FeedId> = feeds.iter().filter_map(|feed| state.lookup(feed)).collect();
-            subscriber.remove(ids);
-            ServerMessage::UnsubscribeAck { feeds }
+        ClientMessage::Unsubscribe { feeds, venues } => {
+            let ids = |symbols: &[String]| -> Vec<FeedId> {
+                symbols
+                    .iter()
+                    .filter_map(|feed| state.lookup(feed))
+                    .collect()
+            };
+            subscriber.remove(ids(&feeds));
+            subscriber.remove_venues(ids(&venues));
+            ServerMessage::UnsubscribeAck { feeds, venues }
         }
         ClientMessage::Ping { id } => ServerMessage::Pong { id },
     }
+}
+
+/// Splits symbols into those this node serves, with their ids, and the rest.
+fn known(
+    state: &ServerState,
+    symbols: Vec<String>,
+    unknown: &mut Vec<String>,
+) -> (Vec<String>, Vec<FeedId>) {
+    let mut known = Vec::new();
+    let mut ids = Vec::new();
+    for symbol in symbols {
+        match state.lookup(&symbol) {
+            Some(id) => {
+                ids.push(id);
+                known.push(symbol);
+            }
+            None => unknown.push(symbol),
+        }
+    }
+    (known, ids)
 }
 
 // ---------------------------------------------------------------- websocket
@@ -406,6 +433,7 @@ fn instant_at(deadline: u64) -> tokio::time::Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Channel;
     use crate::testing::{test_registry, test_transport};
 
     fn symbols() -> Vec<Symbol> {
@@ -449,8 +477,45 @@ mod tests {
             "unknown feeds must be reported: {json}"
         );
 
-        assert!(subscriber.wants(state.lookup("CRYPTO.BTC/USD").expect("known")));
-        assert!(!subscriber.wants(state.lookup("CRYPTO.ETH/USD").expect("known")));
+        assert!(subscriber.wants(
+            Channel::Prices,
+            state.lookup("CRYPTO.BTC/USD").expect("known")
+        ));
+        assert!(!subscriber.wants(
+            Channel::Prices,
+            state.lookup("CRYPTO.ETH/USD").expect("known")
+        ));
+    }
+
+    #[test]
+    fn venue_reports_are_subscribed_apart_from_prices() {
+        let state = state();
+        let subscriber = state
+            .hub()
+            .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
+        let json = serde_json::to_string(&handle_control(
+            r#"{"op":"subscribe","feeds":["*"],"venues":["CRYPTO.BTC/USD","CRYPTO.DOGE/USD"]}"#,
+            &state,
+            &subscriber,
+        ))
+        .expect("serialises");
+        assert!(json.contains(r#""venues":["CRYPTO.BTC/USD"]"#), "{json}");
+        assert!(json.contains("CRYPTO.DOGE/USD"), "{json}");
+        let btc = state.lookup("CRYPTO.BTC/USD").expect("known");
+        let eth = state.lookup("CRYPTO.ETH/USD").expect("known");
+        assert!(subscriber.wants(Channel::Venues, btc));
+        assert!(
+            !subscriber.wants(Channel::Venues, eth),
+            "the price firehose does not cover venue reports"
+        );
+
+        let _ = handle_control(
+            r#"{"op":"unsubscribe","venues":["CRYPTO.BTC/USD"]}"#,
+            &state,
+            &subscriber,
+        );
+        assert!(!subscriber.wants(Channel::Venues, btc));
+        assert!(subscriber.wants(Channel::Prices, btc));
     }
 
     #[test]
@@ -460,8 +525,14 @@ mod tests {
             .hub()
             .subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
         let _ = handle_control(r#"{"op":"subscribe","feeds":["*"]}"#, &state, &subscriber);
-        assert!(subscriber.wants(state.lookup("CRYPTO.BTC/USD").expect("known")));
-        assert!(subscriber.wants(state.lookup("CRYPTO.ETH/USD").expect("known")));
+        assert!(subscriber.wants(
+            Channel::Prices,
+            state.lookup("CRYPTO.BTC/USD").expect("known")
+        ));
+        assert!(subscriber.wants(
+            Channel::Prices,
+            state.lookup("CRYPTO.ETH/USD").expect("known")
+        ));
     }
 
     #[test]
@@ -480,7 +551,10 @@ mod tests {
             &state,
             &subscriber,
         );
-        assert!(!subscriber.wants(state.lookup("CRYPTO.BTC/USD").expect("known")));
+        assert!(!subscriber.wants(
+            Channel::Prices,
+            state.lookup("CRYPTO.BTC/USD").expect("known")
+        ));
     }
 
     #[test]

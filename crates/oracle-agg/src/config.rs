@@ -267,6 +267,15 @@ impl FeedConfig {
                 symbol: self.symbol.to_string(),
             });
         }
+        if self.sources.len() > oracle_types::MAX_VENUE_ENTRIES {
+            return Err(ConfigError::Invalid {
+                symbol: self.symbol.to_string(),
+                reason: format!(
+                    "at most {} sources: a venue report carries one entry for each",
+                    oracle_types::MAX_VENUE_ENTRIES
+                ),
+            });
+        }
         let available = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
         if self.min_sources > available {
             return Err(ConfigError::UnreachableQuorum {

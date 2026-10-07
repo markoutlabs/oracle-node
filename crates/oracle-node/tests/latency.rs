@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oracle_client::{ClientStats, HttpRegistrySource, LatencyReport, OracleClient};
+use oracle_client::{ClientStats, Event, HttpRegistrySource, LatencyReport, OracleClient};
 use oracle_registry_canister::testing::Harness;
 use oracle_server::unix_now;
 use oracle_wire::{NodeEntry, Signer};
@@ -22,6 +22,8 @@ use tokio::runtime::Runtime;
 
 use common::{BINARY, Node, READY, fields_of, free_port};
 
+/// The feed whose last venue report the run prints.
+const SHOWN: &str = "CRYPTO.BTC/USDT";
 /// Venue connections and local books settle in this time; it is not measured.
 const WARM_UP: Duration = Duration::from_secs(15);
 const STATUS: &str = "status";
@@ -73,7 +75,7 @@ fn live_latency_from_the_venues_to_the_sdk() {
     let source = HttpRegistrySource::new(&canister.url("registry.json"), canister.certification())
         .expect("builds");
     let runtime = Runtime::new().expect("runtime");
-    let (latency, stats) = runtime.block_on(async {
+    let (latency, stats, venues) = runtime.block_on(async {
         let mut client = OracleClient::builder_from_source(Arc::new(source), governance)
             .await
             .expect("the registry verifies")
@@ -84,18 +86,25 @@ fn live_latency_from_the_venues_to_the_sdk() {
             .expect("builds");
         let names: Vec<&str> = symbols.iter().map(String::as_str).collect();
         client.subscribe(&names).await.expect("subscribes");
+        client.subscribe_venues(&[SHOWN]).await.expect("subscribes");
         drain(&mut client, WARM_UP).await;
         client.reset_latency();
         let before = client.stats();
-        drain(&mut client, span).await;
+        let venues = drain(&mut client, span).await;
         let mut stats = client.stats();
         stats.accepted = stats.accepted.saturating_sub(before.accepted);
-        (client.latency(), stats)
+        (client.latency(), stats, venues)
     });
     let status = second_report(&node, STATUS);
     let lag = second_report(&node, VENUE_LAG);
     drop(node);
     report(span, symbols.len(), &stats, &latency, &status, &lag);
+    let venues = venues.expect("a venue report arrived");
+    println!(
+        "\nlast venue report for {SHOWN}, signed by {}:\n{}",
+        venues.signer,
+        serde_json::to_string_pretty(&venues.report).expect("serialises")
+    );
     assert!(stats.accepted > 0, "no update arrived: {stats:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -130,9 +139,16 @@ fn serve_every_feed(config: &Path, port: u16) -> Vec<String> {
         .collect()
 }
 
-async fn drain(client: &mut OracleClient, span: Duration) {
+/// Runs the client for `span`, and returns the last venue report.
+async fn drain(client: &mut OracleClient, span: Duration) -> Option<oracle_client::AcceptedVenues> {
     let deadline = tokio::time::Instant::now() + span;
-    while let Ok(Some(_)) = tokio::time::timeout_at(deadline, client.next()).await {}
+    let mut last = None;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, client.next_event()).await {
+        if let Event::Venues(report) = event {
+            last = Some(report);
+        }
+    }
+    last
 }
 
 /// The node reports once a minute. The second report is the first one with no

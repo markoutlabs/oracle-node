@@ -19,6 +19,7 @@ mod observation;
 mod symbol;
 mod update;
 mod venue;
+mod venue_report;
 
 pub use fixed::{Fixed, FixedError};
 pub use flags::Flags;
@@ -26,6 +27,9 @@ pub use observation::{BookDepth, Impact, Level, ObsKind, ObsKindError, Observati
 pub use symbol::{AssetClass, AssetCode, FeedId, FeedKind, Symbol, SymbolError};
 pub use update::PriceUpdate;
 pub use venue::{InstrumentId, MarketKind, Venue, VenueError, VenueSet};
+pub use venue_report::{
+    MAX_VENUE_ENTRIES, QTY_EXPO, RATE_EXPO, SourceStatus, VenueEntry, VenueReport,
+};
 
 /// Nanoseconds in one second, as `u64`.
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;

@@ -81,11 +81,15 @@ pub mod source;
 pub mod testing;
 pub mod verify;
 
-pub use client::{ClientError, ClientStats, OracleClient, OracleClientBuilder, now_unix_nanos};
+pub use client::{
+    ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, now_unix_nanos,
+};
 pub use latency::{LatencyHistogram, LatencyReport, Percentiles};
 pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 pub use source::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, IC_MAINNET_ROOT_KEY,
     RegistrySource,
 };
-pub use verify::{Accepted, RejectReason, Verifier, VerifyConfig, verify_historical};
+pub use verify::{
+    Accepted, AcceptedVenues, RejectReason, Verifier, VerifyConfig, verify_historical,
+};

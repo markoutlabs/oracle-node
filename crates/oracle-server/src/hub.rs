@@ -16,14 +16,14 @@
 //! than reading state will be wrong. If every transition matters, that is a
 //! durable log, not a live socket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use oracle_transport::{BroadcastSealer, os_rng};
 use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Address, SignedUpdate};
+use oracle_wire::{Address, SignedUpdate, SignedVenueReport};
 use tokio::sync::Notify;
 
 /// A signed update, serialized and sealed once and shared by every subscriber.
@@ -77,6 +77,84 @@ impl PreparedUpdate {
     }
 }
 
+/// A venue report, serialized and sealed once and shared by every subscriber.
+pub struct PreparedVenues {
+    /// The feed.
+    pub feed_id: FeedId,
+    /// The canonical symbol.
+    pub symbol: Symbol,
+    sealed: Bytes,
+    signed: SignedVenueReport,
+}
+
+impl PreparedVenues {
+    /// Prepares a signed venue report for fanout, sealing it once.
+    #[must_use]
+    pub fn new(symbol: Symbol, signed: SignedVenueReport, sealer: &BroadcastSealer) -> Self {
+        let sealed = Bytes::from(sealer.seal(&signed.encode_frame(), &mut os_rng()));
+        Self {
+            feed_id: signed.report().feed_id,
+            symbol,
+            sealed,
+            signed,
+        }
+    }
+
+    /// Returns the signed report.
+    #[must_use]
+    pub const fn signed(&self) -> &SignedVenueReport {
+        &self.signed
+    }
+}
+
+/// Which stream a frame belongs to. Each stream has its own slot per feed, so a
+/// venue report never replaces a price.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Channel {
+    /// Price updates.
+    Prices,
+    /// Venue reports.
+    Venues,
+}
+
+/// A frame that waits for one subscriber.
+#[derive(Clone)]
+pub enum Outgoing {
+    /// A price update.
+    Price(Arc<PreparedUpdate>),
+    /// A venue report.
+    Venues(Arc<PreparedVenues>),
+}
+
+impl Outgoing {
+    /// Returns the sealed frame, the same bytes for every subscriber.
+    #[must_use]
+    pub fn sealed(&self) -> Bytes {
+        match self {
+            Self::Price(update) => update.sealed(),
+            Self::Venues(report) => report.sealed.clone(),
+        }
+    }
+
+    /// Returns the feed.
+    #[must_use]
+    pub fn feed_id(&self) -> FeedId {
+        match self {
+            Self::Price(update) => update.feed_id,
+            Self::Venues(report) => report.feed_id,
+        }
+    }
+
+    /// Returns the stream.
+    #[must_use]
+    pub const fn channel(&self) -> Channel {
+        match self {
+            Self::Price(_) => Channel::Prices,
+            Self::Venues(_) => Channel::Venues,
+        }
+    }
+}
+
 /// What a subscriber is listening to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selection {
@@ -101,7 +179,9 @@ pub struct Subscriber {
     id: u64,
     client: Address,
     selection: Mutex<Selection>,
-    pending: Mutex<HashMap<FeedId, Arc<PreparedUpdate>>>,
+    /// Feeds whose venue reports this subscriber wants. Never the firehose.
+    venues: Mutex<HashSet<FeedId>>,
+    pending: Mutex<HashMap<(Channel, FeedId), Outgoing>>,
     dropped: AtomicU64,
     lagged: AtomicBool,
     closed: AtomicBool,
@@ -156,12 +236,35 @@ impl Subscriber {
         }
     }
 
-    /// Returns `true` if this subscriber wants `feed_id`.
+    /// Adds feeds whose venue reports to send.
+    pub fn add_venues(&self, feeds: impl IntoIterator<Item = FeedId>) {
+        if let Ok(mut venues) = self.venues.lock() {
+            venues.extend(feeds);
+        }
+    }
+
+    /// Stops the venue reports of these feeds.
+    pub fn remove_venues(&self, feeds: impl IntoIterator<Item = FeedId>) {
+        if let Ok(mut venues) = self.venues.lock() {
+            for feed in feeds {
+                venues.remove(&feed);
+            }
+        }
+    }
+
+    /// Returns `true` if this subscriber wants `feed_id` on `channel`.
     #[must_use]
-    pub fn wants(&self, feed_id: FeedId) -> bool {
-        self.selection
-            .lock()
-            .is_ok_and(|selection| selection.wants(feed_id))
+    pub fn wants(&self, channel: Channel, feed_id: FeedId) -> bool {
+        match channel {
+            Channel::Prices => self
+                .selection
+                .lock()
+                .is_ok_and(|selection| selection.wants(feed_id)),
+            Channel::Venues => self
+                .venues
+                .lock()
+                .is_ok_and(|venues| venues.contains(&feed_id)),
+        }
     }
 
     /// Returns how many updates were conflated away.
@@ -188,19 +291,20 @@ impl Subscriber {
         self.notify.notify_waiters();
     }
 
-    /// Offers an update, replacing any pending one for the same feed.
-    fn offer(&self, update: &Arc<PreparedUpdate>) {
+    /// Offers a frame, replacing any pending one for the same feed and stream.
+    fn offer(&self, frame: Outgoing) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        if pending.len() >= self.max_pending && !pending.contains_key(&update.feed_id) {
+        let key = (frame.channel(), frame.feed_id());
+        if pending.len() >= self.max_pending && !pending.contains_key(&key) {
             // Too many distinct feeds outstanding: this subscriber is not
             // keeping up at all. Say so rather than quietly dropping data.
             self.lagged.store(true, Ordering::Relaxed);
             self.notify.notify_waiters();
             return;
         }
-        if pending.insert(update.feed_id, Arc::clone(update)).is_some() {
+        if pending.insert(key, frame).is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         drop(pending);
@@ -211,7 +315,7 @@ impl Subscriber {
     ///
     /// Returns an empty vector when the subscriber is closed or has lagged, so
     /// the caller can check [`Subscriber::is_lagged`] and report it.
-    pub async fn drain(&self) -> Vec<Arc<PreparedUpdate>> {
+    pub async fn drain(&self) -> Vec<Outgoing> {
         loop {
             if self.is_closed() || self.is_lagged() {
                 return Vec::new();
@@ -221,7 +325,7 @@ impl Subscriber {
                     return Vec::new();
                 };
                 if !pending.is_empty() {
-                    return pending.drain().map(|(_, update)| update).collect();
+                    return pending.drain().map(|(_, frame)| frame).collect();
                 }
             }
             self.notify.notified().await;
@@ -261,7 +365,8 @@ impl Hub {
         let subscriber = Arc::new(Subscriber {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             client,
-            selection: Mutex::new(Selection::Feeds(std::collections::HashSet::new())),
+            selection: Mutex::new(Selection::Feeds(HashSet::new())),
+            venues: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
             lagged: AtomicBool::new(false),
@@ -299,14 +404,26 @@ impl Hub {
         if let Ok(mut latest) = self.latest.lock() {
             latest.insert(prepared.feed_id, Arc::clone(&prepared));
         }
+        self.offer(&Outgoing::Price(Arc::clone(&prepared)));
+        prepared
+    }
+
+    /// Publishes a venue report to every subscriber that asked for it.
+    pub fn publish_venues(&self, symbol: Symbol, signed: SignedVenueReport) -> Arc<PreparedVenues> {
+        let prepared = Arc::new(PreparedVenues::new(symbol, signed, &self.sealer));
+        self.offer(&Outgoing::Venues(Arc::clone(&prepared)));
+        prepared
+    }
+
+    fn offer(&self, frame: &Outgoing) {
+        let (channel, feed_id) = (frame.channel(), frame.feed_id());
         if let Ok(subscribers) = self.subscribers.lock() {
             for subscriber in subscribers.values() {
-                if !subscriber.is_closed() && subscriber.wants(prepared.feed_id) {
-                    subscriber.offer(&prepared);
+                if !subscriber.is_closed() && subscriber.wants(channel, feed_id) {
+                    subscriber.offer(frame.clone());
                 }
             }
         }
-        prepared
     }
 
     /// Returns the latest update for every feed.
@@ -374,10 +491,7 @@ mod tests {
 
         let drained = subscriber.drain().await;
         assert_eq!(drained.len(), 1, "only the selected feed should arrive");
-        assert_eq!(
-            drained.first().map(|update| update.feed_id),
-            Some(feed_id(&btc))
-        );
+        assert_eq!(drained.first().map(Outgoing::feed_id), Some(feed_id(&btc)));
     }
 
     /// The defining behaviour: a slow subscriber gets the newest price, not a
@@ -396,11 +510,54 @@ mod tests {
         let drained = subscriber.drain().await;
         assert_eq!(drained.len(), 1, "100 updates must conflate to one slot");
         assert_eq!(
-            drained.first().map(|update| update.signed().update().seq),
+            drained.first().and_then(|frame| match frame {
+                Outgoing::Price(update) => Some(update.signed().update().seq),
+                Outgoing::Venues(_) => None,
+            }),
             Some(100),
             "and it must be the newest"
         );
         assert_eq!(subscriber.dropped(), 99);
+    }
+
+    fn venues(symbol: &Symbol, seq: u64) -> SignedVenueReport {
+        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        signer
+            .sign_venue_report(&oracle_types::VenueReport {
+                feed_id: feed_id(symbol),
+                publish_time_ns: 1_754_582_400_000_000_000 + seq,
+                seq,
+                expo: -8,
+                entries: Vec::new(),
+            })
+            .expect("signs")
+    }
+
+    #[tokio::test]
+    async fn a_venue_report_has_its_own_selection_and_its_own_slot() {
+        let hub = hub(64);
+        let btc = symbol("CRYPTO.BTC/USD");
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
+        subscriber.select([feed_id(&btc)].into_iter().collect());
+        hub.publish_venues(btc, venues(&btc, 1));
+        hub.publish(btc, signed(&btc, 1));
+        assert_eq!(
+            subscriber.drain().await.len(),
+            1,
+            "venue reports need their own subscription"
+        );
+
+        subscriber.add_venues([feed_id(&btc)]);
+        hub.publish(btc, signed(&btc, 2));
+        hub.publish_venues(btc, venues(&btc, 2));
+        hub.publish_venues(btc, venues(&btc, 3));
+        let drained = subscriber.drain().await;
+        assert_eq!(drained.len(), 2, "a report never replaces a price");
+        assert!(
+            drained
+                .iter()
+                .any(|frame| frame.channel() == Channel::Venues)
+        );
     }
 
     #[tokio::test]

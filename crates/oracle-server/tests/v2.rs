@@ -10,8 +10,10 @@ use oracle_transport::{
     ClientHandshake, ClientSession, CloseReason, Control, HandshakeMessage, TYPE_CONTROL,
     TYPE_FRAME,
 };
-use oracle_types::Symbol;
-use oracle_wire::{ClientEntry, ClientList, Signer, UnverifiedFrame, feed_id};
+use oracle_types::{Symbol, VenueReport};
+use oracle_wire::{
+    ClientEntry, ClientList, Signer, UnverifiedFrame, UnverifiedVenueFrame, feed_id,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -164,12 +166,16 @@ fn publish(node: &Node, seq: u64) {
 }
 
 async fn subscribe(socket: &mut Socket, session: &mut ClientSession) {
-    send_app(
+    subscribe_with(
         socket,
         session,
         r#"{"op":"subscribe","feeds":["CRYPTO.BTC/USD"]}"#,
     )
     .await;
+}
+
+async fn subscribe_with(socket: &mut Socket, session: &mut ClientSession, request: &str) {
+    send_app(socket, session, request).await;
     loop {
         if let Received::Control(Control::App(json)) = receive(socket, session).await {
             assert!(
@@ -211,6 +217,37 @@ async fn a_listed_client_receives_sealed_frames_signed_by_the_node() {
         signing_key().address()
     );
     assert_eq!(node.transport.session_count(), 1);
+}
+
+#[tokio::test]
+async fn venue_reports_arrive_sealed_and_signed_on_their_own_subscription() {
+    let node = start(
+        &client_list(1, 60, &[(1, unix_now() + 3_600)]),
+        TransportConfig::default(),
+    )
+    .await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
+    subscribe_with(
+        &mut socket,
+        &mut session,
+        r#"{"op":"subscribe","venues":["CRYPTO.BTC/USD"]}"#,
+    )
+    .await;
+    publish(&node, 7);
+    let report = VenueReport {
+        feed_id: feed_id(&BTC.parse::<Symbol>().expect("valid")),
+        publish_time_ns: unix_now() * 1_000_000_000,
+        seq: 1,
+        expo: -8,
+        entries: Vec::new(),
+    };
+    let signed = signing_key().sign_venue_report(&report).expect("signs");
+    let _ = node.state.publish_venues(signed);
+
+    let sealed = next_frame(&mut socket, &mut session).await;
+    let frame = session.keys.open(&sealed).expect("opens");
+    let parsed = UnverifiedVenueFrame::parse(&frame).expect("the venue frame, not the price");
+    assert_eq!(parsed.decode_unverified().expect("decodes"), report);
 }
 
 #[tokio::test]

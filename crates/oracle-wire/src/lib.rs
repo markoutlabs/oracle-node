@@ -82,6 +82,7 @@ mod payload;
 mod registry;
 mod signature;
 mod signer;
+mod venues;
 
 pub use address::{Address, CompressedPublicKey};
 pub use auth::{
@@ -97,7 +98,8 @@ pub use frame::{
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
     KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_NODE_AUTH_OK, KIND_PRICE_UPDATE, KIND_REGISTRY,
-    PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
+    KIND_VENUE_REPORT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update,
+    encode_price_update, feed_id,
 };
 pub use registry::{
     EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, NodeEntry, NodeListing, Quorum,
@@ -105,3 +107,8 @@ pub use registry::{
 };
 pub use signature::{SIGNATURE_LEN, Signature};
 pub use signer::{Signer, recover_address, recover_payload_signer};
+pub use venues::{
+    FRAME_TYPE_VENUE_REPORT, MAX_VENUE_FRAME_SIZE, SignedVenueReport, UnverifiedVenueFrame,
+    VENUE_ENTRY_SIZE, VENUE_HEADER_SIZE, VerifiedVenueReport, decode_venue_report,
+    encode_venue_report,
+};

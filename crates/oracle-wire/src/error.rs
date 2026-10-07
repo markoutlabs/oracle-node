@@ -104,6 +104,31 @@ pub enum WireError {
         expected: usize,
     },
 
+    /// A venue report listed more entries than the format allows.
+    #[error("too many venue entries: {actual} exceeds the limit of {limit}")]
+    TooManyEntries {
+        /// Entries listed.
+        actual: usize,
+        /// Maximum permitted.
+        limit: usize,
+    },
+
+    /// A one-byte code was not one this build knows.
+    #[error("unknown {field} code {value}")]
+    UnknownCode {
+        /// Which field.
+        field: &'static str,
+        /// The code.
+        value: u8,
+    },
+
+    /// A value has more than one byte form, and this was not the canonical one.
+    ///
+    /// A signature commits to bytes. Two encodings of one report would give two
+    /// valid signatures for it.
+    #[error("non-canonical encoding: {0}")]
+    NonCanonical(&'static str),
+
     /// A length-delimited field exceeded its cap.
     ///
     /// The caps exist so that parsing an untrusted registry cannot be turned

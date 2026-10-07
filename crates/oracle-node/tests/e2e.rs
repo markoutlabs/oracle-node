@@ -75,6 +75,9 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
     assert_eq!(address_in(&serving, "address"), Some(old));
     let mut client = Subscriber::start(&runtime, &canister, governance, c1);
     client.until("verified a price", |seen| seen.stats.accepted >= 3);
+    client.until("verified a venue report", |seen| {
+        seen.stats.venue_reports >= 1
+    });
 
     // Rotation under the live client: a new key, `replace_node`, a restart.
     run(Command::new(BINARY)
@@ -288,6 +291,10 @@ impl Subscriber {
                 .build()
                 .expect("builds");
             client.subscribe(&[FEED]).await.expect("subscribes");
+            client
+                .subscribe_venues(&[FEED])
+                .await
+                .expect("subscribes to venue reports");
             client
         });
         let (tx, rx) = watch::channel(seen(&client));

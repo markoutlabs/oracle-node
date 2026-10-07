@@ -139,12 +139,12 @@ impl PriceUpdate {
 /// a silently wrong value and a broken replay check. Strings avoid the entire
 /// class of problem, so every 64-bit field crosses as one.
 #[cfg(feature = "serde")]
-mod num_str {
+pub(crate) mod num_str {
     use core::fmt::Display;
     use core::str::FromStr;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
-    pub(super) fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    pub(crate) fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
     where
         T: Display,
         S: Serializer,
@@ -152,7 +152,7 @@ mod num_str {
         serializer.collect_str(value)
     }
 
-    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    pub(crate) fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
     where
         T: FromStr,
         T::Err: Display,
@@ -160,6 +160,36 @@ mod num_str {
     {
         let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
         text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// [`num_str`] for an optional value: absent is `null`.
+#[cfg(feature = "serde")]
+pub(crate) mod opt_num_str {
+    use core::fmt::Display;
+    use core::str::FromStr;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(crate) fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Display,
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.collect_str(value),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(crate) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        T: FromStr,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        Option::<std::borrow::Cow<'de, str>>::deserialize(deserializer)?
+            .map(|text| text.parse().map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
 

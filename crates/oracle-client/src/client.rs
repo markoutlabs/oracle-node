@@ -15,7 +15,9 @@ use oracle_transport::{
     TYPE_FRAME, TransportError, os_rng,
 };
 use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
-use oracle_wire::{Address, Registry, Signer, VerifiedRegistry, VerifyError, feed_id};
+use oracle_wire::{
+    Address, FRAME_TYPE_VENUE_REPORT, Registry, Signer, VerifiedRegistry, VerifyError, feed_id,
+};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -25,7 +27,7 @@ use tracing::{debug, info, warn};
 use crate::latency::{Latency, LatencyReport};
 use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
-use crate::verify::{RejectReason, Verifier, VerifyConfig};
+use crate::verify::{AcceptedVenues, RejectReason, Verifier, VerifyConfig};
 
 /// The quorum below which the builder demands an explicit acknowledgement.
 const SAFE_QUORUM: usize = 3;
@@ -46,6 +48,16 @@ const DEFAULT_MAX_REGISTRY_AGE: Duration = Duration::from_secs(48 * 3_600);
 
 /// Bounds how long a de-listed node keeps its seat.
 const DEFAULT_REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What [`OracleClient::next_event`] yields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A price, resolved across the nodes.
+    Price(Resolved),
+    /// One node's verified venue report. Not resolved across nodes: each node
+    /// reports what it saw.
+    Venues(AcceptedVenues),
+}
 
 /// A client construction or connection failure.
 #[derive(Debug, thiserror::Error)]
@@ -239,6 +251,7 @@ impl OracleClientBuilder {
             quorum_config: self.quorum_config,
             views: HashMap::new(),
             symbols: HashMap::new(),
+            venue_symbols: HashMap::new(),
             inbound_tx: tx,
             inbound_rx: rx,
             shutdown: CancellationToken::new(),
@@ -262,8 +275,10 @@ impl OracleClientBuilder {
 /// Counters describing what the client has seen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClientStats {
-    /// Frames accepted.
+    /// Price frames accepted.
     pub accepted: u64,
+    /// Venue report frames accepted.
+    pub venue_reports: u64,
     /// Frames refused because they were not signed by a registered node.
     pub untrusted: u64,
     /// Frames refused as replays.
@@ -325,6 +340,8 @@ pub struct OracleClient {
     quorum_config: QuorumConfig,
     views: HashMap<FeedId, FeedView>,
     symbols: HashMap<FeedId, Symbol>,
+    /// Feeds whose venue reports to request.
+    venue_symbols: HashMap<FeedId, Symbol>,
     inbound_tx: mpsc::Sender<Inbound>,
     inbound_rx: mpsc::Receiver<Inbound>,
     shutdown: CancellationToken,
@@ -531,21 +548,34 @@ impl OracleClient {
         if self.client_key.is_none() {
             return Err(ClientError::NoClientKey);
         }
-        let mut parsed = Vec::with_capacity(symbols.len());
-        for text in symbols {
-            let symbol: Symbol = text
-                .parse()
-                .map_err(|_| ClientError::InvalidSymbol((*text).to_owned()))?;
-            parsed.push(symbol);
-        }
-        for symbol in parsed {
+        for symbol in parse_symbols(symbols)? {
             let id = feed_id(&symbol);
             self.symbols.insert(id, symbol);
             self.views.entry(id).or_insert_with(|| FeedView::new(id));
         }
+        self.resubscribe()
+    }
 
-        let all: Vec<Symbol> = self.symbols.values().copied().collect();
-        self.subscription = Some(subscribe_frame(&all));
+    /// Adds feeds whose venue reports to receive, and reconnects every node with
+    /// the full set. [`OracleClient::next_event`] yields them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`OracleClient::subscribe`].
+    pub async fn subscribe_venues(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
+        if self.client_key.is_none() {
+            return Err(ClientError::NoClientKey);
+        }
+        for symbol in parse_symbols(symbols)? {
+            self.venue_symbols.insert(feed_id(&symbol), symbol);
+        }
+        self.resubscribe()
+    }
+
+    fn resubscribe(&mut self) -> Result<(), ClientError> {
+        let prices: Vec<Symbol> = self.symbols.values().copied().collect();
+        let venues: Vec<Symbol> = self.venue_symbols.values().copied().collect();
+        self.subscription = Some(subscribe_frame(&prices, &venues));
         self.runtime = Some(Handle::current());
         for (_, connection) in self.connections.drain() {
             connection.cancel.cancel();
@@ -636,6 +666,18 @@ impl OracleClient {
     ///
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
+        let outcome = self.try_ingest_price(frame, now_ns, now_ns);
+        self.record(&outcome);
+        outcome
+    }
+
+    /// Feeds one price or venue report frame in directly, like
+    /// [`OracleClient::ingest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`] if the frame fails verification.
+    pub fn ingest_event(&mut self, frame: &[u8], now_ns: u64) -> Result<Event, RejectReason> {
         let outcome = self.try_ingest(frame, now_ns, now_ns);
         self.record(&outcome);
         outcome
@@ -657,16 +699,18 @@ impl OracleClient {
         frame: &[u8],
         now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
-        self.ingest_received(frame, now_ns, now_ns).await
+        self.ingest_received(frame, now_ns, now_ns, Self::try_ingest_price)
+            .await
     }
 
-    async fn ingest_received(
+    async fn ingest_received<T>(
         &mut self,
         frame: &[u8],
         received_ns: u64,
         now_ns: u64,
-    ) -> Result<Resolved, RejectReason> {
-        let mut outcome = self.try_ingest(frame, received_ns, now_ns);
+        accept: fn(&mut Self, &[u8], u64, u64) -> Result<T, RejectReason>,
+    ) -> Result<T, RejectReason> {
+        let mut outcome = accept(self, frame, received_ns, now_ns);
         if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { signer })) = &outcome
             && self.refresh_due(now_ns)
         {
@@ -676,7 +720,7 @@ impl OracleClient {
                 Ok(None) => debug!(%signer, "registry unchanged; signer stays unknown"),
                 Err(error) => warn!(%signer, %error, "registry refresh failed"),
             }
-            outcome = self.try_ingest(frame, received_ns, now_ns);
+            outcome = accept(self, frame, received_ns, now_ns);
         }
         self.record(&outcome);
         outcome
@@ -687,8 +731,24 @@ impl OracleClient {
         frame: &[u8],
         received_ns: u64,
         now_ns: u64,
+    ) -> Result<Event, RejectReason> {
+        if frame.first() == Some(&FRAME_TYPE_VENUE_REPORT) {
+            let accepted = self.verifier.accept_venues(frame, now_ns)?;
+            self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
+            return Ok(Event::Venues(accepted));
+        }
+        self.try_ingest_price(frame, received_ns, now_ns)
+            .map(Event::Price)
+    }
+
+    fn try_ingest_price(
+        &mut self,
+        frame: &[u8],
+        received_ns: u64,
+        now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
         let accepted = self.verifier.accept(frame, now_ns)?;
+        self.stats.accepted = self.stats.accepted.saturating_add(1);
         self.latency.arrived(&accepted.update, received_ns);
         let feed = accepted.update.feed_id;
         let view = self
@@ -701,10 +761,11 @@ impl OracleClient {
         Ok(resolved)
     }
 
-    fn record(&mut self, outcome: &Result<Resolved, RejectReason>) {
-        match outcome {
-            Ok(_) => self.stats.accepted = self.stats.accepted.saturating_add(1),
-            Err(reason) => self.stats.record(reason),
+    /// Counts a rejection once, after any refresh. Acceptances count where they
+    /// happen.
+    fn record<T>(&mut self, outcome: &Result<T, RejectReason>) {
+        if let Err(reason) = outcome {
+            self.stats.record(reason);
         }
     }
 
@@ -731,8 +792,20 @@ impl OracleClient {
     /// Yields one resolution per accepted frame, so a consumer sees the feed
     /// state change as soon as any node reports. Returns `None` once every node
     /// connection has ended.
-    /// Scheduled registry fetches are adopted here, so keep calling it.
+    /// Scheduled registry fetches are adopted here, so keep calling it. It skips
+    /// venue reports; [`OracleClient::next_event`] yields them.
     pub async fn next(&mut self) -> Option<Resolved> {
+        loop {
+            if let Event::Price(resolved) = self.next_event().await? {
+                return Some(resolved);
+            }
+        }
+    }
+
+    /// Returns the next resolved price or verified venue report.
+    ///
+    /// Returns `None` once every node connection has ended.
+    pub async fn next_event(&mut self) -> Option<Event> {
         loop {
             let (frame, received_ns) = match self.inbound_rx.recv().await? {
                 Inbound::Frame { frame, received_ns } => (frame, received_ns),
@@ -759,10 +832,15 @@ impl OracleClient {
                 }
             };
             let now_ns = now_unix_nanos();
-            match self.ingest_received(&frame, received_ns, now_ns).await {
-                Ok(resolved) => {
-                    self.latency.resolved(received_ns, now_unix_nanos());
-                    return Some(resolved);
+            match self
+                .ingest_received(&frame, received_ns, now_ns, Self::try_ingest)
+                .await
+            {
+                Ok(event) => {
+                    if let Event::Price(_) = event {
+                        self.latency.resolved(received_ns, now_unix_nanos());
+                    }
+                    return Some(event);
                 }
                 Err(reason) => {
                     debug!(%reason, "rejected an update");
@@ -801,9 +879,21 @@ impl Drop for OracleClient {
 }
 
 /// Builds the subscribe control frame.
-fn subscribe_frame(symbols: &[Symbol]) -> String {
-    let feeds: Vec<String> = symbols.iter().map(ToString::to_string).collect();
-    serde_json::json!({ "op": "subscribe", "feeds": feeds }).to_string()
+fn subscribe_frame(prices: &[Symbol], venues: &[Symbol]) -> String {
+    let names =
+        |symbols: &[Symbol]| -> Vec<String> { symbols.iter().map(ToString::to_string).collect() };
+    serde_json::json!({ "op": "subscribe", "feeds": names(prices), "venues": names(venues) })
+        .to_string()
+}
+
+fn parse_symbols(symbols: &[&str]) -> Result<Vec<Symbol>, ClientError> {
+    symbols
+        .iter()
+        .map(|text| {
+            text.parse()
+                .map_err(|_| ClientError::InvalidSymbol((*text).to_owned()))
+        })
+        .collect()
 }
 
 /// Ceiling on the reconnect delay.

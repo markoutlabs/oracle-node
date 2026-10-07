@@ -17,6 +17,10 @@ pub const PAYLOAD_VERSION: u8 = 1;
 /// Payload kind for a price update.
 pub const KIND_PRICE_UPDATE: u8 = 0x01;
 
+/// Payload kind for a venue report. `0x02` stays reserved for batched price
+/// updates (SPEC §3.4).
+pub const KIND_VENUE_REPORT: u8 = 0x03;
+
 /// Payload kind for a node registry.
 ///
 /// Control-plane kinds have the high bit set, so a data payload can never be
