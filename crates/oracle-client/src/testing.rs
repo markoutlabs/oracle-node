@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oracle_types::{
-    FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus, Venue, VenueEntry,
-    VenueReport, VenueSet,
+    BookLevel, BookUpdate, FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus,
+    Venue, VenueEntry, VenueReport, VenueSet,
 };
 use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, VerifiedRegistry};
 
@@ -107,6 +107,19 @@ impl TestNode {
         self.signing
             .sign_venue_report(report)
             .expect("an encodable report")
+            .encode_frame()
+    }
+
+    /// Signs a book update with the current key and returns the wire frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the update cannot be encoded.
+    #[must_use]
+    pub fn sign_book(&self, update: &BookUpdate) -> Vec<u8> {
+        self.signing
+            .sign_book_update(update)
+            .expect("an encodable update")
             .encode_frame()
     }
 
@@ -253,6 +266,29 @@ pub fn venues_at(publish_time_ns: u64, seq: u64) -> VenueReport {
             funding: None,
             exchange_time_ns: None,
             local_recv_ns: publish_time_ns.saturating_sub(1_000_000),
+        }],
+    }
+}
+
+/// Builds a Binance `BTCUSDT` book frame with one level on each side.
+#[must_use]
+pub fn book_at(publish_time_ns: u64, seq: u64, snapshot: bool, bid_qty: u64) -> BookUpdate {
+    BookUpdate {
+        venue: Venue::Binance,
+        market: MarketKind::Spot,
+        symbol: "BTCUSDT".to_owned(),
+        publish_time_ns,
+        seq,
+        snapshot,
+        exchange_time_ns: None,
+        local_recv_ns: publish_time_ns.saturating_sub(1_000_000),
+        bids: vec![BookLevel {
+            price: 6_399_990_000_000,
+            qty: bid_qty,
+        }],
+        asks: vec![BookLevel {
+            price: 6_400_010_000_000,
+            qty: 100_000_000,
         }],
     }
 }

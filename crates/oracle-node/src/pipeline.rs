@@ -19,7 +19,9 @@ use std::sync::Arc;
 use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
 use oracle_types::{FeedId, PriceUpdate};
-use oracle_wire::{SignedUpdate, SignedVenueReport, Signer, WireError};
+use oracle_wire::{SignedBookUpdate, SignedUpdate, SignedVenueReport, Signer, WireError};
+
+use crate::books::BookPublisher;
 
 /// Counters describing what the pipeline has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,6 +49,7 @@ impl PipelineStats {
 /// Owns the aggregator and the hot signing key.
 pub struct Pipeline {
     aggregator: Aggregator,
+    books: BookPublisher,
     signer: Arc<Signer>,
     stats: PipelineStats,
 }
@@ -57,9 +60,18 @@ impl Pipeline {
     pub fn new(aggregator: Aggregator, signer: Arc<Signer>) -> Self {
         Self {
             aggregator,
+            books: BookPublisher::new(0),
             signer,
             stats: PipelineStats::default(),
         }
+    }
+
+    /// Starts every book's sequence at `floor`, for the same reason as
+    /// [`Aggregator::with_sequence_floor`].
+    #[must_use]
+    pub fn with_book_sequence_floor(mut self, floor: u64) -> Self {
+        self.books = BookPublisher::new(floor);
+        self
     }
 
     /// Returns the counters.
@@ -83,6 +95,7 @@ impl Pipeline {
             IngestEvent::Observation(observation) => {
                 self.stats.observations = self.stats.observations.saturating_add(1);
                 self.aggregator.observe(observation);
+                self.books.observe(observation);
             }
             IngestEvent::Connected { .. } => {
                 self.stats.connects = self.stats.connects.saturating_add(1);
@@ -93,6 +106,7 @@ impl Pipeline {
                 // may have moved while we were blind, and the staleness filter
                 // cannot help if the gap was shorter than its threshold.
                 self.aggregator.invalidate(stream.venue, stream.market);
+                self.books.reset(stream.venue, stream.market);
             }
             // `IngestEvent` is non-exhaustive; a new event kind is additive here.
             _ => {}
@@ -125,6 +139,19 @@ impl Pipeline {
         for report in self.aggregator.poll_venues(now_ns) {
             match self.signer.sign_venue_report(&report) {
                 Ok(report) => signed.push(report),
+                Err(error) => errors.push(error),
+            }
+        }
+        (signed, errors)
+    }
+
+    /// Signs the book frames that are due.
+    pub fn book_updates(&mut self, now_ns: u64) -> (Vec<SignedBookUpdate>, Vec<WireError>) {
+        let mut signed = Vec::new();
+        let mut errors = Vec::new();
+        for update in self.books.poll(now_ns) {
+            match self.signer.sign_book_update(&update) {
+                Ok(update) => signed.push(update),
                 Err(error) => errors.push(error),
             }
         }

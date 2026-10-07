@@ -14,9 +14,10 @@ use oracle_transport::{
     ClientHandshake, ClientSession, Control, HandshakeMessage, KEY_GRACE_SECS, TYPE_CONTROL,
     TYPE_FRAME, TransportError, os_rng,
 };
-use oracle_types::{FeedId, NANOS_PER_SEC, Symbol};
+use oracle_types::{FeedId, InstrumentId, NANOS_PER_SEC, Symbol};
 use oracle_wire::{
-    Address, FRAME_TYPE_VENUE_REPORT, Registry, Signer, VerifiedRegistry, VerifyError, feed_id,
+    Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_VENUE_REPORT, Registry, Signer, VerifiedRegistry,
+    VerifyError, feed_id,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -24,10 +25,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::book::Book;
 use crate::latency::{Latency, LatencyReport};
 use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
-use crate::verify::{AcceptedVenues, RejectReason, Verifier, VerifyConfig};
+use crate::verify::{AcceptedBook, AcceptedVenues, RejectReason, Verifier, VerifyConfig};
 
 /// The quorum below which the builder demands an explicit acknowledgement.
 const SAFE_QUORUM: usize = 3;
@@ -57,6 +59,9 @@ pub enum Event {
     /// One node's verified venue report. Not resolved across nodes: each node
     /// reports what it saw.
     Venues(AcceptedVenues),
+    /// One node's verified book frame, already applied. Read the book with
+    /// [`OracleClient::book`].
+    Book(AcceptedBook),
 }
 
 /// A client construction or connection failure.
@@ -252,6 +257,8 @@ impl OracleClientBuilder {
             views: HashMap::new(),
             symbols: HashMap::new(),
             venue_symbols: HashMap::new(),
+            book_symbols: HashMap::new(),
+            books: HashMap::new(),
             inbound_tx: tx,
             inbound_rx: rx,
             shutdown: CancellationToken::new(),
@@ -279,6 +286,8 @@ pub struct ClientStats {
     pub accepted: u64,
     /// Venue report frames accepted.
     pub venue_reports: u64,
+    /// Book frames accepted.
+    pub book_updates: u64,
     /// Frames refused because they were not signed by a registered node.
     pub untrusted: u64,
     /// Frames refused as replays.
@@ -342,6 +351,10 @@ pub struct OracleClient {
     symbols: HashMap<FeedId, Symbol>,
     /// Feeds whose venue reports to request.
     venue_symbols: HashMap<FeedId, Symbol>,
+    /// Feeds whose sources' books to request.
+    book_symbols: HashMap<FeedId, Symbol>,
+    /// One book per node and venue instrument.
+    books: HashMap<(Address, InstrumentId), Book>,
     inbound_tx: mpsc::Sender<Inbound>,
     inbound_rx: mpsc::Receiver<Inbound>,
     shutdown: CancellationToken,
@@ -572,10 +585,44 @@ impl OracleClient {
         self.resubscribe()
     }
 
+    /// Adds feeds whose sources' books to receive, and reconnects every node
+    /// with the full set. [`OracleClient::book`] reads them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`OracleClient::subscribe`].
+    pub async fn subscribe_books(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
+        if self.client_key.is_none() {
+            return Err(ClientError::NoClientKey);
+        }
+        for symbol in parse_symbols(symbols)? {
+            self.book_symbols.insert(feed_id(&symbol), symbol);
+        }
+        self.resubscribe()
+    }
+
+    /// The freshest valid book for `instrument` across the nodes, or `None` if
+    /// no node's book is valid and younger than `max_age`.
+    ///
+    /// Each node sends its own view, so two nodes' books differ by their
+    /// receipt times. This returns one node's book whole, never a mix.
+    #[must_use]
+    pub fn book(&self, instrument: &InstrumentId, now_ns: u64) -> Option<&Book> {
+        let max_age = u64::try_from(self.quorum_config.max_age.as_nanos()).unwrap_or(u64::MAX);
+        self.books
+            .iter()
+            .filter(|((_, book), _)| book == instrument)
+            .map(|(_, book)| book)
+            .filter(|book| book.is_valid())
+            .filter(|book| now_ns.saturating_sub(book.publish_time_ns) <= max_age)
+            .max_by_key(|book| book.publish_time_ns)
+    }
+
     fn resubscribe(&mut self) -> Result<(), ClientError> {
         let prices: Vec<Symbol> = self.symbols.values().copied().collect();
         let venues: Vec<Symbol> = self.venue_symbols.values().copied().collect();
-        self.subscription = Some(subscribe_frame(&prices, &venues));
+        let books: Vec<Symbol> = self.book_symbols.values().copied().collect();
+        self.subscription = Some(subscribe_frame(&prices, &venues, &books));
         self.runtime = Some(Handle::current());
         for (_, connection) in self.connections.drain() {
             connection.cancel.cancel();
@@ -732,10 +779,25 @@ impl OracleClient {
         received_ns: u64,
         now_ns: u64,
     ) -> Result<Event, RejectReason> {
-        if frame.first() == Some(&FRAME_TYPE_VENUE_REPORT) {
-            let accepted = self.verifier.accept_venues(frame, now_ns)?;
-            self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
-            return Ok(Event::Venues(accepted));
+        match frame.first().copied() {
+            Some(FRAME_TYPE_VENUE_REPORT) => {
+                let accepted = self.verifier.accept_venues(frame, now_ns)?;
+                self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
+                return Ok(Event::Venues(accepted));
+            }
+            Some(FRAME_TYPE_BOOK_UPDATE) => {
+                let accepted = self.verifier.accept_book(frame, now_ns)?;
+                self.stats.book_updates = self.stats.book_updates.saturating_add(1);
+                let update = &accepted.update;
+                let instrument =
+                    InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+                self.books
+                    .entry((accepted.signer, instrument.clone()))
+                    .or_insert_with(|| Book::new(accepted.signer, instrument))
+                    .apply(update);
+                return Ok(Event::Book(accepted));
+            }
+            _ => {}
         }
         self.try_ingest_price(frame, received_ns, now_ns)
             .map(Event::Price)
@@ -879,11 +941,16 @@ impl Drop for OracleClient {
 }
 
 /// Builds the subscribe control frame.
-fn subscribe_frame(prices: &[Symbol], venues: &[Symbol]) -> String {
+fn subscribe_frame(prices: &[Symbol], venues: &[Symbol], books: &[Symbol]) -> String {
     let names =
         |symbols: &[Symbol]| -> Vec<String> { symbols.iter().map(ToString::to_string).collect() };
-    serde_json::json!({ "op": "subscribe", "feeds": names(prices), "venues": names(venues) })
-        .to_string()
+    serde_json::json!({
+        "op": "subscribe",
+        "feeds": names(prices),
+        "venues": names(venues),
+        "books": names(books),
+    })
+    .to_string()
 }
 
 fn parse_symbols(symbols: &[&str]) -> Result<Vec<Symbol>, ClientError> {
@@ -1114,10 +1181,47 @@ pub fn now_unix_nanos() -> u64 {
 mod tests {
     use super::*;
     use crate::Status;
-    use crate::testing::{TestNode, registry_with, update_at};
-    use oracle_types::NANOS_PER_SEC;
+    use crate::testing::{TestNode, book_at, registry_with, update_at};
+    use oracle_types::{MarketKind, NANOS_PER_SEC, Venue};
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
+
+    #[test]
+    fn book_frames_build_the_freshest_valid_book() {
+        let nodes = nodes();
+        let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+        let mut client = OracleClient::builder(registry)
+            .build()
+            .expect("three nodes");
+        let [a, b, _] = nodes.as_slice() else {
+            panic!("three nodes");
+        };
+        let instrument = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+
+        for (frame, at) in [
+            (a.sign_book(&book_at(NOW, 1, true, 100)), NOW),
+            (a.sign_book(&book_at(NOW + 10, 2, false, 300)), NOW + 10),
+            (b.sign_book(&book_at(NOW + 5, 7, true, 200)), NOW + 5),
+        ] {
+            assert!(matches!(
+                client.ingest_event(&frame, at),
+                Ok(Event::Book(_))
+            ));
+        }
+        let book = client.book(&instrument, NOW + 20).expect("a valid book");
+        assert_eq!(book.node, a.signing_address(), "the freshest node");
+        assert_eq!(book.best_bid().map(|level| level.qty), Some(300));
+
+        // Node A skips seq 3: its book is unknown, so node B's serves.
+        let gap = a.sign_book(&book_at(NOW + 30, 4, false, 900));
+        assert!(client.ingest_event(&gap, NOW + 30).is_ok());
+        let book = client.book(&instrument, NOW + 40).expect("node B's book");
+        assert_eq!(book.node, b.signing_address());
+        assert_eq!(client.stats().book_updates, 4);
+
+        let later = NOW + 10 * NANOS_PER_SEC;
+        assert!(client.book(&instrument, later).is_none(), "too old");
+    }
 
     fn nodes() -> Vec<TestNode> {
         (1..=3_u8).map(TestNode::new).collect()

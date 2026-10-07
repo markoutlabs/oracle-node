@@ -13,9 +13,12 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oracle_client::{ClientStats, Event, HttpRegistrySource, LatencyReport, OracleClient};
+use oracle_client::{
+    Book, ClientStats, Event, HttpRegistrySource, LatencyReport, OracleClient, now_unix_nanos,
+};
 use oracle_registry_canister::testing::Harness;
 use oracle_server::unix_now;
+use oracle_types::{InstrumentId, MarketKind, Venue};
 use oracle_wire::{NodeEntry, Signer};
 use serde_json::Value;
 use tokio::runtime::Runtime;
@@ -75,7 +78,7 @@ fn live_latency_from_the_venues_to_the_sdk() {
     let source = HttpRegistrySource::new(&canister.url("registry.json"), canister.certification())
         .expect("builds");
     let runtime = Runtime::new().expect("runtime");
-    let (latency, stats, venues) = runtime.block_on(async {
+    let (latency, stats, venues, books) = runtime.block_on(async {
         let mut client = OracleClient::builder_from_source(Arc::new(source), governance)
             .await
             .expect("the registry verifies")
@@ -87,13 +90,22 @@ fn live_latency_from_the_venues_to_the_sdk() {
         let names: Vec<&str> = symbols.iter().map(String::as_str).collect();
         client.subscribe(&names).await.expect("subscribes");
         client.subscribe_venues(&[SHOWN]).await.expect("subscribes");
+        client.subscribe_books(&[SHOWN]).await.expect("subscribes");
         drain(&mut client, WARM_UP).await;
         client.reset_latency();
         let before = client.stats();
         let venues = drain(&mut client, span).await;
         let mut stats = client.stats();
         stats.accepted = stats.accepted.saturating_sub(before.accepted);
-        (client.latency(), stats, venues)
+        let books: Vec<String> = shown_books()
+            .iter()
+            .map(|instrument| {
+                client
+                    .book(instrument, now_unix_nanos())
+                    .map_or_else(|| format!("{instrument}: no valid book"), describe)
+            })
+            .collect();
+        (client.latency(), stats, venues, books)
     });
     let status = second_report(&node, STATUS);
     let lag = second_report(&node, VENUE_LAG);
@@ -105,8 +117,42 @@ fn live_latency_from_the_venues_to_the_sdk() {
         venues.signer,
         serde_json::to_string_pretty(&venues.report).expect("serialises")
     );
+    println!(
+        "\nbooks of {SHOWN} ({} frames verified):",
+        stats.book_updates
+    );
+    for line in &books {
+        println!("  {line}");
+    }
     assert!(stats.accepted > 0, "no update arrived: {stats:?}");
+    assert!(stats.book_updates > 0, "no book frame arrived: {stats:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The books behind [`SHOWN`], as `node/all-feeds.toml` lists them.
+fn shown_books() -> [InstrumentId; 3] {
+    [
+        InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT"),
+        InstrumentId::new(Venue::Bybit, MarketKind::Spot, "BTCUSDT"),
+        InstrumentId::new(Venue::Okx, MarketKind::Spot, "BTC-USDT"),
+    ]
+}
+
+fn describe(book: &Book) -> String {
+    let side = |level: Option<oracle_types::BookLevel>| {
+        level
+            .and_then(|level| Book::level_fixed(level).ok())
+            .map_or_else(|| "-".to_owned(), |(price, qty)| format!("{qty} @ {price}"))
+    };
+    format!(
+        "{}: seq {}, {} bids, {} asks, best bid {}, best ask {}",
+        book.instrument,
+        book.seq,
+        book.bids().count(),
+        book.asks().count(),
+        side(book.best_bid()),
+        side(book.best_ask()),
+    )
 }
 
 /// Merges the feeds of `node/all-feeds.toml` into the config `init` wrote, and

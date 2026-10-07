@@ -13,13 +13,13 @@ use axum::routing::get;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_transport::{CloseReason, Control, HandshakeMessage, KeyGrant};
-use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Address, Registry, SignedUpdate, SignedVenueReport, feed_id};
+use oracle_types::{FeedId, InstrumentId, Symbol};
+use oracle_wire::{Address, Registry, SignedBookUpdate, SignedUpdate, SignedVenueReport, feed_id};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
-use crate::hub::{Hub, PreparedUpdate, PreparedVenues};
+use crate::hub::{Hub, PreparedBook, PreparedUpdate, PreparedVenues};
 use crate::protocol::{ClientMessage, FIREHOSE, ServerMessage};
 use crate::transport::{Established, NodeTransport, Outbound, unix_now};
 
@@ -42,6 +42,8 @@ pub struct ServerState {
     hub: Arc<Hub>,
     catalog: HashMap<FeedId, Symbol>,
     by_symbol: HashMap<String, FeedId>,
+    /// The books of each feed's sources.
+    books: HashMap<FeedId, Vec<InstrumentId>>,
     registry: Registry,
     transport: Arc<NodeTransport>,
 }
@@ -51,6 +53,17 @@ impl ServerState {
     /// transport's, so every update is sealed once before fan-out.
     #[must_use]
     pub fn new(feeds: &[Symbol], registry: Registry, transport: Arc<NodeTransport>) -> Arc<Self> {
+        Self::with_books(feeds, HashMap::new(), registry, transport)
+    }
+
+    /// Builds server state that also serves the books of each feed's sources.
+    #[must_use]
+    pub fn with_books(
+        feeds: &[Symbol],
+        books: HashMap<FeedId, Vec<InstrumentId>>,
+        registry: Registry,
+        transport: Arc<NodeTransport>,
+    ) -> Arc<Self> {
         let hub = Arc::clone(transport.hub());
         let mut catalog = HashMap::with_capacity(feeds.len());
         let mut by_symbol = HashMap::with_capacity(feeds.len());
@@ -63,6 +76,7 @@ impl ServerState {
             hub,
             catalog,
             by_symbol,
+            books,
             registry,
             transport,
         })
@@ -90,11 +104,33 @@ impl ServerState {
         Some(self.hub.publish(symbol, signed))
     }
 
+    /// Publishes a signed book frame to the subscribers of that book.
+    #[must_use]
+    pub fn publish_book(&self, signed: SignedBookUpdate) -> Arc<PreparedBook> {
+        self.hub.publish_book(signed)
+    }
+
     /// Publishes a signed venue report to the subscribers that asked for it.
     #[must_use]
     pub fn publish_venues(&self, signed: SignedVenueReport) -> Option<Arc<PreparedVenues>> {
         let symbol = *self.catalog.get(&signed.report().feed_id)?;
         Some(self.hub.publish_venues(symbol, signed))
+    }
+
+    /// The books of these feeds' sources, each once.
+    #[must_use]
+    pub fn books_of(&self, feeds: &[FeedId]) -> Vec<InstrumentId> {
+        let mut books: Vec<InstrumentId> = Vec::new();
+        for book in feeds
+            .iter()
+            .filter_map(|feed| self.books.get(feed))
+            .flatten()
+        {
+            if !books.contains(book) {
+                books.push(book.clone());
+            }
+        }
+        books
     }
 
     /// Resolves a symbol to a feed id.
@@ -179,15 +215,24 @@ fn handle_control(
     };
 
     match parsed {
-        ClientMessage::Subscribe { feeds, venues } => {
+        ClientMessage::Subscribe {
+            feeds,
+            venues,
+            books,
+        } => {
             let mut unknown = Vec::new();
             let (venues, venue_ids) = known(state, venues, &mut unknown);
             subscriber.add_venues(venue_ids);
+            let (books, book_ids) = known(state, books, &mut unknown);
+            let instruments = state.books_of(&book_ids);
+            subscriber.add_books(instruments.iter().cloned());
+            state.hub.replay_books(subscriber, &instruments);
             if feeds.iter().any(|feed| feed == FIREHOSE) {
                 subscriber.select_firehose();
                 return ServerMessage::SubscribeAck {
                     feeds: vec![FIREHOSE.to_owned()],
                     venues,
+                    books,
                     unknown,
                 };
             }
@@ -196,10 +241,15 @@ fn handle_control(
             ServerMessage::SubscribeAck {
                 feeds,
                 venues,
+                books,
                 unknown,
             }
         }
-        ClientMessage::Unsubscribe { feeds, venues } => {
+        ClientMessage::Unsubscribe {
+            feeds,
+            venues,
+            books,
+        } => {
             let ids = |symbols: &[String]| -> Vec<FeedId> {
                 symbols
                     .iter()
@@ -208,7 +258,12 @@ fn handle_control(
             };
             subscriber.remove(ids(&feeds));
             subscriber.remove_venues(ids(&venues));
-            ServerMessage::UnsubscribeAck { feeds, venues }
+            subscriber.remove_books(&state.books_of(&ids(&books)));
+            ServerMessage::UnsubscribeAck {
+                feeds,
+                venues,
+                books,
+            }
         }
         ClientMessage::Ping { id } => ServerMessage::Pong { id },
     }

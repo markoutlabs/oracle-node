@@ -72,6 +72,7 @@
 mod address;
 mod auth;
 mod backend;
+mod books;
 mod clients;
 mod codec;
 pub mod domain;
@@ -82,6 +83,7 @@ mod payload;
 mod registry;
 mod signature;
 mod signer;
+mod varframe;
 mod venues;
 
 pub use address::{Address, CompressedPublicKey};
@@ -90,6 +92,10 @@ pub use auth::{
     client_auth_payload, client_auth_transcript,
 };
 pub use backend::name as backend_name;
+pub use books::{
+    FRAME_TYPE_BOOK_UPDATE, MAX_BOOK_PAYLOAD, SignedBookUpdate, UnverifiedBookFrame,
+    VerifiedBookUpdate, decode_book_update, encode_book_update,
+};
 pub use clients::{ClientEntry, ClientList, MAX_CLIENTS, VerifiedClientList};
 pub use error::{VerifyError, WireError};
 pub use frame::{
@@ -97,8 +103,8 @@ pub use frame::{
 };
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
-    KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_NODE_AUTH_OK, KIND_PRICE_UPDATE, KIND_REGISTRY,
-    KIND_VENUE_REPORT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update,
+    KIND_BOOK_UPDATE, KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_NODE_AUTH_OK, KIND_PRICE_UPDATE,
+    KIND_REGISTRY, KIND_VENUE_REPORT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update,
     encode_price_update, feed_id,
 };
 pub use registry::{

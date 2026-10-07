@@ -10,9 +10,10 @@ use oracle_transport::{
     ClientHandshake, ClientSession, CloseReason, Control, HandshakeMessage, TYPE_CONTROL,
     TYPE_FRAME,
 };
-use oracle_types::{Symbol, VenueReport};
+use oracle_types::{BookLevel, BookUpdate, InstrumentId, MarketKind, Symbol, Venue, VenueReport};
 use oracle_wire::{
-    ClientEntry, ClientList, Signer, UnverifiedFrame, UnverifiedVenueFrame, feed_id,
+    ClientEntry, ClientList, Signer, UnverifiedBookFrame, UnverifiedFrame, UnverifiedVenueFrame,
+    feed_id,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,8 +61,10 @@ async fn start_confirmed_at(list: &ClientList, config: TransportConfig, confirme
         .verify(governance_key().address(), 0)
         .expect("verifies");
     let transport = NodeTransport::new(Arc::new(signing_key()), verified, config, 64, confirmed_at);
-    let symbols: Vec<Symbol> = vec![BTC.parse().expect("valid")];
-    let state = ServerState::new(&symbols, test_registry(), Arc::clone(&transport));
+    let btc: Symbol = BTC.parse().expect("valid");
+    let symbols = vec![btc];
+    let books = [(feed_id(&btc), vec![btcusdt()])].into_iter().collect();
+    let state = ServerState::with_books(&symbols, books, test_registry(), Arc::clone(&transport));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("bound");
     let app = router(Arc::clone(&state));
@@ -248,6 +251,50 @@ async fn venue_reports_arrive_sealed_and_signed_on_their_own_subscription() {
     let frame = session.keys.open(&sealed).expect("opens");
     let parsed = UnverifiedVenueFrame::parse(&frame).expect("the venue frame, not the price");
     assert_eq!(parsed.decode_unverified().expect("decodes"), report);
+}
+
+fn btcusdt() -> InstrumentId {
+    InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT")
+}
+
+#[tokio::test]
+async fn a_book_subscriber_gets_the_last_snapshot_at_once() {
+    let node = start(
+        &client_list(1, 60, &[(1, unix_now() + 3_600)]),
+        TransportConfig::default(),
+    )
+    .await;
+    let snapshot = BookUpdate {
+        venue: Venue::Binance,
+        market: MarketKind::Spot,
+        symbol: "BTCUSDT".to_owned(),
+        publish_time_ns: unix_now() * 1_000_000_000,
+        seq: 1,
+        snapshot: true,
+        exchange_time_ns: None,
+        local_recv_ns: 0,
+        bids: vec![BookLevel {
+            price: 6_400_000_000_000,
+            qty: 100_000_000,
+        }],
+        asks: Vec::new(),
+    };
+    // Published before anyone subscribes: the hub keeps it for a joiner.
+    let _ = node
+        .state
+        .publish_book(signing_key().sign_book_update(&snapshot).expect("signs"));
+
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
+    subscribe_with(
+        &mut socket,
+        &mut session,
+        r#"{"op":"subscribe","books":["CRYPTO.BTC/USD"]}"#,
+    )
+    .await;
+    let sealed = next_frame(&mut socket, &mut session).await;
+    let frame = session.keys.open(&sealed).expect("opens");
+    let parsed = UnverifiedBookFrame::parse(&frame).expect("a book frame");
+    assert_eq!(parsed.decode_unverified().expect("decodes"), snapshot);
 }
 
 #[tokio::test]

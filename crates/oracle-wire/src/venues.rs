@@ -33,7 +33,8 @@ use crate::codec::{Reader, Sink as _};
 use crate::payload::{KIND_VENUE_REPORT, PAYLOAD_VERSION};
 use crate::registry::VerifiedRegistry;
 use crate::signature::SIGNATURE_LEN;
-use crate::{Address, Signature, Signer, VerifyError, WireError, domain, signer};
+use crate::varframe::{self, RawFrame};
+use crate::{Address, Signature, Signer, VerifyError, WireError};
 
 /// Frame type for a venue report.
 pub const FRAME_TYPE_VENUE_REPORT: u8 = 2;
@@ -260,12 +261,12 @@ impl SignedVenueReport {
     /// Encodes the wire frame.
     #[must_use]
     pub fn encode_frame(&self) -> Vec<u8> {
-        let mut frame = Vec::with_capacity(1 + Address::LEN + self.payload.len() + SIGNATURE_LEN);
-        frame.push(FRAME_TYPE_VENUE_REPORT);
-        frame.extend_from_slice(self.signer.as_bytes());
-        frame.extend_from_slice(&self.payload);
-        frame.extend_from_slice(self.signature.as_bytes());
-        frame
+        varframe::encode(
+            FRAME_TYPE_VENUE_REPORT,
+            self.signer,
+            &self.payload,
+            self.signature,
+        )
     }
 }
 
@@ -296,9 +297,7 @@ impl Signer {
 /// registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnverifiedVenueFrame {
-    payload: Vec<u8>,
-    signature: Signature,
-    signer_hint: Address,
+    raw: RawFrame,
 }
 
 impl UnverifiedVenueFrame {
@@ -311,46 +310,19 @@ impl UnverifiedVenueFrame {
     /// [`WireError::TrailingBytes`] above the largest, and signature errors from
     /// [`Signature::from_bytes`].
     pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        let frame_type = bytes.first().copied().unwrap_or_default();
-        if frame_type != FRAME_TYPE_VENUE_REPORT {
-            return Err(WireError::UnknownFrameType(frame_type));
-        }
-        let smallest = 1 + Address::LEN + VENUE_HEADER_SIZE + SIGNATURE_LEN;
-        if bytes.len() < smallest {
-            return Err(WireError::Truncated {
-                expected: smallest,
-                actual: bytes.len(),
-            });
-        }
-        if bytes.len() > MAX_VENUE_FRAME_SIZE {
-            return Err(WireError::TrailingBytes(bytes.len() - MAX_VENUE_FRAME_SIZE));
-        }
-        let truncated = WireError::Truncated {
-            expected: smallest,
-            actual: bytes.len(),
-        };
-        let signature_start = bytes.len() - SIGNATURE_LEN;
-        let hint = bytes.get(1..=Address::LEN).ok_or(truncated.clone())?;
-        let payload = bytes
-            .get(1 + Address::LEN..signature_start)
-            .ok_or(truncated.clone())?;
-        let signature: [u8; SIGNATURE_LEN] = bytes
-            .get(signature_start..)
-            .and_then(|tail| tail.try_into().ok())
-            .ok_or(truncated)?;
-        let mut signer_hint = [0_u8; Address::LEN];
-        signer_hint.copy_from_slice(hint);
-        Ok(Self {
-            payload: payload.to_vec(),
-            signature: Signature::from_bytes(signature)?,
-            signer_hint: Address::from_bytes(signer_hint),
-        })
+        RawFrame::parse(
+            bytes,
+            FRAME_TYPE_VENUE_REPORT,
+            VENUE_HEADER_SIZE,
+            VENUE_HEADER_SIZE + VENUE_ENTRY_SIZE * MAX_VENUE_ENTRIES,
+        )
+        .map(|raw| Self { raw })
     }
 
     /// Returns the address the frame *claims* to be from. Outside the signature.
     #[must_use]
     pub const fn signer_hint(&self) -> Address {
-        self.signer_hint
+        self.raw.signer_hint
     }
 
     /// Decodes the payload **without** any trust check. For tooling only.
@@ -359,7 +331,7 @@ impl UnverifiedVenueFrame {
     ///
     /// Returns [`WireError`] if the payload is not a canonical venue report.
     pub fn decode_unverified(&self) -> Result<VenueReport, WireError> {
-        decode_venue_report(&self.payload)
+        decode_venue_report(&self.raw.payload)
     }
 
     /// Verifies the frame against a trusted registry.
@@ -371,8 +343,8 @@ impl UnverifiedVenueFrame {
     ///
     /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedVenueReport, VerifyError> {
-        let report = decode_venue_report(&self.payload)?;
-        let signer = signer::recover_address(&domain::digest(&self.payload), &self.signature)?;
+        let report = decode_venue_report(&self.raw.payload)?;
+        let signer = self.raw.recover_signer()?;
         let node_index = registry.authorize(signer)?;
         Ok(VerifiedVenueReport {
             report,

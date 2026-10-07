@@ -13,6 +13,7 @@
 //! - [`PriceUpdate`] is the logical payload that gets signed. Its byte encoding
 //!   lives in `oracle-wire`, not here, so this crate stays free of crypto deps.
 
+mod book_update;
 mod fixed;
 mod flags;
 mod observation;
@@ -21,6 +22,7 @@ mod update;
 mod venue;
 mod venue_report;
 
+pub use book_update::{BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_BOOK_SYMBOL};
 pub use fixed::{Fixed, FixedError};
 pub use flags::Flags;
 pub use observation::{BookDepth, Impact, Level, ObsKind, ObsKindError, Observation};

@@ -19,7 +19,7 @@ use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
 use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
-use oracle_types::{FeedId, Symbol};
+use oracle_types::{FeedId, InstrumentId, Symbol};
 use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -102,9 +102,18 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
 
     // Sequence numbers must never go backwards for this node, including across
     // restarts. Milliseconds since the epoch outrun any publish counter.
-    let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?
-        .with_sequence_floor(wall_clock_unix_nanos() / 1_000_000);
-    let pipeline = Pipeline::new(aggregator, Arc::clone(&signer));
+    let books: HashMap<FeedId, Vec<InstrumentId>> = resolved
+        .feeds
+        .iter()
+        .map(|feed| {
+            let sources = feed.sources.iter().map(|source| source.instrument.clone());
+            (feed.feed_id, sources.collect())
+        })
+        .collect();
+    let seq_floor = wall_clock_unix_nanos() / 1_000_000;
+    let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?.with_sequence_floor(seq_floor);
+    let pipeline =
+        Pipeline::new(aggregator, Arc::clone(&signer)).with_book_sequence_floor(seq_floor);
 
     // Freshness limits catch a withheld canister update. An operator's own file
     // cannot be withheld, and is never refreshed, so it is exempt.
@@ -124,7 +133,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         config.server.max_pending_feeds,
         unix_now(),
     );
-    let state = ServerState::new(&resolved.symbols, registry, transport);
+    let state = ServerState::with_books(&resolved.symbols, books, registry, transport);
     let shutdown = CancellationToken::new();
     spawn_transport_tasks(
         Arc::clone(state.transport()),
@@ -348,6 +357,7 @@ impl PipelineTask {
         }
     }
 
+    /// Venue reports and book frames go out after each evaluation.
     fn publish_venues(&mut self, now_ns: u64) {
         let (reports, errors) = self.pipeline.venue_reports(now_ns);
         for error in errors {
@@ -355,6 +365,13 @@ impl PipelineTask {
         }
         for report in reports {
             let _ = self.state.publish_venues(report);
+        }
+        let (books, errors) = self.pipeline.book_updates(now_ns);
+        for error in errors {
+            warn!(%error, "book update could not be encoded");
+        }
+        for update in books {
+            let _ = self.state.publish_book(update);
         }
     }
 

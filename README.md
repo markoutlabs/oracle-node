@@ -171,7 +171,9 @@ pending older. A stale price delivered from behind a backlog is worse than no
 price, because the consumer acts on it as though it were current. Frames are
 signed, encoded and sealed once and shared as `Bytes` across every subscriber.
 Venue reports (SPEC §3.3.1) have their own subscription and their own slot per
-feed, so a report never replaces a price.
+feed, so a report never replaces a price. Book deltas (SPEC §3.3.2) cannot
+replace one another, so each client has a bounded queue for each book, and a
+client that falls behind waits for the next snapshot.
 
 The consequence consumers must internalise: **you observe state, not
 transitions.** A sub-second halt can be conflated away. Every frame carries
@@ -241,6 +243,26 @@ while let Some(event) = client.next_event().await {
 The SDK verifies each report like a price: the signature, the registry, its
 own `seq`, and the clock. It does not combine reports across nodes, because
 each node reports what it saw. `next()` skips reports.
+
+#### Books
+
+The node also sends each venue book it keeps (SPEC §3.3.2): a snapshot of the
+top 50 levels every second, and the changed levels in between, at most every
+50 ms. The format is the same for every venue, because the node computes the
+deltas from its own book.
+
+```rust
+client.subscribe_books(&["CRYPTO.BTC/USDT"]).await?;
+// `next_event()` yields Event::Book as frames arrive; the SDK applies them.
+let binance = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+if let Some(book) = client.book(&binance, now_unix_nanos()) {
+    let top = book.best_bid();
+}
+```
+
+The SDK keeps one book per node. A missed frame makes that node's book invalid
+until its next snapshot. `book()` returns the freshest valid book, from one
+node.
 
 #### Client auth
 

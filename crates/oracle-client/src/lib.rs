@@ -73,6 +73,7 @@
 //! # }
 //! ```
 
+mod book;
 mod client;
 pub mod latency;
 pub mod mainnet;
@@ -81,6 +82,7 @@ pub mod source;
 pub mod testing;
 pub mod verify;
 
+pub use book::Book;
 pub use client::{
     ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, now_unix_nanos,
 };
@@ -91,5 +93,5 @@ pub use source::{
     RegistrySource,
 };
 pub use verify::{
-    Accepted, AcceptedVenues, RejectReason, Verifier, VerifyConfig, verify_historical,
+    Accepted, AcceptedBook, AcceptedVenues, RejectReason, Verifier, VerifyConfig, verify_historical,
 };

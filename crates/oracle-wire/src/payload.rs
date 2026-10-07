@@ -21,6 +21,9 @@ pub const KIND_PRICE_UPDATE: u8 = 0x01;
 /// updates (SPEC §3.4).
 pub const KIND_VENUE_REPORT: u8 = 0x03;
 
+/// Payload kind for a book update.
+pub const KIND_BOOK_UPDATE: u8 = 0x04;
+
 /// Payload kind for a node registry.
 ///
 /// Control-plane kinds have the high bit set, so a data payload can never be

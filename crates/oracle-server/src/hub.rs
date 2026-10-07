@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use oracle_transport::{BroadcastSealer, os_rng};
-use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Address, SignedUpdate, SignedVenueReport};
+use oracle_types::{FeedId, InstrumentId, Symbol};
+use oracle_wire::{Address, SignedBookUpdate, SignedUpdate, SignedVenueReport};
 use tokio::sync::Notify;
 
 /// A signed update, serialized and sealed once and shared by every subscriber.
@@ -107,14 +107,49 @@ impl PreparedVenues {
     }
 }
 
-/// Which stream a frame belongs to. Each stream has its own slot per feed, so a
-/// venue report never replaces a price.
+/// A book update, serialized and sealed once and shared by every subscriber.
+pub struct PreparedBook {
+    /// The venue instrument.
+    pub instrument: InstrumentId,
+    /// `true` for a snapshot.
+    pub snapshot: bool,
+    sealed: Bytes,
+    signed: SignedBookUpdate,
+}
+
+impl PreparedBook {
+    /// Prepares a signed book update for fanout, sealing it once.
+    #[must_use]
+    pub fn new(signed: SignedBookUpdate, sealer: &BroadcastSealer) -> Self {
+        let update = signed.update();
+        let instrument = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        let snapshot = update.snapshot;
+        let sealed = Bytes::from(sealer.seal(&signed.encode_frame(), &mut os_rng()));
+        Self {
+            instrument,
+            snapshot,
+            sealed,
+            signed,
+        }
+    }
+
+    /// Returns the signed update.
+    #[must_use]
+    pub const fn signed(&self) -> &SignedBookUpdate {
+        &self.signed
+    }
+}
+
+/// Which stream a frame belongs to. Prices and venue reports each have their
+/// own slot per feed, so a venue report never replaces a price.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Channel {
     /// Price updates.
     Prices,
     /// Venue reports.
     Venues,
+    /// Book snapshots and deltas.
+    Books,
 }
 
 /// A frame that waits for one subscriber.
@@ -124,6 +159,8 @@ pub enum Outgoing {
     Price(Arc<PreparedUpdate>),
     /// A venue report.
     Venues(Arc<PreparedVenues>),
+    /// A book snapshot or delta.
+    Book(Arc<PreparedBook>),
 }
 
 impl Outgoing {
@@ -133,15 +170,17 @@ impl Outgoing {
         match self {
             Self::Price(update) => update.sealed(),
             Self::Venues(report) => report.sealed.clone(),
+            Self::Book(update) => update.sealed.clone(),
         }
     }
 
-    /// Returns the feed.
+    /// Returns the feed, or `None` for a book, which belongs to an instrument.
     #[must_use]
-    pub fn feed_id(&self) -> FeedId {
+    pub fn feed_id(&self) -> Option<FeedId> {
         match self {
-            Self::Price(update) => update.feed_id,
-            Self::Venues(report) => report.feed_id,
+            Self::Price(update) => Some(update.feed_id),
+            Self::Venues(report) => Some(report.feed_id),
+            Self::Book(_) => None,
         }
     }
 
@@ -151,8 +190,22 @@ impl Outgoing {
         match self {
             Self::Price(_) => Channel::Prices,
             Self::Venues(_) => Channel::Venues,
+            Self::Book(_) => Channel::Books,
         }
     }
+}
+
+/// The most book frames one subscriber may have waiting for one book. A
+/// snapshot follows each second, so a client within the cap never needs this.
+const MAX_BOOK_QUEUE: usize = 64;
+
+/// One subscriber's frames for one book. Deltas cannot replace one another, so
+/// they queue behind the snapshot they build on.
+#[derive(Default)]
+struct BookMailbox {
+    frames: Vec<Arc<PreparedBook>>,
+    /// The queue overflowed. Deltas are useless until the next snapshot.
+    awaiting_snapshot: bool,
 }
 
 /// What a subscriber is listening to.
@@ -181,7 +234,10 @@ pub struct Subscriber {
     selection: Mutex<Selection>,
     /// Feeds whose venue reports this subscriber wants. Never the firehose.
     venues: Mutex<HashSet<FeedId>>,
+    /// Books this subscriber wants.
+    books: Mutex<HashSet<InstrumentId>>,
     pending: Mutex<HashMap<(Channel, FeedId), Outgoing>>,
+    book_queue: Mutex<HashMap<InstrumentId, BookMailbox>>,
     dropped: AtomicU64,
     lagged: AtomicBool,
     closed: AtomicBool,
@@ -252,6 +308,62 @@ impl Subscriber {
         }
     }
 
+    /// Adds books to send.
+    pub fn add_books(&self, books: impl IntoIterator<Item = InstrumentId>) {
+        if let Ok(mut selected) = self.books.lock() {
+            selected.extend(books);
+        }
+    }
+
+    /// Stops these books.
+    pub fn remove_books(&self, books: &[InstrumentId]) {
+        if let Ok(mut selected) = self.books.lock() {
+            for book in books {
+                selected.remove(book);
+            }
+        }
+        if let Ok(mut queue) = self.book_queue.lock() {
+            for book in books {
+                queue.remove(book);
+            }
+        }
+    }
+
+    /// Returns `true` if this subscriber wants `book`.
+    #[must_use]
+    pub fn wants_book(&self, book: &InstrumentId) -> bool {
+        self.books
+            .lock()
+            .is_ok_and(|selected| selected.contains(book))
+    }
+
+    /// Queues a book frame behind the snapshot it builds on.
+    fn offer_book(&self, frame: &Arc<PreparedBook>) {
+        let Ok(mut queue) = self.book_queue.lock() else {
+            return;
+        };
+        let mailbox = queue.entry(frame.instrument.clone()).or_default();
+        if frame.snapshot {
+            mailbox.frames.clear();
+            mailbox.frames.push(Arc::clone(frame));
+            mailbox.awaiting_snapshot = false;
+        } else if mailbox.awaiting_snapshot {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        } else if mailbox.frames.len() >= MAX_BOOK_QUEUE {
+            let lost = u64::try_from(mailbox.frames.len()).unwrap_or(u64::MAX);
+            self.dropped
+                .fetch_add(lost.saturating_add(1), Ordering::Relaxed);
+            mailbox.frames.clear();
+            mailbox.awaiting_snapshot = true;
+            return;
+        } else {
+            mailbox.frames.push(Arc::clone(frame));
+        }
+        drop(queue);
+        self.notify.notify_waiters();
+    }
+
     /// Returns `true` if this subscriber wants `feed_id` on `channel`.
     #[must_use]
     pub fn wants(&self, channel: Channel, feed_id: FeedId) -> bool {
@@ -264,6 +376,7 @@ impl Subscriber {
                 .venues
                 .lock()
                 .is_ok_and(|venues| venues.contains(&feed_id)),
+            Channel::Books => false,
         }
     }
 
@@ -296,7 +409,10 @@ impl Subscriber {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        let key = (frame.channel(), frame.feed_id());
+        let Some(feed_id) = frame.feed_id() else {
+            return;
+        };
+        let key = (frame.channel(), feed_id);
         if pending.len() >= self.max_pending && !pending.contains_key(&key) {
             // Too many distinct feeds outstanding: this subscriber is not
             // keeping up at all. Say so rather than quietly dropping data.
@@ -320,13 +436,17 @@ impl Subscriber {
             if self.is_closed() || self.is_lagged() {
                 return Vec::new();
             }
-            {
-                let Ok(mut pending) = self.pending.lock() else {
-                    return Vec::new();
-                };
-                if !pending.is_empty() {
-                    return pending.drain().map(|(_, frame)| frame).collect();
+            let mut frames: Vec<Outgoing> = match self.pending.lock() {
+                Ok(mut pending) => pending.drain().map(|(_, frame)| frame).collect(),
+                Err(_) => return Vec::new(),
+            };
+            if let Ok(mut queue) = self.book_queue.lock() {
+                for mailbox in queue.values_mut() {
+                    frames.extend(mailbox.frames.drain(..).map(Outgoing::Book));
                 }
+            }
+            if !frames.is_empty() {
+                return frames;
             }
             self.notify.notified().await;
         }
@@ -337,6 +457,9 @@ impl Subscriber {
 pub struct Hub {
     subscribers: Mutex<HashMap<u64, Arc<Subscriber>>>,
     latest: Mutex<HashMap<FeedId, Arc<PreparedUpdate>>>,
+    /// For each book, the latest snapshot and the deltas after it, for a
+    /// subscriber that joins between snapshots.
+    book_history: Mutex<HashMap<InstrumentId, Vec<Arc<PreparedBook>>>>,
     next_id: AtomicU64,
     max_pending: usize,
     sealer: Arc<BroadcastSealer>,
@@ -353,6 +476,7 @@ impl Hub {
         Self {
             subscribers: Mutex::new(HashMap::new()),
             latest: Mutex::new(HashMap::new()),
+            book_history: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             max_pending: max_pending.max(1),
             sealer,
@@ -367,6 +491,8 @@ impl Hub {
             client,
             selection: Mutex::new(Selection::Feeds(HashSet::new())),
             venues: Mutex::new(HashSet::new()),
+            books: Mutex::new(HashSet::new()),
+            book_queue: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
             lagged: AtomicBool::new(false),
@@ -415,8 +541,53 @@ impl Hub {
         prepared
     }
 
+    /// Publishes a book frame to every subscriber of that book.
+    pub fn publish_book(&self, signed: SignedBookUpdate) -> Arc<PreparedBook> {
+        let prepared = Arc::new(PreparedBook::new(signed, &self.sealer));
+        if let Ok(mut history) = self.book_history.lock() {
+            let frames = history.entry(prepared.instrument.clone()).or_default();
+            if prepared.snapshot {
+                frames.clear();
+                frames.push(Arc::clone(&prepared));
+            } else if frames.is_empty() || frames.len() >= MAX_BOOK_QUEUE {
+                // No snapshot to build on: a joiner waits for the next one.
+                frames.clear();
+            } else {
+                frames.push(Arc::clone(&prepared));
+            }
+        }
+        if let Ok(subscribers) = self.subscribers.lock() {
+            for subscriber in subscribers.values() {
+                if !subscriber.is_closed() && subscriber.wants_book(&prepared.instrument) {
+                    subscriber.offer_book(&prepared);
+                }
+            }
+        }
+        prepared
+    }
+
+    /// Sends a new subscriber of `books` the latest snapshot of each, and the
+    /// deltas after it. Call it after [`Subscriber::add_books`], so no frame
+    /// falls between the two.
+    pub fn replay_books(&self, subscriber: &Subscriber, books: &[InstrumentId]) {
+        let frames: Vec<Arc<PreparedBook>> = match self.book_history.lock() {
+            Ok(history) => books
+                .iter()
+                .filter_map(|book| history.get(book))
+                .flatten()
+                .cloned()
+                .collect(),
+            Err(_) => return,
+        };
+        for frame in &frames {
+            subscriber.offer_book(frame);
+        }
+    }
+
     fn offer(&self, frame: &Outgoing) {
-        let (channel, feed_id) = (frame.channel(), frame.feed_id());
+        let (channel, Some(feed_id)) = (frame.channel(), frame.feed_id()) else {
+            return;
+        };
         if let Ok(subscribers) = self.subscribers.lock() {
             for subscriber in subscribers.values() {
                 if !subscriber.is_closed() && subscriber.wants(channel, feed_id) {
@@ -491,7 +662,10 @@ mod tests {
 
         let drained = subscriber.drain().await;
         assert_eq!(drained.len(), 1, "only the selected feed should arrive");
-        assert_eq!(drained.first().map(Outgoing::feed_id), Some(feed_id(&btc)));
+        assert_eq!(
+            drained.first().and_then(Outgoing::feed_id),
+            Some(feed_id(&btc))
+        );
     }
 
     /// The defining behaviour: a slow subscriber gets the newest price, not a
@@ -512,7 +686,7 @@ mod tests {
         assert_eq!(
             drained.first().and_then(|frame| match frame {
                 Outgoing::Price(update) => Some(update.signed().update().seq),
-                Outgoing::Venues(_) => None,
+                Outgoing::Venues(_) | Outgoing::Book(_) => None,
             }),
             Some(100),
             "and it must be the newest"
@@ -558,6 +732,76 @@ mod tests {
                 .iter()
                 .any(|frame| frame.channel() == Channel::Venues)
         );
+    }
+
+    fn instrument() -> InstrumentId {
+        InstrumentId::new(Venue::Binance, oracle_types::MarketKind::Spot, "BTCUSDT")
+    }
+
+    fn book(seq: u64, snapshot: bool) -> SignedBookUpdate {
+        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        signer
+            .sign_book_update(&oracle_types::BookUpdate {
+                venue: Venue::Binance,
+                market: oracle_types::MarketKind::Spot,
+                symbol: "BTCUSDT".to_owned(),
+                publish_time_ns: 1_754_582_400_000_000_000 + seq,
+                seq,
+                snapshot,
+                exchange_time_ns: None,
+                local_recv_ns: 0,
+                bids: vec![oracle_types::BookLevel {
+                    price: 100,
+                    qty: u64::from(snapshot),
+                }],
+                asks: Vec::new(),
+            })
+            .expect("signs")
+    }
+
+    fn book_seqs(frames: &[Outgoing]) -> Vec<u64> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Outgoing::Book(update) => Some(update.signed().update().seq),
+                Outgoing::Price(_) | Outgoing::Venues(_) => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_gets_the_snapshot_and_the_deltas_in_order() {
+        let hub = hub(64);
+        hub.publish_book(book(1, true));
+        hub.publish_book(book(2, false));
+        hub.publish_book(book(3, false));
+
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
+        subscriber.add_books([instrument()]);
+        hub.replay_books(&subscriber, &[instrument()]);
+        assert_eq!(book_seqs(&subscriber.drain().await), vec![1, 2, 3]);
+
+        hub.publish_book(book(4, false));
+        hub.publish_book(book(5, false));
+        assert_eq!(
+            book_seqs(&subscriber.drain().await),
+            vec![4, 5],
+            "deltas never replace one another"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_book_queue_waits_for_the_next_snapshot() {
+        let hub = hub(64);
+        let subscriber = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
+        subscriber.add_books([instrument()]);
+        hub.publish_book(book(1, true));
+        for seq in 2..=80 {
+            hub.publish_book(book(seq, false));
+        }
+        assert!(subscriber.dropped() > 0);
+        hub.publish_book(book(81, true));
+        assert_eq!(book_seqs(&subscriber.drain().await), vec![81]);
     }
 
     #[tokio::test]

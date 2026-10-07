@@ -17,9 +17,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use oracle_types::{FeedId, NANOS_PER_SEC, PriceUpdate, VenueReport};
+use oracle_types::{BookUpdate, FeedId, InstrumentId, NANOS_PER_SEC, PriceUpdate, VenueReport};
 use oracle_wire::{
-    Address, NodeListing, UnverifiedFrame, UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
+    Address, NodeListing, UnverifiedBookFrame, UnverifiedFrame, UnverifiedVenueFrame,
+    VerifiedRegistry, VerifyError,
 };
 
 /// Freshness policy.
@@ -118,6 +119,17 @@ pub enum RejectReason {
     },
 }
 
+/// A book update that passed every check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedBook {
+    /// The update.
+    pub update: BookUpdate,
+    /// The node that signed it.
+    pub signer: Address,
+    /// That node's index in the registry it was verified against.
+    pub node_index: usize,
+}
+
 /// A venue report that passed every check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedVenues {
@@ -159,6 +171,7 @@ pub struct Verifier {
     high_water: HashMap<(Address, FeedId), u64>,
     /// Venue reports count their own sequence, apart from prices.
     venue_high_water: HashMap<(Address, FeedId), u64>,
+    book_high_water: HashMap<(Address, InstrumentId), u64>,
     /// Addresses that a registry this verifier once trusted listed, and the
     /// current one does not. Reported as [`RejectReason::RetiredKey`] rather than
     /// unknown, so the client does not go looking for a registry it already has.
@@ -174,6 +187,7 @@ impl Verifier {
             config,
             high_water: HashMap::new(),
             venue_high_water: HashMap::new(),
+            book_high_water: HashMap::new(),
             retired: HashSet::new(),
         }
     }
@@ -197,6 +211,8 @@ impl Verifier {
         self.high_water
             .retain(|(node, _), _| still_listed.contains(node));
         self.venue_high_water
+            .retain(|(node, _), _| still_listed.contains(node));
+        self.book_high_water
             .retain(|(node, _), _| still_listed.contains(node));
         self.registry = registry;
     }
@@ -278,6 +294,47 @@ impl Verifier {
         )?;
         Ok(AcceptedVenues {
             report,
+            signer,
+            node_index,
+        })
+    }
+
+    /// Verifies one book frame, with the same checks as a price frame. A gap
+    /// in `seq` passes here: the book, not the verifier, decides what a gap
+    /// means.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_book(&mut self, frame: &[u8], now_ns: u64) -> Result<AcceptedBook, RejectReason> {
+        let parsed = UnverifiedBookFrame::parse(frame).map_err(VerifyError::from)?;
+        let verified = match parsed.verify(&self.registry) {
+            Ok(verified) => verified,
+            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
+                return Err(RejectReason::RetiredKey { signer });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (signer, node_index) = (verified.signer(), verified.node_index());
+        let update = verified.into_update();
+        if !update.timestamps_coherent() {
+            return Err(RejectReason::IncoherentTimestamps { signer });
+        }
+        self.check_clock(signer, update.publish_time_ns, now_ns)?;
+        let book = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        let key = (signer, book);
+        if let Some(last_seq) = self.book_high_water.get(&key).copied()
+            && update.seq <= last_seq
+        {
+            return Err(RejectReason::Replayed {
+                signer,
+                seq: update.seq,
+                last_seq,
+            });
+        }
+        self.book_high_water.insert(key, update.seq);
+        Ok(AcceptedBook {
+            update,
             signer,
             node_index,
         })
