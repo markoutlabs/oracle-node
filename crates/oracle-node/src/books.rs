@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use oracle_types::{
     BOOK_EXPO, BookDepth, BookLevel, BookUpdate, InstrumentId, MarketKind, ObsKind, Observation,
-    Venue,
+    Venue, side_changes,
 };
 
 /// How often each book sends a full snapshot. A client that missed a frame
@@ -182,25 +182,10 @@ impl BookPublisher {
     }
 }
 
-/// The levels that differ between `sent` and `current`: a new size, or zero for
-/// a level that left.
 fn changes(sent: &Levels, current: &Levels) -> (Side, Side) {
-    let side = |sent: &Side, current: &Side| -> Side {
-        let mut changed: Side = current
-            .iter()
-            .filter(|(price, qty)| sent.get(price) != Some(qty))
-            .map(|(price, qty)| (*price, *qty))
-            .collect();
-        for price in sent.keys() {
-            if !current.contains_key(price) {
-                changed.insert(*price, 0);
-            }
-        }
-        changed
-    };
     (
-        side(&sent.bids, &current.bids),
-        side(&sent.asks, &current.asks),
+        side_changes(&sent.bids, &current.bids),
+        side_changes(&sent.asks, &current.asks),
     )
 }
 

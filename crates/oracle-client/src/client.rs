@@ -618,6 +618,15 @@ impl OracleClient {
             .max_by_key(|book| book.publish_time_ns)
     }
 
+    /// Every book a node has sent, each once.
+    pub fn book_instruments(&self) -> impl Iterator<Item = &InstrumentId> {
+        let mut seen = HashSet::new();
+        self.books
+            .keys()
+            .map(|(_, instrument)| instrument)
+            .filter(move |instrument| seen.insert(*instrument))
+    }
+
     fn resubscribe(&mut self) -> Result<(), ClientError> {
         let prices: Vec<Symbol> = self.symbols.values().copied().collect();
         let venues: Vec<Symbol> = self.venue_symbols.values().copied().collect();

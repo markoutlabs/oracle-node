@@ -64,6 +64,18 @@ pub enum Status {
     Halted,
 }
 
+impl Status {
+    /// Returns the canonical name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Degraded => "degraded",
+            Self::Halted => "halted",
+        }
+    }
+}
+
 /// Why a feed is not `Ok`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -81,6 +93,20 @@ pub enum Concern {
     /// The fetch path is broken or something is withholding newer versions
     /// (SPEC §3.6). Membership changes may be missing.
     RegistryStale,
+}
+
+impl Concern {
+    /// Returns the canonical name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientNodes => "insufficient_nodes",
+            Self::NodeDivergence => "node_divergence",
+            Self::NodeReportedDegraded => "node_reported_degraded",
+            Self::NodeReportedHalted => "node_reported_halted",
+            Self::RegistryStale => "registry_stale",
+        }
+    }
 }
 
 /// A resolved price for one feed.

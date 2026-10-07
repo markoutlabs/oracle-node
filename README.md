@@ -329,6 +329,51 @@ Stored frames are a separate path. `verify_historical` checks a frame against
 the canister's listing of its signer: when the address was listed, and when it
 was replaced or removed.
 
+### `oracle-proxy`
+
+Verified oracle data for web clients (SPEC §6.5). A browser cannot hold a
+client API key, so it cannot use the node transport. The proxy is one listed
+client: it runs the SDK, with the signature checks and the quorum, and serves
+the result as JSON over one plain WebSocket, `/v1/ws`. A reverse proxy in front
+of it terminates TLS. `proxy/proxy.toml` is a commented example.
+
+```sh
+scripts/client-key.sh --out proxy.key          # the proxy's own client key
+scripts/add-client.sh --identity <controller> --address <its address> --expires <date>
+make proxy && target/release/oracle-proxy proxy/proxy.toml
+```
+
+A web client then does this:
+
+```js
+const socket = new WebSocket("wss://oracle.example.com/v1/ws");
+socket.onopen = () => socket.send(JSON.stringify({
+  op: "subscribe",
+  prices: ["CRYPTO.BTC/USD"],
+  venues: ["CRYPTO.BTC/USDT"],
+  books: ["binance:spot:BTCUSDT"],
+}));
+socket.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  // message.type: "subscribed", "price", "venues", "book", "pong" or "error"
+};
+```
+
+| Message | Contents |
+|---|---|
+| `price` | `symbol`, `status`, `price`, `conf`, `nodes`, `concerns`, `publish_time_ns`, `spread_bps` |
+| `venues` | `symbol`, `node`, and the node's venue report (SPEC §3.3.1) |
+| `book` | `book`, `seq`, `snapshot`, `available`, `node`, `bids` and `asks` as `[price, size]` |
+
+Every 64-bit time and every decimal is a string, so JavaScript loses no
+precision. For a book, apply a snapshot, then each delta in `seq` order; a size
+of `"0"` removes the level. `GET /v1/catalog` lists what the proxy serves, and
+`GET /health` shows the upstream client.
+
+The socket is open to anyone, within `[limits]`. Behind a reverse proxy, set
+`trust_forwarded_for = true`, so that the limits see each client's address
+rather than the reverse proxy's.
+
 ### `oracle-node`
 
 The binary. One config file describes the whole node; ingest subscriptions are
@@ -636,6 +681,7 @@ make test lint        # every test, PocketIC included; fmt and clippy
 make canister         # the canister wasm: builds it, writes its .did, bakes
                       # the .did into the wasm as public candid:service
 make node             # the oracle-node binary for this machine
+make proxy            # the oracle-proxy binary for web clients
 make e2e              # the whole system on PocketIC; also part of make test
 make latency          # live latency from the venues to the SDK (below)
 make smoke            # the icp-cli path on a local network (below)

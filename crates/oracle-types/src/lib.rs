@@ -22,7 +22,9 @@ mod update;
 mod venue;
 mod venue_report;
 
-pub use book_update::{BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_BOOK_SYMBOL};
+pub use book_update::{
+    BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_BOOK_SYMBOL, side_changes,
+};
 pub use fixed::{Fixed, FixedError};
 pub use flags::Flags;
 pub use observation::{BookDepth, Impact, Level, ObsKind, ObsKindError, Observation};

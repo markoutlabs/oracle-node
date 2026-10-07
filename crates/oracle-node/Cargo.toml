@@ -44,8 +44,11 @@ sd-notify.workspace = true
 
 [dev-dependencies]
 ed25519-zebra.workspace = true
+oracle-proxy = { path = "../oracle-proxy" }
 oracle-registry-canister = { path = "../oracle-registry-canister" }
 tokio = { workspace = true, features = ["sync"] }
+tokio-tungstenite = { workspace = true, features = ["connect"] }
+futures-util.workspace = true
 
 [lints]
 workspace = true

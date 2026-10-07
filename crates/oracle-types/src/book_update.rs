@@ -5,6 +5,8 @@
 //! exactly the node's top levels. A gap in `seq` makes the book unknown until
 //! the next snapshot.
 
+use std::collections::BTreeMap;
+
 use crate::{MarketKind, Venue};
 
 /// The exponent of every price and size in a book update.
@@ -62,6 +64,23 @@ pub struct BookUpdate {
     pub bids: Vec<BookLevel>,
     /// Asks, lowest price first.
     pub asks: Vec<BookLevel>,
+}
+
+/// The levels of one side that differ between `sent` and `current`: the new
+/// size, or zero for a level that left. Applying them to `sent` gives `current`.
+#[must_use]
+pub fn side_changes(sent: &BTreeMap<i64, u64>, current: &BTreeMap<i64, u64>) -> BTreeMap<i64, u64> {
+    let mut changed: BTreeMap<i64, u64> = current
+        .iter()
+        .filter(|(price, qty)| sent.get(price) != Some(qty))
+        .map(|(price, qty)| (*price, *qty))
+        .collect();
+    for price in sent.keys() {
+        if !current.contains_key(price) {
+            changed.insert(*price, 0);
+        }
+    }
+    changed
 }
 
 impl BookUpdate {
