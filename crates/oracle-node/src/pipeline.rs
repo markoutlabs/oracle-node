@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use oracle_agg::{AggError, Aggregator, FeedStats};
+use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
 use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::{SignedUpdate, Signer};
@@ -115,6 +115,12 @@ impl Pipeline {
     pub fn flush(&mut self, now_ns: u64) -> (Vec<SignedUpdate>, Vec<AggError>) {
         let polled = self.aggregator.poll_changed(now_ns);
         self.sign(polled)
+    }
+
+    /// Returns why a feed last published.
+    #[must_use]
+    pub fn last_trigger(&self, feed_id: FeedId) -> Option<Trigger> {
+        self.aggregator.last_trigger(feed_id)
     }
 
     /// When [`Self::flush`] next has a rate-capped publication to make.

@@ -80,6 +80,29 @@ pub struct FeedStats {
     pub last_reasons: Reasons,
 }
 
+/// Why a feed published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// The feed's first publication.
+    First,
+    /// The status flags changed.
+    Flags,
+    /// The price moved by at least the feed's deviation.
+    Moved,
+    /// Nothing moved, and the heartbeat was due.
+    Heartbeat,
+}
+
+/// Why a feed last published, and how fresh its data was when the trigger fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trigger {
+    /// Why.
+    pub cause: Cause,
+    /// The receipt time of the newest data at the first evaluation that fired.
+    /// When the rate cap held the update, the wait counts from here.
+    pub observed_ns: u64,
+}
+
 /// One feed's runtime state.
 struct FeedRuntime {
     config: FeedConfig,
@@ -99,17 +122,21 @@ struct FeedRuntime {
     dirty: bool,
     /// When a publication the rate cap held back becomes due.
     retry_at_ns: Option<u64>,
+    /// The trigger the rate cap is holding back.
+    held: Option<Trigger>,
+    last_trigger: Option<Trigger>,
 }
 
 /// What the publication policy decided for one evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Decision {
-    Publish,
+    Publish(Cause),
     Hold,
     /// A trigger fired inside the rate cap. Without a retry, a move that
     /// arrives just after a publish would wait for the next input or heartbeat.
     RateCapped {
         until_ns: u64,
+        cause: Cause,
     },
 }
 
@@ -184,6 +211,8 @@ impl Aggregator {
                 stats: FeedStats::default(),
                 dirty: false,
                 retry_at_ns: None,
+                held: None,
+                last_trigger: None,
             });
         }
         // Every peg must exist and must not itself need conversion.
@@ -274,6 +303,15 @@ impl Aggregator {
             .get(&feed_id)
             .and_then(|i| self.feeds.get(*i))
             .map(|feed| feed.stats)
+    }
+
+    /// Returns why a feed last published.
+    #[must_use]
+    pub fn last_trigger(&self, feed_id: FeedId) -> Option<Trigger> {
+        self.by_id
+            .get(&feed_id)
+            .and_then(|i| self.feeds.get(*i))
+            .and_then(|feed| feed.last_trigger)
     }
 
     /// Records an observation against every feed that consumes it.
@@ -458,18 +496,24 @@ impl FeedRuntime {
         };
 
         self.stats.last_reasons = reasons;
-        match self.decide(price, flags, now_ns) {
-            Decision::Publish => {}
+        let fired = |cause| Trigger {
+            cause,
+            observed_ns: observation_time_ns,
+        };
+        let trigger = match self.decide(price, flags, now_ns) {
+            Decision::Publish(cause) => self.held.take().unwrap_or_else(|| fired(cause)),
             Decision::Hold => {
+                self.held = None;
                 self.stats.suppressed = self.stats.suppressed.saturating_add(1);
                 return Ok(None);
             }
-            Decision::RateCapped { until_ns } => {
+            Decision::RateCapped { until_ns, cause } => {
+                self.held.get_or_insert_with(|| fired(cause));
                 self.stats.suppressed = self.stats.suppressed.saturating_add(1);
                 self.retry_at_ns = Some(until_ns);
                 return Ok(None);
             }
-        }
+        };
 
         let expo = self.config.expo;
         let price_mantissa = price
@@ -498,6 +542,7 @@ impl FeedRuntime {
             publish_time_ns: now_ns,
             flags,
         });
+        self.last_trigger = Some(trigger);
 
         Ok(Some(PriceUpdate {
             feed_id: self.config.feed_id,
@@ -534,24 +579,32 @@ impl FeedRuntime {
     /// that a halt or degrade transition can be delayed by up to `min_interval`.
     fn decide(&self, price: Fixed, flags: Flags, now_ns: u64) -> Decision {
         let Some(last) = self.last else {
-            return Decision::Publish;
+            return Decision::Publish(Cause::First);
         };
 
         let elapsed = now_ns.saturating_sub(last.publish_time_ns);
-        let triggered = flags != last.flags
-            || elapsed >= duration_ns(self.config.heartbeat)
-            || price
-                .checked_sub(last.price)
-                .and_then(Fixed::checked_abs)
-                .and_then(|delta| delta.to_bps_of(last.price))
-                .is_some_and(|bps| bps >= self.config.deviation_bps);
+        let moved = price
+            .checked_sub(last.price)
+            .and_then(Fixed::checked_abs)
+            .and_then(|delta| delta.to_bps_of(last.price))
+            .is_some_and(|bps| bps >= self.config.deviation_bps);
+        let cause = if flags != last.flags {
+            Cause::Flags
+        } else if moved {
+            Cause::Moved
+        } else if elapsed >= duration_ns(self.config.heartbeat) {
+            Cause::Heartbeat
+        } else {
+            return Decision::Hold;
+        };
         let min_interval = duration_ns(self.config.min_interval);
-        match (triggered, elapsed < min_interval) {
-            (false, _) => Decision::Hold,
-            (true, false) => Decision::Publish,
-            (true, true) => Decision::RateCapped {
+        if elapsed < min_interval {
+            Decision::RateCapped {
                 until_ns: last.publish_time_ns.saturating_add(min_interval),
-            },
+                cause,
+            }
+        } else {
+            Decision::Publish(cause)
         }
     }
 
@@ -824,6 +877,86 @@ mod tests {
         assert!(aggregator.poll_changed(due - 1).0.is_empty(), "not due yet");
         assert_eq!(aggregator.poll_changed(due).0.len(), 1);
         assert_eq!(aggregator.next_retry_ns(), None);
+    }
+
+    fn both(bid: &'static str, ask: &'static str) -> [(Venue, &'static str, &'static str); 2] {
+        [(Venue::Binance, bid, ask), (Venue::Bybit, bid, ask)]
+    }
+
+    fn trigger(cause: Cause, observed_ns: u64) -> Option<Trigger> {
+        Some(Trigger { cause, observed_ns })
+    }
+
+    #[test]
+    fn each_publication_records_its_trigger() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+        assert_eq!(
+            aggregator.last_trigger(feed_id()),
+            trigger(Cause::First, SECOND)
+        );
+
+        let moved = SECOND + 100_000_000;
+        feed(&mut aggregator, moved, &both("101", "101.02"));
+        assert_eq!(aggregator.poll_changed(moved).0.len(), 1);
+        assert_eq!(
+            aggregator.last_trigger(feed_id()),
+            trigger(Cause::Moved, moved)
+        );
+
+        let beat = moved + SECOND;
+        feed(&mut aggregator, beat, &both("101", "101.02"));
+        assert_eq!(aggregator.poll_changed(beat).0.len(), 1);
+        assert_eq!(
+            aggregator.last_trigger(feed_id()),
+            trigger(Cause::Heartbeat, beat)
+        );
+    }
+
+    #[test]
+    fn a_rate_capped_trigger_keeps_the_time_it_fired() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+
+        let fired = SECOND + 10_000_000;
+        feed(&mut aggregator, fired, &both("101", "101.02"));
+        assert!(aggregator.poll_changed(fired).0.is_empty());
+        let newer = SECOND + 30_000_000;
+        feed(&mut aggregator, newer, &both("101.5", "101.52"));
+        assert!(aggregator.poll_changed(newer).0.is_empty());
+
+        let due = SECOND + 50_000_000;
+        assert_eq!(aggregator.poll_changed(due).0.len(), 1);
+        assert_eq!(
+            aggregator.last_trigger(feed_id()),
+            trigger(Cause::Moved, fired),
+            "the wait inside the cap counts"
+        );
+    }
+
+    #[test]
+    fn a_move_that_reverts_inside_the_cap_drops_its_trigger() {
+        let mut aggregator = aggregator();
+        feed(&mut aggregator, SECOND, &both("100", "100.02"));
+        assert_eq!(aggregator.poll_changed(SECOND).0.len(), 1);
+
+        let fired = SECOND + 10_000_000;
+        feed(&mut aggregator, fired, &both("101", "101.02"));
+        assert!(aggregator.poll_changed(fired).0.is_empty());
+        let back = SECOND + 30_000_000;
+        feed(&mut aggregator, back, &both("100", "100.02"));
+        assert!(aggregator.poll_changed(back).0.is_empty());
+        assert_eq!(aggregator.next_retry_ns(), None);
+
+        let later = SECOND + 200_000_000;
+        feed(&mut aggregator, later, &both("102", "102.02"));
+        assert_eq!(aggregator.poll_changed(later).0.len(), 1);
+        assert_eq!(
+            aggregator.last_trigger(feed_id()),
+            trigger(Cause::Moved, later)
+        );
     }
 
     #[test]

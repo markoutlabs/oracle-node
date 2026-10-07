@@ -418,11 +418,14 @@ picks from where stderr goes:
 
 `RUST_LOG` filters as usual. Once a minute the node logs a `status` line:
 feeds published, clients connected, venue connections up, updates in the last
-minute, and p50 and p99 from venue data to signed update. Only updates that new
-data caused count; a heartbeat repeats old data. Under systemd the same line
-shows in `systemctl status`. A `venue lag` line follows: p50 and p99 from each
-venue's own timestamp to our receipt. It also holds the offset between the
-venue clock and ours.
+minute, and p50 and p99 from venue data to signed update. Only updates that a
+move or a flag change caused count, from the data at the first evaluation that
+fired; a wait in the rate cap counts too. A heartbeat repeats old data, so it
+does not count. Under systemd the same line shows in `systemctl status`. A
+`venue lag` line follows: p50 and p99 from each venue's own timestamp to our
+receipt. It also holds the offset between the venue clock and ours, and it shows
+the share of venue timestamps ahead of our clock. A large share means that our
+clock is behind.
 
 #### Running under systemd
 
@@ -770,15 +773,20 @@ serves every feed in `node/all-feeds.toml` from the live venues. After a 15 s
 warm-up, it measures for `LATENCY_SECS` (default 60) and prints:
 
 ```text
-venue to node (venue clocks)  p50/p99 "binance 132.1/384.5 ms, bybit 102.3/110.0 ms, ..."
-venue data to signed (node)   p50 0.123 ms, p99 193.151 ms
-signed to SDK (delivery)      p50 0.23 ms, p90 0.42 ms, p99 3.53 ms, max 8.31 ms (n=988)
-venue data to SDK (data age)  p50 0.36 ms, p90 174.97 ms, p99 1040.38 ms, max 1941.50 ms (n=919)
-SDK processing                p50 0.10 ms, p90 0.16 ms, p99 0.96 ms, max 6.42 ms (n=988)
+venue to node (venue clocks)  p50/p99 binance 0.0/215.6 ms (97% ahead), bybit 0.0/0.0 ms (100% ahead), ...
+venue data to signed (node)   p50 0.12 ms, p99 51.74 ms
+signed to SDK (delivery)      p50 0.28 ms, p90 0.59 ms, p99 1.51 ms, max 6.33 ms (n=1059)
+venue data to SDK (data age)  p50 0.46 ms, p90 136.57 ms, p99 1073.15 ms, max 1994.75 ms (n=945)
+SDK processing                p50 0.12 ms, p90 0.25 ms, p99 0.57 ms, max 4.87 ms (n=1059)
 ```
 
 The node rows come from the node's second `status` and `venue lag` lines,
 because the first one includes the startup. SPEC §9.1 explains each row.
+
+The venue line above is from a machine whose clock was 144 ms behind NTP.
+Most venue timestamps were ahead of its clock, and a lag below zero reads as
+zero. Check the host clock with `sntp time.apple.com` (macOS) or `chronyc
+tracking` (Linux) before you read that line.
 
 ### Smoke test on the local network
 

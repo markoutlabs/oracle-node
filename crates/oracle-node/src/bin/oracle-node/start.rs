@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
-use oracle_agg::AggError;
+use oracle_agg::{AggError, Cause};
 use oracle_ingest::IngestEvent;
 use oracle_ingest::binance::snapshot::SnapshotConnector;
 use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
@@ -319,8 +319,8 @@ impl PipelineTask {
         self.pipeline.observe(event);
     }
 
-    /// `timed` is `Some` for updates that new input caused. A heartbeat
-    /// repeats old data and a halt carries none, so neither delay is latency.
+    /// `timed` is `Some` after new input. Only a move or a flag change counts
+    /// as latency: a heartbeat repeats old data, and a halt carries none.
     fn publish(
         &mut self,
         (signed, errors): (Vec<SignedUpdate>, Vec<AggError>),
@@ -334,15 +334,16 @@ impl PipelineTask {
             if self.tail {
                 log_update(&update, self.symbols.get(&update.update().feed_id));
             }
-            let (feed_id, observed_ns) =
-                (update.update().feed_id, update.update().observation_time_ns);
-            let halted = update.update().flags.is_halted();
+            let feed_id = update.update().feed_id;
+            let reaction = self
+                .pipeline
+                .last_trigger(feed_id)
+                .filter(|trigger| matches!(trigger.cause, Cause::Moved | Cause::Flags))
+                .filter(|_| !update.update().flags.is_halted());
             published.insert(feed_id);
             let _ = self.state.publish(update);
-            if let Some(clock) = timed
-                && !halted
-            {
-                self.latency.signed(observed_ns, clock.now_ns());
+            if let (Some(clock), Some(trigger)) = (timed, reaction) {
+                self.latency.signed(trigger.observed_ns, clock.now_ns());
             }
         }
     }

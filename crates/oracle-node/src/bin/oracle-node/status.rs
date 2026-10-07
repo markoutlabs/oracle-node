@@ -101,8 +101,8 @@ impl NodeStatus {
             connections = %format_args!("{}/{}", self.connections_up, self.connections),
             updates = self.updates,
             client_list = self.client_list_version,
-            signed_p50_ms = millis(self.signed.p50),
-            signed_p99_ms = millis(self.signed.p99),
+            signed_p50_ms = %format_args!("{:.2}", millis(self.signed.p50)),
+            signed_p99_ms = %format_args!("{:.2}", millis(self.signed.p99)),
             "status"
         );
     }
@@ -116,18 +116,29 @@ fn millis(value: Duration) -> f64 {
 #[derive(Default)]
 pub(crate) struct NodeLatency {
     signed: LatencyHistogram,
-    venues: BTreeMap<Venue, LatencyHistogram>,
+    venues: BTreeMap<Venue, (LatencyHistogram, u64)>,
+}
+
+/// One venue's lag over one status interval.
+pub(crate) struct VenueLag {
+    pub(crate) venue: Venue,
+    pub(crate) lag: Percentiles,
+    /// Timestamps after our receipt time. Many mean that our clock is behind.
+    pub(crate) ahead: u64,
 }
 
 impl NodeLatency {
     /// The venue timestamp is the venue's claim. Thus the lag also holds the
     /// offset between the venue clock and ours.
     pub(crate) fn observed(&mut self, observation: &Observation) {
-        if let Some(sent_ns) = observation.exchange_time_ns {
-            self.venues
-                .entry(observation.venue())
-                .or_default()
-                .record_between(sent_ns, observation.local_recv_ns);
+        if let Some(lag_ns) = observation.venue_lag_ns() {
+            let (lag, ahead) = self.venues.entry(observation.venue()).or_default();
+            if let Ok(lag_ns) = u64::try_from(lag_ns) {
+                lag.record(Duration::from_nanos(lag_ns));
+            } else {
+                lag.record(Duration::ZERO);
+                *ahead = ahead.saturating_add(1);
+            }
         }
     }
 
@@ -136,37 +147,47 @@ impl NodeLatency {
     }
 
     /// Returns the figures for the interval, and starts the next one.
-    pub(crate) fn take(&mut self) -> (Percentiles, Vec<(Venue, Percentiles)>) {
+    pub(crate) fn take(&mut self) -> (Percentiles, Vec<VenueLag>) {
         let signed = self.signed.percentiles();
         self.signed.reset();
         let venues = self
             .venues
             .iter_mut()
-            .map(|(venue, histogram)| {
-                let percentiles = histogram.percentiles();
+            .map(|(venue, (histogram, ahead))| {
+                let lag = VenueLag {
+                    venue: *venue,
+                    lag: histogram.percentiles(),
+                    ahead: std::mem::take(ahead),
+                };
                 histogram.reset();
-                (*venue, percentiles)
+                lag
             })
-            .filter(|(_, percentiles)| percentiles.count > 0)
+            .filter(|venue| venue.lag.count > 0)
             .collect();
         (signed, venues)
     }
 }
 
-/// Logs the venue lag: p50 and p99 for each venue, in one line.
-pub(crate) fn log_venue_lag(venues: &[(Venue, Percentiles)]) {
+/// Logs the venue lag in one line: p50 and p99 for each venue, and the share of
+/// venue timestamps ahead of our clock. A lag below zero reads as zero.
+pub(crate) fn log_venue_lag(venues: &[VenueLag]) {
     if venues.is_empty() {
         return;
     }
     let text = venues
         .iter()
-        .map(|(venue, lag)| {
-            format!(
+        .map(|venue| {
+            let mut text = format!(
                 "{} {:.1}/{:.1} ms",
-                venue.as_str(),
-                millis(lag.p50),
-                millis(lag.p99)
-            )
+                venue.venue.as_str(),
+                millis(venue.lag.p50),
+                millis(venue.lag.p99)
+            );
+            if venue.ahead > 0 {
+                let share = venue.ahead.saturating_mul(100) / venue.lag.count.max(1);
+                text.push_str(&format!(" ({share}% ahead)"));
+            }
+            text
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -197,6 +218,41 @@ impl fmt::Display for NodeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind};
+
+    fn observation(sent_ns: u64, received_ns: u64) -> Observation {
+        Observation {
+            instrument: InstrumentId::new(Venue::Kraken, MarketKind::Spot, "BTC/USD"),
+            kind: ObsKind::Trade,
+            price: Fixed::ONE,
+            bid: None,
+            ask: None,
+            bid_qty: None,
+            ask_qty: None,
+            depth_notional_1bp: None,
+            exchange_time_ns: Some(sent_ns),
+            local_recv_ns: received_ns,
+            seq: None,
+            book: None,
+        }
+    }
+
+    #[test]
+    fn a_venue_clock_ahead_of_ours_is_counted() {
+        let mut latency = NodeLatency::default();
+        latency.observed(&observation(105_000_000, 100_000_000));
+        latency.observed(&observation(90_000_000, 100_000_000));
+        let (_, venues) = latency.take();
+        let [kraken] = venues.as_slice() else {
+            panic!("one venue: {}", venues.len());
+        };
+        assert_eq!((kraken.lag.count, kraken.ahead), (2, 1));
+        assert_eq!(kraken.lag.max.as_millis(), 10);
+        assert!(
+            latency.take().1.is_empty(),
+            "each take starts a new interval"
+        );
+    }
 
     #[test]
     fn the_status_is_one_line() {

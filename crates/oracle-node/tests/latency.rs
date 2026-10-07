@@ -169,8 +169,11 @@ fn report(
     status: &Value,
     lag: &Value,
 ) {
-    let field =
-        |fields: &Value, name: &str| fields.get(name).map_or_else(String::new, Value::to_string);
+    let field = |fields: &Value, name: &str| match fields.get(name) {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
     println!(
         "\nlatency over {} s: {feeds} feeds, {} updates accepted\n",
         span.as_secs(),

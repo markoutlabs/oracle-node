@@ -49,4 +49,4 @@ pub mod stats;
 pub use aggregate::{Aggregation, Outcome, Reasons};
 pub use config::{ConfigError, FeedConfig, SourceConfig};
 pub use quote::SourceQuote;
-pub use state::{AggError, Aggregator, FeedStats};
+pub use state::{AggError, Aggregator, Cause, FeedStats, Trigger};
