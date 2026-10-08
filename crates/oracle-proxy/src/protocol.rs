@@ -90,39 +90,22 @@ fn json(value: &impl Serialize) -> Arc<str> {
 }
 
 #[derive(Serialize)]
-struct PriceMessage {
+struct PriceMessage<'a> {
     r#type: &'static str,
-    symbol: String,
-    feed_id: String,
-    status: &'static str,
-    price: Option<String>,
-    conf: Option<String>,
-    nodes: usize,
-    halted_nodes: usize,
-    concerns: Vec<&'static str>,
-    publish_time_ns: String,
-    spread_bps: Option<String>,
+    #[serde(flatten)]
+    resolved: &'a Resolved,
 }
 
-/// A resolved price.
+/// A resolved price, as the SDK serializes it, under `symbol`.
 #[must_use]
 pub fn price_message(symbol: &Symbol, resolved: &Resolved) -> Arc<str> {
+    let resolved = Resolved {
+        symbol: Some(*symbol),
+        ..resolved.clone()
+    };
     json(&PriceMessage {
         r#type: "price",
-        symbol: symbol.to_string(),
-        feed_id: resolved.feed_id.to_string(),
-        status: resolved.status.as_str(),
-        price: resolved.price.map(|price| price.to_string()),
-        conf: resolved.conf.map(|conf| conf.to_string()),
-        nodes: resolved.nodes,
-        halted_nodes: resolved.halted_nodes,
-        concerns: resolved
-            .concerns
-            .iter()
-            .map(|concern| concern.as_str())
-            .collect(),
-        publish_time_ns: resolved.publish_time_ns.to_string(),
-        spread_bps: resolved.spread_bps.map(|bps| bps.to_string()),
+        resolved: &resolved,
     })
 }
 

@@ -848,8 +848,10 @@ impl OracleClient {
                 .is_none_or(|last| now_ns.saturating_sub(last) >= floor)
     }
 
-    /// Adds the client-level concerns a feed view cannot know about.
+    /// Adds what a feed view cannot know: the symbol, and the client-level
+    /// concerns.
     fn annotate(&self, resolved: &mut Resolved, now_ns: u64) {
+        resolved.symbol = self.symbols.get(&resolved.feed_id).copied();
         if self.registry_is_stale(now_ns) {
             resolved.concerns.push(Concern::RegistryStale);
             if resolved.status == Status::Ok {

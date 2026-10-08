@@ -23,8 +23,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oracle_agg::stats;
-use oracle_types::{FeedId, Fixed, PriceUpdate};
+use oracle_types::{FeedId, Fixed, PriceUpdate, Symbol};
 use oracle_wire::Address;
+use serde::{Deserialize, Serialize};
 
 /// Quorum and divergence policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +55,8 @@ impl Default for QuorumConfig {
 }
 
 /// How much to trust a resolved price.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Enough nodes agree.
     Ok,
@@ -77,7 +79,8 @@ impl Status {
 }
 
 /// Why a feed is not `Ok`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Concern {
     /// Fewer live nodes than the quorum requires.
@@ -110,10 +113,16 @@ impl Concern {
 }
 
 /// A resolved price for one feed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// As JSON, decimals and the publish time are strings: a JavaScript number
+/// loses precision on a nanosecond timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolved {
     /// The feed.
     pub feed_id: FeedId,
+    /// The feed's symbol. The client sets it for every subscribed feed; a
+    /// [`FeedView`] on its own cannot know it.
+    pub symbol: Option<Symbol>,
     /// How much to trust it.
     pub status: Status,
     /// The cross-node median, or `None` when halted with nothing to report.
@@ -127,6 +136,7 @@ pub struct Resolved {
     /// Why it is not `Ok`.
     pub concerns: Vec<Concern>,
     /// The freshest contributing publish time.
+    #[serde(with = "oracle_types::num_str")]
     pub publish_time_ns: u64,
     /// Inter-node spread as basis points of the median, when there is a price.
     ///
@@ -233,6 +243,7 @@ impl FeedView {
             concerns.push(Concern::InsufficientNodes);
             return Resolved {
                 feed_id: self.feed_id,
+                symbol: None,
                 status: Status::Halted,
                 price: None,
                 conf: None,
@@ -281,6 +292,7 @@ impl FeedView {
 
         Resolved {
             feed_id: self.feed_id,
+            symbol: None,
             status,
             price,
             conf: Some(conf),
@@ -320,6 +332,36 @@ mod tests {
             num_sources: 5,
             sources: Venue::ALL.into_iter().collect::<VenueSet>(),
         }
+    }
+
+    #[test]
+    fn a_resolved_price_is_json_with_strings_and_names() {
+        let resolved = Resolved {
+            feed_id: FeedId::from_bytes([7; 32]),
+            symbol: Some("CRYPTO.BTC/USD".parse().expect("valid")),
+            status: Status::Degraded,
+            price: Some("86599.95".parse().expect("decimal")),
+            conf: Some("19.71".parse().expect("decimal")),
+            nodes: 3,
+            halted_nodes: 1,
+            concerns: vec![Concern::NodeReportedHalted],
+            publish_time_ns: 1_754_582_400_123_456_789,
+            spread_bps: None,
+        };
+        let json = serde_json::to_value(&resolved).expect("serializes");
+        let field = |pointer: &str| json.pointer(pointer).cloned();
+        assert_eq!(field("/status"), Some("degraded".into()));
+        assert_eq!(field("/concerns/0"), Some("node_reported_halted".into()));
+        assert_eq!(field("/price"), Some("86599.95".into()));
+        assert_eq!(
+            field("/publish_time_ns"),
+            Some("1754582400123456789".into()),
+            "a string"
+        );
+        assert_eq!(field("/symbol"), Some("CRYPTO.BTC/USD".into()));
+        assert_eq!(field("/spread_bps"), Some(serde_json::Value::Null));
+        let back: Resolved = serde_json::from_value(json).expect("parses");
+        assert_eq!(back, resolved);
     }
 
     fn view(nodes: &[(u8, &str, &str, Flags)]) -> FeedView {

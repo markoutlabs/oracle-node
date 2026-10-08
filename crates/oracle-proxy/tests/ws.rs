@@ -80,6 +80,7 @@ async fn next(socket: &mut Socket) -> Option<Value> {
 fn resolved(price: &str) -> Resolved {
     Resolved {
         feed_id: feed_id(&btc()),
+        symbol: None,
         status: Status::Ok,
         price: Some(price.parse::<Fixed>().expect("decimal")),
         conf: Some(Fixed::ONE),

@@ -30,6 +30,8 @@ pub use flags::Flags;
 pub use observation::{BookDepth, Impact, Level, ObsKind, ObsKindError, Observation};
 pub use symbol::{AssetClass, AssetCode, FeedId, FeedKind, Symbol, SymbolError};
 pub use update::PriceUpdate;
+#[cfg(feature = "serde")]
+pub use update::{num_str, opt_num_str};
 pub use venue::{InstrumentId, MarketKind, Venue, VenueError, VenueSet};
 pub use venue_report::{
     MAX_VENUE_ENTRIES, QTY_EXPO, RATE_EXPO, SourceStatus, VenueEntry, VenueReport,

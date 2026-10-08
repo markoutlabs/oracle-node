@@ -205,6 +205,16 @@ Two pure, synchronous halves with a thin async layer on top:
 signatures from one node confirms who is talking and nothing else, and that is
 the mistake most likely to be made during integration and then never revisited.
 
+`Resolved` serializes with serde. `symbol` names the feed; the client sets it
+for every subscribed feed. Decimals and `publish_time_ns` are strings, because a
+JavaScript number loses precision on a nanosecond timestamp:
+
+```json
+{"feed_id":"0x0523…20e2","symbol":"CRYPTO.BTC/USD","status":"ok",
+ "price":"86599.95","conf":"19.71359135","nodes":3,"halted_nodes":0,
+ "concerns":[],"publish_time_ns":"1791299498663252000","spread_bps":"0"}
+```
+
 `OracleClient::latency` reports p50, p90, p99 and max for three spans of each
 accepted update. The client stamps each frame when it arrives, before it
 decrypts the frame.
