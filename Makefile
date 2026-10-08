@@ -3,7 +3,8 @@
 #   make canister                    # the registry canister wasm, with its .did baked in
 #   make test lint                   # what CI runs
 #   make network deploy              # the canister on the local network
-#   make release                     # reproducible wasm and Linux node binary, in Docker
+#   make release                     # reproducible wasm and Linux binaries, in Docker
+#   make publish                     # those, and release/install.sh, as a GitHub release
 #   make deploy ENV=ic IDENTITY=me   # the release wasm on mainnet, controlled by `me`
 #   make deploy ENV=ic IDENTITY=me REPRODUCIBLE=0   # the same, built here without Docker
 
@@ -19,7 +20,7 @@ DID := crates/oracle-registry-canister/oracle-registry-canister.did
 RELEASE_DIR := target/release-artifacts
 
 .PHONY: help build canister extract_did bake_candid_metadata node proxy test lint e2e latency smoke \
-	release network network-stop deploy governance check-identity
+	release publish network network-stop deploy governance check-identity
 
 help: ## List the targets
 	@grep -E '^[a-z0-9_-]+:.*## ' $(MAKEFILE_LIST) \
@@ -61,8 +62,11 @@ latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SEC
 smoke: ## The icp-cli path on a local network: deploy, and the calls init and rotate print
 	scripts/smoke.sh
 
-release: ## Reproducible wasm and Linux node binary, in Docker, with SHA256SUMS
+release: ## Reproducible wasm and Linux node and proxy binaries (amd64, arm64), with SHA256SUMS
 	release/build.sh
+
+publish: ## Upload the release artifacts and release/install.sh as GitHub release v<version>
+	release/publish.sh
 
 network: ## Start the local network in the background
 	icp network start -d

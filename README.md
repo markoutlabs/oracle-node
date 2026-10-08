@@ -24,6 +24,23 @@ The defence against a lying or malfunctioning node is not cryptographic. It is t
 | M5.5 | Registry canister, one key per node | **done** |
 | M6 | Hardening | in progress: keys encrypted at rest, replay harness, adversarial suite, authenticated and encrypted transport |
 
+## Install
+
+On Linux (amd64 or arm64, glibc 2.28 or newer), the install script downloads a
+release binary and checks it against the release's `SHA256SUMS`:
+
+```bash
+# The node. Then run `oracle-node init`.
+curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh
+
+# The web proxy.
+curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh -s -- proxy
+```
+
+`--version v0.1.0` installs a given release, and `--to <dir>` sets the
+directory (default `/usr/local/bin`, or `~/.local/bin` without root or sudo).
+On other systems, build from source with `make node` or `make proxy`.
+
 ## Crates
 
 ### `oracle-types`
@@ -724,13 +741,28 @@ make network-stop
 ### Release
 
 `make release` builds the release artifacts in a pinned Docker image (Rust,
-`ic-wasm` and `candid-extractor` at fixed versions), so anyone can rebuild them
-and get the same bytes:
+zig, `cargo-zigbuild`, `ic-wasm` and `candid-extractor` at fixed versions), so
+anyone can rebuild them and get the same bytes:
 
 ```text
 target/release-artifacts/oracle_registry_canister.wasm
-target/release-artifacts/oracle-node-linux-amd64
+target/release-artifacts/oracle-node-linux-{amd64,arm64}
+target/release-artifacts/oracle-proxy-linux-{amd64,arm64}
 target/release-artifacts/SHA256SUMS
+```
+
+zig links the Linux binaries against glibc 2.28, so they run on Debian 10,
+Ubuntu 20.04, RHEL 8 and later.
+
+`make publish` uploads these files and `release/install.sh` as the GitHub
+release `v<version>`, with the workspace version from `Cargo.toml`. It refuses
+unless the tree is clean, the artifacts come from `HEAD`, and the tag
+`v<version>` points at `HEAD` and is pushed:
+
+```bash
+make release
+git tag v0.1.0 && git push origin v0.1.0
+make publish
 ```
 
 ### Deploying the registry canister to mainnet
