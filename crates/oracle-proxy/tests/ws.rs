@@ -12,11 +12,13 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_client::{Book, Resolved, Status};
 use oracle_proxy::config::Limits;
 use oracle_proxy::hub::Hub;
+use oracle_proxy::protocol::NodesSnapshot;
 use oracle_proxy::web;
 use oracle_types::{BookLevel, BookUpdate, Fixed, InstrumentId, MarketKind, Symbol, Venue};
 use oracle_wire::{Address, feed_id};
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -75,6 +77,19 @@ async fn next(socket: &mut Socket) -> Option<Value> {
             Some(Ok(other)) => panic!("unexpected {other:?}"),
         }
     }
+}
+
+/// A plain HTTP GET from a page on `origin`: the status line, the headers and the body.
+async fn get(addr: SocketAddr, path: &str, origin: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connects");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.expect("sends");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.expect("reads");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("a response");
+    (head.to_ascii_lowercase(), body.to_owned())
 }
 
 fn resolved(price: &str) -> Resolved {
@@ -187,4 +202,37 @@ async fn one_address_gets_only_its_share_of_sockets() {
         panic!("the second socket must be refused");
     };
     assert_eq!(response.status(), 429);
+}
+
+#[tokio::test]
+async fn node_reports_arrive_on_the_socket_and_on_a_cross_origin_get() {
+    let (hub, addr) = start(Limits::default()).await;
+    hub.publish_nodes(&NodesSnapshot {
+        time_ns: NOW,
+        registry_version: 7,
+        quorum: 3,
+        nodes: Vec::new(),
+    });
+
+    let mut socket = open(addr).await;
+    send(&mut socket, r#"{"op":"subscribe","nodes":true}"#).await;
+    assert_eq!(next(&mut socket).await.expect("an ack")["nodes"], true);
+    let nodes = next(&mut socket).await.expect("the latest report");
+    assert_eq!(nodes["type"], "nodes");
+    assert_eq!(nodes["registry_version"], 7);
+    assert_eq!(nodes["time_ns"], NOW.to_string());
+
+    let (head, body) = get(addr, "/v1/nodes", "https://dashboard.example").await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["quorum"], 3);
+
+    let (head, body) = get(addr, "/v1/catalog", "https://dashboard.example").await;
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    let catalog: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        catalog["nodes"], true,
+        "the catalog says node reports are served"
+    );
 }

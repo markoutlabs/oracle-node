@@ -112,6 +112,47 @@ impl Concern {
     }
 }
 
+/// What one node's latest update for a feed counts as, by the rules of
+/// [`FeedView::resolve`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeFeedState {
+    /// Fresh, and counted toward the quorum.
+    Live,
+    /// Fresh and counted, but the node flags its own sources as degraded.
+    Degraded,
+    /// The node reports the feed halted. It does not count.
+    Halted,
+    /// Older than `max_age`. It does not count.
+    Stale,
+}
+
+impl NodeFeedState {
+    /// Classifies one node's latest update.
+    #[must_use]
+    pub fn of(update: &PriceUpdate, config: &QuorumConfig, now_ns: u64) -> Self {
+        if update.flags.is_halted() {
+            return Self::Halted;
+        }
+        // A node that stopped talking must stop counting toward the quorum.
+        let max_age = u64::try_from(config.max_age.as_nanos()).unwrap_or(u64::MAX);
+        if now_ns.saturating_sub(update.publish_time_ns) > max_age {
+            return Self::Stale;
+        }
+        if update.flags.is_degraded() {
+            Self::Degraded
+        } else {
+            Self::Live
+        }
+    }
+
+    /// Returns `true` if the update counts toward the quorum.
+    #[must_use]
+    pub const fn counts(self) -> bool {
+        matches!(self, Self::Live | Self::Degraded)
+    }
+}
+
 /// A resolved price for one feed.
 ///
 /// As JSON, decimals and the publish time are strings: a JavaScript number
@@ -207,6 +248,12 @@ impl FeedView {
         self.per_node.iter()
     }
 
+    /// One node's latest accepted update.
+    #[must_use]
+    pub fn get(&self, node: &Address) -> Option<&PriceUpdate> {
+        self.per_node.get(node)
+    }
+
     /// Returns `true` if no node has reported.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -216,21 +263,16 @@ impl FeedView {
     /// Resolves the feed.
     #[must_use]
     pub fn resolve(&self, config: &QuorumConfig, now_ns: u64) -> Resolved {
-        let max_age = u64::try_from(config.max_age.as_nanos()).unwrap_or(u64::MAX);
         let mut concerns = Vec::new();
         let mut halted_nodes = 0;
 
         let mut live: Vec<&PriceUpdate> = Vec::with_capacity(self.per_node.len());
         for update in self.per_node.values() {
-            if update.flags.is_halted() {
-                halted_nodes += 1;
-                continue;
+            match NodeFeedState::of(update, config, now_ns) {
+                NodeFeedState::Halted => halted_nodes += 1,
+                NodeFeedState::Stale => {}
+                NodeFeedState::Live | NodeFeedState::Degraded => live.push(update),
             }
-            // A node that stopped talking must stop counting toward the quorum.
-            if now_ns.saturating_sub(update.publish_time_ns) > max_age {
-                continue;
-            }
-            live.push(update);
         }
         if halted_nodes > 0 {
             concerns.push(Concern::NodeReportedHalted);

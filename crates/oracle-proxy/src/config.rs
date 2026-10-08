@@ -107,8 +107,8 @@ pub struct Limits {
     pub max_book_queue: usize,
     /// How often books are compared and their changes sent, in milliseconds.
     pub book_interval_ms: u64,
-    /// Takes the client address from the first `X-Forwarded-For` entry. Set it
-    /// only behind a reverse proxy that sets that header.
+    /// Takes the client address from the last `X-Forwarded-For` entry, the one
+    /// the reverse proxy adds. Set it only behind a reverse proxy that sets it.
     pub trust_forwarded_for: bool,
 }
 

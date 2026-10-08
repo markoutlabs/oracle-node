@@ -77,6 +77,7 @@ mod book;
 mod client;
 pub mod latency;
 pub mod mainnet;
+pub mod nodes;
 pub mod quorum;
 pub mod source;
 pub mod testing;
@@ -87,7 +88,8 @@ pub use client::{
     ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, now_unix_nanos,
 };
 pub use latency::{LatencyHistogram, LatencyReport, Percentiles};
-pub use quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
+pub use nodes::{ConnectionState, DeliveryWindow, NodeFeed, NodeFrames, NodeReport};
+pub use quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 pub use source::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, IC_MAINNET_ROOT_KEY,
     RegistrySource,

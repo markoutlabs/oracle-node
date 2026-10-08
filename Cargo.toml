@@ -55,6 +55,7 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # Per-IP and per-connection limits in the web proxy.
 governor = "0.10"
+tower-http = { version = "0.6", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # Latency percentiles in the SDK and the node.
 hdrhistogram = { version = "7", default-features = false }

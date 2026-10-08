@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::config::{FeedsConfig, UpstreamConfig};
 use crate::hub::{Hub, UpstreamStatus};
+use crate::protocol::NodesSnapshot;
 
 /// How often each price feed is resolved again without a new frame. A node
 /// that goes silent then shows as a halted feed, not as the last good price.
@@ -151,6 +152,12 @@ pub async fn run(
                 stats: client.stats(),
             };
             hub.set_upstream(status);
+            hub.publish_nodes(&NodesSnapshot {
+                time_ns: at,
+                registry_version: client.registry_version(),
+                quorum: client.quorum_config().quorum,
+                nodes: client.nodes(at),
+            });
         }
     }
 }

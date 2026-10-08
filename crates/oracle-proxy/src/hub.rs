@@ -16,13 +16,14 @@ use oracle_types::{BookLevel, FeedId, InstrumentId, Symbol, side_changes};
 use oracle_wire::{Address, feed_id};
 use tokio::sync::Notify;
 
-use crate::protocol::{self, BookFrame, Topics};
+use crate::protocol::{self, BookFrame, NodesSnapshot, Topics};
 
 /// A conflating slot: the newest message replaces the one waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Slot {
     Price(FeedId),
     Venues(FeedId, Address),
+    Nodes,
 }
 
 /// Every lock here guards plain data that each write leaves whole.
@@ -35,11 +36,12 @@ struct Selection {
     prices: HashSet<FeedId>,
     venues: HashSet<FeedId>,
     books: HashSet<InstrumentId>,
+    nodes: bool,
 }
 
 impl Selection {
     fn len(&self) -> usize {
-        self.prices.len() + self.venues.len() + self.books.len()
+        self.prices.len() + self.venues.len() + self.books.len() + usize::from(self.nodes)
     }
 }
 
@@ -276,11 +278,13 @@ impl Hub {
             let mut selection = lock(&client.selection);
             selection.prices.extend(prices.iter().copied());
             selection.venues.extend(venues.iter().copied());
+            selection.nodes |= accepted.nodes;
             drop(selection);
             for (slot, message) in latest.iter() {
                 let wanted = match slot {
                     Slot::Price(feed) => prices.contains(feed),
                     Slot::Venues(feed, _) => venues.contains(feed),
+                    Slot::Nodes => accepted.nodes,
                 };
                 if wanted {
                     client.offer(*slot, message);
@@ -312,11 +316,15 @@ impl Hub {
         for book in &books {
             selection.books.remove(book);
         }
+        if accepted.nodes {
+            selection.nodes = false;
+        }
         drop(selection);
         let mut outbox = lock(&client.outbox);
         outbox.slots.retain(|slot, _| match slot {
             Slot::Price(feed) => !prices.contains(feed),
             Slot::Venues(feed, _) => !venues.contains(feed),
+            Slot::Nodes => !accepted.nodes,
         });
         for book in &books {
             outbox.books.remove(book);
@@ -336,7 +344,10 @@ impl Hub {
         Vec<InstrumentId>,
         Vec<String>,
     ) {
-        let mut accepted = Topics::default();
+        let mut accepted = Topics {
+            nodes: topics.nodes,
+            ..Topics::default()
+        };
         let mut unknown = Vec::new();
         let mut feeds =
             |names: &[String], served: &HashMap<String, Symbol>, out: &mut Vec<String>| {
@@ -393,6 +404,21 @@ impl Hub {
         self.publish(Slot::Venues(feed, accepted.signer), &message, |selection| {
             selection.venues.contains(&feed)
         });
+    }
+
+    /// Publishes the node reports.
+    pub fn publish_nodes(&self, snapshot: &NodesSnapshot) {
+        let message = protocol::nodes_message(snapshot);
+        self.publish(Slot::Nodes, &message, |selection| selection.nodes);
+    }
+
+    /// The latest node reports, or an empty report before the first.
+    #[must_use]
+    pub fn nodes(&self) -> Arc<str> {
+        lock(&self.latest).get(&Slot::Nodes).map_or_else(
+            || protocol::nodes_message(&NodesSnapshot::default()),
+            Arc::clone,
+        )
     }
 
     fn publish(&self, slot: Slot, message: &Arc<str>, wants: impl Fn(&Selection) -> bool) {
@@ -485,6 +511,7 @@ impl Hub {
             prices: names(&self.prices),
             venues: names(&self.venues),
             books,
+            nodes: true,
         }
     }
 
@@ -579,7 +606,51 @@ mod tests {
             prices: prices.iter().map(|name| (*name).to_owned()).collect(),
             venues: Vec::new(),
             books: books.iter().map(|name| (*name).to_owned()).collect(),
+            nodes: false,
         }
+    }
+
+    fn snapshot(time_ns: u64) -> NodesSnapshot {
+        NodesSnapshot {
+            time_ns,
+            registry_version: 4,
+            quorum: 3,
+            nodes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_reports_conflate_and_stop_after_an_unsubscribe() {
+        let hub = hub(64);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&hub.nodes()).expect("json")["time_ns"],
+            "0",
+            "an empty report before the first"
+        );
+        hub.publish_nodes(&snapshot(NOW));
+        let client = client(&hub);
+        let nodes_only = Topics {
+            nodes: true,
+            ..Topics::default()
+        };
+        client.reply(hub.subscribe(&client, &nodes_only));
+        let first = messages(&client.drain().await);
+        assert_eq!(first[0]["nodes"], true, "the reply echoes the flag");
+        assert_eq!(first[1]["type"], "nodes");
+        assert_eq!(first[1]["time_ns"], NOW.to_string());
+        assert_eq!(first[1]["registry_version"], 4);
+
+        hub.publish_nodes(&snapshot(NOW + 1));
+        hub.publish_nodes(&snapshot(NOW + 2));
+        let next = messages(&client.drain().await);
+        assert_eq!(next.len(), 1, "conflated");
+        assert_eq!(next[0]["time_ns"], (NOW + 2).to_string());
+
+        client.reply(hub.unsubscribe(&client, &nodes_only));
+        hub.publish_nodes(&snapshot(NOW + 3));
+        let last = messages(&client.drain().await);
+        assert_eq!(last.len(), 1, "only the reply");
+        assert_eq!(last[0]["type"], "unsubscribed");
     }
 
     #[tokio::test]
@@ -668,6 +739,7 @@ mod tests {
                 prices: vec!["CRYPTO.BTC/USD".to_owned()],
                 venues: vec!["CRYPTO.BTC/USD".to_owned()],
                 books: Vec::new(),
+                nodes: false,
             },
         );
         assert!(reply.contains("too_many_subscriptions"), "{reply}");

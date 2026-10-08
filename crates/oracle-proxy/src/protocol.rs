@@ -2,8 +2,8 @@
 //!
 //! ```jsonc
 //! // client → proxy
-//! {"op":"subscribe","prices":["CRYPTO.BTC/USD"],"venues":[...],"books":["binance:spot:BTCUSDT"]}
-//! {"op":"unsubscribe","prices":[...],"venues":[...],"books":[...]}
+//! {"op":"subscribe","prices":["CRYPTO.BTC/USD"],"venues":[...],"books":["binance:spot:BTCUSDT"],"nodes":true}
+//! {"op":"unsubscribe","prices":[...],"venues":[...],"books":[...],"nodes":true}
 //! {"op":"ping","id":1}
 //!
 //! // proxy → client
@@ -11,6 +11,7 @@
 //! {"type":"price","symbol":"CRYPTO.BTC/USD","status":"ok","price":"86599.95",...}
 //! {"type":"venues","symbol":"CRYPTO.BTC/USDT","node":"0x…","report":{...}}
 //! {"type":"book","book":"binance:spot:BTCUSDT","seq":12,"snapshot":false,...}
+//! {"type":"nodes","time_ns":"…","registry_version":3,"quorum":3,"nodes":[...]}
 //! {"type":"pong","id":1}
 //! {"type":"error","code":"rate_limited","message":"..."}
 //! ```
@@ -20,7 +21,7 @@
 
 use std::sync::Arc;
 
-use oracle_client::{AcceptedVenues, Book, Resolved};
+use oracle_client::{AcceptedVenues, Book, NodeReport, Resolved};
 use oracle_types::{BookLevel, InstrumentId, MarketKind, Symbol, Venue, VenueReport};
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +41,8 @@ pub enum ClientOp {
     },
 }
 
-/// Topics by name: feed symbols for prices and venue reports, and
-/// `venue:market:symbol` for books.
+/// Topics by name: feed symbols for prices and venue reports,
+/// `venue:market:symbol` for books, and a flag for the node reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Topics {
@@ -54,13 +55,16 @@ pub struct Topics {
     /// Books, as `venue:market:symbol`.
     #[serde(default)]
     pub books: Vec<String>,
+    /// The node reports, once a second.
+    #[serde(default)]
+    pub nodes: bool,
 }
 
 impl Topics {
     /// How many topics are listed.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.prices.len() + self.venues.len() + self.books.len()
+        self.prices.len() + self.venues.len() + self.books.len() + usize::from(self.nodes)
     }
 
     /// Returns `true` if nothing is listed.
@@ -196,6 +200,7 @@ struct Subscribed<'a> {
     prices: &'a [String],
     venues: &'a [String],
     books: &'a [String],
+    nodes: bool,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     unknown: &'a [String],
 }
@@ -208,7 +213,38 @@ pub fn subscribed(kind: &'static str, accepted: &Topics, unknown: &[String]) -> 
         prices: &accepted.prices,
         venues: &accepted.venues,
         books: &accepted.books,
+        nodes: accepted.nodes,
         unknown,
+    })
+}
+
+/// Every node in the registry, as the proxy's SDK client sees it.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NodesSnapshot {
+    /// When the snapshot was taken.
+    #[serde(with = "oracle_types::num_str")]
+    pub time_ns: u64,
+    /// The registry version the SDK client trusts.
+    pub registry_version: u64,
+    /// Nodes that must agree on a price.
+    pub quorum: usize,
+    /// Each node's connection, frames and feeds.
+    pub nodes: Vec<NodeReport>,
+}
+
+#[derive(Serialize)]
+struct NodesMessage<'a> {
+    r#type: &'static str,
+    #[serde(flatten)]
+    snapshot: &'a NodesSnapshot,
+}
+
+/// The node reports.
+#[must_use]
+pub fn nodes_message(snapshot: &NodesSnapshot) -> Arc<str> {
+    json(&NodesMessage {
+        r#type: "nodes",
+        snapshot,
     })
 }
 

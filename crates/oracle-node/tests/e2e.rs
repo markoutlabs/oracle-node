@@ -317,6 +317,36 @@ fn web_client_reads_a_price(
         .expect("an ok price through the proxy");
         assert_eq!(price.get("symbol"), Some(&Value::from(FEED)));
         assert_eq!(price.get("nodes"), Some(&Value::from(1)));
+
+        // The node report: connected, with the feed live and at the median.
+        socket
+            .send(Message::Text(r#"{"op":"subscribe","nodes":true}"#.into()))
+            .await
+            .expect("sends");
+        let node = tokio::time::timeout(WAIT, async {
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let json: Value = serde_json::from_str(&text).expect("json");
+                if json.get("type") == Some(&Value::from("nodes")) {
+                    return json.pointer("/nodes/0").cloned().expect("one node");
+                }
+            }
+            panic!("the proxy closed the socket");
+        })
+        .await
+        .expect("a node report through the proxy");
+        assert_eq!(
+            node.pointer("/connection/state"),
+            Some(&Value::from("connected"))
+        );
+        assert_eq!(node.pointer("/feeds/0/symbol"), Some(&Value::from(FEED)));
+        assert_eq!(node.pointer("/feeds/0/state"), Some(&Value::from("live")));
+        assert_eq!(
+            node.pointer("/feeds/0/deviation_bps"),
+            Some(&Value::from("0"))
+        );
         feeding.abort();
         serving.abort();
     });

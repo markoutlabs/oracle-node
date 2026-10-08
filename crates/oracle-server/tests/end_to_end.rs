@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_client::{OracleClient, Status, testing as client_testing};
+use oracle_client::{
+    ConnectionState, NodeFeedState, OracleClient, Status, testing as client_testing,
+};
 use oracle_server::testing::{client_key, sample_update, signing_key, test_transport};
 use oracle_server::{ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
@@ -164,6 +166,20 @@ async fn a_signed_update_travels_the_wire_and_verifies() {
     );
     assert!(client.stats().accepted >= 1);
     assert_eq!(client.stats().untrusted, 0);
+
+    let report = client.nodes(now_ns());
+    let [node_report] = report.as_slice() else {
+        panic!("one node in the registry")
+    };
+    assert!(matches!(
+        node_report.connection,
+        ConnectionState::Connected { .. }
+    ));
+    assert_eq!(node_report.connects, 1);
+    assert!(node_report.frames.accepted >= 1);
+    let feed = node_report.feeds.first().expect("the subscribed feed");
+    assert_eq!(feed.state, Some(NodeFeedState::Live));
+    assert_eq!(feed.deviation_bps, Some(oracle_types::Fixed::ZERO));
 }
 
 /// A frame signed by a key the registry does not list must be refused, however

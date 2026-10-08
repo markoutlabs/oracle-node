@@ -2777,6 +2777,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.30.0",
  "toml 0.9.12+spec-1.1.0",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

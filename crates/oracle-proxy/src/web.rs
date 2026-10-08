@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt as _, StreamExt as _};
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::Limits;
 use crate::hub::Hub;
@@ -34,24 +35,40 @@ pub struct WebState {
     admission: Arc<Admission>,
 }
 
-/// Builds the router: `/v1/ws`, `/v1/catalog` and `/health`. Serve it with
-/// `into_make_service_with_connect_info::<SocketAddr>()`, which the limits
-/// need.
+/// Builds the router: `/v1/ws`, `/v1/catalog`, `/v1/nodes` and `/health`.
+/// Serve it with `into_make_service_with_connect_info::<SocketAddr>()`, which
+/// the limits need.
 pub fn router(hub: Arc<Hub>, limits: Limits) -> Router {
     let state = Arc::new(WebState {
         admission: Arc::new(Admission::new(&limits)),
         hub,
         limits,
     });
+    // Public, read-only data: a dashboard on any origin may read it.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET]);
+    let open = Router::new()
+        .route("/v1/catalog", get(catalog))
+        .route("/v1/nodes", get(nodes))
+        .route("/health", get(health))
+        .layer(cors);
     Router::new()
         .route("/v1/ws", get(ws))
-        .route("/v1/catalog", get(catalog))
-        .route("/health", get(health))
+        .merge(open)
         .with_state(state)
 }
 
 async fn catalog(State(state): State<Arc<WebState>>) -> Response {
     Json(state.hub.catalog()).into_response()
+}
+
+async fn nodes(State(state): State<Arc<WebState>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        state.hub.nodes().to_string(),
+    )
+        .into_response()
 }
 
 async fn health(State(state): State<Arc<WebState>>) -> Response {

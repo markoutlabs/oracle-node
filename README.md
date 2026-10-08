@@ -379,23 +379,34 @@ socket.onopen = () => socket.send(JSON.stringify({
   prices: ["CRYPTO.BTC/USD"],
   venues: ["CRYPTO.BTC/USDT"],
   books: ["binance:spot:BTCUSDT"],
+  nodes: true,
 }));
 socket.onmessage = (event) => {
   const message = JSON.parse(event.data);
-  // message.type: "subscribed", "price", "venues", "book", "pong" or "error"
+  // message.type: "subscribed", "unsubscribed", "price", "venues", "book",
+  // "nodes", "pong" or "error"
 };
 ```
 
 | Message | Contents |
 |---|---|
-| `price` | `symbol`, `status`, `price`, `conf`, `nodes`, `concerns`, `publish_time_ns`, `spread_bps` |
+| `price` | `feed_id`, `symbol`, `status`, `price`, `conf`, `nodes`, `halted_nodes`, `concerns`, `publish_time_ns`, `spread_bps` |
 | `venues` | `symbol`, `node`, and the node's venue report (SPEC §3.3.1) |
-| `book` | `book`, `seq`, `snapshot`, `available`, `node`, `bids` and `asks` as `[price, size]` |
+| `book` | `book`, `seq`, `snapshot`, `available`, `node`, `publish_time_ns`, `local_recv_ns`, and `bids` and `asks` as `[price, size]` |
+| `nodes` | once a second: `time_ns`, `registry_version`, `quorum`, and for each registry node its connection, frame counts, delivery latency, and its latest price for each feed with its distance from the median |
 
-Every 64-bit time and every decimal is a string, so JavaScript loses no
-precision. For a book, apply a snapshot, then each delta in `seq` order; a size
-of `"0"` removes the level. `GET /v1/catalog` lists what the proxy serves, and
-`GET /health` shows the upstream client.
+Every time and every decimal is a string, so JavaScript loses no precision.
+Counts, `seq` and `expo` are numbers. For a book, apply a snapshot, then each
+delta in `seq` order; a size of `"0"` removes the level.
+
+The open routes send `Access-Control-Allow-Origin: *`, so a dashboard on any
+origin can read them:
+
+- `GET /v1/catalog` lists what the proxy serves;
+- `GET /v1/nodes` returns the latest `nodes` message;
+- `GET /health` shows the upstream client.
+
+`OracleClient::nodes(now_ns)` gives the same node reports to a Rust consumer.
 
 The socket is open to anyone, within `[limits]`. Behind a reverse proxy, set
 `trust_forwarded_for = true`, so that the limits see each client's address
@@ -791,6 +802,27 @@ rebuild the installed module and get its hash. After the first deploy:
 
 The canister signs with the `key_1` threshold key. Each signing round costs
 cycles, so keep the canister topped up.
+
+### Local stack
+
+`scripts/dev-stack.sh` runs a whole oracle on this machine, for UI and SDK
+work. Nothing on mainnet changes:
+
+- the registry canister, reinstalled on the local network, with the throwaway
+  `oracle-e2e` identity as governance;
+- three nodes on ports 8801 to 8803, each serving every feed in
+  `node/all-feeds.toml` from the live venues;
+- oracle-proxy on `ws://127.0.0.1:8792/v1/ws`, at quorum 3, with its key listed.
+
+```sh
+scripts/dev-stack.sh            # Ctrl-C stops the nodes, the proxy and the network
+NODES=1 scripts/dev-stack.sh    # one node at quorum 1
+KEEP=1 scripts/dev-stack.sh     # keep the local network after exit
+```
+
+Keys, configs and logs are in `target/dev-stack/`. Stop one node to watch the
+quorum halt the feeds, and start it again with `oracle-node start
+target/dev-stack/nodeN/config.toml`.
 
 ### Running a node locally
 

@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 
 use crate::book::Book;
 use crate::latency::{Latency, LatencyReport};
-use crate::quorum::{Concern, FeedView, QuorumConfig, Resolved, Status};
+use crate::nodes::{ConnectionState, Links, NodeFeed, NodeReport, Tally, rejected_node};
+use crate::quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
 use crate::verify::{AcceptedBook, AcceptedVenues, RejectReason, Verifier, VerifyConfig};
 
@@ -264,6 +265,8 @@ impl OracleClientBuilder {
             shutdown: CancellationToken::new(),
             stats: ClientStats::default(),
             latency: Latency::default(),
+            links: Links::default(),
+            tallies: HashMap::new(),
             source: self.source,
             refresh_interval: self.refresh_interval,
             poll_interval: self.poll_interval,
@@ -360,6 +363,10 @@ pub struct OracleClient {
     shutdown: CancellationToken,
     stats: ClientStats,
     latency: Latency,
+    /// Each node's connection, written by its connection task.
+    links: Links,
+    /// Each node's frames, keyed by signer.
+    tallies: HashMap<Address, Tally>,
     source: Option<Arc<dyn RegistrySource>>,
     refresh_interval: Duration,
     poll_interval: Duration,
@@ -435,6 +442,62 @@ impl OracleClient {
     #[must_use]
     pub const fn registry_version(&self) -> u64 {
         self.registry.version()
+    }
+
+    /// Returns the quorum rules the client resolves with.
+    #[must_use]
+    pub const fn quorum_config(&self) -> QuorumConfig {
+        self.quorum_config
+    }
+
+    /// Reports every node in the registry: its connection, its frames, and its
+    /// latest update for each subscribed price feed against the median.
+    ///
+    /// For monitoring. The quorum, not this report, decides what a price is.
+    #[must_use]
+    pub fn nodes(&self, now_ns: u64) -> Vec<NodeReport> {
+        let mut feeds: Vec<(&Symbol, Option<&FeedView>)> = self
+            .symbols
+            .iter()
+            .map(|(id, symbol)| (symbol, self.views.get(id)))
+            .collect();
+        feeds.sort_by_key(|(symbol, _)| symbol.to_string());
+        let medians: Vec<Option<_>> = feeds
+            .iter()
+            .map(|(_, view)| view.and_then(|view| view.resolve(&self.quorum_config, now_ns).price))
+            .collect();
+
+        self.registry
+            .nodes()
+            .iter()
+            .map(|entry| {
+                let link = self.links.get(&entry.address);
+                let tally = self.tallies.get(&entry.address);
+                NodeReport {
+                    address: entry.address,
+                    weight: entry.weight,
+                    endpoints: entry.endpoints.clone(),
+                    connection: link.state,
+                    connects: link.connects,
+                    failures: link.failures,
+                    last_error: link.last_error,
+                    last_frame_ns: tally.and_then(|tally| tally.last_frame_ns),
+                    frames: tally.map(|tally| tally.frames).unwrap_or_default(),
+                    delivery: tally.and_then(|tally| tally.delivery(now_ns)),
+                    feeds: feeds
+                        .iter()
+                        .zip(&medians)
+                        .map(|((symbol, view), median)| {
+                            let update = view.and_then(|view| view.get(&entry.address));
+                            let state = update.map(|update| {
+                                NodeFeedState::of(update, &self.quorum_config, now_ns)
+                            });
+                            NodeFeed::new(**symbol, update, state, *median)
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// Returns how long ago a source last proved the trusted registry current,
@@ -681,6 +744,7 @@ impl OracleClient {
                     endpoint: endpoint.to_owned(),
                     request: request.clone(),
                     client_key: Arc::clone(client_key),
+                    links: self.links.clone(),
                 },
                 self.inbound_tx.clone(),
                 cancel.clone(),
@@ -792,11 +856,17 @@ impl OracleClient {
             Some(FRAME_TYPE_VENUE_REPORT) => {
                 let accepted = self.verifier.accept_venues(frame, now_ns)?;
                 self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
+                let tally = self.tallies.entry(accepted.signer).or_default();
+                tally.frames.venue_reports = tally.frames.venue_reports.saturating_add(1);
+                tally.seen(received_ns);
                 return Ok(Event::Venues(accepted));
             }
             Some(FRAME_TYPE_BOOK_UPDATE) => {
                 let accepted = self.verifier.accept_book(frame, now_ns)?;
                 self.stats.book_updates = self.stats.book_updates.saturating_add(1);
+                let tally = self.tallies.entry(accepted.signer).or_default();
+                tally.frames.book_updates = tally.frames.book_updates.saturating_add(1);
+                tally.seen(received_ns);
                 let update = &accepted.update;
                 let instrument =
                     InstrumentId::new(update.venue, update.market, update.symbol.as_str());
@@ -821,6 +891,10 @@ impl OracleClient {
         let accepted = self.verifier.accept(frame, now_ns)?;
         self.stats.accepted = self.stats.accepted.saturating_add(1);
         self.latency.arrived(&accepted.update, received_ns);
+        self.tallies
+            .entry(accepted.signer)
+            .or_default()
+            .price(&accepted.update, received_ns);
         let feed = accepted.update.feed_id;
         let view = self
             .views
@@ -837,6 +911,9 @@ impl OracleClient {
     fn record<T>(&mut self, outcome: &Result<T, RejectReason>) {
         if let Err(reason) = outcome {
             self.stats.record(reason);
+            if let Some(node) = rejected_node(reason) {
+                self.tallies.entry(node).or_default().frames.record(reason);
+            }
         }
     }
 
@@ -1030,6 +1107,7 @@ struct NodeTarget {
     endpoint: String,
     request: String,
     client_key: Arc<Signer>,
+    links: Links,
 }
 
 /// Time from connect to `auth_ok`.
@@ -1039,6 +1117,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: CancellationToken) {
     let mut backoff = reconnect_ladder();
     while !shutdown.is_cancelled() {
+        target.links.update(target.node, |link| {
+            link.state = ConnectionState::Connecting;
+        });
         // Also drops a de-listed node in the middle of a handshake.
         let outcome = tokio::select! {
             biased;
@@ -1049,12 +1130,21 @@ async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: Canc
             Ok(()) => backoff = reconnect_ladder(),
             Err(reason) => {
                 warn!(endpoint = %target.endpoint, %reason, "node connection failed");
+                target.links.update(target.node, |link| {
+                    link.failures = link.failures.saturating_add(1);
+                    link.last_error = Some(reason);
+                });
             }
         }
         if shutdown.is_cancelled() {
             break;
         }
         let delay = backoff.next().unwrap_or(RECONNECT_MAX);
+        let retry_at_ns =
+            now_unix_nanos().saturating_add(u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX));
+        target.links.update(target.node, |link| {
+            link.state = ConnectionState::Backoff { retry_at_ns };
+        });
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
@@ -1083,6 +1173,12 @@ async fn pump(
     let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(socket, target, tx))
         .await
         .map_err(|_| "handshake timed out".to_owned())??;
+    target.links.update(target.node, |link| {
+        link.state = ConnectionState::Connected {
+            since_ns: now_unix_nanos(),
+        };
+        link.connects = link.connects.saturating_add(1);
+    });
     // Only now, after the node proved its key, do the subscriptions leave.
     let subscribe = session
         .sealer
