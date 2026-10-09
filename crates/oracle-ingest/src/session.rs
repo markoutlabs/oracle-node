@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use crate::backoff::{Backoff, BackoffConfig};
 use crate::clock::MonotonicClock;
-use crate::{Connector, DecodeError, IngestError, IngestEvent, StreamId, Transport};
+use crate::{
+    Connector, DecodeError, IngestError, IngestEvent, StreamId, Transport, TransportError,
+};
 
 /// How a session decodes the payloads it receives.
 pub trait MessageHandler: Send {
@@ -57,6 +59,12 @@ pub struct SessionConfig {
     /// failure mode — a half-open socket that never delivers again — is common
     /// enough that waiting for TCP to notice is not good enough.
     pub idle_timeout: Duration,
+    /// Give up on a connect after this long and retry with backoff.
+    ///
+    /// A host can accept TCP and never finish TLS or the upgrade, such as after
+    /// a network outage. Without a limit, the session would wait forever and
+    /// its feeds would stay halted until a restart.
+    pub connect_timeout: Duration,
     /// Recycle the connection after this long, before the venue does it for us.
     ///
     /// Binance closes streams at 24 hours. Reconnecting slightly early turns a
@@ -77,6 +85,7 @@ impl SessionConfig {
             subscribe: Vec::new(),
             keepalive: None,
             idle_timeout: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             backoff: BackoffConfig::default(),
         }
@@ -145,7 +154,14 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             let connected = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                result = self.connector.connect(&self.config.url) => result,
+                result = timeout(self.config.connect_timeout, self.connector.connect(&self.config.url)) => {
+                    result.unwrap_or_else(|_| {
+                        Err(TransportError::Connect(format!(
+                            "no answer in {:?}",
+                            self.config.connect_timeout
+                        )))
+                    })
+                }
             };
 
             let mut conn = match connected {

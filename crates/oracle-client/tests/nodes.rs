@@ -91,6 +91,39 @@ async fn an_unreachable_node_shows_its_failures_and_backoff() {
     }
 }
 
+/// A node host that accepts TCP and never answers: after a network outage, a
+/// connect with no limit waited forever and the node never came back.
+#[tokio::test(start_paused = true)]
+async fn a_node_that_never_answers_is_a_connect_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let endpoint = format!("ws://{}/v2/ws", listener.local_addr().expect("bound"));
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            sockets.push(socket);
+        }
+    });
+    let nodes = fleet();
+    let mut client = client(&nodes, &endpoint);
+    client.subscribe(&[SYMBOL]).await.expect("subscribes");
+
+    // Paused time: each sleep jumps to the next timer, the 10 s connect limit.
+    let mut report = client.nodes(now_unix_nanos());
+    for _ in 0..60 {
+        if report.iter().all(|node| node.failures >= 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        report = client.nodes(now_unix_nanos());
+    }
+    held.abort();
+    for node in &report {
+        assert!(node.failures >= 1, "{node:?}");
+        assert_eq!(node.last_error.as_deref(), Some("connect timed out"));
+        assert_eq!(node.connects, 0);
+    }
+}
+
 #[tokio::test]
 async fn each_node_reports_its_frames_and_its_distance_from_the_median() {
     let nodes = fleet();

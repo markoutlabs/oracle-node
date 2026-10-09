@@ -1261,6 +1261,10 @@ struct NodeTarget {
     links: Links,
 }
 
+/// Time to open the socket: TCP, TLS and the upgrade. A host can accept TCP
+/// and never answer, such as after a network outage.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Time from connect to `auth_ok`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1305,8 +1309,10 @@ async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: Canc
 }
 
 async fn connect_and_pump(target: &NodeTarget, tx: &mpsc::Sender<Inbound>) -> Result<(), String> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(&target.endpoint)
+    let connecting = tokio_tungstenite::connect_async(&target.endpoint);
+    let (mut socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
+        .map_err(|_| "connect timed out".to_owned())?
         .map_err(|e| e.to_string())?;
     pump(&mut socket, target, tx).await
 }
