@@ -144,6 +144,7 @@ pub struct OracleClientBuilder {
     poll_interval: Duration,
     max_registry_age: Duration,
     client_key: Option<Arc<Signer>>,
+    idle_timeout: Duration,
 }
 
 impl OracleClientBuilder {
@@ -178,6 +179,15 @@ impl OracleClientBuilder {
     #[must_use]
     pub const fn registry_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Reconnects to a node that sends nothing for this long; 30 s by default.
+    /// The client pings each node three times in that time, and the node
+    /// answers each ping, so only a dead connection stays quiet.
+    #[must_use]
+    pub const fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 
@@ -298,6 +308,7 @@ impl OracleClientBuilder {
             connections: HashMap::new(),
             polling: false,
             client_key: self.client_key,
+            idle_timeout: self.idle_timeout,
             tap: Tap::default(),
         })
     }
@@ -411,6 +422,7 @@ pub struct OracleClient {
     connections: HashMap<Address, NodeConnection>,
     polling: bool,
     client_key: Option<Arc<Signer>>,
+    idle_timeout: Duration,
     tap: Tap,
 }
 
@@ -430,6 +442,7 @@ impl OracleClient {
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             poll_interval: DEFAULT_REGISTRY_POLL_INTERVAL,
             max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
+            idle_timeout: IDLE_TIMEOUT,
         }
     }
 
@@ -852,6 +865,7 @@ impl OracleClient {
                     request: request.clone(),
                     client_key: Arc::clone(client_key),
                     links: self.links.clone(),
+                    idle_timeout: self.idle_timeout,
                 },
                 self.inbound_tx.clone(),
                 cancel.clone(),
@@ -1259,6 +1273,7 @@ struct NodeTarget {
     request: String,
     client_key: Arc<Signer>,
     links: Links,
+    idle_timeout: Duration,
 }
 
 /// Time to open the socket: TCP, TLS and the upgrade. A host can accept TCP
@@ -1267,6 +1282,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time from connect to `auth_ok`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A session with no message of any kind for this long is dead, such as a
+/// socket that a network outage cut without a close. The session pings the
+/// node three times in this time, and the node answers each ping.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connects to one node and forwards its binary frames, reconnecting on failure.
 async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: CancellationToken) {
@@ -1347,7 +1367,32 @@ async fn pump(
         .map_err(|e| e.to_string())?;
 
     let mut missing_since: Option<u64> = None;
-    while let Some(message) = socket.next().await {
+    let every = (target.idle_timeout / 3).max(Duration::from_millis(1));
+    let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    let mut last_message = tokio::time::Instant::now();
+    loop {
+        let message = tokio::select! {
+            message = socket.next() => message,
+            _ = keepalive.tick() => {
+                if last_message.elapsed() >= target.idle_timeout {
+                    return Err(format!(
+                        "no message from the node for {:?}",
+                        target.idle_timeout
+                    ));
+                }
+                let ping = session
+                    .sealer
+                    .seal(&Control::App(br#"{"op":"ping"}"#.to_vec()))
+                    .map_err(|e| e.to_string())?;
+                socket
+                    .send(Message::Binary(ping.into()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        let Some(message) = message else { break };
+        last_message = tokio::time::Instant::now();
         let bytes = match message.map_err(|e| e.to_string())? {
             Message::Binary(bytes) => bytes,
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
