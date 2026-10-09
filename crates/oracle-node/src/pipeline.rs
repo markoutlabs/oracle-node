@@ -19,9 +19,12 @@ use std::sync::Arc;
 use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
 use oracle_types::{FeedId, InstrumentId, PriceUpdate};
-use oracle_wire::{SignedBookUpdate, SignedUpdate, SignedVenueReport, Signer, WireError};
+use oracle_wire::{
+    SignedBookUpdate, SignedFundingUpdate, SignedUpdate, SignedVenueReport, Signer, WireError,
+};
 
 use crate::books::BookPublisher;
+use crate::funding::FundingPublisher;
 
 /// Counters describing what the pipeline has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +53,7 @@ impl PipelineStats {
 pub struct Pipeline {
     aggregator: Aggregator,
     books: BookPublisher,
+    funding: FundingPublisher,
     signer: Arc<Signer>,
     stats: PipelineStats,
 }
@@ -61,16 +65,18 @@ impl Pipeline {
         Self {
             aggregator,
             books: BookPublisher::new(0),
+            funding: FundingPublisher::new(0),
             signer,
             stats: PipelineStats::default(),
         }
     }
 
-    /// Starts every book's sequence at `floor`, for the same reason as
-    /// [`Aggregator::with_sequence_floor`].
+    /// Starts the sequence of every book and every funding stream at `floor`,
+    /// for the same reason as [`Aggregator::with_sequence_floor`].
     #[must_use]
-    pub fn with_book_sequence_floor(mut self, floor: u64) -> Self {
+    pub fn with_stream_sequence_floor(mut self, floor: u64) -> Self {
         self.books = BookPublisher::new(floor);
+        self.funding = FundingPublisher::new(floor);
         self
     }
 
@@ -96,6 +102,7 @@ impl Pipeline {
                 self.stats.observations = self.stats.observations.saturating_add(1);
                 self.aggregator.observe(observation);
                 self.books.observe(observation);
+                self.funding.observe(observation);
             }
             IngestEvent::Connected { .. } => {
                 self.stats.connects = self.stats.connects.saturating_add(1);
@@ -107,6 +114,7 @@ impl Pipeline {
                 // cannot help if the gap was shorter than its threshold.
                 self.aggregator.invalidate(stream.venue, stream.market);
                 self.books.reset(stream.venue, stream.market);
+                self.funding.reset(stream.venue, stream.market);
             }
             // `IngestEvent` is non-exhaustive; a new event kind is additive here.
             _ => {}
@@ -161,6 +169,21 @@ impl Pipeline {
         let mut errors = Vec::new();
         for update in self.books.poll(now_ns, wanted) {
             match self.signer.sign_book_update(&update) {
+                Ok(update) => signed.push(update),
+                Err(error) => errors.push(error),
+            }
+        }
+        (signed, errors)
+    }
+
+    /// Signs the funding frames that are due; see [`FundingPublisher::poll`].
+    /// They go out whether or not anyone subscribed, so the server always has
+    /// the latest one for the next subscriber.
+    pub fn funding_updates(&mut self, now_ns: u64) -> (Vec<SignedFundingUpdate>, Vec<WireError>) {
+        let mut signed = Vec::new();
+        let mut errors = Vec::new();
+        for update in self.funding.poll(now_ns) {
+            match self.signer.sign_funding_update(&update) {
                 Ok(update) => signed.push(update),
                 Err(error) => errors.push(error),
             }
@@ -255,6 +278,7 @@ mod tests {
             local_recv_ns: recv_ns,
             seq: None,
             book: None,
+            funding: None,
         })
     }
 

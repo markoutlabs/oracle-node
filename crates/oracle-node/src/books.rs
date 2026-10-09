@@ -58,6 +58,8 @@ struct BookState {
     current: Option<Arc<BookDepth>>,
     exchange_time_ns: Option<u64>,
     local_recv_ns: u64,
+    /// The venue's update id of the current book, where the venue sends one.
+    venue_seq: Option<u64>,
     seq: u64,
     last_sent_ns: Option<u64>,
     last_snapshot_ns: Option<u64>,
@@ -97,6 +99,7 @@ impl BookPublisher {
                 current: None,
                 exchange_time_ns: None,
                 local_recv_ns: 0,
+                venue_seq: None,
                 seq: seq_floor,
                 last_sent_ns: None,
                 last_snapshot_ns: None,
@@ -106,6 +109,7 @@ impl BookPublisher {
         state.current.clone_from(&observation.book);
         state.exchange_time_ns = observation.exchange_time_ns;
         state.local_recv_ns = observation.local_recv_ns;
+        state.venue_seq = observation.seq;
         state.dirty = true;
     }
 
@@ -115,6 +119,8 @@ impl BookPublisher {
         for (instrument, state) in &mut self.books {
             if instrument.venue == venue && instrument.market == market {
                 state.current = None;
+                // The empty snapshot shows no venue state.
+                state.venue_seq = None;
                 state.reset = true;
                 state.dirty = true;
             }
@@ -173,6 +179,7 @@ impl BookPublisher {
                 snapshot,
                 exchange_time_ns: state.exchange_time_ns,
                 local_recv_ns: state.local_recv_ns.min(now_ns),
+                venue_seq: state.venue_seq,
                 bids,
                 asks,
             });
@@ -243,6 +250,7 @@ mod tests {
                 bids: side(bids),
                 asks: side(asks),
             })),
+            funding: None,
         }
     }
 
@@ -371,6 +379,35 @@ mod tests {
         };
         assert_eq!(delta.seq, 2, "no seq was spent on the skipped delta");
         assert_eq!(delta.bids, vec![level("100", "2")]);
+    }
+
+    #[test]
+    fn each_frame_carries_the_venue_update_id_of_its_book() {
+        let mut publisher = BookPublisher::new(0);
+        let mut first = depth(&[("100", "1")], &[("101", "1")], START);
+        first.seq = Some(73_514_215_042);
+        publisher.observe(&first);
+        let snapshot = publisher.poll(START, |_| true);
+        assert_eq!(
+            snapshot.first().and_then(|update| update.venue_seq),
+            Some(73_514_215_042)
+        );
+
+        let later = START + 100_000_000;
+        let mut next = depth(&[("100", "2")], &[("101", "1")], later);
+        next.seq = Some(73_514_215_050);
+        publisher.observe(&next);
+        let delta = publisher.poll(later, |_| true);
+        assert_eq!(
+            delta.first().and_then(|update| update.venue_seq),
+            Some(73_514_215_050)
+        );
+
+        // An empty snapshot after a drop shows no venue state.
+        publisher.reset(Venue::Binance, MarketKind::Spot);
+        let after = later + 100_000_000;
+        let empty = publisher.poll(after, |_| true);
+        assert_eq!(empty.first().map(|update| update.venue_seq), Some(None));
     }
 
     #[test]

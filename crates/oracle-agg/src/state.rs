@@ -793,6 +793,7 @@ fn venue_entry(
     VenueEntry {
         venue: source.instrument.venue,
         market: source.instrument.market,
+        symbol: source.instrument.symbol.to_string(),
         status,
         weight_bps,
         bid: top.and_then(|o| o.bid).and_then(price),
@@ -850,6 +851,7 @@ mod tests {
             local_recv_ns: recv_ns,
             seq: None,
             book: None,
+            funding: None,
         }
     }
 
@@ -1122,10 +1124,11 @@ mod tests {
     }
 
     fn entry(report: &VenueReport, venue: Venue) -> VenueEntry {
-        *report
+        report
             .entries
             .iter()
             .find(|entry| entry.venue == venue)
+            .cloned()
             .expect("an entry for each source")
     }
 

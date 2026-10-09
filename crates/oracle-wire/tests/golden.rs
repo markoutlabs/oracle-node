@@ -34,13 +34,15 @@ use std::fs;
 use std::path::PathBuf;
 
 use oracle_types::{
-    BookLevel, BookUpdate, FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus,
-    Symbol, Venue, VenueEntry, VenueReport,
+    BookLevel, BookUpdate, FeedId, Flags, FundingBasis, FundingUpdate, MarketKind, NANOS_PER_SEC,
+    OpenInterest, OpenInterestUnit, PriceUpdate, SettledFunding, SourceStatus, Symbol, Venue,
+    VenueEntry, VenueReport,
 };
 use oracle_wire::{
     NodeEntry, Quorum, Registry, Signer, UnverifiedBookFrame, UnverifiedFrame,
-    UnverifiedVenueFrame, decode_book_update, decode_venue_report, domain, encode_book_update,
-    encode_price_update, encode_venue_report, feed_id,
+    UnverifiedFundingFrame, UnverifiedVenueFrame, decode_book_update, decode_funding_update,
+    decode_venue_report, domain, encode_book_update, encode_funding_update, encode_price_update,
+    encode_venue_report, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +67,7 @@ struct GoldenFile {
     registry: RegistryVector,
     venue_reports: Vec<VenueReportVector>,
     book_updates: Vec<BookUpdateVector>,
+    funding_updates: Vec<FundingUpdateVector>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -85,6 +88,18 @@ struct BookUpdateVector {
     secret_key: String,
     signer: String,
     update: BookUpdate,
+    payload: String,
+    digest: String,
+    signature: String,
+    frame: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct FundingUpdateVector {
+    name: String,
+    secret_key: String,
+    signer: String,
+    update: FundingUpdate,
     payload: String,
     digest: String,
     signature: String,
@@ -251,9 +266,19 @@ fn sample_updates() -> Vec<(&'static str, u8, PriceUpdate)> {
 }
 
 fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
+    let symbol = match venue {
+        Venue::Binance | Venue::Bybit => "BTCUSDT",
+        Venue::Okx => "BTC-USDT",
+        Venue::Coinbase => "BTC-USD",
+        Venue::Kraken => "BTC/USD",
+        Venue::Deribit => "BTC-PERPETUAL",
+        // A venue added later; these vectors never use it.
+        _ => "OTHER",
+    };
     VenueEntry {
         venue,
         market,
+        symbol: symbol.to_owned(),
         status,
         weight_bps: 0,
         bid: None,
@@ -288,6 +313,7 @@ fn sample_venue_reports() -> Vec<(&'static str, VenueReport)> {
             funding: Some(i64::MIN),
             exchange_time_ns: Some(u64::MAX),
             local_recv_ns: u64::MAX,
+            symbol: "X".repeat(oracle_types::MAX_VENUE_SYMBOL),
             ..entry(venue, MarketKind::LinearPerp, status)
         })
         .collect();
@@ -360,6 +386,7 @@ fn sample_book_updates() -> Vec<(&'static str, BookUpdate)> {
                 snapshot: true,
                 exchange_time_ns: Some(BASE_TIME_NS - 40_000_000),
                 local_recv_ns: BASE_TIME_NS - 1_000_000,
+                venue_seq: Some(73_514_215_042),
                 bids: vec![
                     level(8_377_800_000_000, 494_541_000),
                     level(8_377_790_000_000, 12_000_000),
@@ -381,6 +408,7 @@ fn sample_book_updates() -> Vec<(&'static str, BookUpdate)> {
                 snapshot: false,
                 exchange_time_ns: None,
                 local_recv_ns: BASE_TIME_NS + 49_000_000,
+                venue_seq: None,
                 bids: vec![level(8_378_000_000_000, 0)],
                 asks: vec![
                     level(8_378_010_000_000, 158_930_282),
@@ -393,14 +421,90 @@ fn sample_book_updates() -> Vec<(&'static str, BookUpdate)> {
             BookUpdate {
                 venue: Venue::Deribit,
                 market: MarketKind::InversePerp,
-                symbol: "X".repeat(oracle_types::MAX_BOOK_SYMBOL),
+                symbol: "X".repeat(oracle_types::MAX_VENUE_SYMBOL),
                 publish_time_ns: u64::MAX,
                 seq: u64::MAX,
                 snapshot: false,
                 exchange_time_ns: Some(u64::MAX),
                 local_recv_ns: u64::MAX,
+                venue_seq: Some(u64::MAX),
                 bids: vec![level(i64::MAX, u64::MAX), level(i64::MIN, 0)],
                 asks: vec![level(i64::MIN, 0), level(i64::MAX, u64::MAX)],
+            },
+        ),
+    ]
+}
+
+fn sample_funding_updates() -> Vec<(&'static str, FundingUpdate)> {
+    const HOUR_NS: u64 = 3_600 * NANOS_PER_SEC;
+    vec![
+        (
+            "okx_swap_settled",
+            FundingUpdate {
+                venue: Venue::Okx,
+                market: MarketKind::LinearPerp,
+                symbol: "BTC-USDT-SWAP".to_owned(),
+                publish_time_ns: BASE_TIME_NS,
+                seq: 1_754_582_400_003,
+                basis: FundingBasis::Interval,
+                rate: -30_339_016,
+                predicted_rate: None,
+                interval_ns: Some(8 * HOUR_NS),
+                next_funding_time_ns: Some(BASE_TIME_NS + 5 * HOUR_NS),
+                settled: Some(SettledFunding {
+                    rate: 6_729_944,
+                    time_ns: BASE_TIME_NS - 3 * HOUR_NS,
+                }),
+                open_interest: None,
+                exchange_time_ns: Some(BASE_TIME_NS - 17_000_000_000),
+                local_recv_ns: BASE_TIME_NS - 16_900_000_000,
+            },
+        ),
+        (
+            "deribit_eight_hours",
+            FundingUpdate {
+                venue: Venue::Deribit,
+                market: MarketKind::InversePerp,
+                symbol: "BTC-PERPETUAL".to_owned(),
+                publish_time_ns: BASE_TIME_NS + 1_000_000_000,
+                seq: 1_754_582_400_004,
+                basis: FundingBasis::EightHours,
+                rate: 108_460_000,
+                predicted_rate: None,
+                interval_ns: None,
+                next_funding_time_ns: None,
+                settled: None,
+                open_interest: Some(OpenInterest {
+                    amount: 81_919_585_000_000_000,
+                    unit: OpenInterestUnit::Quote,
+                }),
+                exchange_time_ns: Some(BASE_TIME_NS + 900_000_000),
+                local_recv_ns: BASE_TIME_NS + 950_000_000,
+            },
+        ),
+        (
+            "boundary_extremes",
+            FundingUpdate {
+                venue: Venue::Kraken,
+                market: MarketKind::LinearPerp,
+                symbol: "X".repeat(oracle_types::MAX_VENUE_SYMBOL),
+                publish_time_ns: u64::MAX,
+                seq: u64::MAX,
+                basis: FundingBasis::Interval,
+                rate: i64::MIN,
+                predicted_rate: Some(i64::MAX),
+                interval_ns: Some(u64::MAX),
+                next_funding_time_ns: Some(u64::MAX),
+                settled: Some(SettledFunding {
+                    rate: i64::MIN,
+                    time_ns: u64::MAX,
+                }),
+                open_interest: Some(OpenInterest {
+                    amount: u64::MAX,
+                    unit: OpenInterestUnit::Contracts,
+                }),
+                exchange_time_ns: Some(u64::MAX),
+                local_recv_ns: u64::MAX,
             },
         ),
     ]
@@ -502,6 +606,23 @@ fn build() -> GoldenFile {
         })
         .collect();
 
+    let funding_updates = sample_funding_updates()
+        .into_iter()
+        .map(|(name, update)| {
+            let signed = node.sign_funding_update(&update).expect("encodes");
+            FundingUpdateVector {
+                name: name.to_owned(),
+                secret_key: hex0x(&node_secret),
+                signer: node.address().to_string(),
+                update,
+                payload: hex0x(signed.payload()),
+                digest: hex0x(&domain::digest(signed.payload())),
+                signature: signed.signature().to_string(),
+                frame: hex0x(&signed.encode_frame()),
+            }
+        })
+        .collect();
+
     GoldenFile {
         note: "Frozen protocol vectors. A diff here means the wire format changed \
                and previously-issued signatures no longer verify."
@@ -523,6 +644,7 @@ fn build() -> GoldenFile {
         },
         venue_reports,
         book_updates,
+        funding_updates,
     }
 }
 
@@ -621,6 +743,10 @@ fn golden_vectors_are_unchanged() {
         generated.book_updates, expected.book_updates,
         "book update encoding changed"
     );
+    assert_eq!(
+        generated.funding_updates, expected.funding_updates,
+        "funding update encoding changed"
+    );
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.
@@ -662,6 +788,14 @@ fn stored_frames_verify_against_the_stored_registry() {
     for vector in &file.book_updates {
         let frame = hex::decode(vector.frame.trim_start_matches("0x")).expect("valid hex");
         let verified = UnverifiedBookFrame::parse(&frame)
+            .expect("frame parses")
+            .verify(&registry)
+            .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
+        assert_eq!(verified.update(), &vector.update);
+    }
+    for vector in &file.funding_updates {
+        let frame = hex::decode(vector.frame.trim_start_matches("0x")).expect("valid hex");
+        let verified = UnverifiedFundingFrame::parse(&frame)
             .expect("frame parses")
             .verify(&registry)
             .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
@@ -712,6 +846,17 @@ fn stored_payloads_round_trip() {
             vector.name
         );
     }
+    for vector in file.funding_updates {
+        let bytes = hex::decode(vector.payload.trim_start_matches("0x")).expect("valid hex");
+        let decoded = decode_funding_update(&bytes).expect("decodes");
+        assert_eq!(decoded, vector.update, "`{}`", vector.name);
+        assert_eq!(
+            hex0x(&encode_funding_update(&decoded).expect("encodes")),
+            vector.payload,
+            "`{}` did not re-encode identically",
+            vector.name
+        );
+    }
 }
 
 /// Cross-check against `foundry`, an independent secp256k1 and Keccak-256
@@ -742,6 +887,11 @@ fn signature_matches_foundry() {
         )
         .chain(
             file.book_updates
+                .iter()
+                .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature)),
+        )
+        .chain(
+            file.funding_updates
                 .iter()
                 .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature)),
         );

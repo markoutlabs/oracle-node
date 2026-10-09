@@ -254,6 +254,7 @@ pub fn decode_payload(
             local_recv_ns,
             seq: message.sequence,
             book: None,
+            funding: None,
         });
     }
 
@@ -271,6 +272,7 @@ pub fn decode_payload(
             local_recv_ns,
             seq: message.sequence,
             book: None,
+            funding: None,
         });
     }
 

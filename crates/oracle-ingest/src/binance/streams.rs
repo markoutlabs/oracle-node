@@ -5,8 +5,14 @@ use oracle_types::MarketKind;
 /// Spot combined-stream endpoint.
 pub const SPOT_BASE: &str = "wss://stream.binance.com:9443/stream";
 
-/// USD-margined futures combined-stream endpoint.
-pub const FUTURES_BASE: &str = "wss://fstream.binance.com/stream";
+/// USD-margined futures endpoint for the book ticker and depth.
+///
+/// Binance serves futures streams on two routes. The old `/stream` path serves
+/// only these, and gives no error for the others.
+pub const FUTURES_BASE: &str = "wss://fstream.binance.com/public/stream";
+
+/// USD-margined futures endpoint for trades and the mark price.
+pub const FUTURES_MARKET_BASE: &str = "wss://fstream.binance.com/market/stream";
 
 /// Streams per connection.
 ///
@@ -49,6 +55,13 @@ impl StreamKind {
             // contract under the right-looking name.
             MarketKind::InversePerp => None,
         }
+    }
+
+    /// Returns `true` for a stream that Binance futures serve on the market
+    /// route, [`FUTURES_MARKET_BASE`].
+    #[must_use]
+    pub const fn on_market_route(self) -> bool {
+        matches!(self, Self::AggTrade | Self::MarkPrice)
     }
 
     /// Returns the suffix Binance uses in stream names.

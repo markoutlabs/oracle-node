@@ -43,8 +43,10 @@ pub struct BinanceConfig {
     pub perp: Vec<InstrumentSpec>,
     /// Override the spot endpoint. Tests point this at a local server.
     pub spot_base_url: String,
-    /// Override the futures endpoint.
+    /// Override the futures endpoint of the book ticker and depth.
     pub perp_base_url: String,
+    /// Override the futures endpoint of trades and the mark price.
+    pub perp_market_url: String,
     /// The REST endpoint spot depth snapshots come from.
     pub spot_rest_url: String,
     /// The REST endpoint futures depth snapshots come from.
@@ -80,6 +82,7 @@ impl Default for BinanceConfig {
             perp: Vec::new(),
             spot_base_url: streams::SPOT_BASE.to_owned(),
             perp_base_url: streams::FUTURES_BASE.to_owned(),
+            perp_market_url: streams::FUTURES_MARKET_BASE.to_owned(),
             spot_rest_url: snapshot::SPOT_REST.to_owned(),
             perp_rest_url: snapshot::FUTURES_REST.to_owned(),
             idle_timeout: Duration::from_secs(60),
@@ -205,7 +208,21 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
                 }));
                 names.sort_unstable();
             }
-            let urls = combined_urls(base, &names, self.config.streams_per_connection);
+            // Futures trades and mark prices have their own route.
+            let (market_names, names): (Vec<String>, Vec<String>) =
+                names.into_iter().partition(|name| {
+                    market == MarketKind::LinearPerp
+                        && StreamKind::from_stream_name(name)
+                            .is_some_and(StreamKind::on_market_route)
+                });
+            let chunk = self.config.streams_per_connection;
+            let urls = combined_urls(base, &names, chunk)
+                .into_iter()
+                .chain(combined_urls(
+                    &self.config.perp_market_url,
+                    &market_names,
+                    chunk,
+                ));
             for url in urls {
                 let mut session = SessionConfig::new(StreamId::new(Venue::Binance, market), url);
                 session.idle_timeout = self.config.idle_timeout;
@@ -349,8 +366,8 @@ mod tests {
         let plan = adapter.plan().expect("plans");
         assert_eq!(
             plan.len(),
-            2,
-            "one spot connection and one futures connection"
+            3,
+            "one spot connection and one for each futures route"
         );
 
         let spot = plan
@@ -362,12 +379,19 @@ mod tests {
         assert!(spot.0.url.contains("ethusdt@aggTrade"));
         assert!(!spot.0.url.contains("markPrice"), "spot has no mark price");
 
-        let perp = plan
+        let perp: Vec<&str> = plan
             .iter()
-            .find(|(_, m, _)| *m == MarketKind::LinearPerp)
-            .expect("perp");
-        assert!(perp.0.url.starts_with(streams::FUTURES_BASE));
-        assert!(perp.0.url.contains("btcusdt@markPrice@1s"));
+            .filter(|(_, m, _)| *m == MarketKind::LinearPerp)
+            .map(|(session, _, _)| session.url.as_str())
+            .collect();
+        let [public, market] = perp.as_slice() else {
+            panic!("two futures connections: {perp:?}");
+        };
+        assert!(public.starts_with(streams::FUTURES_BASE));
+        assert!(public.contains("btcusdt@bookTicker") && !public.contains("markPrice"));
+        assert!(market.starts_with(streams::FUTURES_MARKET_BASE));
+        assert!(market.contains("btcusdt@markPrice@1s") && market.contains("btcusdt@aggTrade"));
+        assert!(!market.contains("bookTicker"));
     }
 
     #[test]

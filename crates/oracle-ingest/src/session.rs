@@ -407,6 +407,7 @@ mod tests {
                 local_recv_ns,
                 seq: None,
                 book: None,
+                funding: None,
             });
             Ok(())
         }

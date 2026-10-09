@@ -4,7 +4,6 @@
 #
 #   oracle_registry_canister.wasm   the canister, with its candid:service baked in
 #   oracle-node-linux-{amd64,arm64}   the node binary for Linux servers
-#   oracle-proxy-linux-{amd64,arm64}  the web proxy binary for Linux servers
 #   SHA256SUMS                      compare these with anyone else's build
 #
 # The container keeps its own target dir (target/docker/), so the host build

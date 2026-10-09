@@ -10,11 +10,12 @@
 //! [5..5+L]           symbol, printable ASCII
 //! then      u64      publish time, unix ns
 //!           u64      seq
-//!           u8       flags: bit 0 snapshot
+//!           u8       flags: bit 0 snapshot, bit 1 venue seq present
 //!           i32      price exponent = -8
 //!           i32      size exponent = -8
 //!           u64      venue time, 0 when the venue sends none
 //!           u64      our receipt time
+//!           u64      venue seq, 0 when bit 1 is clear
 //!           u8, u8   bid count, ask count, each at most 128
 //!           16 × n   bids, then asks: price i64, size u64
 //!
@@ -22,7 +23,7 @@
 //! ```
 
 use oracle_types::{
-    BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_BOOK_SYMBOL, MarketKind, Venue,
+    BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_VENUE_SYMBOL, MarketKind, Venue,
 };
 
 use crate::codec::{Reader, Sink as _};
@@ -35,12 +36,16 @@ use crate::{Address, Signature, Signer, VerifyError, WireError};
 pub const FRAME_TYPE_BOOK_UPDATE: u8 = 3;
 
 /// Payload bytes besides the symbol and the levels.
-const FIXED_SIZE: usize = 5 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 2;
+const FIXED_SIZE: usize = 5 + 8 + 8 + 1 + 4 + 4 + 8 + 8 + 8 + 2;
 const LEVEL_SIZE: usize = 16;
 const SNAPSHOT: u8 = 1;
+/// The venue seq field holds a value. A zero id is real on some venues, so
+/// zero cannot mean "none".
+const VENUE_SEQ: u8 = 2;
 
 /// The largest book update payload.
-pub const MAX_BOOK_PAYLOAD: usize = FIXED_SIZE + MAX_BOOK_SYMBOL + 2 * MAX_BOOK_LEVELS * LEVEL_SIZE;
+pub const MAX_BOOK_PAYLOAD: usize =
+    FIXED_SIZE + MAX_VENUE_SYMBOL + 2 * MAX_BOOK_LEVELS * LEVEL_SIZE;
 
 /// Encodes a book update into its canonical bytes.
 ///
@@ -51,7 +56,7 @@ pub const MAX_BOOK_PAYLOAD: usize = FIXED_SIZE + MAX_BOOK_SYMBOL + 2 * MAX_BOOK_
 /// repeated, or of size zero in a snapshot.
 pub fn encode_book_update(update: &BookUpdate) -> Result<Vec<u8>, WireError> {
     let symbol = update.symbol.as_bytes();
-    check_symbol(symbol)?;
+    check_symbol(symbol, "book symbol")?;
     let bids = count(&update.bids)?;
     let asks = count(&update.asks)?;
     check_side(&update.bids, update.snapshot, |a, b| a > b)?;
@@ -68,11 +73,19 @@ pub fn encode_book_update(update: &BookUpdate) -> Result<Vec<u8>, WireError> {
     buf.put_bytes(symbol);
     buf.put_u64(update.publish_time_ns);
     buf.put_u64(update.seq);
-    buf.put_u8(if update.snapshot { SNAPSHOT } else { 0 });
+    let mut flags = 0;
+    if update.snapshot {
+        flags |= SNAPSHOT;
+    }
+    if update.venue_seq.is_some() {
+        flags |= VENUE_SEQ;
+    }
+    buf.put_u8(flags);
     buf.put_i32(BOOK_EXPO);
     buf.put_i32(BOOK_EXPO);
     buf.put_u64(update.exchange_time_ns.unwrap_or(0));
     buf.put_u64(update.local_recv_ns);
+    buf.put_u64(update.venue_seq.unwrap_or(0));
     buf.put_u8(bids);
     buf.put_u8(asks);
     for level in update.bids.iter().chain(&update.asks) {
@@ -108,21 +121,29 @@ pub fn decode_book_update(bytes: &[u8]) -> Result<BookUpdate, WireError> {
     let market = MarketKind::from_index(market).ok_or_else(|| code("market", market))?;
     let length = usize::from(reader.u8()?);
     let symbol = reader.take(length)?;
-    check_symbol(symbol)?;
+    check_symbol(symbol, "book symbol")?;
     let symbol = String::from_utf8(symbol.to_vec())
         .map_err(|_| WireError::NonCanonical("a symbol that is not ASCII"))?;
     let publish_time_ns = reader.u64()?;
     let seq = reader.u64()?;
-    let snapshot = match reader.u8()? {
-        0 => false,
-        SNAPSHOT => true,
-        _ => return Err(WireError::NonCanonical("an unknown book flag")),
-    };
+    let flags = reader.u8()?;
+    if flags & !(SNAPSHOT | VENUE_SEQ) != 0 {
+        return Err(WireError::NonCanonical("an unknown book flag"));
+    }
+    let snapshot = flags & SNAPSHOT != 0;
     if reader.i32()? != BOOK_EXPO || reader.i32()? != BOOK_EXPO {
         return Err(WireError::NonCanonical("a book exponent other than -8"));
     }
     let exchange_time_ns = Some(reader.u64()?).filter(|time| *time != 0);
     let local_recv_ns = reader.u64()?;
+    let venue_seq = reader.u64()?;
+    let venue_seq = if flags & VENUE_SEQ != 0 {
+        Some(venue_seq)
+    } else if venue_seq == 0 {
+        None
+    } else {
+        return Err(WireError::NonCanonical("a venue seq without its flag"));
+    };
     let bid_count = usize::from(reader.u8()?);
     let ask_count = usize::from(reader.u8()?);
     if bid_count.max(ask_count) > MAX_BOOK_LEVELS {
@@ -155,17 +176,19 @@ pub fn decode_book_update(bytes: &[u8]) -> Result<BookUpdate, WireError> {
         snapshot,
         exchange_time_ns,
         local_recv_ns,
+        venue_seq,
         bids,
         asks,
     })
 }
 
-fn check_symbol(symbol: &[u8]) -> Result<(), WireError> {
-    if symbol.is_empty() || symbol.len() > MAX_BOOK_SYMBOL {
+/// A venue symbol: 1 to 32 printable ASCII bytes.
+pub(crate) fn check_symbol(symbol: &[u8], field: &'static str) -> Result<(), WireError> {
+    if symbol.is_empty() || symbol.len() > MAX_VENUE_SYMBOL {
         return Err(WireError::FieldTooLong {
-            field: "book symbol",
+            field,
             actual: symbol.len(),
-            limit: MAX_BOOK_SYMBOL,
+            limit: MAX_VENUE_SYMBOL,
         });
     }
     if !symbol.iter().all(u8::is_ascii_graphic) {
@@ -407,6 +430,7 @@ mod tests {
             snapshot: true,
             exchange_time_ns: Some(1_754_582_400_100_000_000),
             local_recv_ns: 1_754_582_400_110_000_000,
+            venue_seq: Some(48_118_000_123),
             bids: vec![
                 level(6_431_250_000_000, 150_000_000),
                 level(6_431_240_000_000, 7),
@@ -463,7 +487,7 @@ mod tests {
             Err(WireError::NonCanonical("a snapshot level of size zero"))
         );
         let long = BookUpdate {
-            symbol: "X".repeat(MAX_BOOK_SYMBOL + 1),
+            symbol: "X".repeat(MAX_VENUE_SYMBOL + 1),
             ..snapshot()
         };
         assert!(encode_book_update(&long).is_err());

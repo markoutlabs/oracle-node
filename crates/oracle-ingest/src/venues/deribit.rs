@@ -25,7 +25,11 @@
 //! BTC. Every other venue reports base units, so the amounts are converted on the
 //! way in — see [`MarketKind::InversePerp`](oracle_types::MarketKind::InversePerp).
 
-use oracle_types::{Fixed, MarketKind, ObsKind, Observation};
+use std::sync::Arc;
+
+use oracle_types::{
+    Fixed, FundingBasis, FundingInfo, MarketKind, ObsKind, Observation, OpenInterestUnit,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -132,6 +136,9 @@ struct Ticker<'a> {
     /// Funding over a fixed eight-hour window, as a fraction.
     #[serde(rename = "funding_8h", borrow, default)]
     funding_8h: Option<&'a RawValue>,
+    /// USD for an inverse perpetual, the base coin for a linear one.
+    #[serde(rename = "open_interest", borrow, default)]
+    open_interest: Option<&'a RawValue>,
 }
 
 /// A book message: a snapshot, or the levels that changed. Entries are
@@ -291,11 +298,25 @@ pub fn decode_payload(
                 local_recv_ns,
                 seq: None,
                 book: None,
+                funding: None,
             });
             emitted = true;
         }
     }
 
+    let unit = if entry.instrument.market == MarketKind::InversePerp {
+        OpenInterestUnit::Quote
+    } else {
+        OpenInterestUnit::Base
+    };
+    let funding = Arc::new(FundingInfo {
+        open_interest: ticker
+            .open_interest
+            .map(|raw| decimal_literal("open_interest", raw))
+            .transpose()?
+            .map(|oi| (oi, unit)),
+        ..FundingInfo::new(FundingBasis::EightHours)
+    });
     for (field, kind, raw) in [
         ("last_price", ObsKind::Trade, ticker.last_price),
         ("mark_price", ObsKind::MarkPrice, ticker.mark_price),
@@ -316,6 +337,7 @@ pub fn decode_payload(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: (kind == ObsKind::Funding).then(|| Arc::clone(&funding)),
         });
         emitted = true;
     }

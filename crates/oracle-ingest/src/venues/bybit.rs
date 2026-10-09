@@ -8,16 +8,20 @@
 //!   message, fields that did not change are absent. Every numeric field is
 //!   therefore optional, and a missing one means "unchanged", not "zero".
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{MarketKind, ObsKind, Observation};
+use oracle_types::{
+    Fixed, FundingBasis, FundingInfo, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
+    OpenInterestUnit,
+};
 use serde::Deserialize;
 
-use crate::book::{Books, Side};
+use crate::book::{Books, LastFunding, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal;
+use super::{decimal, integer};
 
 /// Spot endpoint.
 pub const SPOT_URL: &str = "wss://stream.bybit.com/v5/public/spot";
@@ -125,6 +129,14 @@ struct Ticker<'a> {
     index_price: Option<&'a str>,
     #[serde(rename = "fundingRate", borrow, default)]
     funding_rate: Option<&'a str>,
+    #[serde(rename = "fundingIntervalHour", borrow, default)]
+    funding_interval_hours: Option<&'a str>,
+    /// Milliseconds, as a string.
+    #[serde(rename = "nextFundingTime", borrow, default)]
+    next_funding_time: Option<&'a str>,
+    /// In the base asset for a linear contract.
+    #[serde(rename = "openInterest", borrow, default)]
+    open_interest: Option<&'a str>,
 }
 
 /// The session's entry point: `orderbook.50` is kept in `books`; every other
@@ -146,6 +158,10 @@ pub fn decode(
     let (Some(topic), Some(data)) = (envelope.topic, envelope.data) else {
         return decode_payload(payload, map, local_recv_ns, out);
     };
+    if topic.starts_with("tickers.") {
+        let data = data.get().as_bytes();
+        return decode_ticker(data, map, envelope.ts, local_recv_ns, Some(books), out);
+    }
     if !topic.starts_with(&book_topic) {
         return decode_payload(payload, map, local_recv_ns, out);
     }
@@ -214,7 +230,7 @@ pub fn decode_payload(
         return decode_trades(data, map, local_recv_ns, out);
     }
     if topic.starts_with("tickers.") {
-        return decode_ticker(data, map, envelope.ts, local_recv_ns, out);
+        return decode_ticker(data, map, envelope.ts, local_recv_ns, None, out);
     }
     Err(DecodeError::UnhandledStream(topic.to_owned()))
 }
@@ -264,6 +280,7 @@ fn decode_book(
         local_recv_ns,
         seq: book.update_id,
         book: None,
+        funding: None,
     });
     Ok(())
 }
@@ -295,6 +312,7 @@ fn decode_trades(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: None,
         });
     }
     if seen {
@@ -304,11 +322,14 @@ fn decode_trades(
     }
 }
 
+/// Decodes a ticker. With the connection's `books`, a delta's funding fields
+/// merge into the last ones, so each funding observation has the whole state.
 fn decode_ticker(
     data: &[u8],
     map: &InstrumentMap,
     ts: Option<u64>,
     local_recv_ns: u64,
+    books: Option<&mut Books>,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
     let ticker: Ticker<'_> =
@@ -318,7 +339,7 @@ fn decode_ticker(
         .ok_or_else(|| DecodeError::UnknownInstrument(ticker.symbol.to_owned()))?;
 
     let exchange_time_ns = ts.map(millis_to_nanos);
-    let mut push = |kind: ObsKind, price: oracle_types::Fixed| {
+    let mut push = |kind: ObsKind, price: Fixed, funding: Option<Arc<FundingInfo>>| {
         out.push(Observation {
             instrument: entry.instrument.clone(),
             kind,
@@ -332,21 +353,58 @@ fn decode_ticker(
             local_recv_ns,
             seq: None,
             book: None,
+            funding,
         });
     };
 
     // Deltas omit unchanged fields. Absent means unchanged, not zero.
     let mut emitted = false;
     if let Some(mark) = ticker.mark_price {
-        push(ObsKind::MarkPrice, decimal("markPrice", mark)?);
+        push(ObsKind::MarkPrice, decimal("markPrice", mark)?, None);
         emitted = true;
     }
     if let Some(index) = ticker.index_price {
-        push(ObsKind::IndexPrice, decimal("indexPrice", index)?);
+        push(ObsKind::IndexPrice, decimal("indexPrice", index)?, None);
         emitted = true;
     }
-    if let Some(rate) = ticker.funding_rate {
-        push(ObsKind::Funding, decimal("fundingRate", rate)?);
+    let mut fresh = LastFunding {
+        rate: ticker
+            .funding_rate
+            .map(|rate| decimal("fundingRate", rate))
+            .transpose()?,
+        interval_ns: ticker
+            .funding_interval_hours
+            .map(|hours| integer("fundingIntervalHour", hours))
+            .transpose()?
+            .map(|hours| hours.saturating_mul(3_600 * NANOS_PER_SEC)),
+        next_funding_time_ns: ticker
+            .next_funding_time
+            .map(|ms| integer("nextFundingTime", ms))
+            .transpose()?
+            .filter(|ms| *ms > 0)
+            .map(millis_to_nanos),
+        open_interest: ticker
+            .open_interest
+            .map(|oi| decimal("openInterest", oi))
+            .transpose()?,
+    };
+    let changed = fresh != LastFunding::default();
+    if let Some(books) = books {
+        let last = books.funding(ticker.symbol);
+        last.rate = fresh.rate.or(last.rate);
+        last.interval_ns = fresh.interval_ns.or(last.interval_ns);
+        last.next_funding_time_ns = fresh.next_funding_time_ns.or(last.next_funding_time_ns);
+        last.open_interest = fresh.open_interest.or(last.open_interest);
+        fresh = *last;
+    }
+    if let (true, Some(rate)) = (changed, fresh.rate) {
+        let info = FundingInfo {
+            interval_ns: fresh.interval_ns,
+            next_funding_time_ns: fresh.next_funding_time_ns,
+            open_interest: fresh.open_interest.map(|oi| (oi, OpenInterestUnit::Base)),
+            ..FundingInfo::new(FundingBasis::Interval)
+        };
+        push(ObsKind::Funding, rate, Some(Arc::new(info)));
         emitted = true;
     }
     if emitted {

@@ -18,7 +18,11 @@
 //! a fraction over the venue's own interval. Averaging it against an 8h venue
 //! without scaling would be off by 8×; see SPEC.md §13, open question 3.
 
-use oracle_types::{Fixed, ObsKind, Observation};
+use std::sync::Arc;
+
+use oracle_types::{
+    Fixed, FundingBasis, FundingInfo, NANOS_PER_SEC, ObsKind, Observation, OpenInterestUnit,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -26,6 +30,9 @@ use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
 use super::decimal_literal;
+
+/// Kraken Futures pays funding every hour.
+const FUNDING_INTERVAL_NS: u64 = 3_600 * NANOS_PER_SEC;
 
 /// The public endpoint.
 pub const URL: &str = "wss://futures.kraken.com/ws/v1";
@@ -81,6 +88,14 @@ struct Ticker<'a> {
     /// meaningless rather than merely mis-scaled.
     #[serde(rename = "relative_funding_rate", borrow, default)]
     relative_funding_rate: Option<&'a RawValue>,
+    #[serde(rename = "relative_funding_rate_prediction", borrow, default)]
+    relative_funding_rate_prediction: Option<&'a RawValue>,
+    /// Milliseconds.
+    #[serde(rename = "next_funding_rate_time", default)]
+    next_funding_rate_time: Option<u64>,
+    /// In contracts.
+    #[serde(rename = "openInterest", borrow, default)]
+    open_interest: Option<&'a RawValue>,
     /// Milliseconds.
     #[serde(default)]
     time: Option<u64>,
@@ -166,10 +181,34 @@ pub fn decode_payload(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: None,
         });
         emitted = true;
     }
 
+    let funding = ticker
+        .relative_funding_rate
+        .map(|_| -> Result<FundingInfo, DecodeError> {
+            Ok(FundingInfo {
+                predicted: ticker
+                    .relative_funding_rate_prediction
+                    .map(|raw| decimal_literal("relative_funding_rate_prediction", raw))
+                    .transpose()?,
+                interval_ns: Some(FUNDING_INTERVAL_NS),
+                next_funding_time_ns: ticker
+                    .next_funding_rate_time
+                    .filter(|ms| *ms > 0)
+                    .map(millis_to_nanos),
+                open_interest: ticker
+                    .open_interest
+                    .map(|raw| decimal_literal("openInterest", raw))
+                    .transpose()?
+                    .map(|oi| (oi, OpenInterestUnit::Contracts)),
+                ..FundingInfo::new(FundingBasis::Interval)
+            })
+        })
+        .transpose()?
+        .map(Arc::new);
     for (field, kind, raw) in [
         ("last", ObsKind::Trade, ticker.last),
         ("markPrice", ObsKind::MarkPrice, ticker.mark_price),
@@ -194,6 +233,9 @@ pub fn decode_payload(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: (kind == ObsKind::Funding)
+                .then(|| funding.clone())
+                .flatten(),
         });
         emitted = true;
     }

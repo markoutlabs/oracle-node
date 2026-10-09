@@ -16,8 +16,8 @@ use oracle_transport::{
 };
 use oracle_types::{FeedId, InstrumentId, NANOS_PER_SEC, Symbol};
 use oracle_wire::{
-    Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_VENUE_REPORT, Registry, Signer, VerifiedRegistry,
-    VerifyError, feed_id,
+    Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_FUNDING_UPDATE, FRAME_TYPE_VENUE_REPORT, Registry,
+    Signer, VerifiedRegistry, VerifyError, feed_id,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -30,7 +30,11 @@ use crate::latency::{Latency, LatencyReport};
 use crate::nodes::{ConnectionState, Links, NodeFeed, NodeReport, Tally, rejected_node};
 use crate::quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 use crate::source::{FetchError, RegistrySource};
-use crate::verify::{AcceptedBook, AcceptedVenues, RejectReason, Verifier, VerifyConfig};
+use crate::tap::{FrameKind, Tap, TappedFrame, Verdict};
+use crate::verify::{
+    AcceptedBook, AcceptedFunding, AcceptedVenues, FUNDING_MAX_AGE, RejectReason, Verifier,
+    VerifyConfig,
+};
 
 /// The quorum below which the builder demands an explicit acknowledgement.
 const SAFE_QUORUM: usize = 3;
@@ -63,6 +67,9 @@ pub enum Event {
     /// One node's verified book frame, already applied. Read the book with
     /// [`OracleClient::book`].
     Book(AcceptedBook),
+    /// One node's verified funding frame. Each frame carries the whole state;
+    /// [`OracleClient::funding`] reads the freshest.
+    Funding(AcceptedFunding),
 }
 
 /// A client construction or connection failure.
@@ -199,11 +206,21 @@ impl OracleClientBuilder {
         self
     }
 
-    /// Sets how old an update may be before it is refused.
+    /// Sets how old a price update may be before it is refused. The default is
+    /// 2 s, two of the nodes' 1 s heartbeats. Books use it too.
     #[must_use]
     pub const fn max_age(mut self, max_age: Duration) -> Self {
         self.verify.max_age = max_age;
         self.quorum_config.max_age = max_age;
+        self
+    }
+
+    /// Sets the same limit for a slow feed (funding, open interest). The
+    /// default is 25 s: nodes publish these feeds on a 10 s heartbeat.
+    #[must_use]
+    pub const fn slow_max_age(mut self, max_age: Duration) -> Self {
+        self.verify.slow_max_age = max_age;
+        self.quorum_config.slow_max_age = max_age;
         self
     }
 
@@ -260,6 +277,9 @@ impl OracleClientBuilder {
             venue_symbols: HashMap::new(),
             book_symbols: HashMap::new(),
             books: HashMap::new(),
+            funding_symbols: HashMap::new(),
+            all_funding: false,
+            funding: HashMap::new(),
             inbound_tx: tx,
             inbound_rx: rx,
             shutdown: CancellationToken::new(),
@@ -278,6 +298,7 @@ impl OracleClientBuilder {
             connections: HashMap::new(),
             polling: false,
             client_key: self.client_key,
+            tap: Tap::default(),
         })
     }
 }
@@ -291,6 +312,8 @@ pub struct ClientStats {
     pub venue_reports: u64,
     /// Book frames accepted.
     pub book_updates: u64,
+    /// Funding frames accepted.
+    pub funding_updates: u64,
     /// Frames refused because they were not signed by a registered node.
     pub untrusted: u64,
     /// Frames refused as replays.
@@ -307,6 +330,8 @@ pub struct ClientStats {
     pub polls: u64,
     /// Registry fetches that failed or did not verify.
     pub refresh_failures: u64,
+    /// Frame copies that [`OracleClient::frames`] had no room for.
+    pub tap_dropped: u64,
 }
 
 impl ClientStats {
@@ -358,6 +383,12 @@ pub struct OracleClient {
     book_symbols: HashMap<FeedId, Symbol>,
     /// One book per node and venue instrument.
     books: HashMap<(Address, InstrumentId), Book>,
+    /// Feeds whose perpetual sources' funding to request.
+    funding_symbols: HashMap<FeedId, Symbol>,
+    /// Request the funding of every perpetual.
+    all_funding: bool,
+    /// The latest funding frame of each node and perpetual.
+    funding: HashMap<(Address, InstrumentId), AcceptedFunding>,
     inbound_tx: mpsc::Sender<Inbound>,
     inbound_rx: mpsc::Receiver<Inbound>,
     shutdown: CancellationToken,
@@ -380,6 +411,7 @@ pub struct OracleClient {
     connections: HashMap<Address, NodeConnection>,
     polling: bool,
     client_key: Option<Arc<Signer>>,
+    tap: Tap,
 }
 
 impl OracleClient {
@@ -444,6 +476,20 @@ impl OracleClient {
         self.registry.version()
     }
 
+    /// Returns the governance-signed registry that the client verifies against.
+    #[must_use]
+    pub const fn registry(&self) -> &VerifiedRegistry {
+        &self.registry
+    }
+
+    /// Opens a channel with a copy of each frame whose signature and registry
+    /// check pass, accepted or not, for an archive. The client never waits on
+    /// it: when it is full, a copy is dropped and counted in
+    /// [`ClientStats::tap_dropped`]. A second call replaces the first channel.
+    pub fn frames(&mut self, capacity: usize) -> mpsc::Receiver<TappedFrame> {
+        self.tap.open(capacity)
+    }
+
     /// Returns the quorum rules the client resolves with.
     #[must_use]
     pub const fn quorum_config(&self) -> QuorumConfig {
@@ -489,9 +535,9 @@ impl OracleClient {
                         .zip(&medians)
                         .map(|((symbol, view), median)| {
                             let update = view.and_then(|view| view.get(&entry.address));
-                            let state = update.map(|update| {
-                                NodeFeedState::of(update, &self.quorum_config, now_ns)
-                            });
+                            let max_age = self.quorum_config.max_age_for(symbol.kind());
+                            let state =
+                                update.map(|update| NodeFeedState::of(update, max_age, now_ns));
                             NodeFeed::new(**symbol, update, state, *median)
                         })
                         .collect(),
@@ -626,8 +672,13 @@ impl OracleClient {
         }
         for symbol in parse_symbols(symbols)? {
             let id = feed_id(&symbol);
+            if symbol.kind().is_slow() {
+                self.verifier.mark_slow(id);
+            }
             self.symbols.insert(id, symbol);
-            self.views.entry(id).or_insert_with(|| FeedView::new(id));
+            self.views
+                .entry(id)
+                .or_insert_with(|| FeedView::with_kind(id, symbol.kind()));
         }
         self.resubscribe()
     }
@@ -643,7 +694,11 @@ impl OracleClient {
             return Err(ClientError::NoClientKey);
         }
         for symbol in parse_symbols(symbols)? {
-            self.venue_symbols.insert(feed_id(&symbol), symbol);
+            let id = feed_id(&symbol);
+            if symbol.kind().is_slow() {
+                self.verifier.mark_slow(id);
+            }
+            self.venue_symbols.insert(id, symbol);
         }
         self.resubscribe()
     }
@@ -681,6 +736,50 @@ impl OracleClient {
             .max_by_key(|book| book.publish_time_ns)
     }
 
+    /// Adds feeds whose perpetual sources' funding to receive, and reconnects
+    /// every node with the full set. `"*"` asks for every perpetual.
+    /// [`OracleClient::funding`] reads them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`OracleClient::subscribe`].
+    pub async fn subscribe_funding(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
+        if self.client_key.is_none() {
+            return Err(ClientError::NoClientKey);
+        }
+        let (all, named): (Vec<&str>, Vec<&str>) =
+            symbols.iter().partition(|symbol| **symbol == "*");
+        self.all_funding |= !all.is_empty();
+        for symbol in parse_symbols(&named)? {
+            self.funding_symbols.insert(feed_id(&symbol), symbol);
+        }
+        self.resubscribe()
+    }
+
+    /// The freshest funding frame for `perpetual` across the nodes, or `None`
+    /// if no node sent one in the last two funding heartbeats.
+    ///
+    /// Each node reads the venue on its own, so this is one node's frame whole.
+    #[must_use]
+    pub fn funding(&self, perpetual: &InstrumentId, now_ns: u64) -> Option<&AcceptedFunding> {
+        let max_age = u64::try_from(FUNDING_MAX_AGE.as_nanos()).unwrap_or(u64::MAX);
+        self.funding
+            .iter()
+            .filter(|((_, instrument), _)| instrument == perpetual)
+            .map(|(_, accepted)| accepted)
+            .filter(|accepted| now_ns.saturating_sub(accepted.update.publish_time_ns) <= max_age)
+            .max_by_key(|accepted| accepted.update.publish_time_ns)
+    }
+
+    /// Every perpetual a node has sent funding for, each once.
+    pub fn funding_instruments(&self) -> impl Iterator<Item = &InstrumentId> {
+        let mut seen = HashSet::new();
+        self.funding
+            .keys()
+            .map(|(_, instrument)| instrument)
+            .filter(move |instrument| seen.insert(*instrument))
+    }
+
     /// Every book a node has sent, each once.
     pub fn book_instruments(&self) -> impl Iterator<Item = &InstrumentId> {
         let mut seen = HashSet::new();
@@ -694,7 +793,15 @@ impl OracleClient {
         let prices: Vec<Symbol> = self.symbols.values().copied().collect();
         let venues: Vec<Symbol> = self.venue_symbols.values().copied().collect();
         let books: Vec<Symbol> = self.book_symbols.values().copied().collect();
-        self.subscription = Some(subscribe_frame(&prices, &venues, &books));
+        let funding: Vec<String> = if self.all_funding {
+            vec!["*".to_owned()]
+        } else {
+            self.funding_symbols
+                .values()
+                .map(ToString::to_string)
+                .collect()
+        };
+        self.subscription = Some(subscribe_frame(&prices, &venues, &books, &funding));
         self.runtime = Some(Handle::current());
         for (_, connection) in self.connections.drain() {
             connection.cancel.cancel();
@@ -787,7 +894,7 @@ impl OracleClient {
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
         let outcome = self.try_ingest_price(frame, now_ns, now_ns);
-        self.record(&outcome);
+        self.record(frame, now_ns, &outcome);
         outcome
     }
 
@@ -799,7 +906,7 @@ impl OracleClient {
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest_event(&mut self, frame: &[u8], now_ns: u64) -> Result<Event, RejectReason> {
         let outcome = self.try_ingest(frame, now_ns, now_ns);
-        self.record(&outcome);
+        self.record(frame, now_ns, &outcome);
         outcome
     }
 
@@ -842,8 +949,25 @@ impl OracleClient {
             }
             outcome = accept(self, frame, received_ns, now_ns);
         }
-        self.record(&outcome);
+        self.record(frame, received_ns, &outcome);
         outcome
+    }
+
+    /// Copies a frame whose signature verified to [`OracleClient::frames`].
+    fn copy(&mut self, frame: &[u8], signer: Address, received_ns: u64, verdict: Verdict) {
+        if !self.tap.is_open() {
+            return;
+        }
+        let copied = TappedFrame {
+            bytes: frame.to_vec(),
+            signer,
+            kind: FrameKind::of(frame),
+            received_ns,
+            verdict,
+        };
+        if !self.tap.offer(copied) {
+            self.stats.tap_dropped = self.stats.tap_dropped.saturating_add(1);
+        }
     }
 
     fn try_ingest(
@@ -855,6 +979,7 @@ impl OracleClient {
         match frame.first().copied() {
             Some(FRAME_TYPE_VENUE_REPORT) => {
                 let accepted = self.verifier.accept_venues(frame, now_ns)?;
+                self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
                 self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
                 let tally = self.tallies.entry(accepted.signer).or_default();
                 tally.frames.venue_reports = tally.frames.venue_reports.saturating_add(1);
@@ -863,6 +988,7 @@ impl OracleClient {
             }
             Some(FRAME_TYPE_BOOK_UPDATE) => {
                 let accepted = self.verifier.accept_book(frame, now_ns)?;
+                self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
                 self.stats.book_updates = self.stats.book_updates.saturating_add(1);
                 let tally = self.tallies.entry(accepted.signer).or_default();
                 tally.frames.book_updates = tally.frames.book_updates.saturating_add(1);
@@ -875,6 +1001,20 @@ impl OracleClient {
                     .or_insert_with(|| Book::new(accepted.signer, instrument))
                     .apply(update);
                 return Ok(Event::Book(accepted));
+            }
+            Some(FRAME_TYPE_FUNDING_UPDATE) => {
+                let accepted = self.verifier.accept_funding(frame, now_ns)?;
+                self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
+                self.stats.funding_updates = self.stats.funding_updates.saturating_add(1);
+                let tally = self.tallies.entry(accepted.signer).or_default();
+                tally.frames.funding_updates = tally.frames.funding_updates.saturating_add(1);
+                tally.seen(received_ns);
+                let update = &accepted.update;
+                let perpetual =
+                    InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+                self.funding
+                    .insert((accepted.signer, perpetual), accepted.clone());
+                return Ok(Event::Funding(accepted));
             }
             _ => {}
         }
@@ -889,6 +1029,7 @@ impl OracleClient {
         now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
         let accepted = self.verifier.accept(frame, now_ns)?;
+        self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
         self.stats.accepted = self.stats.accepted.saturating_add(1);
         self.latency.arrived(&accepted.update, received_ns);
         self.tallies
@@ -908,11 +1049,15 @@ impl OracleClient {
 
     /// Counts a rejection once, after any refresh. Acceptances count where they
     /// happen.
-    fn record<T>(&mut self, outcome: &Result<T, RejectReason>) {
+    /// A rejection after a valid signature still goes to [`OracleClient::frames`].
+    fn record<T>(&mut self, frame: &[u8], received_ns: u64, outcome: &Result<T, RejectReason>) {
         if let Err(reason) = outcome {
             self.stats.record(reason);
             if let Some(node) = rejected_node(reason) {
                 self.tallies.entry(node).or_default().frames.record(reason);
+                if let Some(verdict) = Verdict::of(reason) {
+                    self.copy(frame, node, received_ns, verdict);
+                }
             }
         }
     }
@@ -1029,7 +1174,12 @@ impl Drop for OracleClient {
 }
 
 /// Builds the subscribe control frame.
-fn subscribe_frame(prices: &[Symbol], venues: &[Symbol], books: &[Symbol]) -> String {
+fn subscribe_frame(
+    prices: &[Symbol],
+    venues: &[Symbol],
+    books: &[Symbol],
+    funding: &[String],
+) -> String {
     let names =
         |symbols: &[Symbol]| -> Vec<String> { symbols.iter().map(ToString::to_string).collect() };
     serde_json::json!({
@@ -1037,6 +1187,7 @@ fn subscribe_frame(prices: &[Symbol], venues: &[Symbol], books: &[Symbol]) -> St
         "feeds": names(prices),
         "venues": names(venues),
         "books": names(books),
+        "funding": funding,
     })
     .to_string()
 }
@@ -1288,7 +1439,7 @@ pub fn now_unix_nanos() -> u64 {
 mod tests {
     use super::*;
     use crate::Status;
-    use crate::testing::{TestNode, book_at, registry_with, update_at};
+    use crate::testing::{TestNode, book_at, funding_at, registry_with, update_at};
     use oracle_types::{MarketKind, NANOS_PER_SEC, Venue};
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
@@ -1332,6 +1483,44 @@ mod tests {
 
     fn nodes() -> Vec<TestNode> {
         (1..=3_u8).map(TestNode::new).collect()
+    }
+
+    #[test]
+    fn funding_frames_keep_the_freshest_and_refuse_replays() {
+        let nodes = nodes();
+        let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+        let mut client = OracleClient::builder(registry)
+            .build()
+            .expect("three nodes");
+        let [a, b, _] = nodes.as_slice() else {
+            panic!("three nodes");
+        };
+        let perpetual = InstrumentId::new(Venue::Bybit, MarketKind::LinearPerp, "BTCUSDT");
+        let rate =
+            |client: &OracleClient, at| client.funding(&perpetual, at).map(|f| f.update.rate);
+
+        // A replayed frame of the server can be a heartbeat old, and passes.
+        let old = a.sign_funding(&funding_at(NOW - 60 * NANOS_PER_SEC, 1, 100));
+        assert!(matches!(
+            client.ingest_event(&old, NOW),
+            Ok(Event::Funding(_))
+        ));
+        let newer = b.sign_funding(&funding_at(NOW, 9, 200));
+        assert!(client.ingest_event(&newer, NOW).is_ok());
+        assert_eq!(rate(&client, NOW), Some(200), "the freshest node");
+
+        assert!(matches!(
+            client.ingest_event(&old, NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
+        let stale = a.sign_funding(&funding_at(NOW - 121 * NANOS_PER_SEC, 2, 100));
+        assert!(matches!(
+            client.ingest_event(&stale, NOW),
+            Err(RejectReason::TooOld { .. })
+        ));
+        assert_eq!(client.stats().funding_updates, 2);
+        assert_eq!(client.funding_instruments().count(), 1);
+        assert_eq!(rate(&client, NOW + 121 * NANOS_PER_SEC), None, "too old");
     }
 
     #[test]

@@ -149,6 +149,7 @@ mod tests {
             snapshot,
             exchange_time_ns: None,
             local_recv_ns: 0,
+            venue_seq: None,
             bids: side(bids),
             asks: side(asks),
         }

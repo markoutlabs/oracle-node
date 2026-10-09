@@ -128,7 +128,7 @@ impl<'de> serde::Deserialize<'de> for SourceStatus {
 ///
 /// Prices are at the report's `expo`, sizes at [`QTY_EXPO`], and funding at
 /// [`RATE_EXPO`]. A field the venue does not send for this instrument is `None`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct VenueEntry {
@@ -136,6 +136,8 @@ pub struct VenueEntry {
     pub venue: Venue,
     /// Spot or perpetual.
     pub market: MarketKind,
+    /// The venue's own symbol for the instrument, such as `BTCUSDT`.
+    pub symbol: String,
     /// How the source counted in the last evaluation.
     pub status: SourceStatus,
     /// The source's share of the price's total weight, in basis points. Zero
@@ -237,6 +239,7 @@ mod tests {
             entries: vec![VenueEntry {
                 venue: Venue::Kraken,
                 market: MarketKind::Spot,
+                symbol: "BTC/USD".to_owned(),
                 status: SourceStatus::Used,
                 weight_bps: 5_000,
                 bid: Some(6_431_250_000_000),

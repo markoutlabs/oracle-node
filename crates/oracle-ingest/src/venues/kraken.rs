@@ -261,6 +261,7 @@ pub fn decode_payload(
                 local_recv_ns,
                 seq: None,
                 book: None,
+                funding: None,
             });
             emitted = true;
         }
@@ -279,6 +280,7 @@ pub fn decode_payload(
                 local_recv_ns,
                 seq: None,
                 book: None,
+                funding: None,
             });
             emitted = true;
         }

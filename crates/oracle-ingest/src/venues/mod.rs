@@ -31,6 +31,15 @@ pub(crate) fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeE
     })
 }
 
+/// Parses a whole number that arrived as a JSON string, such as a time in
+/// milliseconds.
+pub(crate) fn integer(field: &'static str, value: &str) -> Result<u64, DecodeError> {
+    value.parse().map_err(|_| DecodeError::BadDecimal {
+        field,
+        value: value.to_owned(),
+    })
+}
+
 /// Parses a decimal that arrived as a bare JSON number.
 ///
 /// Takes the **raw literal text** rather than a parsed `f64`. Kraken v2 sends

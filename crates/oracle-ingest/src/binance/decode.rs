@@ -4,7 +4,9 @@
 //! no async. That is what lets the tests below run against captured payloads
 //! rather than a live exchange.
 
-use oracle_types::{Fixed, Level, MarketKind, ObsKind, Observation};
+use std::sync::Arc;
+
+use oracle_types::{Fixed, FundingBasis, FundingInfo, Level, MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -189,6 +191,9 @@ struct MarkPrice<'a> {
     index: Option<&'a str>,
     #[serde(rename = "r", borrow, default)]
     funding_rate: Option<&'a str>,
+    /// The next funding time, in milliseconds.
+    #[serde(rename = "T", default)]
+    next_funding_time_ms: Option<u64>,
 }
 
 /// Parses a decimal field.
@@ -297,6 +302,7 @@ fn decode_book_ticker(
         local_recv_ns,
         seq: Some(ticker.update_id),
         book: None,
+        funding: None,
     });
     Ok(())
 }
@@ -328,6 +334,7 @@ fn decode_agg_trade(
         local_recv_ns,
         seq: Some(trade.agg_id),
         book: None,
+        funding: None,
     });
     Ok(())
 }
@@ -345,7 +352,7 @@ fn decode_mark_price(
         .ok_or_else(|| DecodeError::UnknownInstrument(update.symbol.to_owned()))?;
 
     let exchange_time_ns = Some(millis_to_nanos(update.event_time_ms));
-    let mut push = |kind: ObsKind, price: Fixed| {
+    let mut push = |kind: ObsKind, price: Fixed, funding: Option<Arc<FundingInfo>>| {
         out.push(Observation {
             instrument: entry.instrument.clone(),
             kind,
@@ -359,19 +366,27 @@ fn decode_mark_price(
             local_recv_ns,
             seq: None,
             book: None,
+            funding,
         });
     };
 
-    push(ObsKind::MarkPrice, decimal("p", update.mark)?);
+    push(ObsKind::MarkPrice, decimal("p", update.mark)?, None);
     if let Some(index) = update.index {
-        push(ObsKind::IndexPrice, decimal("i", index)?);
+        push(ObsKind::IndexPrice, decimal("i", index)?, None);
     }
     if let Some(rate) = update.funding_rate {
         // Emitted raw, over whatever interval Binance uses for this contract —
         // 8 hours for most, 4 for some, and the message does not say which. The
         // interval has to come from instrument metadata before this can be
         // normalized to the `FUNDING_8H` feed. See SPEC.md §13, open question 3.
-        push(ObsKind::Funding, decimal("r", rate)?);
+        let info = FundingInfo {
+            next_funding_time_ns: update
+                .next_funding_time_ms
+                .filter(|ms| *ms > 0)
+                .map(millis_to_nanos),
+            ..FundingInfo::new(FundingBasis::Interval)
+        };
+        push(ObsKind::Funding, decimal("r", rate)?, Some(Arc::new(info)));
     }
     Ok(())
 }

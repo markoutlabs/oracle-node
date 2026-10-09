@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # A local oracle for development: the registry canister on the local network,
-# NODES nodes that read the live venues, and oracle-proxy in front of them.
-# Nothing on mainnet is touched. It reinstalls the local canister, and it uses
-# a throwaway icp identity, never your default.
+# and NODES nodes that read the live venues. Nothing on mainnet is touched. It
+# reinstalls the local canister, and it uses a throwaway icp identity, never
+# your default.
 #
-#   scripts/dev-stack.sh            # 3 nodes at quorum 3; Ctrl-C stops everything
-#   NODES=1 scripts/dev-stack.sh    # one node, at quorum 1
+#   scripts/dev-stack.sh            # 3 nodes; Ctrl-C stops them and the network
+#   NODES=1 scripts/dev-stack.sh    # one node
 #   KEEP=1 scripts/dev-stack.sh     # leave the local network running on exit
 #
-# The proxy serves ws://127.0.0.1:8792/v1/ws, and node N listens on 880N. Each
-# node serves every feed in node/all-feeds.toml. Logs and keys are in
+# Node N listens on 880N and serves every feed in node/all-feeds.toml. One
+# client key is listed, for a local SDK client. When the nodes serve, the
+# script writes target/dev-stack/stack.env: the canister, the gateway, the
+# governance address, that key and the feeds. The oracle-proxy repo's
+# scripts/dev.sh reads it and starts the proxy. Logs and keys are in
 # target/dev-stack/.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 IDENTITY=${DEV_IDENTITY:-oracle-e2e}
 NODES=${NODES:-3}
-PROXY_PORT=${PROXY_PORT:-8792}
-# Books cost a signature per change on every node, so only a few by default.
-BOOKS=${BOOKS:-"CRYPTO.BTC/USDT CRYPTO.BTC/USD"}
 DIR=$(pwd)/target/dev-stack
 BIN=$(pwd)/target/release
 
@@ -50,17 +50,10 @@ run_printed() { # file
   eval "$line --identity $IDENTITY" | grep -q "Ok = " || die "$line failed"
 }
 
-# A TOML array of strings.
-toml_list() {
-  local out="" item
-  for item in "$@"; do out+="${out:+, }\"$item\""; done
-  printf '[%s]' "$out"
-}
-
 [[ $NODES =~ ^[1-9]$ ]] || die "NODES must be 1 to 9"
 
 say "build"
-cargo build -q --release --locked -p oracle-node --bin oracle-node -p oracle-proxy --bin oracle-proxy
+cargo build -q --release --locked -p oracle-node --bin oracle-node
 
 say "registry canister on the local network"
 icp identity list 2>/dev/null | grep -qw "$IDENTITY" \
@@ -84,7 +77,7 @@ while IFS= read -r symbol; do SYMBOLS+=("$symbol"); done \
 
 say "$NODES nodes"
 for i in $(seq 1 "$NODES"); do
-  # Above the proxy's port, so the defaults never collide.
+  # Above oracle-proxy's default port, 8792, so the two never collide.
   port=$((8800 + i))
   node="$DIR/node$i"
   "$BIN/oracle-node" init --out "$node" --endpoint "ws://127.0.0.1:$port/v2/ws" \
@@ -103,54 +96,47 @@ for i in $(seq 1 "$NODES"); do
   echo "node$i  $(python3 -c 'import sys,json; print(json.load(open(sys.argv[1]))["address"])' "$node/node-entry.json")  ws://127.0.0.1:$port/v2/ws"
 done
 
-say "the proxy's client key, listed"
-key_out=$(scripts/client-key.sh --out "$DIR/proxy.key")
+say "a client key, listed"
+key_out=$(scripts/client-key.sh --out "$DIR/client.key")
 ADDRESS=$(awk '/^address/ {print $2}' <<<"$key_out")
 ENV=local scripts/add-client.sh --identity "$IDENTITY" --address "$ADDRESS" \
   --expires $(($(date +%s) + 30 * 86400)) >/dev/null 2>&1 || die "add_client failed"
-echo "proxy  $ADDRESS"
-
-if [ "$NODES" -ge 3 ]; then QUORUM=3 LOW=false; else QUORUM=$NODES LOW=true; fi
-# shellcheck disable=SC2086 # BOOKS is a space-separated list on purpose.
-cat >"$DIR/proxy.toml" <<EOF
-listen = "127.0.0.1:$PROXY_PORT"
-
-[upstream]
-canister_id = "$CANISTER"
-registry_url = "$GATEWAY/registry.json?canisterId=$CANISTER"
-root_key = "$ROOT_KEY"
-governance = "$GOV"
-client_key_file = "$DIR/proxy.key"
-quorum = $QUORUM
-allow_low_quorum = $LOW
-
-[feeds]
-prices = $(toml_list "${SYMBOLS[@]}")
-venues = $(toml_list "${SYMBOLS[@]}")
-books = $(toml_list $BOOKS)
-EOF
+echo "client  $ADDRESS  $DIR/client.key"
 
 say "start"
 for i in $(seq 1 "$NODES"); do
   start "node$i" "$DIR/node$i.log" "$BIN/oracle-node" start "$DIR/node$i/config.toml"
 done
-start proxy "$DIR/proxy.log" "$BIN/oracle-proxy" "$DIR/proxy.toml"
-
-health="http://127.0.0.1:$PROXY_PORT/health"
-for _ in $(seq 1 120); do
-  curl -sf "$health" | grep -q '"status":"ok"' && break
-  sleep 0.5
+for i in $(seq 1 "$NODES"); do
+  health="http://127.0.0.1:$((8800 + i))/v2/health"
+  for _ in $(seq 1 120); do
+    ! curl -sf "$health" >/dev/null || break
+    sleep 0.5
+  done
+  curl -sf "$health" >/dev/null || die "node$i does not serve after 60 s; see $DIR/node$i.log"
 done
-curl -sf "$health" | grep -q '"status":"ok"' || die "the proxy has no price after 60 s; see $DIR/proxy.log"
+
+# Written last and renamed, so a reader never sees half a file.
+cat >"$DIR/stack.env.new" <<EOF
+CANISTER="$CANISTER"
+GATEWAY="$GATEWAY"
+ROOT_KEY="$ROOT_KEY"
+GOVERNANCE="$GOV"
+NODES=$NODES
+CLIENT_KEY="$DIR/client.key"
+SYMBOLS="${SYMBOLS[*]}"
+EOF
+mv "$DIR/stack.env.new" "$DIR/stack.env"
 
 cat <<EOF
 
 The oracle runs on the local network:
-  proxy      ws://127.0.0.1:$PROXY_PORT/v1/ws
-  catalog    http://127.0.0.1:$PROXY_PORT/v1/catalog
-  nodes      http://127.0.0.1:$PROXY_PORT/v1/nodes
+  nodes      ws://127.0.0.1:8801/v2/ws to ws://127.0.0.1:880$NODES/v2/ws
+  client     $DIR/client.key, listed
+  stack      $DIR/stack.env
   logs       $DIR/*.log
-Stop a node to watch the quorum react: kill <pid> (node pids: ${PIDS[*]:0:$NODES}).
+For the web proxy, run scripts/dev.sh in the oracle-proxy repo.
+Stop a node to watch the quorum react: kill <pid> (node pids: ${PIDS[*]}).
 Ctrl-C stops everything.
 EOF
 

@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use oracle_transport::{BroadcastSealer, os_rng};
 use oracle_types::{FeedId, InstrumentId, Symbol};
-use oracle_wire::{Address, SignedBookUpdate, SignedUpdate, SignedVenueReport};
+use oracle_wire::{
+    Address, SignedBookUpdate, SignedFundingUpdate, SignedUpdate, SignedVenueReport,
+};
 use tokio::sync::Notify;
 
 /// A signed update, serialized and sealed once and shared by every subscriber.
@@ -140,6 +142,35 @@ impl PreparedBook {
     }
 }
 
+/// A funding update, serialized and sealed once and shared by every subscriber.
+pub struct PreparedFunding {
+    /// The perpetual.
+    pub instrument: InstrumentId,
+    sealed: Bytes,
+    signed: SignedFundingUpdate,
+}
+
+impl PreparedFunding {
+    /// Prepares a signed funding update for fanout, sealing it once.
+    #[must_use]
+    pub fn new(signed: SignedFundingUpdate, sealer: &BroadcastSealer) -> Self {
+        let update = signed.update();
+        let instrument = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        let sealed = Bytes::from(sealer.seal(&signed.encode_frame(), &mut os_rng()));
+        Self {
+            instrument,
+            sealed,
+            signed,
+        }
+    }
+
+    /// Returns the signed update.
+    #[must_use]
+    pub const fn signed(&self) -> &SignedFundingUpdate {
+        &self.signed
+    }
+}
+
 /// Which stream a frame belongs to. Prices and venue reports each have their
 /// own slot per feed, so a venue report never replaces a price.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -150,6 +181,8 @@ pub enum Channel {
     Venues,
     /// Book snapshots and deltas.
     Books,
+    /// Funding updates.
+    Funding,
 }
 
 /// A frame that waits for one subscriber.
@@ -161,6 +194,8 @@ pub enum Outgoing {
     Venues(Arc<PreparedVenues>),
     /// A book snapshot or delta.
     Book(Arc<PreparedBook>),
+    /// A funding update.
+    Funding(Arc<PreparedFunding>),
 }
 
 impl Outgoing {
@@ -171,16 +206,18 @@ impl Outgoing {
             Self::Price(update) => update.sealed(),
             Self::Venues(report) => report.sealed.clone(),
             Self::Book(update) => update.sealed.clone(),
+            Self::Funding(update) => update.sealed.clone(),
         }
     }
 
-    /// Returns the feed, or `None` for a book, which belongs to an instrument.
+    /// Returns the feed, or `None` for a book or funding, which belong to an
+    /// instrument.
     #[must_use]
     pub fn feed_id(&self) -> Option<FeedId> {
         match self {
             Self::Price(update) => Some(update.feed_id),
             Self::Venues(report) => Some(report.feed_id),
-            Self::Book(_) => None,
+            Self::Book(_) | Self::Funding(_) => None,
         }
     }
 
@@ -191,6 +228,7 @@ impl Outgoing {
             Self::Price(_) => Channel::Prices,
             Self::Venues(_) => Channel::Venues,
             Self::Book(_) => Channel::Books,
+            Self::Funding(_) => Channel::Funding,
         }
     }
 }
@@ -206,6 +244,18 @@ struct BookMailbox {
     frames: Vec<Arc<PreparedBook>>,
     /// The queue overflowed. Deltas are useless until the next snapshot.
     awaiting_snapshot: bool,
+}
+
+/// Which perpetuals' funding a subscriber wants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum FundingSelection {
+    /// No perpetual.
+    #[default]
+    None,
+    /// These perpetuals.
+    Some(HashSet<InstrumentId>),
+    /// Every perpetual: few, and each sends at most one frame a second.
+    All,
 }
 
 /// What a subscriber is listening to.
@@ -238,6 +288,10 @@ pub struct Subscriber {
     books: Mutex<HashSet<InstrumentId>>,
     pending: Mutex<HashMap<(Channel, FeedId), Outgoing>>,
     book_queue: Mutex<HashMap<InstrumentId, BookMailbox>>,
+    /// Perpetuals whose funding this subscriber wants.
+    funding: Mutex<FundingSelection>,
+    /// One slot per perpetual: each frame carries the whole state.
+    funding_pending: Mutex<HashMap<InstrumentId, Arc<PreparedFunding>>>,
     dropped: AtomicU64,
     lagged: AtomicBool,
     closed: AtomicBool,
@@ -337,6 +391,67 @@ impl Subscriber {
             .is_ok_and(|selected| selected.contains(book))
     }
 
+    /// Adds perpetuals whose funding to send.
+    pub fn add_funding(&self, instruments: impl IntoIterator<Item = InstrumentId>) {
+        if let Ok(mut selection) = self.funding.lock() {
+            if let FundingSelection::Some(set) = &mut *selection {
+                set.extend(instruments);
+            } else if *selection == FundingSelection::None {
+                *selection = FundingSelection::Some(instruments.into_iter().collect());
+            }
+        }
+    }
+
+    /// Sends the funding of every perpetual.
+    pub fn add_all_funding(&self) {
+        if let Ok(mut selection) = self.funding.lock() {
+            *selection = FundingSelection::All;
+        }
+    }
+
+    /// Stops the funding of these perpetuals, or of all with `all`.
+    pub fn remove_funding(&self, instruments: &[InstrumentId], all: bool) {
+        if let Ok(mut selection) = self.funding.lock() {
+            if all {
+                *selection = FundingSelection::None;
+            } else if let FundingSelection::Some(set) = &mut *selection {
+                for instrument in instruments {
+                    set.remove(instrument);
+                }
+            }
+        }
+        if let Ok(mut pending) = self.funding_pending.lock() {
+            pending.retain(|instrument, _| !all && !instruments.contains(instrument));
+        }
+    }
+
+    /// Returns `true` if this subscriber wants the funding of `instrument`.
+    #[must_use]
+    pub fn wants_funding(&self, instrument: &InstrumentId) -> bool {
+        self.funding
+            .lock()
+            .is_ok_and(|selection| match &*selection {
+                FundingSelection::None => false,
+                FundingSelection::Some(set) => set.contains(instrument),
+                FundingSelection::All => true,
+            })
+    }
+
+    /// Offers a funding frame, replacing any pending one for the perpetual.
+    fn offer_funding(&self, frame: &Arc<PreparedFunding>) {
+        let Ok(mut pending) = self.funding_pending.lock() else {
+            return;
+        };
+        if pending
+            .insert(frame.instrument.clone(), Arc::clone(frame))
+            .is_some()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(pending);
+        self.notify.notify_waiters();
+    }
+
     /// Queues a book frame behind the snapshot it builds on.
     fn offer_book(&self, frame: &Arc<PreparedBook>) {
         let Ok(mut queue) = self.book_queue.lock() else {
@@ -376,7 +491,7 @@ impl Subscriber {
                 .venues
                 .lock()
                 .is_ok_and(|venues| venues.contains(&feed_id)),
-            Channel::Books => false,
+            Channel::Books | Channel::Funding => false,
         }
     }
 
@@ -445,6 +560,9 @@ impl Subscriber {
                     frames.extend(mailbox.frames.drain(..).map(Outgoing::Book));
                 }
             }
+            if let Ok(mut pending) = self.funding_pending.lock() {
+                frames.extend(pending.drain().map(|(_, frame)| Outgoing::Funding(frame)));
+            }
             if !frames.is_empty() {
                 return frames;
             }
@@ -460,6 +578,8 @@ pub struct Hub {
     /// For each book, the latest snapshot and the deltas after it, for a
     /// subscriber that joins between snapshots.
     book_history: Mutex<HashMap<InstrumentId, Vec<Arc<PreparedBook>>>>,
+    /// The latest funding frame of each perpetual, for a new subscriber.
+    latest_funding: Mutex<HashMap<InstrumentId, Arc<PreparedFunding>>>,
     next_id: AtomicU64,
     max_pending: usize,
     sealer: Arc<BroadcastSealer>,
@@ -477,6 +597,7 @@ impl Hub {
             subscribers: Mutex::new(HashMap::new()),
             latest: Mutex::new(HashMap::new()),
             book_history: Mutex::new(HashMap::new()),
+            latest_funding: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             max_pending: max_pending.max(1),
             sealer,
@@ -493,6 +614,8 @@ impl Hub {
             venues: Mutex::new(HashSet::new()),
             books: Mutex::new(HashSet::new()),
             book_queue: Mutex::new(HashMap::new()),
+            funding: Mutex::new(FundingSelection::None),
+            funding_pending: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
             lagged: AtomicBool::new(false),
@@ -605,6 +728,38 @@ impl Hub {
         }
     }
 
+    /// Publishes a funding frame to every subscriber of that perpetual.
+    pub fn publish_funding(&self, signed: SignedFundingUpdate) -> Arc<PreparedFunding> {
+        let prepared = Arc::new(PreparedFunding::new(signed, &self.sealer));
+        if let Ok(mut latest) = self.latest_funding.lock() {
+            latest.insert(prepared.instrument.clone(), Arc::clone(&prepared));
+        }
+        if let Ok(subscribers) = self.subscribers.lock() {
+            for subscriber in subscribers.values() {
+                if !subscriber.is_closed() && subscriber.wants_funding(&prepared.instrument) {
+                    subscriber.offer_funding(&prepared);
+                }
+            }
+        }
+        prepared
+    }
+
+    /// Sends a new subscriber the latest funding frame of each perpetual it
+    /// now wants. Call it after [`Subscriber::add_funding`].
+    pub fn replay_funding(&self, subscriber: &Subscriber) {
+        let frames: Vec<Arc<PreparedFunding>> = match self.latest_funding.lock() {
+            Ok(latest) => latest
+                .values()
+                .filter(|frame| subscriber.wants_funding(&frame.instrument))
+                .cloned()
+                .collect(),
+            Err(_) => return,
+        };
+        for frame in &frames {
+            subscriber.offer_funding(frame);
+        }
+    }
+
     fn offer(&self, frame: &Outgoing) {
         let (channel, Some(feed_id)) = (frame.channel(), frame.feed_id()) else {
             return;
@@ -707,7 +862,7 @@ mod tests {
         assert_eq!(
             drained.first().and_then(|frame| match frame {
                 Outgoing::Price(update) => Some(update.signed().update().seq),
-                Outgoing::Venues(_) | Outgoing::Book(_) => None,
+                Outgoing::Venues(_) | Outgoing::Book(_) | Outgoing::Funding(_) => None,
             }),
             Some(100),
             "and it must be the newest"
@@ -771,6 +926,7 @@ mod tests {
                 snapshot,
                 exchange_time_ns: None,
                 local_recv_ns: 0,
+                venue_seq: None,
                 bids: vec![oracle_types::BookLevel {
                     price: 100,
                     qty: u64::from(snapshot),
@@ -785,9 +941,87 @@ mod tests {
             .iter()
             .filter_map(|frame| match frame {
                 Outgoing::Book(update) => Some(update.signed().update().seq),
-                Outgoing::Price(_) | Outgoing::Venues(_) => None,
+                Outgoing::Price(_) | Outgoing::Venues(_) | Outgoing::Funding(_) => None,
             })
             .collect()
+    }
+
+    fn funding(symbol: &str, seq: u64) -> SignedFundingUpdate {
+        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        signer
+            .sign_funding_update(&oracle_types::FundingUpdate {
+                venue: oracle_types::Venue::Bybit,
+                market: oracle_types::MarketKind::LinearPerp,
+                symbol: symbol.to_owned(),
+                publish_time_ns: seq,
+                seq,
+                basis: oracle_types::FundingBasis::Interval,
+                rate: 100_000_000,
+                predicted_rate: None,
+                interval_ns: None,
+                next_funding_time_ns: None,
+                settled: None,
+                open_interest: None,
+                exchange_time_ns: None,
+                local_recv_ns: seq,
+            })
+            .expect("signs")
+    }
+
+    fn funding_seqs(frames: &[Outgoing]) -> Vec<(String, u64)> {
+        let mut seqs: Vec<(String, u64)> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Outgoing::Funding(update) => {
+                    let update = update.signed().update();
+                    Some((update.symbol.clone(), update.seq))
+                }
+                _ => None,
+            })
+            .collect();
+        seqs.sort();
+        seqs
+    }
+
+    #[tokio::test]
+    async fn funding_conflates_per_perpetual_and_a_joiner_gets_the_latest() {
+        let hub = hub(64);
+        let btc = || {
+            InstrumentId::new(
+                oracle_types::Venue::Bybit,
+                oracle_types::MarketKind::LinearPerp,
+                "BTCUSDT",
+            )
+        };
+        hub.publish_funding(funding("BTCUSDT", 1));
+        hub.publish_funding(funding("ETHUSDT", 1));
+
+        let one = hub.subscribe(oracle_wire::Address::from_bytes([0xC1; 20]));
+        one.add_funding([btc()]);
+        hub.replay_funding(&one);
+        assert_eq!(
+            funding_seqs(&one.drain().await),
+            vec![("BTCUSDT".to_owned(), 1)]
+        );
+
+        let all = hub.subscribe(oracle_wire::Address::from_bytes([0xC2; 20]));
+        all.add_all_funding();
+        hub.replay_funding(&all);
+        for seq in 2..=4 {
+            hub.publish_funding(funding("BTCUSDT", seq));
+        }
+        assert_eq!(
+            funding_seqs(&one.drain().await),
+            vec![("BTCUSDT".to_owned(), 4)]
+        );
+        assert_eq!(
+            funding_seqs(&all.drain().await),
+            vec![("BTCUSDT".to_owned(), 4), ("ETHUSDT".to_owned(), 1)]
+        );
+
+        all.remove_funding(&[], true);
+        hub.publish_funding(funding("ETHUSDT", 2));
+        assert!(!all.wants_funding(&btc()));
     }
 
     #[tokio::test]

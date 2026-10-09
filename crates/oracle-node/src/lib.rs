@@ -18,6 +18,7 @@
 pub mod adapters;
 pub mod books;
 pub mod config;
+pub mod funding;
 pub mod init;
 pub mod keyfile;
 pub mod logging;

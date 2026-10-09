@@ -151,3 +151,30 @@ async fn each_node_reports_its_frames_and_its_distance_from_the_median() {
         "past max_age every update is stale"
     );
 }
+
+#[tokio::test]
+async fn a_funding_feed_is_live_between_its_heartbeats() {
+    const FUNDING: &str = "CRYPTO.BTC/USD.FUNDING_8H";
+    let nodes = fleet();
+    let [first, ..] = nodes.as_slice() else {
+        panic!("three nodes")
+    };
+    let mut client = client(&nodes, &closed_endpoint().await);
+    client.subscribe(&[FUNDING]).await.expect("subscribes");
+
+    // Nine seconds old: between two heartbeats of a slow feed.
+    let now = now_unix_nanos();
+    let symbol: Symbol = FUNDING.parse().expect("valid");
+    let mut update = update_at(now - 9 * NANOS_PER_SEC, 1);
+    update.feed_id = feed_id(&symbol);
+    client
+        .ingest(&first.sign(&update), now)
+        .expect("a slow feed takes it");
+
+    let report = client.nodes(now);
+    let feed = of(&report, first.signing_address())
+        .feeds
+        .first()
+        .expect("the funding feed");
+    assert_eq!(feed.state, Some(NodeFeedState::Live));
+}

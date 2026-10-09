@@ -78,6 +78,7 @@ fn quote_book(venue: Venue, bid: Fixed, ask: Fixed, recv_ns: u64) -> Observation
         local_recv_ns: recv_ns,
         seq: None,
         book: None,
+        funding: None,
     }
 }
 

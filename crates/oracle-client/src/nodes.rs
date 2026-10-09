@@ -74,6 +74,8 @@ pub struct NodeFrames {
     pub venue_reports: u64,
     /// Book frames accepted.
     pub book_updates: u64,
+    /// Funding frames accepted.
+    pub funding_updates: u64,
     /// Frames refused as replays.
     pub replayed: u64,
     /// Frames refused as stale or future-dated.

@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oracle_types::{
-    BookLevel, BookUpdate, FeedId, Flags, MarketKind, NANOS_PER_SEC, PriceUpdate, SourceStatus,
-    Venue, VenueEntry, VenueReport, VenueSet,
+    BookLevel, BookUpdate, FeedId, Flags, FundingBasis, FundingUpdate, MarketKind, NANOS_PER_SEC,
+    PriceUpdate, SourceStatus, Venue, VenueEntry, VenueReport, VenueSet,
 };
 use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, VerifiedRegistry};
 
@@ -119,6 +119,19 @@ impl TestNode {
     pub fn sign_book(&self, update: &BookUpdate) -> Vec<u8> {
         self.signing
             .sign_book_update(update)
+            .expect("an encodable update")
+            .encode_frame()
+    }
+
+    /// Signs a funding update with the current key and returns the wire frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the update cannot be encoded.
+    #[must_use]
+    pub fn sign_funding(&self, update: &FundingUpdate) -> Vec<u8> {
+        self.signing
+            .sign_funding_update(update)
             .expect("an encodable update")
             .encode_frame()
     }
@@ -253,6 +266,7 @@ pub fn venues_at(publish_time_ns: u64, seq: u64) -> VenueReport {
         entries: vec![VenueEntry {
             venue: Venue::Binance,
             market: MarketKind::Spot,
+            symbol: "BTCUSDT".to_owned(),
             status: SourceStatus::Used,
             weight_bps: 10_000,
             bid: Some(6_399_990_000_000),
@@ -270,6 +284,27 @@ pub fn venues_at(publish_time_ns: u64, seq: u64) -> VenueReport {
     }
 }
 
+/// A funding update for Bybit's `BTCUSDT` perpetual at `publish_time_ns`.
+#[must_use]
+pub fn funding_at(publish_time_ns: u64, seq: u64, rate: i64) -> FundingUpdate {
+    FundingUpdate {
+        venue: Venue::Bybit,
+        market: MarketKind::LinearPerp,
+        symbol: "BTCUSDT".to_owned(),
+        publish_time_ns,
+        seq,
+        basis: FundingBasis::Interval,
+        rate,
+        predicted_rate: None,
+        interval_ns: Some(8 * 3_600 * NANOS_PER_SEC),
+        next_funding_time_ns: None,
+        settled: None,
+        open_interest: None,
+        exchange_time_ns: None,
+        local_recv_ns: publish_time_ns.saturating_sub(1_000_000),
+    }
+}
+
 /// Builds a Binance `BTCUSDT` book frame with one level on each side.
 #[must_use]
 pub fn book_at(publish_time_ns: u64, seq: u64, snapshot: bool, bid_qty: u64) -> BookUpdate {
@@ -282,6 +317,7 @@ pub fn book_at(publish_time_ns: u64, seq: u64, snapshot: bool, bid_qty: u64) -> 
         snapshot,
         exchange_time_ns: None,
         local_recv_ns: publish_time_ns.saturating_sub(1_000_000),
+        venue_seq: Some(seq),
         bids: vec![BookLevel {
             price: 6_399_990_000_000,
             qty: bid_qty,

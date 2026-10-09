@@ -80,6 +80,7 @@ pub mod mainnet;
 pub mod nodes;
 pub mod quorum;
 pub mod source;
+pub mod tap;
 pub mod testing;
 pub mod verify;
 
@@ -94,6 +95,8 @@ pub use source::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, IC_MAINNET_ROOT_KEY,
     RegistrySource,
 };
+pub use tap::{FrameKind, TappedFrame, Verdict};
 pub use verify::{
-    Accepted, AcceptedBook, AcceptedVenues, RejectReason, Verifier, VerifyConfig, verify_historical,
+    Accepted, AcceptedBook, AcceptedFunding, AcceptedVenues, RejectReason, Verifier, VerifyConfig,
+    verify_historical,
 };

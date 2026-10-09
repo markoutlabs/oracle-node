@@ -273,6 +273,7 @@ async fn a_book_subscriber_gets_the_last_snapshot_at_once() {
         snapshot: true,
         exchange_time_ns: None,
         local_recv_ns: 0,
+        venue_seq: None,
         bids: vec![BookLevel {
             price: 6_400_000_000_000,
             qty: 100_000_000,

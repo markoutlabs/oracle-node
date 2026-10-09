@@ -1,10 +1,10 @@
 #!/bin/sh
-# Installs oracle-node or oracle-proxy from a GitHub release, after it checks the
-# binary against the release's SHA256SUMS.
+# Installs oracle-node from a GitHub release, after it checks the binary against
+# the release's SHA256SUMS. The web proxy has its own repo and installer:
+# https://github.com/pxr64/oracle-proxy
 #
 #   curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh
-#   curl -fsSL …/install.sh | sh -s -- proxy
-#   curl -fsSL …/install.sh | sh -s -- node --version v0.1.0 --to "$HOME/bin"
+#   curl -fsSL …/install.sh | sh -s -- --version v0.1.0 --to "$HOME/bin"
 #
 # Environment: ORACLE_VERSION, ORACLE_INSTALL_DIR and ORACLE_REPO set the same
 # things as --version, --to and the source repository.
@@ -23,10 +23,9 @@ fail() {
 }
 
 usage() {
-  say "usage: install.sh [node|proxy] [--version <tag>] [--to <dir>]"
+  say "usage: install.sh [node] [--version <tag>] [--to <dir>]"
   say ""
-  say "  node      install oracle-node (the default)"
-  say "  proxy     install oracle-proxy"
+  say "  node      install oracle-node (the default, and the only component)"
   say "  --version a release tag such as v0.1.0 (default: the latest release)"
   say "  --to      the directory for the binary (default: /usr/local/bin, or"
   say "            ~/.local/bin without root or sudo)"
@@ -90,10 +89,10 @@ choose_dir() {
 }
 
 main() {
-  component=node
   while [ $# -gt 0 ]; do
     case "$1" in
-      node | proxy) component="$1" ;;
+      node) ;;
+      proxy) fail "oracle-proxy has its own installer: https://github.com/pxr64/oracle-proxy" ;;
       --version)
         [ $# -ge 2 ] || fail "--version needs a tag"
         VERSION="$2"
@@ -115,7 +114,7 @@ main() {
     esac
     shift
   done
-  bin="oracle-$component"
+  bin=oracle-node
 
   check_platform
   choose_dir
@@ -151,12 +150,7 @@ main() {
   esac
 
   say ""
-  if [ "$component" = node ]; then
-    say "Next: run 'oracle-node init' to create the node key and its config."
-  else
-    say "Next: write a config from the example, then run 'oracle-proxy proxy.toml'."
-    say "  https://github.com/$REPO/blob/main/proxy/proxy.toml"
-  fi
+  say "Next: run 'oracle-node init' to create the node key and its config."
 }
 
 # Everything runs from here, so a download cut short runs nothing.

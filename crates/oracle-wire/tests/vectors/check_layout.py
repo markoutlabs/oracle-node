@@ -2,7 +2,7 @@
 """Checks golden.json with a second implementation of the wire format.
 
 Every payload is built again from its JSON fields with `struct`, from the
-tables in SPEC §3.3, §3.3.1 and §3.3.2, and hashed with foundry's `cast keccak`.
+tables in SPEC §3.3, §3.3.1, §3.3.2 and §3.3.3, and hashed with foundry's `cast keccak`.
 Nothing here shares code with the Rust encoder.
 
     python3 check_layout.py golden.json
@@ -16,7 +16,9 @@ import sys
 VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit"]
 MARKETS = ["spot", "linear_perp", "inverse_perp"]
 STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted"]
-FRAME_TYPES = {"price": 1, "venues": 2, "book": 3}
+FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4}
+BASES = ["interval", "eight_hours"]
+UNITS = ["base", "contracts", "quote"]
 
 
 def keccak(data: bytes) -> bytes:
@@ -65,7 +67,7 @@ SLOTS = [
 
 
 def venue_report(r: dict) -> bytes:
-    """SPEC §3.3.1: 55 + 95 × n bytes."""
+    """SPEC §3.3.1: 55 bytes, then 96 + L bytes for each entry."""
     out = struct.pack(
         ">BB32sQQiB",
         1,
@@ -78,14 +80,12 @@ def venue_report(r: dict) -> bytes:
     )
     for e in r["entries"]:
         present = sum(1 << i for i, (name, _) in enumerate(SLOTS) if e[name] is not None)
+        symbol = e["symbol"].encode("ascii")
         out += struct.pack(
-            ">BBBHH",
-            VENUES.index(e["venue"]),
-            MARKETS.index(e["market"]),
-            STATUSES.index(e["status"]),
-            present,
-            e["weight_bps"],
+            ">BBB", VENUES.index(e["venue"]), MARKETS.index(e["market"]), len(symbol)
         )
+        out += symbol
+        out += struct.pack(">BHH", STATUSES.index(e["status"]), present, e["weight_bps"])
         for name, kind in SLOTS:
             out += struct.pack(">" + kind, int(e[name]) if e[name] is not None else 0)
         out += struct.pack(">Q", int(e["local_recv_ns"]))
@@ -99,20 +99,64 @@ def book_update(u: dict) -> bytes:
         ">BBBBB", 1, 4, VENUES.index(u["venue"]), MARKETS.index(u["market"]), len(symbol)
     )
     out += symbol
+    flags = (1 if u["snapshot"] else 0) | (2 if u["venue_seq"] is not None else 0)
     out += struct.pack(
-        ">QQBiiQQBB",
+        ">QQBiiQQQBB",
         int(u["publish_time_ns"]),
         int(u["seq"]),
-        1 if u["snapshot"] else 0,
+        flags,
         -8,
         -8,
         int(u["exchange_time_ns"] or 0),
         int(u["local_recv_ns"]),
+        int(u["venue_seq"] or 0),
         len(u["bids"]),
         len(u["asks"]),
     )
     for level in u["bids"] + u["asks"]:
         out += struct.pack(">qQ", int(level["price"]), int(level["qty"]))
+    return out
+
+
+def funding_update(u: dict) -> bytes:
+    """SPEC §3.3.3."""
+    symbol = u["symbol"].encode("ascii")
+    out = struct.pack(
+        ">BBBBB", 1, 5, VENUES.index(u["venue"]), MARKETS.index(u["market"]), len(symbol)
+    )
+    out += symbol
+    settled = u["settled"] or {"rate": 0, "time_ns": 0}
+    oi = u["open_interest"]
+    flags = 0
+    for bit, present in enumerate(
+        [
+            u["predicted_rate"] is not None,
+            u["interval_ns"] is not None,
+            u["next_funding_time_ns"] is not None,
+            u["settled"] is not None,
+            oi is not None,
+        ]
+    ):
+        flags |= int(present) << bit
+    out += struct.pack(
+        ">QQBBBiiqqQQqQQQQ",
+        int(u["publish_time_ns"]),
+        int(u["seq"]),
+        flags,
+        BASES.index(u["basis"]),
+        UNITS.index(oi["unit"]) if oi else 0,
+        -12,
+        -8,
+        int(u["rate"]),
+        int(u["predicted_rate"] or 0),
+        int(u["interval_ns"] or 0),
+        int(u["next_funding_time_ns"] or 0),
+        int(settled["rate"]),
+        int(settled["time_ns"]),
+        int(oi["amount"]) if oi else 0,
+        int(u["exchange_time_ns"] or 0),
+        int(u["local_recv_ns"]),
+    )
     return out
 
 
@@ -149,6 +193,9 @@ def main() -> int:
         count += 1
     for vector in golden["book_updates"]:
         errors += check("book", vector, book_update(vector["update"]), separator)
+        count += 1
+    for vector in golden["funding_updates"]:
+        errors += check("funding", vector, funding_update(vector["update"]), separator)
         count += 1
     for error in errors:
         print(error)

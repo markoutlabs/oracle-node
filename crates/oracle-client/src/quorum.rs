@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oracle_agg::stats;
-use oracle_types::{FeedId, Fixed, PriceUpdate, Symbol};
+use oracle_types::{FeedId, FeedKind, Fixed, PriceUpdate, Symbol};
 use oracle_wire::Address;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,10 @@ pub struct QuorumConfig {
     /// after its last update was accepted. Without this the quorum would be met
     /// by nodes that stopped talking minutes ago.
     pub max_age: Duration,
+
+    /// The same limit for a slow feed (funding, open interest), which nodes
+    /// publish on a 10 s heartbeat.
+    pub slow_max_age: Duration,
 }
 
 impl Default for QuorumConfig {
@@ -50,6 +54,19 @@ impl Default for QuorumConfig {
             quorum: 3,
             max_divergence_bps: Fixed::from_raw(50 * 1_000_000_000_000),
             max_age: Duration::from_secs(2),
+            slow_max_age: crate::verify::SLOW_MAX_AGE,
+        }
+    }
+}
+
+impl QuorumConfig {
+    /// Returns the staleness limit for a feed of this kind.
+    #[must_use]
+    pub const fn max_age_for(&self, kind: FeedKind) -> Duration {
+        if kind.is_slow() {
+            self.slow_max_age
+        } else {
+            self.max_age
         }
     }
 }
@@ -123,19 +140,20 @@ pub enum NodeFeedState {
     Degraded,
     /// The node reports the feed halted. It does not count.
     Halted,
-    /// Older than `max_age`. It does not count.
+    /// Older than the feed's staleness limit. It does not count.
     Stale,
 }
 
 impl NodeFeedState {
-    /// Classifies one node's latest update.
+    /// Classifies one node's latest update against the feed's staleness limit,
+    /// [`QuorumConfig::max_age_for`].
     #[must_use]
-    pub fn of(update: &PriceUpdate, config: &QuorumConfig, now_ns: u64) -> Self {
+    pub fn of(update: &PriceUpdate, max_age: Duration, now_ns: u64) -> Self {
         if update.flags.is_halted() {
             return Self::Halted;
         }
         // A node that stopped talking must stop counting toward the quorum.
-        let max_age = u64::try_from(config.max_age.as_nanos()).unwrap_or(u64::MAX);
+        let max_age = u64::try_from(max_age.as_nanos()).unwrap_or(u64::MAX);
         if now_ns.saturating_sub(update.publish_time_ns) > max_age {
             return Self::Stale;
         }
@@ -201,17 +219,32 @@ impl Resolved {
 #[derive(Clone, Debug, Default)]
 pub struct FeedView {
     feed_id: FeedId,
+    kind: FeedKind,
     per_node: HashMap<Address, PriceUpdate>,
 }
 
 impl FeedView {
-    /// Builds an empty view.
+    /// Builds an empty view of a price feed.
     #[must_use]
     pub fn new(feed_id: FeedId) -> Self {
+        Self::with_kind(feed_id, FeedKind::Price)
+    }
+
+    /// Builds an empty view of a feed of this kind. A slow kind gets the slow
+    /// staleness limit.
+    #[must_use]
+    pub fn with_kind(feed_id: FeedId, kind: FeedKind) -> Self {
         Self {
             feed_id,
+            kind,
             per_node: HashMap::new(),
         }
+    }
+
+    /// Returns the feed's kind.
+    #[must_use]
+    pub const fn kind(&self) -> FeedKind {
+        self.kind
     }
 
     /// Records a node's latest update, keeping the newer of the two.
@@ -265,10 +298,11 @@ impl FeedView {
     pub fn resolve(&self, config: &QuorumConfig, now_ns: u64) -> Resolved {
         let mut concerns = Vec::new();
         let mut halted_nodes = 0;
+        let max_age = config.max_age_for(self.kind);
 
         let mut live: Vec<&PriceUpdate> = Vec::with_capacity(self.per_node.len());
         for update in self.per_node.values() {
-            match NodeFeedState::of(update, config, now_ns) {
+            match NodeFeedState::of(update, max_age, now_ns) {
                 NodeFeedState::Halted => halted_nodes += 1,
                 NodeFeedState::Stale => {}
                 NodeFeedState::Live | NodeFeedState::Degraded => live.push(update),
@@ -374,6 +408,26 @@ mod tests {
             num_sources: 5,
             sources: Venue::ALL.into_iter().collect::<VenueSet>(),
         }
+    }
+
+    #[test]
+    fn a_slow_feed_stays_live_between_its_heartbeats() {
+        let config = QuorumConfig {
+            quorum: 1,
+            ..QuorumConfig::default()
+        };
+        let next_heartbeat = NOW + 9 * NANOS_PER_SEC;
+        let mut price = FeedView::new(FeedId::from_bytes([7; 32]));
+        price.record(node(1), update("64000", "0.5", 1, Flags::NONE));
+        assert_eq!(price.resolve(&config, next_heartbeat).nodes, 0);
+
+        let mut funding = FeedView::with_kind(FeedId::from_bytes([7; 32]), FeedKind::Funding8h);
+        funding.record(node(1), update("0.0001", "0.00001", 1, Flags::NONE));
+        let resolved = funding.resolve(&config, next_heartbeat);
+        assert_eq!(resolved.nodes, 1);
+        assert_eq!(resolved.status, Status::Ok);
+        let after_two_lost = funding.resolve(&config, NOW + 26 * NANOS_PER_SEC);
+        assert_eq!(after_two_lost.status, Status::Halted);
     }
 
     #[test]

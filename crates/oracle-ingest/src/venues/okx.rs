@@ -7,16 +7,17 @@
 //! - Subscription arguments are objects, and the count per request is capped, so
 //!   large catalogues need several frames.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{Fixed, ObsKind, Observation};
+use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation};
 use serde::Deserialize;
 
 use crate::book::{Books, LocalBook, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal;
+use super::{decimal, integer};
 
 /// The public endpoint.
 pub const URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
@@ -146,14 +147,68 @@ struct MarkPrice<'a> {
     ts: Option<&'a str>,
 }
 
+/// Times are milliseconds as strings, and an absent value is an empty string.
 #[derive(Deserialize)]
 struct FundingRate<'a> {
     #[serde(rename = "instId", borrow)]
     inst_id: &'a str,
     #[serde(rename = "fundingRate", borrow)]
     funding_rate: &'a str,
+    /// When the current rate is paid: the next settlement.
+    #[serde(rename = "fundingTime", borrow, default)]
+    funding_time: Option<&'a str>,
+    /// The settlement after it. The two give the interval.
+    #[serde(rename = "nextFundingTime", borrow, default)]
+    next_funding_time: Option<&'a str>,
+    #[serde(rename = "nextFundingRate", borrow, default)]
+    next_funding_rate: Option<&'a str>,
+    /// The rate settled at `prevFundingTime`, final once `settState` is `settled`.
+    #[serde(rename = "settFundingRate", borrow, default)]
+    settled_rate: Option<&'a str>,
+    #[serde(rename = "settState", borrow, default)]
+    settled_state: Option<&'a str>,
+    #[serde(rename = "prevFundingTime", borrow, default)]
+    previous_funding_time: Option<&'a str>,
     #[serde(rename = "ts", borrow, default)]
     ts: Option<&'a str>,
+}
+
+/// The funding fields of one `funding-rate` entry.
+fn funding_info(funding: &FundingRate<'_>) -> Result<FundingInfo, DecodeError> {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.filter(|text| !text.is_empty())
+    }
+    let millis = |field, value: Option<&str>| {
+        present(value)
+            .map(|ms| integer(field, ms))
+            .transpose()
+            .map(|ms| ms.filter(|ms| *ms > 0).map(millis_to_nanos))
+    };
+    let next = millis("fundingTime", funding.funding_time)?;
+    let after = millis("nextFundingTime", funding.next_funding_time)?;
+    let settled_time = millis("prevFundingTime", funding.previous_funding_time)?;
+    let settled = match (
+        funding.settled_state,
+        present(funding.settled_rate),
+        settled_time,
+    ) {
+        (Some("settled"), Some(rate), Some(time)) => {
+            Some((decimal("settFundingRate", rate)?, time))
+        }
+        _ => None,
+    };
+    Ok(FundingInfo {
+        predicted: present(funding.next_funding_rate)
+            .map(|rate| decimal("nextFundingRate", rate))
+            .transpose()?,
+        interval_ns: next
+            .zip(after)
+            .and_then(|(next, after)| after.checked_sub(next))
+            .filter(|interval| *interval > 0),
+        next_funding_time_ns: next,
+        settled,
+        ..FundingInfo::new(FundingBasis::Interval)
+    })
 }
 
 /// A size in base units: contracts times the contract size on a swap, as sent
@@ -340,6 +395,7 @@ fn decode_bbo(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: None,
         });
         emitted = true;
     }
@@ -376,6 +432,7 @@ fn decode_trades(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: None,
         });
         emitted = true;
     }
@@ -412,6 +469,7 @@ fn decode_mark_price(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: None,
         });
         emitted = true;
     }
@@ -435,6 +493,7 @@ fn decode_funding(
         let Some(entry) = map.lookup(funding.inst_id) else {
             continue;
         };
+        let info = funding_info(&funding)?;
         out.push(Observation {
             instrument: entry.instrument.clone(),
             kind: ObsKind::Funding,
@@ -448,6 +507,7 @@ fn decode_funding(
             local_recv_ns,
             seq: None,
             book: None,
+            funding: Some(Arc::new(info)),
         });
         emitted = true;
     }

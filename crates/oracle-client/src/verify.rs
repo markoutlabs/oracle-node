@@ -17,10 +17,13 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use oracle_types::{BookUpdate, FeedId, InstrumentId, NANOS_PER_SEC, PriceUpdate, VenueReport};
+use oracle_types::{
+    BookUpdate, FUNDING_HEARTBEAT, FeedId, FundingUpdate, InstrumentId, NANOS_PER_SEC, PriceUpdate,
+    SLOW_HEARTBEAT, VenueReport,
+};
 use oracle_wire::{
-    Address, NodeListing, UnverifiedBookFrame, UnverifiedFrame, UnverifiedVenueFrame,
-    VerifiedRegistry, VerifyError,
+    Address, NodeListing, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
+    UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
 };
 
 /// Freshness policy.
@@ -32,6 +35,10 @@ pub struct VerifyConfig {
     /// and rebroadcasts an old, perfectly-signed one. There is no cryptographic
     /// substitute.
     pub max_age: Duration,
+
+    /// The same limit for a slow feed (funding, open interest), which nodes
+    /// publish on a 10 s heartbeat. See [`Verifier::mark_slow`].
+    pub slow_max_age: Duration,
 
     /// Tolerance for a node's clock running ahead of ours.
     ///
@@ -45,10 +52,20 @@ impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
             max_age: Duration::from_secs(2),
+            slow_max_age: SLOW_MAX_AGE,
             max_skew: Duration::from_millis(500),
         }
     }
 }
+
+/// Two slow heartbeats and a margin, so one lost heartbeat does not make a slow
+/// feed stale.
+pub(crate) const SLOW_MAX_AGE: Duration = Duration::from_secs(25);
+const _: () = assert!(SLOW_MAX_AGE.as_secs() > 2 * SLOW_HEARTBEAT.as_secs());
+
+/// How old a funding frame may be. A new subscriber gets the node's latest
+/// frame, which can be a whole heartbeat old.
+pub(crate) const FUNDING_MAX_AGE: Duration = FUNDING_HEARTBEAT.saturating_mul(2);
 
 /// Why an update was refused.
 ///
@@ -130,6 +147,17 @@ pub struct AcceptedBook {
     pub node_index: usize,
 }
 
+/// A funding update that passed every check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedFunding {
+    /// The update.
+    pub update: FundingUpdate,
+    /// The node that signed it.
+    pub signer: Address,
+    /// That node's index in the registry it was verified against.
+    pub node_index: usize,
+}
+
 /// A venue report that passed every check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedVenues {
@@ -172,10 +200,13 @@ pub struct Verifier {
     /// Venue reports count their own sequence, apart from prices.
     venue_high_water: HashMap<(Address, FeedId), u64>,
     book_high_water: HashMap<(Address, InstrumentId), u64>,
+    funding_high_water: HashMap<(Address, InstrumentId), u64>,
     /// Addresses that a registry this verifier once trusted listed, and the
     /// current one does not. Reported as [`RejectReason::RetiredKey`] rather than
     /// unknown, so the client does not go looking for a registry it already has.
     retired: HashSet<Address>,
+    /// Feeds held to `slow_max_age`. A feed id does not show its kind.
+    slow: HashSet<FeedId>,
 }
 
 impl Verifier {
@@ -188,7 +219,23 @@ impl Verifier {
             high_water: HashMap::new(),
             venue_high_water: HashMap::new(),
             book_high_water: HashMap::new(),
+            funding_high_water: HashMap::new(),
             retired: HashSet::new(),
+            slow: HashSet::new(),
+        }
+    }
+
+    /// Holds this feed's prices and venue reports to `slow_max_age`. The client
+    /// calls it for each funding or open interest feed that it subscribes to.
+    pub fn mark_slow(&mut self, feed_id: FeedId) {
+        self.slow.insert(feed_id);
+    }
+
+    fn max_age(&self, feed_id: FeedId) -> Duration {
+        if self.slow.contains(&feed_id) {
+            self.config.slow_max_age
+        } else {
+            self.config.max_age
         }
     }
 
@@ -213,6 +260,8 @@ impl Verifier {
         self.venue_high_water
             .retain(|(node, _), _| still_listed.contains(node));
         self.book_high_water
+            .retain(|(node, _), _| still_listed.contains(node));
+        self.funding_high_water
             .retain(|(node, _), _| still_listed.contains(node));
         self.registry = registry;
     }
@@ -248,7 +297,12 @@ impl Verifier {
         }
         // Clock checks before the sequence update, so a rejected frame cannot
         // advance the high-water mark and lock out the legitimate one behind it.
-        self.check_clock(signer, update.publish_time_ns, now_ns)?;
+        self.check_clock(
+            signer,
+            update.publish_time_ns,
+            now_ns,
+            self.max_age(update.feed_id),
+        )?;
         advance(
             &mut self.high_water,
             (signer, update.feed_id),
@@ -285,7 +339,12 @@ impl Verifier {
         if !report.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-        self.check_clock(signer, report.publish_time_ns, now_ns)?;
+        self.check_clock(
+            signer,
+            report.publish_time_ns,
+            now_ns,
+            self.max_age(report.feed_id),
+        )?;
         advance(
             &mut self.venue_high_water,
             (signer, report.feed_id),
@@ -320,7 +379,7 @@ impl Verifier {
         if !update.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-        self.check_clock(signer, update.publish_time_ns, now_ns)?;
+        self.check_clock(signer, update.publish_time_ns, now_ns, self.config.max_age)?;
         let book = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
         let key = (signer, book);
         if let Some(last_seq) = self.book_high_water.get(&key).copied()
@@ -340,11 +399,56 @@ impl Verifier {
         })
     }
 
+    /// Verifies one funding frame, with the same checks as a book frame. The
+    /// age limit is two funding heartbeats.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_funding(
+        &mut self,
+        frame: &[u8],
+        now_ns: u64,
+    ) -> Result<AcceptedFunding, RejectReason> {
+        let parsed = UnverifiedFundingFrame::parse(frame).map_err(VerifyError::from)?;
+        let verified = match parsed.verify(&self.registry) {
+            Ok(verified) => verified,
+            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
+                return Err(RejectReason::RetiredKey { signer });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let (signer, node_index) = (verified.signer(), verified.node_index());
+        let update = verified.into_update();
+        if !update.timestamps_coherent() {
+            return Err(RejectReason::IncoherentTimestamps { signer });
+        }
+        self.check_clock(signer, update.publish_time_ns, now_ns, FUNDING_MAX_AGE)?;
+        let perpetual = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        let key = (signer, perpetual);
+        if let Some(last_seq) = self.funding_high_water.get(&key).copied()
+            && update.seq <= last_seq
+        {
+            return Err(RejectReason::Replayed {
+                signer,
+                seq: update.seq,
+                last_seq,
+            });
+        }
+        self.funding_high_water.insert(key, update.seq);
+        Ok(AcceptedFunding {
+            update,
+            signer,
+            node_index,
+        })
+    }
+
     fn check_clock(
         &self,
         signer: Address,
         publish_time_ns: u64,
         now_ns: u64,
+        max_age: Duration,
     ) -> Result<(), RejectReason> {
         if publish_time_ns > now_ns {
             let skew = publish_time_ns - now_ns;
@@ -358,7 +462,7 @@ impl Verifier {
             }
         } else {
             let age = now_ns - publish_time_ns;
-            let limit = nanos(self.config.max_age);
+            let limit = nanos(max_age);
             if age > limit {
                 return Err(RejectReason::TooOld {
                     signer,
@@ -458,6 +562,30 @@ mod tests {
         let accepted = verifier.accept(&frame, NOW).expect("accepted");
         assert_eq!(accepted.signer, node.signing_address());
         assert_eq!(accepted.update.seq, 1);
+    }
+
+    #[test]
+    fn a_slow_feed_is_held_to_its_own_limit() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let between_heartbeats = update_at(NOW - 9 * NANOS_PER_SEC, 1);
+        let frame = node.sign(&between_heartbeats);
+        assert!(
+            matches!(
+                verifier.accept(&frame, NOW),
+                Err(RejectReason::TooOld { .. })
+            ),
+            "a price feed allows 2 s"
+        );
+        verifier.mark_slow(between_heartbeats.feed_id);
+        verifier
+            .accept(&frame, NOW)
+            .expect("a slow feed allows 25 s");
+        let too_old = node.sign(&update_at(NOW - 30 * NANOS_PER_SEC, 2));
+        assert!(matches!(
+            verifier.accept(&too_old, NOW),
+            Err(RejectReason::TooOld { .. })
+        ));
     }
 
     #[test]

@@ -19,7 +19,7 @@ WASM := target/wasm32-unknown-unknown/release/oracle_registry_canister.wasm
 DID := crates/oracle-registry-canister/oracle-registry-canister.did
 RELEASE_DIR := target/release-artifacts
 
-.PHONY: help build canister extract_did bake_candid_metadata node proxy test lint e2e latency smoke \
+.PHONY: help build canister extract_did bake_candid_metadata node test lint e2e latency smoke \
 	release publish network network-stop deploy governance check-identity
 
 help: ## List the targets
@@ -38,9 +38,6 @@ extract_did: ## Regenerate the .did from the built wasm
 # Public, so tools such as `icp canister call` read the interface from the canister.
 bake_candid_metadata: ## Embed the .did in the wasm as candid:service
 	ic-wasm $(WASM) -o $(WASM) metadata candid:service -f $(DID) -v public --keep-name-section
-
-proxy: ## The oracle-proxy binary for this machine
-	cargo build --release --locked -p oracle-proxy
 
 node: ## The oracle-node binary for this machine
 	cargo build --release --locked -p oracle-node --bin oracle-node
@@ -62,7 +59,7 @@ latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SEC
 smoke: ## The icp-cli path on a local network: deploy, and the calls init and rotate print
 	scripts/smoke.sh
 
-release: ## Reproducible wasm and Linux node and proxy binaries (amd64, arm64), with SHA256SUMS
+release: ## Reproducible wasm and Linux node binaries (amd64, arm64), with SHA256SUMS
 	release/build.sh
 
 publish: ## Upload the release artifacts and release/install.sh as GitHub release v<version>

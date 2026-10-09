@@ -113,7 +113,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     let seq_floor = wall_clock_unix_nanos() / 1_000_000;
     let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?.with_sequence_floor(seq_floor);
     let pipeline =
-        Pipeline::new(aggregator, Arc::clone(&signer)).with_book_sequence_floor(seq_floor);
+        Pipeline::new(aggregator, Arc::clone(&signer)).with_stream_sequence_floor(seq_floor);
 
     // Freshness limits catch a withheld canister update. An operator's own file
     // cannot be withheld, and is never refreshed, so it is exempt.
@@ -357,7 +357,8 @@ impl PipelineTask {
         }
     }
 
-    /// Venue reports and book frames go out after each evaluation.
+    /// Venue reports, book frames and funding frames go out after each
+    /// evaluation.
     fn publish_venues(&mut self, now_ns: u64) {
         let hub = Arc::clone(self.state.hub());
         let (reports, errors) = self
@@ -377,6 +378,13 @@ impl PipelineTask {
         }
         for update in books {
             let _ = self.state.publish_book(update);
+        }
+        let (funding, errors) = self.pipeline.funding_updates(now_ns);
+        for error in errors {
+            warn!(%error, "funding update could not be encoded");
+        }
+        for update in funding {
+            let _ = self.state.publish_funding(update);
         }
     }
 

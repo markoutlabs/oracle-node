@@ -1,7 +1,7 @@
 //! The venue report payload and its frame.
 //!
 //! ```text
-//! payload, 55 + 95 × n bytes:
+//! payload, 55 bytes, then n entries of 96 + L bytes:
 //! [0]       u8       version = 1
 //! [1]       u8       kind = 0x03
 //! [2..34]   [u8;32]  feed id
@@ -9,15 +9,17 @@
 //! [42..50]  u64      seq
 //! [50..54]  i32      price exponent
 //! [54]      u8       n, at most 32
-//! then n entries of 95 bytes:
-//! [0]       u8       venue
-//! [1]       u8       market
-//! [2]       u8       status
-//! [3..5]    u16      fields present, bit i for slot i
-//! [5..7]    u16      weight, basis points
-//! [7..87]   10 × 8   bid, ask, bid size, ask size, impact bid, impact ask,
+//! then each entry:
+//!           u8       venue
+//!           u8       market
+//!           u8       symbol length L, 1..=32
+//!           L        the venue's symbol, printable ASCII
+//!           u8       status
+//!           u16      fields present, bit i for slot i
+//!           u16      weight, basis points
+//!           10 × 8   bid, ask, bid size, ask size, impact bid, impact ask,
 //!                    mark, index, funding, venue time; zero when absent
-//! [87..95]  u64      our receipt time
+//!           u64      our receipt time
 //!
 //! frame: [0] type = 2 ‖ [1..21] signer hint ‖ payload ‖ 65-byte signature
 //! ```
@@ -26,9 +28,11 @@
 //! [`UnverifiedVenueFrame`], and only a registry turns it into a report.
 
 use oracle_types::{
-    FeedId, MAX_VENUE_ENTRIES, MarketKind, SourceStatus, Venue, VenueEntry, VenueReport,
+    FeedId, MAX_VENUE_ENTRIES, MAX_VENUE_SYMBOL, MarketKind, SourceStatus, Venue, VenueEntry,
+    VenueReport,
 };
 
+use crate::books::check_symbol;
 use crate::codec::{Reader, Sink as _};
 use crate::payload::{KIND_VENUE_REPORT, PAYLOAD_VERSION};
 use crate::registry::VerifiedRegistry;
@@ -42,12 +46,15 @@ pub const FRAME_TYPE_VENUE_REPORT: u8 = 2;
 /// Size of the payload before the entries.
 pub const VENUE_HEADER_SIZE: usize = 55;
 
-/// Size of one entry.
-pub const VENUE_ENTRY_SIZE: usize = 95;
+/// Size of one entry besides its symbol.
+pub const VENUE_ENTRY_FIXED_SIZE: usize = 96;
 
 /// The largest venue report frame.
-pub const MAX_VENUE_FRAME_SIZE: usize =
-    1 + Address::LEN + VENUE_HEADER_SIZE + VENUE_ENTRY_SIZE * MAX_VENUE_ENTRIES + SIGNATURE_LEN;
+pub const MAX_VENUE_FRAME_SIZE: usize = 1
+    + Address::LEN
+    + VENUE_HEADER_SIZE
+    + (VENUE_ENTRY_FIXED_SIZE + MAX_VENUE_SYMBOL) * MAX_VENUE_ENTRIES
+    + SIGNATURE_LEN;
 
 /// The ten optional slots, in wire order.
 const SLOTS: usize = 10;
@@ -69,7 +76,8 @@ pub fn encode_venue_report(report: &VenueReport) -> Result<Vec<u8>, WireError> {
             actual: count,
             limit: MAX_VENUE_ENTRIES,
         })?;
-    let mut buf = Vec::with_capacity(VENUE_HEADER_SIZE + VENUE_ENTRY_SIZE * count);
+    let symbols: usize = report.entries.iter().map(|entry| entry.symbol.len()).sum();
+    let mut buf = Vec::with_capacity(VENUE_HEADER_SIZE + VENUE_ENTRY_FIXED_SIZE * count + symbols);
     buf.put_u8(PAYLOAD_VERSION);
     buf.put_u8(KIND_VENUE_REPORT);
     buf.put_bytes(report.feed_id.as_bytes());
@@ -87,8 +95,12 @@ pub fn encode_venue_report(report: &VenueReport) -> Result<Vec<u8>, WireError> {
             .enumerate()
             .filter(|(_, slot)| slot.is_some())
             .fold(0_u16, |bits, (index, _)| bits | (1 << index));
+        let symbol = entry.symbol.as_bytes();
+        check_symbol(symbol, "venue symbol")?;
         buf.put_u8(entry.venue.index());
         buf.put_u8(entry.market.index());
+        buf.put_u8(u8::try_from(symbol.len()).unwrap_or(u8::MAX));
+        buf.put_bytes(symbol);
         buf.put_u8(entry.status.index());
         buf.put_u16(present);
         buf.put_u16(entry.weight_bps);
@@ -150,7 +162,8 @@ pub fn decode_venue_report(bytes: &[u8]) -> Result<VenueReport, WireError> {
             limit: MAX_VENUE_ENTRIES,
         });
     }
-    let expected = VENUE_HEADER_SIZE + VENUE_ENTRY_SIZE * count;
+    // Each entry has at least a one-byte symbol.
+    let expected = VENUE_HEADER_SIZE + (VENUE_ENTRY_FIXED_SIZE + 1) * count;
     if bytes.len() < expected {
         return Err(WireError::Truncated {
             expected,
@@ -177,6 +190,11 @@ fn decode_entry(reader: &mut Reader<'_>) -> Result<VenueEntry, WireError> {
     let venue = Venue::from_index(venue).ok_or_else(|| code("venue", venue))?;
     let market = reader.u8()?;
     let market = MarketKind::from_index(market).ok_or_else(|| code("market", market))?;
+    let length = usize::from(reader.u8()?);
+    let symbol = reader.take(length)?;
+    check_symbol(symbol, "venue symbol")?;
+    let symbol = String::from_utf8(symbol.to_vec())
+        .map_err(|_| WireError::NonCanonical("a symbol that is not ASCII"))?;
     let status = reader.u8()?;
     let status = SourceStatus::from_index(status).ok_or_else(|| code("status", status))?;
     let present = reader.u16()?;
@@ -214,6 +232,7 @@ fn decode_entry(reader: &mut Reader<'_>) -> Result<VenueEntry, WireError> {
     Ok(VenueEntry {
         venue,
         market,
+        symbol,
         status,
         weight_bps,
         bid: signed(bid),
@@ -320,7 +339,7 @@ impl UnverifiedVenueFrame {
             bytes,
             FRAME_TYPE_VENUE_REPORT,
             VENUE_HEADER_SIZE,
-            VENUE_HEADER_SIZE + VENUE_ENTRY_SIZE * MAX_VENUE_ENTRIES,
+            VENUE_HEADER_SIZE + (VENUE_ENTRY_FIXED_SIZE + MAX_VENUE_SYMBOL) * MAX_VENUE_ENTRIES,
         )
         .map(|raw| Self { raw })
     }
@@ -422,10 +441,18 @@ mod tests {
             .expect("verifies")
     }
 
+    /// Every test entry has this symbol, so each entry has one size.
+    const SYMBOL: &str = "BTCUSDT";
+    const ENTRY: usize = VENUE_ENTRY_FIXED_SIZE + SYMBOL.len();
+    /// Where an entry's status and its first slot start.
+    const STATUS_AT: usize = 3 + SYMBOL.len();
+    const SLOTS_AT: usize = STATUS_AT + 5;
+
     fn entry(venue: Venue, status: SourceStatus) -> VenueEntry {
         VenueEntry {
             venue,
             market: MarketKind::Spot,
+            symbol: SYMBOL.to_owned(),
             status,
             weight_bps: 0,
             bid: None,
@@ -477,7 +504,7 @@ mod tests {
     #[test]
     fn a_report_round_trips_through_its_bytes() {
         let bytes = encode_venue_report(&report()).expect("encodes");
-        assert_eq!(bytes.len(), VENUE_HEADER_SIZE + 3 * VENUE_ENTRY_SIZE);
+        assert_eq!(bytes.len(), VENUE_HEADER_SIZE + 3 * ENTRY);
         assert_eq!(decode_venue_report(&bytes), Ok(report()));
     }
 
@@ -503,7 +530,7 @@ mod tests {
         let signed = node().sign_venue_report(&report()).expect("signs");
         let mut bytes = signed.encode_frame();
         // The first entry's bid, in the middle of the payload.
-        let at = 1 + Address::LEN + VENUE_HEADER_SIZE + 7 + 7;
+        let at = 1 + Address::LEN + VENUE_HEADER_SIZE + SLOTS_AT + 7;
         if let Some(byte) = bytes.get_mut(at) {
             *byte ^= 1;
         }
@@ -538,10 +565,10 @@ mod tests {
     #[test]
     fn non_canonical_bytes_are_refused() {
         let bytes = encode_venue_report(&report()).expect("encodes");
-        let entry = VENUE_HEADER_SIZE + 2 * VENUE_ENTRY_SIZE;
+        let entry = VENUE_HEADER_SIZE + 2 * ENTRY;
 
         let mut absent = bytes.clone();
-        if let Some(byte) = absent.get_mut(entry + 7) {
+        if let Some(byte) = absent.get_mut(entry + SLOTS_AT) {
             *byte = 1;
         }
         assert_eq!(
@@ -550,7 +577,7 @@ mod tests {
         );
 
         let mut status = bytes.clone();
-        if let Some(byte) = status.get_mut(entry + 2) {
+        if let Some(byte) = status.get_mut(entry + STATUS_AT) {
             *byte = 9;
         }
         assert_eq!(
@@ -561,9 +588,34 @@ mod tests {
             })
         );
 
+        let mut symbol = bytes.clone();
+        if let Some(byte) = symbol.get_mut(entry + 3) {
+            *byte = b' ';
+        }
+        assert_eq!(
+            decode_venue_report(&symbol),
+            Err(WireError::NonCanonical(
+                "a symbol that is not printable ASCII"
+            ))
+        );
+
         let mut trailing = bytes;
         trailing.push(0);
         assert!(decode_venue_report(&trailing).is_err());
+    }
+
+    #[test]
+    fn an_entry_without_a_valid_symbol_does_not_encode() {
+        for symbol in [String::new(), "X".repeat(MAX_VENUE_SYMBOL + 1)] {
+            let mut report = report();
+            if let Some(first) = report.entries.first_mut() {
+                first.symbol = symbol;
+            }
+            assert!(matches!(
+                encode_venue_report(&report),
+                Err(WireError::FieldTooLong { .. })
+            ));
+        }
     }
 
     #[test]

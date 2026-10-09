@@ -206,9 +206,8 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD.FUNDING_8H"
-# Funding updates on the order of minutes, so the spot staleness threshold would
-# halt it permanently. `slow` relaxes it to 90s and drops the sanity band.
-slow = true
+# A funding feed is slow by its kind: a 10 s heartbeat, a 90 s staleness limit
+# for its venues, and no sanity band.
 min_sources = 1
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["funding"] },
@@ -216,7 +215,6 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USD.FUNDING_8H"
-slow = true
 min_sources = 1
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "ETH-PERPETUAL", kinds = ["funding"] },

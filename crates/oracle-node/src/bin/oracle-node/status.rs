@@ -234,6 +234,7 @@ mod tests {
             local_recv_ns: received_ns,
             seq: None,
             book: None,
+            funding: None,
         }
     }
 

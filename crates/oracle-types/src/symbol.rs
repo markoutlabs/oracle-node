@@ -7,6 +7,7 @@
 
 use core::fmt::{self, Write as _};
 use core::str::FromStr;
+use core::time::Duration;
 
 /// Maximum length of an asset code such as `BTC` or `1000PEPE`.
 pub const MAX_ASSET_CODE_LEN: usize = 16;
@@ -199,7 +200,31 @@ impl FeedKind {
             Self::Funding8h => -9,
         }
     }
+
+    /// Returns `true` for a quantity that moves slowly: funding rates and open
+    /// interest. Its feeds publish on [`SLOW_HEARTBEAT`].
+    #[must_use]
+    pub const fn is_slow(self) -> bool {
+        matches!(self, Self::Funding8h | Self::OpenInterest)
+    }
+
+    /// Returns the longest time a node goes without publishing a feed of this kind.
+    #[must_use]
+    pub const fn heartbeat(self) -> Duration {
+        if self.is_slow() {
+            SLOW_HEARTBEAT
+        } else {
+            PRICE_HEARTBEAT
+        }
+    }
 }
+
+/// Every node publishes each price feed at least this often. A protocol rule,
+/// not a setting: consumers derive their staleness limits from it.
+pub const PRICE_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// Every node publishes each slow feed (funding, open interest) at least this often.
+pub const SLOW_HEARTBEAT: Duration = Duration::from_secs(10);
 
 impl FromStr for FeedKind {
     type Err = SymbolError;
@@ -470,6 +495,23 @@ impl<'de> serde::Deserialize<'de> for FeedId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heartbeat_follows_the_kind() {
+        for kind in [FeedKind::Funding8h, FeedKind::OpenInterest] {
+            assert!(kind.is_slow());
+            assert_eq!(kind.heartbeat(), SLOW_HEARTBEAT);
+        }
+        for kind in [
+            FeedKind::Price,
+            FeedKind::PerpMark,
+            FeedKind::PerpIndex,
+            FeedKind::PerpMid,
+        ] {
+            assert!(!kind.is_slow());
+            assert_eq!(kind.heartbeat(), PRICE_HEARTBEAT);
+        }
+    }
 
     #[test]
     fn parses_spot_and_kinded_symbols() {

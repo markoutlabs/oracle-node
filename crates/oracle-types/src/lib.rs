@@ -16,6 +16,7 @@
 mod book_update;
 mod fixed;
 mod flags;
+mod funding;
 mod observation;
 mod symbol;
 mod update;
@@ -23,12 +24,18 @@ mod venue;
 mod venue_report;
 
 pub use book_update::{
-    BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_BOOK_SYMBOL, side_changes,
+    BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_VENUE_SYMBOL, side_changes,
 };
 pub use fixed::{Fixed, FixedError};
 pub use flags::Flags;
+pub use funding::{
+    FUNDING_EXPO, FUNDING_HEARTBEAT, FundingBasis, FundingInfo, FundingUpdate, OPEN_INTEREST_EXPO,
+    OpenInterest, OpenInterestUnit, SettledFunding,
+};
 pub use observation::{BookDepth, Impact, Level, ObsKind, ObsKindError, Observation};
-pub use symbol::{AssetClass, AssetCode, FeedId, FeedKind, Symbol, SymbolError};
+pub use symbol::{
+    AssetClass, AssetCode, FeedId, FeedKind, PRICE_HEARTBEAT, SLOW_HEARTBEAT, Symbol, SymbolError,
+};
 pub use update::PriceUpdate;
 #[cfg(feature = "serde")]
 pub use update::{num_str, opt_num_str};

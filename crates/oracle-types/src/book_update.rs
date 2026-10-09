@@ -16,8 +16,8 @@ pub const BOOK_EXPO: i32 = -8;
 /// window changes at most 100 levels on a side.
 pub const MAX_BOOK_LEVELS: usize = 128;
 
-/// The longest venue symbol a book update carries.
-pub const MAX_BOOK_SYMBOL: usize = 32;
+/// The longest venue symbol that a book update or a venue report entry carries.
+pub const MAX_VENUE_SYMBOL: usize = 32;
 
 /// One price level: a price and the size resting there, both at the update's
 /// exponents. In a delta, a size of zero removes the level.
@@ -60,6 +60,11 @@ pub struct BookUpdate {
     /// Our receipt time of the newest book data, or `0` with none.
     #[cfg_attr(feature = "serde", serde(with = "crate::update::num_str"))]
     pub local_recv_ns: u64,
+    /// The venue's own update id of the newest book data, if it sends one:
+    /// Binance and Bybit `u`, OKX `seqId`, Deribit `change_id`. It names the
+    /// exact venue book state, and orders the books of two nodes.
+    #[cfg_attr(feature = "serde", serde(with = "crate::update::opt_num_str"))]
+    pub venue_seq: Option<u64>,
     /// Bids, highest price first.
     pub bids: Vec<BookLevel>,
     /// Asks, lowest price first.

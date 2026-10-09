@@ -196,15 +196,9 @@ pub struct FeedSettings {
     /// Surviving venues required before the feed publishes a usable price.
     #[serde(default)]
     pub min_sources: Option<u32>,
-    /// Treat this as a slow-moving quantity: funding rates, open interest.
-    #[serde(default)]
-    pub slow: bool,
     /// Publish on a move of at least this many basis points, as a decimal string.
     #[serde(default)]
     pub deviation_bps: Option<String>,
-    /// Publish at least this often, in milliseconds, even when nothing moves.
-    #[serde(default)]
-    pub heartbeat_ms: Option<u64>,
     /// Never publish more often than this, in milliseconds.
     #[serde(default)]
     pub min_interval_ms: Option<u64>,
@@ -567,11 +561,9 @@ impl NodeConfig {
             }
 
             let id = feed_id(&symbol);
-            let mut config = if feed.slow {
-                FeedConfig::slow(symbol, id, sources)
-            } else {
-                FeedConfig::spot(symbol, id, sources)
-            };
+            // The symbol's kind fixes the class and its heartbeat, the same in
+            // every node, because consumers rely on that heartbeat.
+            let mut config = FeedConfig::for_symbol(symbol, id, sources);
             if let Some(min_sources) = feed.min_sources {
                 config.min_sources = min_sources;
             }
@@ -579,9 +571,6 @@ impl NodeConfig {
                 config.deviation_bps = text.parse().map_err(|e| {
                     ConfigError::Invalid(format!("feed `{}`: bad deviation_bps: {e}", feed.symbol))
                 })?;
-            }
-            if let Some(ms) = feed.heartbeat_ms {
-                config.heartbeat = Duration::from_millis(ms);
             }
             if let Some(ms) = feed.min_interval_ms {
                 config.min_interval = Duration::from_millis(ms);
@@ -692,6 +681,8 @@ fn apply_endpoints(
                 Some(&mut binance.spot_base_url)
             }
             (Venue::Binance, MarketKind::LinearPerp) if !binance.perp.is_empty() => {
+                // One override serves both futures routes.
+                binance.perp_market_url.clone_from(&endpoint.url);
                 Some(&mut binance.perp_base_url)
             }
             (Venue::Binance, _) => None,
@@ -852,6 +843,7 @@ fn venue_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oracle_types::{PRICE_HEARTBEAT, SLOW_HEARTBEAT};
 
     const SAMPLE: &str = r#"
 [server]
@@ -957,15 +949,33 @@ sources = [
     }
 
     #[test]
-    fn slow_feeds_use_the_relaxed_policy() {
+    fn a_funding_feed_is_slow_by_its_kind() {
         let text = SAMPLE.replace(
             r#"symbol = "CRYPTO.BTC/USDT.PERP_MARK""#,
-            "symbol = \"CRYPTO.BTC/USDT.FUNDING_8H\"\nslow = true",
+            r#"symbol = "CRYPTO.BTC/USDT.FUNDING_8H""#,
         );
         let resolved = parse(&text).resolve().expect("resolves");
+        let price = resolved.feeds.first().expect("a feed");
+        assert_eq!(price.heartbeat, PRICE_HEARTBEAT);
         let funding = resolved.feeds.get(1).expect("a second feed");
+        assert_eq!(funding.heartbeat, SLOW_HEARTBEAT);
         assert_eq!(funding.max_age, Duration::from_secs(90));
         assert_eq!(funding.expo, -9);
+    }
+
+    #[test]
+    fn the_heartbeat_and_the_class_are_not_settings() {
+        for setting in ["heartbeat_ms = 500", "slow = true"] {
+            let text = SAMPLE.replacen(
+                "min_sources = 1\n",
+                &format!("min_sources = 1\n{setting}\n"),
+                1,
+            );
+            assert!(
+                toml::from_str::<NodeConfig>(&text).is_err(),
+                "{setting} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -1116,13 +1126,12 @@ sources = [
     fn a_feed_sets_its_own_publication_policy() {
         let text = SAMPLE.replacen(
             "min_sources = 1\n",
-            "min_sources = 1\ndeviation_bps = \"0.5\"\nheartbeat_ms = 500\nmin_interval_ms = 10\n",
+            "min_sources = 1\ndeviation_bps = \"0.5\"\nmin_interval_ms = 10\n",
             1,
         );
         let resolved = parse(&text).resolve().expect("resolves");
         let feed = resolved.feeds.first().expect("a feed");
         assert_eq!(feed.deviation_bps.to_string(), "0.5");
-        assert_eq!(feed.heartbeat, Duration::from_millis(500));
         assert_eq!(feed.min_interval, Duration::from_millis(10));
         let other = resolved.feeds.get(1).expect("a second feed");
         assert_eq!(other.deviation_bps.to_string(), "1", "the default");
@@ -1131,7 +1140,8 @@ sources = [
             ("impact_notional = \"0\"", "impact_notional"),
             ("impact_notional = \"much\"", "impact_notional"),
             ("min_interval_ms = 0", "min_interval"),
-            ("heartbeat_ms = 5\nmin_interval_ms = 10", "heartbeat"),
+            // Above the fixed one-second heartbeat, which could then never fire.
+            ("min_interval_ms = 2000", "heartbeat"),
             ("deviation_bps = \"-1\"", "deviation_bps"),
             ("deviation_bps = \"lots\"", "deviation_bps"),
         ] {

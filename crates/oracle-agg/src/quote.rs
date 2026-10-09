@@ -292,6 +292,7 @@ mod tests {
             local_recv_ns: NOW - age_ns,
             seq: None,
             book: None,
+            funding: None,
         }
     }
 
@@ -309,6 +310,7 @@ mod tests {
             local_recv_ns: NOW - age_ns,
             seq: None,
             book: None,
+            funding: None,
         }
     }
 

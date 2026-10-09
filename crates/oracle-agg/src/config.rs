@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use oracle_types::{FeedId, Fixed, InstrumentId, ObsKind, Symbol, Venue};
+use oracle_types::{
+    FeedId, Fixed, InstrumentId, ObsKind, PRICE_HEARTBEAT, SLOW_HEARTBEAT, Symbol, Venue,
+};
 
 /// How one venue contributes to one feed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,7 +166,9 @@ pub struct FeedConfig {
     /// Publish when the price has moved at least this far, in basis points.
     pub deviation_bps: Fixed,
 
-    /// Publish at least this often, even when nothing moves.
+    /// Publish at least this often, even when nothing moves. The protocol fixes
+    /// it for each feed kind ([`oracle_types::FeedKind::heartbeat`]); only tests
+    /// change it.
     pub heartbeat: Duration,
 
     /// Never publish more often than this.
@@ -180,6 +184,17 @@ pub struct FeedConfig {
 }
 
 impl FeedConfig {
+    /// Builds the feed that the protocol prescribes for the symbol's kind: a slow
+    /// feed for funding and open interest, a spot feed for every price.
+    #[must_use]
+    pub fn for_symbol(symbol: Symbol, feed_id: FeedId, sources: Vec<SourceConfig>) -> Self {
+        if symbol.kind().is_slow() {
+            Self::slow(symbol, feed_id, sources)
+        } else {
+            Self::spot(symbol, feed_id, sources)
+        }
+    }
+
     /// Builds a spot price feed with the defaults from SPEC.md §5.
     ///
     /// # Errors
@@ -211,7 +226,7 @@ impl FeedConfig {
             ),
             // One confidence floor: a smaller move is inside our own uncertainty.
             deviation_bps: Fixed::ONE,
-            heartbeat: Duration::from_millis(1_000),
+            heartbeat: PRICE_HEARTBEAT,
             min_interval: Duration::from_millis(50),
             impact_notional: None,
         }
@@ -225,7 +240,7 @@ impl FeedConfig {
     pub fn slow(symbol: Symbol, feed_id: FeedId, sources: Vec<SourceConfig>) -> Self {
         Self {
             max_age: Duration::from_secs(90),
-            heartbeat: Duration::from_secs(10),
+            heartbeat: SLOW_HEARTBEAT,
             min_interval: Duration::from_secs(1),
             min_sources: 1,
             // A funding rate crosses zero routinely, so a multiplicative band

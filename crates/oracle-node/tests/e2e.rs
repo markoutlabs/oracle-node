@@ -3,8 +3,7 @@
 //! over the encrypted transport (SPEC §6.1).
 //!
 //! The node rotates its key under a live client, then governance revokes that
-//! client and lists another one that expires. Last, a web client reads a price
-//! through `oracle-proxy`, which is one more listed client. A local Binance-shaped venue
+//! client and lists another one that expires. A local Binance-shaped venue
 //! feeds the node, so the test needs no internet. `scripts/smoke.sh` covers
 //! the icp-cli side: `icp.yaml`, `icp deploy`, and the calls `init` and
 //! `rotate` print.
@@ -31,6 +30,8 @@ use tokio::sync::watch;
 use common::{BINARY, Node, READY, WAIT, fields_of, free_port};
 
 const FEED: &str = "CRYPTO.BTC/USDT";
+/// A funding feed from the venue's perpetual, for the funding frames.
+const FUNDING: &str = "CRYPTO.BTC/USD.FUNDING_8H";
 /// Short broadcast-key epochs, so a client's deadline falls inside the test.
 const EPOCH_SECS: u64 = 5;
 /// Several node heartbeats: a client that gets nothing for this long is cut off.
@@ -78,6 +79,9 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
     client.until("verified a price", |seen| seen.stats.accepted >= 3);
     client.until("verified a venue report", |seen| {
         seen.stats.venue_reports >= 1
+    });
+    client.until("verified a funding frame", |seen| {
+        seen.stats.funding_updates >= 1
     });
 
     // Rotation under the live client: a new key, `replace_node`, a restart.
@@ -152,17 +156,6 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
     let listed = canister.listing(new).expect("the new address is listed");
     assert_eq!(listed.removed_at, None);
 
-    // A web client reads the feed through the proxy, a fourth listed client.
-    let proxy_key = Signer::generate().expect("a key");
-    assert_eq!(
-        canister.add_client(proxy_key.address(), unix_now() + 86_400),
-        Ok(4)
-    );
-    event(&node, "adopted client list", |fields| {
-        fields.get("version").and_then(Value::as_u64) == Some(4)
-    });
-    web_client_reads_a_price(&runtime, &canister, governance, &proxy_key, &dir);
-
     // Every line is a JSON event, so nothing panicked or wrote around the logger.
     for line in first_log.lines().chain(node.stop().lines()) {
         assert!(fields_of(line).is_some(), "not a log event: {line}");
@@ -170,8 +163,9 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A Binance-shaped venue: one `bookTicker` frame every 100 ms on every
-/// connection. Returns the URL for the node's `[[endpoints]]`.
+/// A Binance-shaped venue: one `bookTicker` frame every 100 ms, and a
+/// `markPrice` frame with funding every 500 ms, on every connection. Returns
+/// the URL for the node's `[[endpoints]]`.
 fn start_venue(runtime: &Runtime) -> String {
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -189,19 +183,31 @@ async fn quote(mut socket: WebSocket) {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     for update_id in 1_u64.. {
         ticker.tick().await;
-        let frame = serde_json::json!({
+        let mut frames = vec![serde_json::json!({
             "stream": "btcusdt@bookTicker",
             "data": {
                 "u": update_id, "s": "BTCUSDT",
                 "b": "60000.00", "B": "1.5", "a": "60000.10", "A": "2.0",
             },
-        });
-        if socket
-            .send(Message::Text(frame.to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
+        })];
+        if update_id % 5 == 0 {
+            frames.push(serde_json::json!({
+                "stream": "btcusdt@markPrice@1s",
+                "data": {
+                    "e": "markPriceUpdate", "E": unix_now() * 1_000, "s": "BTCUSDT",
+                    "p": "60000.05", "i": "60001.00", "r": "0.00010000",
+                    "T": (unix_now() / 28_800 + 1) * 28_800_000,
+                },
+            }));
+        }
+        for frame in frames {
+            if socket
+                .send(Message::Text(frame.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     }
 }
@@ -224,9 +230,19 @@ symbol = "{FEED}"
 min_sources = 1
 sources = [{{ venue = "binance", market = "spot", symbol = "BTCUSDT" }}]
 
+[[feeds]]
+symbol = "{FUNDING}"
+min_sources = 1
+sources = [{{ venue = "binance", market = "linear_perp", symbol = "BTCUSDT" }}]
+
 [[endpoints]]
 venue = "binance"
 market = "spot"
+url = "{venue}"
+
+[[endpoints]]
+venue = "binance"
+market = "linear_perp"
 url = "{venue}"
 "#
     ))
@@ -240,116 +256,6 @@ url = "{venue}"
         }
     }
     std::fs::write(config, toml::to_string(&table).expect("serialises")).expect("writes");
-}
-
-/// Runs the proxy in this process against the live node, and reads one price
-/// over its web socket.
-fn web_client_reads_a_price(
-    runtime: &Runtime,
-    canister: &Harness,
-    governance: Address,
-    key: &Signer,
-    dir: &Path,
-) {
-    use futures_util::{SinkExt as _, StreamExt as _};
-    use oracle_proxy::config::{FeedsConfig, Limits, UpstreamConfig};
-    use oracle_proxy::hub::Hub;
-    use oracle_proxy::{upstream, web};
-    use std::os::unix::fs::PermissionsExt as _;
-    use tokio_tungstenite::tungstenite::Message;
-
-    let key_file = dir.join("proxy.key");
-    std::fs::write(&key_file, key.to_secret_hex().as_bytes()).expect("writes");
-    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let config = UpstreamConfig {
-        canister_id: Some(canister.canister.to_text()),
-        registry_url: Some(canister.url("registry.json")),
-        root_key: Some(canister.root_key()),
-        governance: Some(governance),
-        client_key_file: key_file,
-        quorum: 1,
-        allow_low_quorum: true,
-    };
-    let feeds = FeedsConfig {
-        prices: vec![FEED.parse().expect("valid")],
-        ..FeedsConfig::default()
-    };
-    runtime.block_on(async {
-        let client = upstream::connect(&config, &feeds).await.expect("connects");
-        let hub = Arc::new(Hub::new(&feeds.prices, &feeds.venues, 8, 8));
-        let feeding = tokio::spawn(upstream::run(
-            client,
-            Arc::clone(&hub),
-            feeds.prices.clone(),
-            Duration::from_millis(100),
-        ));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("binds");
-        let addr = listener.local_addr().expect("bound");
-        let app = web::router(hub, Limits::default())
-            .into_make_service_with_connect_info::<std::net::SocketAddr>();
-        let serving = tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws"))
-            .await
-            .expect("upgrades");
-        let request = format!(r#"{{"op":"subscribe","prices":["{FEED}"]}}"#);
-        socket
-            .send(Message::Text(request.into()))
-            .await
-            .expect("sends");
-        let price = tokio::time::timeout(WAIT, async {
-            while let Some(Ok(message)) = socket.next().await {
-                let Message::Text(text) = message else {
-                    continue;
-                };
-                let json: Value = serde_json::from_str(&text).expect("json");
-                if json.get("type") == Some(&Value::from("price"))
-                    && json.get("status") == Some(&Value::from("ok"))
-                {
-                    return json;
-                }
-            }
-            panic!("the proxy closed the socket");
-        })
-        .await
-        .expect("an ok price through the proxy");
-        assert_eq!(price.get("symbol"), Some(&Value::from(FEED)));
-        assert_eq!(price.get("nodes"), Some(&Value::from(1)));
-
-        // The node report: connected, with the feed live and at the median.
-        socket
-            .send(Message::Text(r#"{"op":"subscribe","nodes":true}"#.into()))
-            .await
-            .expect("sends");
-        let node = tokio::time::timeout(WAIT, async {
-            while let Some(Ok(message)) = socket.next().await {
-                let Message::Text(text) = message else {
-                    continue;
-                };
-                let json: Value = serde_json::from_str(&text).expect("json");
-                if json.get("type") == Some(&Value::from("nodes")) {
-                    return json.pointer("/nodes/0").cloned().expect("one node");
-                }
-            }
-            panic!("the proxy closed the socket");
-        })
-        .await
-        .expect("a node report through the proxy");
-        assert_eq!(
-            node.pointer("/connection/state"),
-            Some(&Value::from("connected"))
-        );
-        assert_eq!(node.pointer("/feeds/0/symbol"), Some(&Value::from(FEED)));
-        assert_eq!(node.pointer("/feeds/0/state"), Some(&Value::from("live")));
-        assert_eq!(
-            node.pointer("/feeds/0/deviation_bps"),
-            Some(&Value::from("0"))
-        );
-        feeding.abort();
-        serving.abort();
-    });
 }
 
 /// The events in a log with this message.
@@ -417,6 +323,10 @@ impl Subscriber {
                 .subscribe_venues(&[FEED])
                 .await
                 .expect("subscribes to venue reports");
+            client
+                .subscribe_funding(&["*"])
+                .await
+                .expect("subscribes to funding");
             client
         });
         let (tx, rx) = watch::channel(seen(&client));

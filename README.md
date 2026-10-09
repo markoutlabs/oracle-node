@@ -32,14 +32,14 @@ release binary and checks it against the release's `SHA256SUMS`:
 ```bash
 # The node. Then run `oracle-node init`.
 curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh
-
-# The web proxy.
-curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh -s -- proxy
 ```
 
 `--version v0.1.0` installs a given release, and `--to <dir>` sets the
 directory (default `/usr/local/bin`, or `~/.local/bin` without root or sudo).
-On other systems, build from source with `make node` or `make proxy`.
+On other systems, build from source with `make node`.
+
+The web proxy has its own repo and installer:
+[pxr64/oracle-proxy](https://github.com/pxr64/oracle-proxy).
 
 ## Crates
 
@@ -143,8 +143,11 @@ observations ──▶ per-venue quote     (microprice, staleness, crossed books
 
 A feed is evaluated when one of its inputs changes, so a move publishes when it
 arrives; a 25 ms timer catches heartbeats and stale venues. `deviation_bps` (1 by
-default), `heartbeat_ms` and `min_interval_ms` are set per feed. A move held back
-by the rate cap publishes the moment the cap expires.
+default) and `min_interval_ms` are set per feed. The heartbeat is not a setting:
+every node publishes a price feed at least once a second, and a funding or open
+interest feed at least every 10 s, so consumers can derive their staleness
+limits from it. A move held back by the rate cap publishes the moment the cap
+expires.
 
 With `impact_notional` set on a feed, each venue is priced at the average fill
 for that notional instead of its microprice, moved by the live top of book
@@ -291,6 +294,25 @@ The SDK keeps one book per node. A missed frame makes that node's book invalid
 until its next snapshot. `book()` returns the freshest valid book, from one
 node.
 
+#### Funding
+
+The node also sends the funding of each perpetual source (SPEC §3.3.3): the
+rate as the venue states it, with its basis, and the predicted rate, the
+interval, the next funding time, the last settled rate and the open interest
+where the venue sends them. A frame goes out on each change, at most once a
+second, and at least once a minute.
+
+```rust
+client.subscribe_funding(&["CRYPTO.BTC/USD"]).await?; // or &["*"] for every perpetual
+let okx = InstrumentId::new(Venue::Okx, MarketKind::LinearPerp, "BTC-USDT-SWAP");
+if let Some(funding) = client.funding(&okx, now_unix_nanos()) {
+    let rate = funding.update.rate; // a mantissa at FUNDING_EXPO, −12
+}
+```
+
+Each frame carries the whole state, so `funding()` returns the freshest frame,
+from one node.
+
 #### Client auth
 
 Nodes serve prices only to listed clients, over `/v2/ws`, encrypted (SPEC
@@ -356,61 +378,20 @@ Stored frames are a separate path. `verify_historical` checks a frame against
 the canister's listing of its signer: when the address was listed, and when it
 was replaced or removed.
 
-### `oracle-proxy`
+An archive takes its frames from `client.frames(capacity)`: a bounded channel
+with a copy of each frame whose signature and registry check pass, with the
+SDK's verdict. The client never waits on it. A copy that does not fit is
+dropped and counted in `ClientStats::tap_dropped`.
 
-Verified oracle data for web clients (SPEC §6.5). A browser cannot hold a
-client API key, so it cannot use the node transport. The proxy is one listed
-client: it runs the SDK, with the signature checks and the quorum, and serves
-the result as JSON over one plain WebSocket, `/v1/ws`. A reverse proxy in front
-of it terminates TLS. `proxy/proxy.toml` is a commented example.
+### Web proxy
 
-```sh
-scripts/client-key.sh --out proxy.key          # the proxy's own client key
-scripts/add-client.sh --identity <controller> --address <its address> --expires <date>
-make proxy && target/release/oracle-proxy proxy/proxy.toml
-```
+`oracle-proxy` serves verified oracle data to web clients, as JSON over one
+WebSocket (SPEC §6.5). It is one listed SDK client, with the signature checks
+and the quorum. Its code, config, protocol and installer are in their own repo,
+[pxr64/oracle-proxy](https://github.com/pxr64/oracle-proxy).
 
-A web client then does this:
-
-```js
-const socket = new WebSocket("wss://oracle.example.com/v1/ws");
-socket.onopen = () => socket.send(JSON.stringify({
-  op: "subscribe",
-  prices: ["CRYPTO.BTC/USD"],
-  venues: ["CRYPTO.BTC/USDT"],
-  books: ["binance:spot:BTCUSDT"],
-  nodes: true,
-}));
-socket.onmessage = (event) => {
-  const message = JSON.parse(event.data);
-  // message.type: "subscribed", "unsubscribed", "price", "venues", "book",
-  // "nodes", "pong" or "error"
-};
-```
-
-| Message | Contents |
-|---|---|
-| `price` | `feed_id`, `symbol`, `status`, `price`, `conf`, `nodes`, `halted_nodes`, `concerns`, `publish_time_ns`, `spread_bps` |
-| `venues` | `symbol`, `node`, and the node's venue report (SPEC §3.3.1) |
-| `book` | `book`, `seq`, `snapshot`, `available`, `node`, `publish_time_ns`, `local_recv_ns`, and `bids` and `asks` as `[price, size]` |
-| `nodes` | once a second: `time_ns`, `registry_version`, `quorum`, and for each registry node its connection, frame counts, delivery latency, and its latest price for each feed with its distance from the median |
-
-Every time and every decimal is a string, so JavaScript loses no precision.
-Counts, `seq` and `expo` are numbers. For a book, apply a snapshot, then each
-delta in `seq` order; a size of `"0"` removes the level.
-
-The open routes send `Access-Control-Allow-Origin: *`, so a dashboard on any
-origin can read them:
-
-- `GET /v1/catalog` lists what the proxy serves;
-- `GET /v1/nodes` returns the latest `nodes` message;
-- `GET /health` shows the upstream client.
-
-`OracleClient::nodes(now_ns)` gives the same node reports to a Rust consumer.
-
-The socket is open to anyone, within `[limits]`. Behind a reverse proxy, set
-`trust_forwarded_for = true`, so that the limits see each client's address
-rather than the reverse proxy's.
+`OracleClient::nodes(now_ns)` gives a Rust consumer the node reports that the
+proxy serves.
 
 ### `oracle-node`
 
@@ -722,7 +703,6 @@ make test lint        # every test, PocketIC included; fmt and clippy
 make canister         # the canister wasm: builds it, writes its .did, bakes
                       # the .did into the wasm as public candid:service
 make node             # the oracle-node binary for this machine
-make proxy            # the oracle-proxy binary for web clients
 make e2e              # the whole system on PocketIC; also part of make test
 make latency          # live latency from the venues to the SDK (below)
 make smoke            # the icp-cli path on a local network (below)
@@ -758,7 +738,6 @@ anyone can rebuild them and get the same bytes:
 ```text
 target/release-artifacts/oracle_registry_canister.wasm
 target/release-artifacts/oracle-node-linux-{amd64,arm64}
-target/release-artifacts/oracle-proxy-linux-{amd64,arm64}
 target/release-artifacts/SHA256SUMS
 ```
 
@@ -812,17 +791,21 @@ work. Nothing on mainnet changes:
   `oracle-e2e` identity as governance;
 - three nodes on ports 8801 to 8803, each serving every feed in
   `node/all-feeds.toml` from the live venues;
-- oracle-proxy on `ws://127.0.0.1:8792/v1/ws`, at quorum 3, with its key listed.
+- one client key, listed, for a local SDK client.
 
 ```sh
-scripts/dev-stack.sh            # Ctrl-C stops the nodes, the proxy and the network
-NODES=1 scripts/dev-stack.sh    # one node at quorum 1
+scripts/dev-stack.sh            # Ctrl-C stops the nodes and the network
+NODES=1 scripts/dev-stack.sh    # one node
 KEEP=1 scripts/dev-stack.sh     # keep the local network after exit
 ```
 
-Keys, configs and logs are in `target/dev-stack/`. Stop one node to watch the
-quorum halt the feeds, and start it again with `oracle-node start
-target/dev-stack/nodeN/config.toml`.
+Keys, configs and logs are in `target/dev-stack/`. When the nodes serve, the
+script writes `target/dev-stack/stack.env`: the canister, the gateway, the
+governance address, the client key and the feeds. The web proxy's
+`scripts/dev.sh`, in [pxr64/oracle-proxy](https://github.com/pxr64/oracle-proxy),
+runs this script and starts the proxy from that file. With the proxy running,
+stop one node to watch its quorum halt the feeds. Start the node again with
+`oracle-node start target/dev-stack/nodeN/config.toml`.
 
 ### Running a node locally
 

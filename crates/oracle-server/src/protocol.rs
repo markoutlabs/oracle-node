@@ -21,6 +21,10 @@ pub enum ClientMessage {
         /// Canonical symbols whose sources' books to send. No firehose.
         #[serde(default)]
         books: Vec<String>,
+        /// Canonical symbols whose perpetual sources' funding to send. `["*"]`
+        /// sends every perpetual.
+        #[serde(default)]
+        funding: Vec<String>,
     },
     /// Stop receiving the listed feeds.
     Unsubscribe {
@@ -33,6 +37,9 @@ pub enum ClientMessage {
         /// Canonical symbols whose books to stop.
         #[serde(default)]
         books: Vec<String>,
+        /// Canonical symbols whose funding to stop; `["*"]` stops all.
+        #[serde(default)]
+        funding: Vec<String>,
     },
     /// Liveness check.
     Ping {
@@ -57,6 +64,9 @@ pub enum ServerMessage {
         /// Accepted book symbols.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         books: Vec<String>,
+        /// Accepted funding symbols.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        funding: Vec<String>,
         /// Symbols this node does not serve.
         unknown: Vec<String>,
     },
@@ -70,6 +80,9 @@ pub enum ServerMessage {
         /// Removed book symbols.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         books: Vec<String>,
+        /// Removed funding symbols.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        funding: Vec<String>,
     },
     /// Reply to a ping.
     Pong {
@@ -111,6 +124,7 @@ mod tests {
                 feeds: vec!["CRYPTO.BTC/USD".to_owned()],
                 venues: Vec::new(),
                 books: Vec::new(),
+                funding: Vec::new(),
             }
         );
         let venues: ClientMessage =
@@ -122,6 +136,22 @@ mod tests {
                 feeds: Vec::new(),
                 venues: vec!["CRYPTO.BTC/USD".to_owned()],
                 books: Vec::new(),
+                funding: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_funding_subscription_takes_feed_symbols_or_all() {
+        let parsed: ClientMessage =
+            serde_json::from_str(r#"{"op":"subscribe","funding":["*"]}"#).expect("parses");
+        assert_eq!(
+            parsed,
+            ClientMessage::Subscribe {
+                feeds: Vec::new(),
+                venues: Vec::new(),
+                books: Vec::new(),
+                funding: vec!["*".to_owned()],
             }
         );
     }
@@ -135,6 +165,7 @@ mod tests {
                 feeds: vec!["A.B/C".to_owned()],
                 venues: Vec::new(),
                 books: Vec::new(),
+                funding: Vec::new(),
             }
         );
         assert_eq!(
@@ -159,6 +190,7 @@ mod tests {
             feeds: vec!["CRYPTO.BTC/USD".to_owned()],
             venues: vec![],
             books: vec![],
+            funding: vec![],
             unknown: vec![],
         };
         let json = serde_json::to_string(&ack).expect("serializes");

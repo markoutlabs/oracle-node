@@ -3,7 +3,7 @@
 use core::fmt;
 use std::sync::Arc;
 
-use crate::{Fixed, InstrumentId, Venue};
+use crate::{Fixed, FundingInfo, InstrumentId, Venue};
 
 /// What an [`Observation`] reports.
 ///
@@ -257,6 +257,8 @@ pub struct Observation {
     pub seq: Option<u64>,
     /// The top levels of the book, for [`ObsKind::Depth`].
     pub book: Option<Arc<BookDepth>>,
+    /// The venue's other funding fields, for [`ObsKind::Funding`].
+    pub funding: Option<Arc<FundingInfo>>,
 }
 
 impl Observation {
@@ -373,6 +375,7 @@ mod tests {
             local_recv_ns: 2_000,
             seq: None,
             book: None,
+            funding: None,
         }
     }
 

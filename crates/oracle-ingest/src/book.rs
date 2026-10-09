@@ -129,6 +129,20 @@ impl LocalBook {
     }
 }
 
+/// The last funding fields of one instrument, for a venue whose messages
+/// carry only the fields that changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LastFunding {
+    /// The funding rate.
+    pub rate: Option<Fixed>,
+    /// The funding period, in nanoseconds.
+    pub interval_ns: Option<u64>,
+    /// The next funding time, in unix nanoseconds.
+    pub next_funding_time_ns: Option<u64>,
+    /// The open interest, in the venue's unit.
+    pub open_interest: Option<Fixed>,
+}
+
 /// Every book on one connection, by venue symbol. Emptied on each connect, so
 /// nothing from before a gap survives it.
 #[derive(Clone, Debug, Default)]
@@ -137,13 +151,20 @@ pub struct Books {
     /// The last sequence number on the connection, for venues that number
     /// every message rather than each book.
     pub sequence: Option<u64>,
+    funding: HashMap<String, LastFunding>,
 }
 
 impl Books {
-    /// Drops every book.
+    /// Drops every book and every funding state.
     pub fn clear(&mut self) {
         self.by_symbol.clear();
         self.sequence = None;
+        self.funding.clear();
+    }
+
+    /// The last funding fields for a venue symbol, created empty.
+    pub fn funding(&mut self, symbol: &str) -> &mut LastFunding {
+        self.funding.entry(symbol.to_owned()).or_default()
     }
 
     /// The book for a venue symbol, created empty.
@@ -199,6 +220,7 @@ impl Books {
             local_recv_ns,
             seq: book.last_id,
             book: Some(Arc::new(BookDepth { bids, asks })),
+            funding: None,
         });
         Ok(())
     }

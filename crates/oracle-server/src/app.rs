@@ -14,12 +14,15 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_transport::{CloseReason, Control, HandshakeMessage, KeyGrant};
 use oracle_types::{FeedId, InstrumentId, Symbol};
-use oracle_wire::{Address, Registry, SignedBookUpdate, SignedUpdate, SignedVenueReport, feed_id};
+use oracle_wire::{
+    Address, Registry, SignedBookUpdate, SignedFundingUpdate, SignedUpdate, SignedVenueReport,
+    feed_id,
+};
 use serde::Serialize;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
-use crate::hub::{Hub, PreparedBook, PreparedUpdate, PreparedVenues};
+use crate::hub::{Hub, PreparedBook, PreparedFunding, PreparedUpdate, PreparedVenues};
 use crate::protocol::{ClientMessage, FIREHOSE, ServerMessage};
 use crate::transport::{Established, NodeTransport, Outbound, unix_now};
 
@@ -110,6 +113,12 @@ impl ServerState {
         self.hub.publish_book(signed)
     }
 
+    /// Publishes a signed funding frame to the subscribers of that perpetual.
+    #[must_use]
+    pub fn publish_funding(&self, signed: SignedFundingUpdate) -> Arc<PreparedFunding> {
+        self.hub.publish_funding(signed)
+    }
+
     /// Publishes a signed venue report to the subscribers that asked for it.
     #[must_use]
     pub fn publish_venues(&self, signed: SignedVenueReport) -> Option<Arc<PreparedVenues>> {
@@ -131,6 +140,14 @@ impl ServerState {
             }
         }
         books
+    }
+
+    /// The perpetual sources of these feeds, each once.
+    #[must_use]
+    pub fn perps_of(&self, feeds: &[FeedId]) -> Vec<InstrumentId> {
+        let mut perps = self.books_of(feeds);
+        perps.retain(|instrument| instrument.market.is_perp());
+        perps
     }
 
     /// Resolves a symbol to a feed id.
@@ -219,6 +236,7 @@ fn handle_control(
             feeds,
             venues,
             books,
+            funding,
         } => {
             let mut unknown = Vec::new();
             let (venues, venue_ids) = known(state, venues, &mut unknown);
@@ -227,12 +245,22 @@ fn handle_control(
             let instruments = state.books_of(&book_ids);
             subscriber.add_books(instruments.iter().cloned());
             state.hub.replay_books(subscriber, &instruments);
+            let funding = if funding.iter().any(|feed| feed == FIREHOSE) {
+                subscriber.add_all_funding();
+                vec![FIREHOSE.to_owned()]
+            } else {
+                let (funding, funding_ids) = known(state, funding, &mut unknown);
+                subscriber.add_funding(state.perps_of(&funding_ids));
+                funding
+            };
+            state.hub.replay_funding(subscriber);
             if feeds.iter().any(|feed| feed == FIREHOSE) {
                 subscriber.select_firehose();
                 return ServerMessage::SubscribeAck {
                     feeds: vec![FIREHOSE.to_owned()],
                     venues,
                     books,
+                    funding,
                     unknown,
                 };
             }
@@ -242,6 +270,7 @@ fn handle_control(
                 feeds,
                 venues,
                 books,
+                funding,
                 unknown,
             }
         }
@@ -249,6 +278,7 @@ fn handle_control(
             feeds,
             venues,
             books,
+            funding,
         } => {
             let ids = |symbols: &[String]| -> Vec<FeedId> {
                 symbols
@@ -259,10 +289,15 @@ fn handle_control(
             subscriber.remove(ids(&feeds));
             subscriber.remove_venues(ids(&venues));
             subscriber.remove_books(&state.books_of(&ids(&books)));
+            subscriber.remove_funding(
+                &state.perps_of(&ids(&funding)),
+                funding.iter().any(|feed| feed == FIREHOSE),
+            );
             ServerMessage::UnsubscribeAck {
                 feeds,
                 venues,
                 books,
+                funding,
             }
         }
         ClientMessage::Ping { id } => ServerMessage::Pong { id },

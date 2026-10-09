@@ -27,6 +27,9 @@ pub mod testing;
 pub mod transport;
 
 pub use app::{FeedEntry, ServerState, router};
-pub use hub::{Channel, Hub, Outgoing, PreparedBook, PreparedUpdate, PreparedVenues, Subscriber};
+pub use hub::{
+    Channel, Hub, Outgoing, PreparedBook, PreparedFunding, PreparedUpdate, PreparedVenues,
+    Subscriber,
+};
 pub use protocol::{ClientMessage, ServerMessage};
 pub use transport::{NodeTransport, TransportConfig, unix_now};

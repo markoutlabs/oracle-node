@@ -6,8 +6,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 DIR=target/release-artifacts
-ASSETS=(oracle_registry_canister.wasm oracle-node-linux-amd64 oracle-node-linux-arm64
-  oracle-proxy-linux-amd64 oracle-proxy-linux-arm64 SHA256SUMS)
+ASSETS=(oracle_registry_canister.wasm oracle-node-linux-amd64 oracle-node-linux-arm64 SHA256SUMS)
 
 fail() {
   echo "publish: $*" >&2
@@ -32,12 +31,10 @@ done
 
 repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 notes="$(cat <<NOTES
-Install the node, or the web proxy, on Linux (amd64 or arm64, glibc 2.28 or newer):
+Install the node on Linux (amd64 or arm64, glibc 2.28 or newer):
 
 \`\`\`sh
-# The node, then the web proxy, from this release
-curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh -s -- node --version $tag
-curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh -s -- proxy --version $tag
+curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh -s -- --version $tag
 \`\`\`
 
 The script checks each binary against SHA256SUMS. The build is reproducible: \`make release\`
