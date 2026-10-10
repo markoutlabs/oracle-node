@@ -43,10 +43,12 @@ struct Published {
     flags: Flags,
 }
 
-/// Per-venue latest observations, one slot per [`ObsKind`].
+/// Per-venue latest observations, one slot per [`ObsKind`], and when the
+/// connection carrying each kind last received anything.
 #[derive(Clone, Debug, Default)]
 struct SourceSlots {
     latest: [Option<Observation>; ObsKind::COUNT],
+    alive: [u64; ObsKind::COUNT],
 }
 
 impl SourceSlots {
@@ -56,8 +58,15 @@ impl SourceSlots {
         }
     }
 
+    fn mark_alive(&mut self, kind: ObsKind, at_ns: u64) {
+        if let Some(alive) = self.alive.get_mut(kind.index()) {
+            *alive = (*alive).max(at_ns);
+        }
+    }
+
     fn clear(&mut self) {
         self.latest = Default::default();
+        self.alive = Default::default();
     }
 }
 
@@ -350,6 +359,25 @@ impl Aggregator {
         }
     }
 
+    /// Records that the connections carrying these instruments and kinds were
+    /// alive at `at_ns`. A quiet value on a live connection stays current.
+    pub fn alive(&mut self, sources: &[(InstrumentId, ObsKind)], at_ns: u64) {
+        for (instrument, kind) in sources {
+            let Some(targets) = self.routes.get(instrument) else {
+                continue;
+            };
+            for (feed_index, source_index) in targets {
+                if let Some(slots) = self
+                    .feeds
+                    .get_mut(*feed_index)
+                    .and_then(|feed| feed.sources.get_mut(*source_index))
+                {
+                    slots.mark_alive(*kind, at_ns);
+                }
+            }
+        }
+    }
+
     /// Discards everything known about a venue connection.
     ///
     /// Must be called the moment a connection drops. A book carried across a gap
@@ -607,13 +635,20 @@ impl FeedRuntime {
             .enumerate()
             .map(|(index, source)| {
                 let slots = self.sources.get(index).ok_or(SourceStatus::NoData)?;
-                quote::derive(index, source, &self.config, &slots.latest, now_ns)
+                quote::derive(
+                    index,
+                    source,
+                    &self.config,
+                    &slots.latest,
+                    &slots.alive,
+                    now_ns,
+                )
             })
             .collect()
     }
 
     fn poll_venues(&mut self, now_ns: u64) -> Option<VenueReport> {
-        let min_interval = duration_ns(self.config.min_interval);
+        let min_interval = duration_ns(self.config.min_interval.max(self.config.venue_interval));
         if let Some(last) = self.venue_last_ns {
             let elapsed = now_ns.saturating_sub(last);
             if !self.venue_dirty && elapsed < duration_ns(self.config.heartbeat) {
@@ -1180,6 +1215,38 @@ mod tests {
         assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Stale);
     }
 
+    /// The same quiet books stay in the price while their connections report
+    /// liveness, and go stale when the reports stop.
+    #[test]
+    fn a_quiet_source_on_a_live_connection_stays_in_the_price() {
+        let mut aggregator = aggregator();
+        feed(
+            &mut aggregator,
+            SECOND,
+            &[
+                (Venue::Binance, "100", "100.02"),
+                (Venue::Bybit, "100.01", "100.03"),
+            ],
+        );
+        let _ = aggregator.poll_changed(SECOND);
+
+        let later = SECOND + 3 * SECOND;
+        let carried = [
+            (instrument(Venue::Binance), ObsKind::BookTop),
+            (instrument(Venue::Bybit), ObsKind::BookTop),
+        ];
+        aggregator.alive(&carried, later - SECOND / 10);
+        let _ = aggregator.poll_all(later);
+        let report = aggregator.poll_venues(later, |_| true).remove(0);
+        assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Used);
+        assert_eq!(entry(&report, Venue::Bybit).status, SourceStatus::Used);
+
+        let silent = later + 3 * SECOND;
+        let _ = aggregator.poll_all(silent);
+        let report = aggregator.poll_venues(silent, |_| true).remove(0);
+        assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Stale);
+    }
+
     #[test]
     fn an_unwanted_report_is_not_built_and_goes_out_once_wanted() {
         let mut aggregator = aggregator();
@@ -1191,21 +1258,22 @@ mod tests {
         assert_eq!(aggregator.poll_venues(wanted, |_| true).len(), 1);
     }
 
+    /// A venue report has its own cap, one a second, above the price's 50 ms.
     #[test]
-    fn venue_reports_follow_the_rate_cap_and_the_heartbeat() {
+    fn venue_reports_follow_their_cap_and_the_heartbeat() {
         let mut aggregator = aggregator();
         feed(&mut aggregator, SECOND, &both("100", "100.02"));
         let _ = aggregator.poll_changed(SECOND);
         assert_eq!(aggregator.poll_venues(SECOND, |_| true).len(), 1);
 
-        let soon = SECOND + 10_000_000;
+        let soon = SECOND + 100_000_000;
         feed(&mut aggregator, soon, &both("100", "100.02"));
         let _ = aggregator.poll_changed(soon);
         assert!(
             aggregator.poll_venues(soon, |_| true).is_empty(),
             "inside the cap"
         );
-        let due = SECOND + 50_000_000;
+        let due = SECOND + SECOND;
         assert_eq!(aggregator.next_retry_ns(), Some(due));
         let reports = aggregator.poll_venues(due, |_| true);
         assert_eq!(reports.first().map(|report| report.seq), Some(2));

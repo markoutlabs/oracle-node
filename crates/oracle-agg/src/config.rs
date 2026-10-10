@@ -101,19 +101,19 @@ pub struct FeedConfig {
     /// detectable; three is right for anything load-bearing.
     pub min_sources: u32,
 
-    /// Drop an observation older than this, measured on our receipt clock.
+    /// Drop a source whose venue has confirmed nothing for this long: no new
+    /// value, and no message on the connection that carries it. Measured on
+    /// our receipt clock.
     pub max_age: Duration,
+
+    /// Drop a value that has not changed for this long, even on a live
+    /// connection. Venues send on change, so a quiet value stays current; this
+    /// bounds the case of one instrument frozen inside a live venue feed. Five
+    /// minutes: a small coin's Coinbase ticker or Bybit mark can rest for one.
+    pub max_unchanged: Duration,
 
     /// Half-life of the sanity-band reference EMA.
     pub ema_half_life: Duration,
-
-    /// Freshness weighting time constant: weight is `tau / (tau + age)`.
-    ///
-    /// A hyperbolic decay rather than the exponential the spec sketches. It is
-    /// monotone, lands in `(0, 1]`, needs no transcendental function, and is
-    /// therefore exactly reproducible on replay — which an `exp` over fixed-point
-    /// would not be.
-    pub recency_tau: Duration,
 
     /// Reference notional for depth weighting: `sqrt(depth / reference)`, capped.
     ///
@@ -178,6 +178,11 @@ pub struct FeedConfig {
     /// the most stress.
     pub min_interval: Duration,
 
+    /// Never sign a venue report more often than this. Every client checks each
+    /// report's signature, and an archive keeps one a second, so a faster
+    /// report costs more than it shows.
+    pub venue_interval: Duration,
+
     /// Price each venue at the average fill for this notional, in quote units,
     /// from its depth snapshots. `None` keeps the top-of-book microprice.
     pub impact_notional: Option<Fixed>,
@@ -210,8 +215,8 @@ impl FeedConfig {
             quote_conversion: None,
             min_sources: 2,
             max_age: Duration::from_millis(2_000),
+            max_unchanged: Duration::from_secs(300),
             ema_half_life: Duration::from_secs(300),
-            recency_tau: Duration::from_millis(500),
             depth_reference: Fixed::from_raw(100_000 * 1_000_000_000_000),
             depth_cap: Fixed::from_raw(2 * 1_000_000_000_000),
             weight_cap_multiple: Fixed::from_raw(3 * 1_000_000_000_000),
@@ -228,6 +233,7 @@ impl FeedConfig {
             deviation_bps: Fixed::ONE,
             heartbeat: PRICE_HEARTBEAT,
             min_interval: Duration::from_millis(50),
+            venue_interval: Duration::from_secs(1),
             impact_notional: None,
         }
     }
@@ -240,6 +246,7 @@ impl FeedConfig {
     pub fn slow(symbol: Symbol, feed_id: FeedId, sources: Vec<SourceConfig>) -> Self {
         Self {
             max_age: Duration::from_secs(90),
+            max_unchanged: Duration::from_secs(300),
             heartbeat: SLOW_HEARTBEAT,
             min_interval: Duration::from_secs(1),
             min_sources: 1,

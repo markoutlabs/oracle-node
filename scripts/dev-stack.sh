@@ -7,6 +7,7 @@
 #   scripts/dev-stack.sh            # 3 nodes; Ctrl-C stops them and the network
 #   NODES=1 scripts/dev-stack.sh    # one node
 #   KEEP=1 scripts/dev-stack.sh     # leave the local network running on exit
+#   ASSETS=1 scripts/dev-stack.sh   # also the feeds of node/assets.toml (scripts/asset-feeds.py)
 #
 # Node N listens on 880N and serves every feed in node/all-feeds.toml. One
 # client key is listed, for a local SDK client. When the nodes serve, the
@@ -71,9 +72,12 @@ echo "$GOVERNANCE"
 rm -rf "$DIR" && mkdir -p "$DIR"
 printf 'dev-stack\n' >"$DIR/passphrase" && chmod 600 "$DIR/passphrase"
 FEEDS_AT=$(grep -n '^\[\[feeds\]\]' node/all-feeds.toml | head -n 1 | cut -d: -f1)
+# node/assets.toml holds feeds only, so it follows the playground's feeds as it is.
+EXTRA_FEEDS=()
+[ -z "${ASSETS:-}" ] || EXTRA_FEEDS=(node/assets.toml)
 SYMBOLS=()
 while IFS= read -r symbol; do SYMBOLS+=("$symbol"); done \
-  < <(sed -n 's/^symbol = "\(.*\)"$/\1/p' node/all-feeds.toml)
+  < <(sed -n 's/^symbol = "\(.*\)"$/\1/p' node/all-feeds.toml ${EXTRA_FEEDS[@]+"${EXTRA_FEEDS[@]}"})
 
 say "$NODES nodes"
 for i in $(seq 1 "$NODES"); do
@@ -89,8 +93,14 @@ for i in $(seq 1 "$NODES"); do
   config="$node/config.toml"
   starter_feeds=$(grep -n '^\[\[feeds\]\]' "$config" | head -n 1 | cut -d: -f1)
   {
-    sed -n "1,$((starter_feeds - 1))p" "$config" | sed 's/^listen = "0\.0\.0\.0:/listen = "127.0.0.1:/'
+    # A client of every channel of ~250 feeds can have more than 512 waiting.
+    sed -n "1,$((starter_feeds - 1))p" "$config" | sed 's/^listen = "0\.0\.0\.0:/listen = "127.0.0.1:/' \
+      | if [ -n "${ASSETS:-}" ]; then sed 's/^max_pending_feeds = .*/max_pending_feeds = 2048/'; else cat; fi
     tail -n +"$FEEDS_AT" node/all-feeds.toml
+    for extra in ${EXTRA_FEEDS[@]+"${EXTRA_FEEDS[@]}"}; do
+      printf '\n'
+      cat "$extra"
+    done
   } >"$config.new"
   mv "$config.new" "$config"
   echo "node$i  $(python3 -c 'import sys,json; print(json.load(open(sys.argv[1]))["address"])' "$node/node-entry.json")  ws://127.0.0.1:$port/v2/ws"

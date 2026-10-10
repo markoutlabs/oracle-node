@@ -47,6 +47,8 @@ pub(crate) fn log_observation(event: &IngestEvent) {
         IngestEvent::Disconnected { stream, reason } => {
             warn!(target: "tail", %stream, %reason, "stream down — venue state invalidated");
         }
+        // Five a second for each connection, and no new value in any of them.
+        IngestEvent::Alive { .. } => {}
         // `IngestEvent` is non-exhaustive. A tail that silently skipped a new
         // variant would be least useful exactly when something new appeared.
         other => info!(target: "tail", ?other, "event"),

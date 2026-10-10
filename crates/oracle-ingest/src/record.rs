@@ -6,8 +6,9 @@
 //! input. That is what makes an incident reproducible months later and a
 //! constant tunable against a real dislocation rather than a guess.
 //!
-//! One JSON object per line. Text frames are kept as text. Control frames are
-//! not recorded: liveness is the transport's business, not the aggregator's.
+//! One JSON object per line. Text frames are kept as text. A ping or a pong is
+//! a `control` record: it confirms the connection's values (SPEC §5.2), so a
+//! replay needs it to make the same staleness decisions.
 
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -47,6 +48,14 @@ pub enum Record {
         /// The frame, verbatim.
         bytes: Vec<u8>,
     },
+    /// A ping or a pong arrived. It carries no data, but it confirms the
+    /// connection.
+    Control {
+        /// Receipt time, unix nanoseconds.
+        t: u64,
+        /// The endpoint.
+        url: String,
+    },
     /// The connection ended.
     Close {
         /// Time, unix nanoseconds.
@@ -66,6 +75,7 @@ impl Record {
             Self::Connect { url, .. }
             | Self::Text { url, .. }
             | Self::Binary { url, .. }
+            | Self::Control { url, .. }
             | Self::Close { url, .. } => url,
         }
     }
@@ -77,6 +87,7 @@ impl Record {
             Self::Connect { t, .. }
             | Self::Text { t, .. }
             | Self::Binary { t, .. }
+            | Self::Control { t, .. }
             | Self::Close { t, .. } => *t,
         }
     }
@@ -224,7 +235,9 @@ impl<T: Transport> Transport for RecordingConn<T> {
                 url,
                 bytes: bytes.clone(),
             }),
-            Ok(Some(_)) => {}
+            Ok(Some(Frame::Ping | Frame::Pong)) => {
+                self.recorder.write(&Record::Control { t, url });
+            }
             Ok(None) => self.recorder.write(&Record::Close {
                 t,
                 url,
@@ -241,6 +254,10 @@ impl<T: Transport> Transport for RecordingConn<T> {
 
     async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
         self.inner.send_text(text).await
+    }
+
+    async fn send_ping(&mut self) -> Result<(), TransportError> {
+        self.inner.send_ping().await
     }
 }
 
@@ -265,8 +282,12 @@ mod tests {
                 url: "wss://a".to_owned(),
                 bytes: vec![0, 255],
             },
-            Record::Close {
+            Record::Control {
                 t: 4,
+                url: "wss://a".to_owned(),
+            },
+            Record::Close {
+                t: 5,
                 url: "wss://a".to_owned(),
                 reason: "closed by peer".to_owned(),
             },

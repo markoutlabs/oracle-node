@@ -40,7 +40,7 @@ pub enum Frame {
     Binary(Vec<u8>),
     /// A ping. Replying is the transport's job; the session counts it as liveness.
     Ping,
-    /// A pong, usually answering our own keepalive.
+    /// A pong, usually answering our own probe.
     Pong,
 }
 
@@ -81,6 +81,13 @@ pub trait Transport: Send {
         &mut self,
         text: String,
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
+
+    /// Sends a WebSocket ping. The peer must answer with a pong (RFC 6455).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Send`] if the frame cannot be written.
+    fn send_ping(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;
 }
 
 /// Opens connections.
@@ -126,6 +133,13 @@ impl Transport for WebSocket {
     async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
         self.inner
             .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| TransportError::Send(e.to_string()))
+    }
+
+    async fn send_ping(&mut self) -> Result<(), TransportError> {
+        self.inner
+            .send(Message::Ping(Default::default()))
             .await
             .map_err(|e| TransportError::Send(e.to_string()))
     }

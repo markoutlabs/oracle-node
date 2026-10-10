@@ -1,9 +1,11 @@
 //! The connect-decode-reconnect loop every adapter runs on.
 
+use std::collections::{HashMap, HashSet};
 use std::future::pending;
+use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::Observation;
+use oracle_types::{InstrumentId, ObsKind, Observation};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval_at, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +39,78 @@ pub trait MessageHandler: Send {
     fn on_connect(&mut self) {}
 }
 
+/// How often a session reports that its connection is alive.
+const ALIVE_EVERY: Duration = Duration::from_millis(200);
+
+/// Each instrument and kind that one connection delivered, and when it last
+/// reported them alive.
+struct Carried {
+    seen: HashSet<(InstrumentId, ObsKind)>,
+    list: Arc<[(InstrumentId, ObsKind)]>,
+    last_sent_ns: Option<u64>,
+    /// When each one last delivered a value, for the silence check.
+    last_seen: HashMap<(InstrumentId, ObsKind), Instant>,
+}
+
+/// How often the session looks for a silent instrument.
+const SILENCE_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// Values that change while the market is open. A trade or a funding rate can
+/// rest for long, so its silence proves nothing.
+const ALWAYS_MOVING: [ObsKind; 4] = [
+    ObsKind::BookTop,
+    ObsKind::Depth,
+    ObsKind::MarkPrice,
+    ObsKind::IndexPrice,
+];
+
+impl Carried {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            list: Arc::from(Vec::new()),
+            last_sent_ns: None,
+            last_seen: HashMap::new(),
+        }
+    }
+
+    fn learn(&mut self, observation: &Observation) {
+        let key = (observation.instrument.clone(), observation.kind);
+        self.last_seen.insert(key.clone(), Instant::now());
+        if self.seen.insert(key) {
+            self.list = self.seen.iter().cloned().collect();
+        }
+    }
+
+    /// A value that changes while the market is open and has sent nothing for
+    /// `after`, if any.
+    fn silent(&self, now: Instant, after: Duration) -> Option<&(InstrumentId, ObsKind)> {
+        self.last_seen
+            .iter()
+            .filter(|((_, kind), _)| ALWAYS_MOVING.contains(kind))
+            .find(|(_, last)| now.saturating_duration_since(**last) >= after)
+            .map(|(key, _)| key)
+    }
+
+    /// The liveness event that is due, if any.
+    fn alive(&mut self, stream: StreamId, now_ns: u64) -> Option<IngestEvent> {
+        let every = u64::try_from(ALIVE_EVERY.as_nanos()).unwrap_or(u64::MAX);
+        if self.list.is_empty()
+            || self
+                .last_sent_ns
+                .is_some_and(|last| now_ns.saturating_sub(last) < every)
+        {
+            return None;
+        }
+        self.last_sent_ns = Some(now_ns);
+        Some(IngestEvent::Alive {
+            stream,
+            sources: Arc::clone(&self.list),
+            local_recv_ns: now_ns,
+        })
+    }
+}
+
 /// Session tuning.
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
@@ -52,12 +126,23 @@ pub struct SessionConfig {
     /// Bybit among them — require a JSON or text keepalive and will drop a
     /// connection that only answers protocol pings.
     pub keepalive: Option<(Duration, String)>,
+    /// Send a WebSocket ping after this long with no frame.
+    ///
+    /// A quiet market sends nothing, and only a frame confirms the values that
+    /// the connection carries (SPEC §5.2). The pong is that frame, so this must
+    /// stay below half the staleness limit.
+    pub probe_after: Duration,
+    /// Reconnect when one instrument's book, mark or index has sent nothing for
+    /// this long while the connection lives: the venue stopped that stream, and
+    /// a new connection subscribes again. A connection must be this old first,
+    /// so it recycles at most once per period. `None` for a channel that moves
+    /// only on a trade, such as Coinbase's `ticker`.
+    pub resubscribe_after: Option<Duration>,
     /// Reconnect if nothing at all arrives for this long.
     ///
-    /// Set above the venue's own ping period. A silent connection is
-    /// indistinguishable from a healthy one on a quiet instrument, and the
-    /// failure mode — a half-open socket that never delivers again — is common
-    /// enough that waiting for TCP to notice is not good enough.
+    /// The probes make a healthy connection answer at least every
+    /// `probe_after`, so this only has to cover a slow pong. A half-open
+    /// socket, such as after a sleep, then ends in seconds, not when TCP notices.
     pub idle_timeout: Duration,
     /// Give up on a connect after this long and retry with backoff.
     ///
@@ -84,7 +169,9 @@ impl SessionConfig {
             url: url.into(),
             subscribe: Vec::new(),
             keepalive: None,
-            idle_timeout: Duration::from_secs(60),
+            probe_after: Duration::from_secs(1),
+            resubscribe_after: Some(Duration::from_secs(15 * 60)),
+            idle_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             backoff: BackoffConfig::default(),
@@ -111,6 +198,10 @@ pub struct SessionStats {
     pub decode_skipped: u64,
     /// Connections closed because nothing arrived within `idle_timeout`.
     pub idle_timeouts: u64,
+    /// Pings sent to a quiet connection.
+    pub probes: u64,
+    /// Connections recycled because one instrument fell silent inside them.
+    pub resubscribes: u64,
     /// Connections recycled at `max_session`.
     pub session_recycles: u64,
 }
@@ -236,6 +327,14 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             .as_ref()
             .map(|(period, _)| interval_at(Instant::now() + *period, *period));
         let mut observations: Vec<Observation> = Vec::with_capacity(8);
+        let mut carried = Carried::new();
+        let mut last_frame = Instant::now();
+        let mut probe_at = last_frame + self.config.probe_after;
+        let connected_at = last_frame;
+        let mut silence_check = self
+            .config
+            .resubscribe_after
+            .map(|_| interval_at(connected_at + SILENCE_CHECK_EVERY, SILENCE_CHECK_EVERY));
 
         loop {
             let received = tokio::select! {
@@ -253,55 +352,86 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                     }
                     continue;
                 }
-                result = timeout(self.config.idle_timeout, conn.recv()) => result,
-            };
-
-            let frame = match received {
-                Err(_elapsed) => {
+                () = sleep_until(last_frame + self.config.idle_timeout) => {
                     self.stats.idle_timeouts = self.stats.idle_timeouts.saturating_add(1);
                     return Ok(format!("idle for {:?}", self.config.idle_timeout));
                 }
-                Ok(Err(err)) => return Ok(err.to_string()),
-                Ok(Ok(None)) => return Ok("closed by peer".to_owned()),
-                Ok(Ok(Some(frame))) => frame,
+                () = tick(silence_check.as_mut()) => {
+                    let now = Instant::now();
+                    if let Some(after) = self.config.resubscribe_after
+                        && now.saturating_duration_since(connected_at) >= after
+                        && let Some((instrument, kind)) = carried.silent(now, after)
+                    {
+                        self.stats.resubscribes = self.stats.resubscribes.saturating_add(1);
+                        return Ok(format!(
+                            "{instrument} {} silent for {after:?}; subscribing again",
+                            kind.as_str()
+                        ));
+                    }
+                    continue;
+                }
+                () = sleep_until(probe_at) => {
+                    if let Err(err) = conn.send_ping().await {
+                        return Ok(format!("probe send failed: {err}"));
+                    }
+                    self.stats.probes = self.stats.probes.saturating_add(1);
+                    probe_at = Instant::now() + self.config.probe_after;
+                    continue;
+                }
+                result = conn.recv() => result,
             };
 
-            // A ping counts as liveness and nothing more; the transport answers it.
-            let Some(payload) = frame.payload() else {
-                continue;
+            let frame = match received {
+                Err(err) => return Ok(err.to_string()),
+                Ok(None) => return Ok("closed by peer".to_owned()),
+                Ok(Some(frame)) => frame,
             };
+            last_frame = Instant::now();
+            probe_at = last_frame + self.config.probe_after;
 
             let local_recv_ns = self.clock.now_ns();
-            observations.clear();
-            match self
-                .handler
-                .on_payload(payload, local_recv_ns, &mut observations)
-            {
-                Ok(()) => {
-                    self.stats.messages_decoded = self.stats.messages_decoded.saturating_add(1)
-                }
-                Err(err) if err.is_benign() => {
-                    self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
-                    continue;
-                }
-                Err(err @ DecodeError::Resync(_)) => {
-                    // Observations decoded before the failure are dropped with it.
-                    warn!(%stream, error = %err, "resyncing");
-                    return Ok(err.to_string());
-                }
-                Err(err) => {
-                    self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
-                    debug!(%stream, error = %err, "decode failed");
-                    continue;
+            // A ping carries no payload; the transport answers it.
+            if let Some(payload) = frame.payload() {
+                observations.clear();
+                let decoded =
+                    match self
+                        .handler
+                        .on_payload(payload, local_recv_ns, &mut observations)
+                    {
+                        Ok(()) => {
+                            self.stats.messages_decoded =
+                                self.stats.messages_decoded.saturating_add(1);
+                            true
+                        }
+                        Err(err) if err.is_benign() => {
+                            self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
+                            false
+                        }
+                        Err(err @ DecodeError::Resync(_)) => {
+                            // Observations decoded before the failure are dropped with it.
+                            warn!(%stream, error = %err, "resyncing");
+                            return Ok(err.to_string());
+                        }
+                        Err(err) => {
+                            self.stats.decode_errors = self.stats.decode_errors.saturating_add(1);
+                            debug!(%stream, error = %err, "decode failed");
+                            false
+                        }
+                    };
+                if decoded {
+                    for observation in observations.drain(..) {
+                        self.stats.observations = self.stats.observations.saturating_add(1);
+                        carried.learn(&observation);
+                        // Awaiting a full channel is deliberate backpressure: if
+                        // the aggregator cannot keep up, stop reading the socket
+                        // rather than buffer without bound.
+                        send(out, IngestEvent::observation(observation)).await?;
+                    }
                 }
             }
-
-            for observation in observations.drain(..) {
-                self.stats.observations = self.stats.observations.saturating_add(1);
-                // Awaiting a full channel is deliberate backpressure: if the
-                // aggregator cannot keep up, stop reading the socket rather than
-                // buffer without bound.
-                send(out, IngestEvent::observation(observation)).await?;
+            // Any frame proves the connection alive, a ping and an ack included.
+            if let Some(alive) = carried.alive(stream, local_recv_ns) {
+                send(out, alive).await?;
             }
         }
     }
@@ -354,6 +484,291 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// One trade, then silence, except for a pong to each ping when `answers`.
+    struct QuietConnector {
+        answers: bool,
+    }
+
+    struct QuietConn {
+        frames: Vec<Frame>,
+        answers: bool,
+    }
+
+    impl Connector for QuietConnector {
+        type Conn = QuietConn;
+
+        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
+            Ok(QuietConn {
+                frames: vec![Frame::Text("100".to_owned())],
+                answers: self.answers,
+            })
+        }
+    }
+
+    impl Transport for QuietConn {
+        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
+            if self.frames.is_empty() {
+                pending::<()>().await;
+            }
+            Ok(Some(self.frames.remove(0)))
+        }
+
+        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            if self.answers {
+                self.frames.push(Frame::Pong);
+            }
+            Ok(())
+        }
+    }
+
+    /// `A` sends a value each second for ever; `B` sends one, then nothing.
+    /// `kind` is the kind of both.
+    struct TickingConnector {
+        kind: ObsKind,
+    }
+
+    struct TickingConn {
+        kind: ObsKind,
+        sent_b: bool,
+        /// A stored deadline keeps `recv` cancel-safe, as the session needs.
+        next_at: Instant,
+    }
+
+    impl Connector for TickingConnector {
+        type Conn = TickingConn;
+
+        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
+            Ok(TickingConn {
+                kind: self.kind,
+                sent_b: false,
+                next_at: Instant::now() + Duration::from_secs(1),
+            })
+        }
+    }
+
+    impl Transport for TickingConn {
+        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
+            let symbol = if self.sent_b {
+                sleep_until(self.next_at).await;
+                self.next_at += Duration::from_secs(1);
+                "A"
+            } else {
+                self.sent_b = true;
+                "B"
+            };
+            let kind = if self.kind == ObsKind::Trade {
+                "trade"
+            } else {
+                "book"
+            };
+            Ok(Some(Frame::Text(format!("{symbol} {kind}"))))
+        }
+
+        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// `SYMBOL book` or `SYMBOL trade`, at a price of 100.
+    struct KeyedHandler;
+
+    impl MessageHandler for KeyedHandler {
+        fn on_payload(
+            &mut self,
+            payload: &[u8],
+            local_recv_ns: u64,
+            out: &mut Vec<Observation>,
+        ) -> Result<(), DecodeError> {
+            let text =
+                core::str::from_utf8(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+            let (symbol, kind) = text
+                .split_once(' ')
+                .ok_or_else(|| DecodeError::Malformed(text.to_owned()))?;
+            let price: Fixed = "100".parse().map_err(|_| DecodeError::Control)?;
+            let book = kind == "book";
+            out.push(Observation {
+                instrument: InstrumentId::new(Venue::Binance, MarketKind::Spot, symbol),
+                kind: if book {
+                    ObsKind::BookTop
+                } else {
+                    ObsKind::Trade
+                },
+                price,
+                bid: book.then_some(price),
+                ask: book.then_some(price),
+                bid_qty: None,
+                ask_qty: None,
+                depth_notional_1bp: None,
+                exchange_time_ns: None,
+                local_recv_ns,
+                seq: None,
+                book: None,
+                funding: None,
+            });
+            Ok(())
+        }
+    }
+
+    /// Runs a ticking session for `run`; returns its disconnect reasons and stats.
+    async fn ticking(
+        kind: ObsKind,
+        resubscribe_after: Option<Duration>,
+        run: Duration,
+    ) -> (Vec<String>, SessionStats) {
+        let (tx, mut rx) = mpsc::channel(4_096);
+        let shutdown = CancellationToken::new();
+        let mut config = config();
+        config.idle_timeout = Duration::from_secs(10);
+        config.resubscribe_after = resubscribe_after;
+        let session = Session::new(
+            config,
+            TickingConnector { kind },
+            KeyedHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+        let reasons = tokio::spawn(async move {
+            let mut reasons = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let IngestEvent::Disconnected { reason, .. } = event {
+                    reasons.push(reason);
+                }
+            }
+            reasons
+        });
+        sleep(run).await;
+        shutdown.cancel();
+        let stats = handle.await.expect("joins").expect("runs");
+        (reasons.await.expect("joins"), stats)
+    }
+
+    /// One instrument's book stops while the connection lives: after the
+    /// period, the session reconnects, which subscribes again.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_book_inside_a_live_connection_reconnects() {
+        let after = Duration::from_secs(15 * 60);
+        let (reasons, stats) = ticking(ObsKind::BookTop, Some(after), after + 60 * SECOND_D).await;
+        assert_eq!(stats.resubscribes, 1, "{reasons:?}");
+        assert!(
+            reasons.first().is_some_and(
+                |reason| reason.contains("binance:spot:B") && reason.contains("silent")
+            ),
+            "{reasons:?}"
+        );
+    }
+
+    /// A trade can rest for long; its silence is not a stopped stream.
+    #[tokio::test(start_paused = true)]
+    async fn silent_trades_do_not_reconnect() {
+        let after = Duration::from_secs(15 * 60);
+        let (reasons, stats) = ticking(ObsKind::Trade, Some(after), after + 60 * SECOND_D).await;
+        assert_eq!(stats.resubscribes, 0);
+        assert_eq!(reasons, ["shutdown"], "one connection, never dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_silence_check_can_be_off() {
+        let (_, stats) = ticking(ObsKind::BookTop, None, Duration::from_secs(20 * 60)).await;
+        assert_eq!(stats.resubscribes, 0);
+    }
+
+    const SECOND_D: Duration = Duration::from_secs(1);
+
+    /// Runs a quiet session for `run`, and returns its events and stats.
+    async fn quiet_session(answers: bool, run: Duration) -> (Vec<IngestEvent>, SessionStats) {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let shutdown = CancellationToken::new();
+        let mut config = config();
+        config.probe_after = Duration::from_millis(100);
+        config.idle_timeout = Duration::from_millis(500);
+        let session = Session::new(
+            config,
+            QuietConnector { answers },
+            CountingHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+        sleep(run).await;
+        shutdown.cancel();
+        let stats = handle.await.expect("joins").expect("runs");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (events, stats)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_connection_that_answers_probes_stays_alive() {
+        let (events, stats) = quiet_session(true, Duration::from_secs(3)).await;
+        let dropped = events.iter().any(|event| {
+            matches!(event, IngestEvent::Disconnected { reason, .. } if reason != "shutdown")
+        });
+        // Six idle timeouts long, held open only by the pongs.
+        assert!(!dropped, "{events:?}");
+        assert_eq!(stats.idle_timeouts, 0);
+        assert!(stats.probes >= 20, "{} probes", stats.probes);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, IngestEvent::Alive { .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_connection_that_ignores_probes_is_dropped() {
+        let (events, stats) = quiet_session(false, Duration::from_millis(1_200)).await;
+        assert!(stats.idle_timeouts >= 1, "{events:?}");
+        assert!(events.iter().any(|event| {
+            matches!(event, IngestEvent::Disconnected { reason, .. } if reason.contains("idle"))
+        }));
+    }
+
+    /// A keepalive is our own frame, not the venue's. It must not hold a
+    /// silent connection open.
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_does_not_hide_a_silent_connection() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let connector = MockConnector {
+            fail_first: 0,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            script: Arc::new(std::sync::Mutex::new(vec![vec![]])),
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mut config = config();
+        config.keepalive = Some((Duration::from_millis(10), "ping".to_owned()));
+        let session = Session::new(
+            config,
+            connector,
+            CountingHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+        assert!(matches!(
+            next_event(&mut rx).await,
+            Some(IngestEvent::Connected { .. })
+        ));
+        match next_event(&mut rx).await {
+            Some(IngestEvent::Disconnected { reason, .. }) => assert!(reason.contains("idle")),
+            other => panic!("expected an idle disconnect, got {other:?}"),
+        }
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     /// A connector that fails a set number of times, then serves scripted sessions.
@@ -476,7 +891,7 @@ mod tests {
 
         let mut seen = Vec::new();
         while seen.len() < 5 {
-            match rx.recv().await.expect("an event") {
+            match next_event(&mut rx).await.expect("an event") {
                 IngestEvent::Connected { .. } => seen.push("connected".to_owned()),
                 IngestEvent::Disconnected { reason, .. } => seen.push(reason),
                 event => seen.push(
@@ -516,6 +931,16 @@ mod tests {
         config
     }
 
+    /// The next event that is not a liveness report.
+    async fn next_event(rx: &mut mpsc::Receiver<IngestEvent>) -> Option<IngestEvent> {
+        loop {
+            match rx.recv().await? {
+                IngestEvent::Alive { .. } => {}
+                event => return Some(event),
+            }
+        }
+    }
+
     fn text(payload: &str) -> Result<Option<Frame>, TransportError> {
         Ok(Some(Frame::Text(payload.to_owned())))
     }
@@ -544,23 +969,23 @@ mod tests {
         let handle = tokio::spawn(session.run(tx, shutdown.clone()));
 
         assert!(matches!(
-            rx.recv().await,
+            next_event(&mut rx).await,
             Some(IngestEvent::Connected { .. })
         ));
-        let first = rx.recv().await.expect("observation");
+        let first = next_event(&mut rx).await.expect("observation");
         assert_eq!(
             first.as_observation().map(|o| o.price),
             Some("100.5".parse().expect("valid"))
         );
         assert!(
-            rx.recv()
+            next_event(&mut rx)
                 .await
                 .expect("observation")
                 .as_observation()
                 .is_some()
         );
         assert!(matches!(
-            rx.recv().await,
+            next_event(&mut rx).await,
             Some(IngestEvent::Disconnected { .. })
         ));
 
@@ -643,6 +1068,61 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_connection_reports_what_it_carries_while_it_lives() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let connector = MockConnector {
+            fail_first: 0,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            // An ack before any data proves nothing about an instrument yet.
+            script: Arc::new(std::sync::Mutex::new(vec![vec![
+                text("ack"),
+                text("1"),
+                text("2"),
+                text("ack"),
+            ]])),
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let session = Session::new(
+            config(),
+            connector,
+            CountingHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let done = matches!(event, IngestEvent::Disconnected { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        shutdown.cancel();
+        let _ = handle.await;
+
+        let alive: Vec<&IngestEvent> = events
+            .iter()
+            .filter(|event| matches!(event, IngestEvent::Alive { .. }))
+            .collect();
+        // The frames arrive together: one report, after the first observation.
+        assert_eq!(alive.len(), 1, "{events:?}");
+        let Some(IngestEvent::Alive { sources, .. }) = alive.first() else {
+            panic!("an alive event");
+        };
+        let btc = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        assert_eq!(sources.as_ref(), [(btc, ObsKind::Trade)].as_slice());
+        let first_observation = events
+            .iter()
+            .position(|event| matches!(event, IngestEvent::Observation(_)));
+        let first_alive = events
+            .iter()
+            .position(|event| matches!(event, IngestEvent::Alive { .. }));
+        assert!(first_observation < first_alive);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn disconnect_is_announced_before_the_next_connect() {
         // Ordering is the contract: a consumer must be told to drop its book
         // before any post-reconnect quote can reach it.
@@ -667,11 +1147,12 @@ mod tests {
         let handle = tokio::spawn(session.run(tx, shutdown.clone()));
 
         let mut sequence = Vec::new();
-        for _ in 0..6 {
+        while sequence.len() < 6 {
             match rx.recv().await {
                 Some(IngestEvent::Connected { .. }) => sequence.push("connected"),
                 Some(IngestEvent::Disconnected { .. }) => sequence.push("disconnected"),
                 Some(IngestEvent::Observation(_)) => sequence.push("observation"),
+                Some(IngestEvent::Alive { .. }) => {}
                 None => break,
             }
         }

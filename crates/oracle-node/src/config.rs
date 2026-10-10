@@ -271,10 +271,14 @@ const fn default_max_pending() -> usize {
 /// Peg confidence above which dependent feeds degrade, from SPEC.md §5.3.
 const DEFAULT_MAX_PEG_CONF_BPS: Fixed = Fixed::from_raw(50 * 1_000_000_000_000);
 
-/// Idle timeout for the socket-subscribing venues.
-const VENUE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Idle timeout for the socket-subscribing venues. The session probes a quiet
+/// connection every second, so a healthy one never stays silent this long.
+const VENUE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Session recycle age for the socket-subscribing venues.
 const VENUE_MAX_SESSION: Duration = Duration::from_secs(23 * 3_600);
+/// A book, mark or index silent this long inside a live connection makes it
+/// reconnect, which subscribes again.
+const VENUE_RESUBSCRIBE_AFTER: Duration = Duration::from_secs(15 * 60);
 /// Subscription arguments per frame.
 const VENUE_CHUNK: usize = 100;
 
@@ -741,6 +745,7 @@ fn book_connection(
             subscribe: coinbase::book_subscribe_frames(product_ids),
             keepalive: None,
             idle_timeout: VENUE_IDLE_TIMEOUT,
+            resubscribe_after: Some(VENUE_RESUBSCRIBE_AFTER),
             max_session: VENUE_MAX_SESSION,
             decode: coinbase::decode_book,
         },
@@ -846,6 +851,8 @@ fn venue_connection(
             subscribe,
             keepalive,
             idle_timeout: VENUE_IDLE_TIMEOUT,
+            // Coinbase's `ticker` moves only on a trade: its silence is a quiet coin.
+            resubscribe_after: (venue != Venue::Coinbase).then_some(VENUE_RESUBSCRIBE_AFTER),
             max_session: VENUE_MAX_SESSION,
             decode,
         },
@@ -902,6 +909,19 @@ sources = [
             .expect("a perp mid feed");
         assert!(perp_mid.impact_notional.is_some());
         assert!(resolved.binance.perp.iter().any(|spec| spec.depth));
+    }
+
+    /// scripts/asset-feeds.py writes feeds only; with the playground they make
+    /// one config, and every venue symbol in it must resolve.
+    #[test]
+    fn the_generated_asset_feeds_resolve_with_the_playground() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../node/");
+        let all = std::fs::read_to_string(format!("{root}all-feeds.toml")).expect("all-feeds");
+        let assets = std::fs::read_to_string(format!("{root}assets.toml")).expect("assets");
+        let resolved = parse(&format!("{all}\n{assets}"))
+            .resolve()
+            .expect("resolves");
+        assert!(resolved.feeds.len() > 100, "{} feeds", resolved.feeds.len());
     }
 
     #[test]

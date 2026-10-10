@@ -35,6 +35,9 @@ pub struct VenueSpec {
     pub keepalive: Option<(Duration, String)>,
     /// Reconnect if nothing arrives for this long.
     pub idle_timeout: Duration,
+    /// Reconnect when one instrument falls silent for this long; see
+    /// [`SessionConfig::resubscribe_after`](crate::SessionConfig::resubscribe_after).
+    pub resubscribe_after: Option<Duration>,
     /// Recycle the connection at this age.
     pub max_session: Duration,
     /// How to decode this connection's payloads.
@@ -154,6 +157,7 @@ fn session_config(spec: &VenueSpec, venue: Venue) -> SessionConfig {
     config.subscribe = spec.subscribe.clone();
     config.keepalive = spec.keepalive.clone();
     config.idle_timeout = spec.idle_timeout;
+    config.resubscribe_after = spec.resubscribe_after;
     config.max_session = spec.max_session;
     config
 }
@@ -213,6 +217,9 @@ mod tests {
         async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
             Ok(())
         }
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     impl Connector for NullConnector {
@@ -231,6 +238,7 @@ mod tests {
             subscribe: vec![r#"{"op":"subscribe"}"#.to_owned()],
             keepalive: Some((Duration::from_secs(20), r#"{"op":"ping"}"#.to_owned())),
             idle_timeout: Duration::from_secs(30),
+            resubscribe_after: None,
             max_session: Duration::from_secs(3_600),
             decode,
         }

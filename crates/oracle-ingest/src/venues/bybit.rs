@@ -52,11 +52,16 @@ pub const fn url(market: MarketKind) -> &'static str {
 /// Book levels kept per side: Bybit's `orderbook.50`.
 pub const BOOK_DEPTH: usize = 50;
 
+/// Topics in one spot subscribe request. Bybit refuses the whole request past
+/// this (`args size >10`); tested on 2026-10-10. Its perpetuals take more.
+pub const SPOT_MAX_ARGS: usize = 10;
+
 /// Builds the subscribe frames for a market's instruments, each with whether it
 /// wants the book.
 ///
 /// Chunked because Bybit caps arguments per request; separate frames on one
-/// connection are cheaper than separate connections.
+/// connection are cheaper than separate connections. A spot frame never has
+/// more than [`SPOT_MAX_ARGS`].
 #[must_use]
 pub fn subscribe_frames<'a>(
     instruments: impl Iterator<Item = (&'a str, bool)>,
@@ -77,6 +82,11 @@ pub fn subscribe_frames<'a>(
         }
     }
     topics.sort_unstable();
+    let chunk = if market.is_perp() {
+        chunk
+    } else {
+        chunk.min(SPOT_MAX_ARGS)
+    };
     topics
         .chunks(chunk.max(1))
         .map(|group| serde_json::json!({ "op": "subscribe", "args": group }).to_string())
@@ -564,6 +574,24 @@ mod tests {
         let symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"].map(|symbol| (symbol, false));
         let frames = subscribe_frames(symbols.into_iter(), MarketKind::Spot, 2);
         assert_eq!(frames.len(), 3, "six topics at two per frame");
+    }
+
+    /// Bybit refuses a whole spot request with more than ten topics, so a
+    /// large chunk must not reach spot. Perpetuals keep the chunk asked for.
+    #[test]
+    fn spot_frames_never_exceed_ten_topics() {
+        let symbols: Vec<String> = (0..40).map(|index| format!("A{index}USDT")).collect();
+        let instruments = || symbols.iter().map(|symbol| (symbol.as_str(), false));
+        for frame in subscribe_frames(instruments(), MarketKind::Spot, 100) {
+            let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
+            let args = value
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len);
+            assert!(args.is_some_and(|count| count <= SPOT_MAX_ARGS), "{frame}");
+        }
+        let linear = subscribe_frames(instruments(), MarketKind::LinearPerp, 100);
+        assert_eq!(linear.len(), 2, "120 topics at 100 per frame");
     }
 
     #[test]

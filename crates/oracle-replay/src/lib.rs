@@ -159,11 +159,17 @@ impl Transport for ReplayConn {
         Ok(match record {
             Some(Record::Text { text, .. }) => Some(Frame::Text(text)),
             Some(Record::Binary { bytes, .. }) => Some(Frame::Binary(bytes)),
+            Some(Record::Control { .. }) => Some(Frame::Pong),
             Some(Record::Close { .. } | Record::Connect { .. }) | None => None,
         })
     }
 
     async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    // The recording holds the pongs that the live probes got.
+    async fn send_ping(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -251,8 +257,10 @@ pub async fn run(
         // may have released frames far beyond the one being applied here.
         // Timers fire at recorded time, before the event that crossed them,
         // which is how the live node orders them.
-        if let IngestEvent::Observation(observation) = &event {
-            now = now.max(observation.local_recv_ns);
+        match &event {
+            IngestEvent::Observation(observation) => now = now.max(observation.local_recv_ns),
+            IngestEvent::Alive { local_recv_ns, .. } => now = now.max(*local_recv_ns),
+            _ => {}
         }
         loop {
             let retry = pipeline

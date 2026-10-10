@@ -167,6 +167,10 @@ impl<T: Transport> Transport for SnapshotTransport<T> {
     async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
         self.inner.send_text(text).await
     }
+
+    async fn send_ping(&mut self) -> Result<(), TransportError> {
+        self.inner.send_ping().await
+    }
 }
 
 /// Fetches one snapshot. A failure becomes a frame too, so the decoder can ask

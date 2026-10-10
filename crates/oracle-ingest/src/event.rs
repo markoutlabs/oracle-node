@@ -1,6 +1,8 @@
 //! What an adapter emits downstream.
 
-use oracle_types::{MarketKind, Observation, Venue};
+use std::sync::Arc;
+
+use oracle_types::{InstrumentId, MarketKind, ObsKind, Observation, Venue};
 
 /// Identifies one venue connection: a venue plus a market type.
 ///
@@ -47,6 +49,20 @@ pub enum IngestEvent {
         stream: StreamId,
     },
 
+    /// A connection received something: data, a heartbeat or a reply.
+    ///
+    /// Venues send a value when it changes, so while its connection lives, an
+    /// unchanged value is still the venue's current one. Without this, a quiet
+    /// instrument would look dead after the staleness limit.
+    Alive {
+        /// Which connection.
+        stream: StreamId,
+        /// Each instrument and kind that this connection has delivered.
+        sources: Arc<[(InstrumentId, ObsKind)]>,
+        /// Our receipt time.
+        local_recv_ns: u64,
+    },
+
     /// A connection went away.
     ///
     /// **Consumers must immediately invalidate all state for this stream.** A
@@ -82,7 +98,9 @@ impl IngestEvent {
     pub fn stream(&self) -> StreamId {
         match self {
             Self::Observation(obs) => StreamId::new(obs.instrument.venue, obs.instrument.market),
-            Self::Connected { stream } | Self::Disconnected { stream, .. } => *stream,
+            Self::Connected { stream }
+            | Self::Disconnected { stream, .. }
+            | Self::Alive { stream, .. } => *stream,
         }
     }
 }

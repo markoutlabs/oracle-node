@@ -51,11 +51,9 @@ pub struct BinanceConfig {
     pub spot_rest_url: String,
     /// The REST endpoint futures depth snapshots come from.
     pub perp_rest_url: String,
-    /// Reconnect if nothing arrives for this long.
-    ///
-    /// Binance sends a protocol ping roughly every 20 seconds, and a quiet
-    /// instrument may not quote for a while, so this has to sit comfortably above
-    /// the ping period rather than the quote rate.
+    /// Reconnect if nothing arrives for this long. The session probes a quiet
+    /// connection (`SessionConfig::probe_after`), so this only has to cover a
+    /// slow pong.
     pub idle_timeout: Duration,
     /// Recycle connections at this age, below Binance's own 24-hour limit.
     pub max_session: Duration,
@@ -85,7 +83,7 @@ impl Default for BinanceConfig {
             perp_market_url: streams::FUTURES_MARKET_BASE.to_owned(),
             spot_rest_url: snapshot::SPOT_REST.to_owned(),
             perp_rest_url: snapshot::FUTURES_REST.to_owned(),
-            idle_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             streams_per_connection: MAX_STREAMS_PER_CONNECTION,
         }
@@ -291,6 +289,9 @@ mod tests {
             Ok(None)
         }
         async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
             Ok(())
         }
     }

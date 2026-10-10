@@ -39,6 +39,9 @@ impl Transport for ScriptedConn {
     async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
         Ok(())
     }
+    async fn send_ping(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -143,6 +146,8 @@ async fn run(
     let mut events = Vec::new();
     while events.len() < expected_events {
         match rx.recv().await {
+            // Liveness reports interleave with everything; these tests read the rest.
+            Some(IngestEvent::Alive { .. }) => {}
             Some(event) => events.push(event),
             None => break,
         }

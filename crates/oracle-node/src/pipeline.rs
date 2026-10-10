@@ -104,6 +104,11 @@ impl Pipeline {
                 self.books.observe(observation);
                 self.funding.observe(observation);
             }
+            IngestEvent::Alive {
+                sources,
+                local_recv_ns,
+                ..
+            } => self.aggregator.alive(sources, *local_recv_ns),
             IngestEvent::Connected { .. } => {
                 self.stats.connects = self.stats.connects.saturating_add(1);
             }
