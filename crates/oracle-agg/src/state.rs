@@ -733,10 +733,11 @@ fn statuses(
     derived: &[Result<SourceQuote, SourceStatus>],
     outcome: &Outcome,
 ) -> Vec<(SourceStatus, u16)> {
-    let weights = match outcome {
-        Outcome::Priced(aggregation) => Some(&aggregation.weights),
-        Outcome::Halted { .. } => None,
+    let (weights, reasons) = match outcome {
+        Outcome::Priced(aggregation) => (Some(&aggregation.weights), aggregation.reasons),
+        Outcome::Halted { reasons, .. } => (None, *reasons),
     };
+    let peg_lost = reasons.contains(Reasons::PEG_UNAVAILABLE);
     let total = weights.map_or(Fixed::ZERO, |weights| {
         weights
             .iter()
@@ -746,6 +747,7 @@ fn statuses(
         .iter()
         .map(|derived| match (derived, weights) {
             (Err(status), _) => (*status, 0),
+            (Ok(quote), _) if peg_lost && quote.converted => (SourceStatus::PegUnavailable, 0),
             (Ok(_), None) => (SourceStatus::FeedHalted, 0),
             (Ok(quote), Some(weights)) => weights
                 .iter()

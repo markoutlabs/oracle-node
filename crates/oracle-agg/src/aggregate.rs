@@ -42,7 +42,8 @@ impl Reasons {
     pub const TRADE_FALLBACK: Self = Self(1 << 4);
     /// At least one source was converted through a peg feed.
     pub const SYNTHETIC_QUOTE: Self = Self(1 << 5);
-    /// The peg feed needed for conversion was missing or unusable.
+    /// The peg feed needed for conversion was missing or unusable, so the
+    /// converted sources dropped out.
     pub const PEG_UNAVAILABLE: Self = Self(1 << 6);
     /// The peg feed is live but its own confidence is too wide to lean on.
     pub const PEG_UNCERTAIN: Self = Self(1 << 7);
@@ -78,7 +79,11 @@ impl Reasons {
         if self.contains(Self::SYNTHETIC_QUOTE) {
             bits |= Flags::SYNTHETIC_QUOTE.bits();
         }
-        if self.0 & (Self::OUTLIER_PRESSURE.0 | Self::UNCORROBORATED_JUMP.0 | Self::PEG_UNCERTAIN.0)
+        if self.0
+            & (Self::OUTLIER_PRESSURE.0
+                | Self::UNCORROBORATED_JUMP.0
+                | Self::PEG_UNCERTAIN.0
+                | Self::PEG_UNAVAILABLE.0)
             != 0
         {
             bits |= Flags::DEGRADED.bits();
@@ -186,8 +191,8 @@ impl Peg {
 
 /// Converts stablecoin-quoted prices into the feed's quote asset.
 ///
-/// Returns `false` if the peg is unusable, in which case the caller must halt
-/// rather than publish unconverted prices under a `/USD` symbol.
+/// Returns `false` if the peg is unusable, in which case the caller must drop
+/// the converted sources rather than publish them under a `/USD` symbol.
 fn apply_peg(quotes: &mut [SourceQuote], peg: Peg) -> bool {
     if !peg.price.is_positive() {
         return false;
@@ -257,30 +262,25 @@ pub fn aggregate(
                 live: 0,
             };
         };
-        let live = u32::try_from(quotes.len()).unwrap_or(u32::MAX);
-        // No peg means no honest way to state these prices in the quote asset.
-        // Publishing them unconverted would be wrong by whatever the peg has
-        // drifted, which is exactly the error nobody would notice.
-        let Some(peg) = peg else {
-            return Outcome::Halted {
-                reasons: reasons | Reasons::PEG_UNAVAILABLE,
-                live,
-            };
-        };
-        if !apply_peg(&mut quotes, peg) {
-            return Outcome::Halted {
-                reasons: reasons | Reasons::PEG_UNAVAILABLE,
-                live,
-            };
+        match peg {
+            Some(peg) if apply_peg(&mut quotes, peg) => {
+                reasons |= Reasons::SYNTHETIC_QUOTE;
+                if peg
+                    .conf_bps()
+                    .is_none_or(|bps| bps > conversion.max_peg_conf_bps)
+                {
+                    reasons |= Reasons::PEG_UNCERTAIN;
+                }
+                applied_peg = Some(peg);
+            }
+            // No peg means no honest way to state the converted prices in the
+            // quote asset, so they drop out. The native sources still price the
+            // feed, degraded, and the quorum below decides whether they suffice.
+            _ => {
+                quotes.retain(|quote| !quote.converted);
+                reasons |= Reasons::PEG_UNAVAILABLE;
+            }
         }
-        reasons |= Reasons::SYNTHETIC_QUOTE;
-        if peg
-            .conf_bps()
-            .is_none_or(|bps| bps > conversion.max_peg_conf_bps)
-        {
-            reasons |= Reasons::PEG_UNCERTAIN;
-        }
-        applied_peg = Some(peg);
     }
 
     let live = u32::try_from(quotes.len()).unwrap_or(u32::MAX);

@@ -8,12 +8,15 @@
 //! The contract these tests hold the aggregator to: a depeg must surface as
 //! confidence widening across every dependent feed, never as a uniform
 //! mispricing, and never as a peg-quoted price published under a USD symbol.
+//! Without a peg, the converted sources drop out and the native ones price the
+//! feed, degraded, while they meet its quorum.
 
 use oracle_agg::aggregate::Reasons;
 use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_agg::{Aggregator, FeedConfig};
 use oracle_types::{
-    FeedId, Fixed, InstrumentId, MarketKind, ObsKind, Observation, PriceUpdate, Symbol, Venue,
+    FeedId, Fixed, InstrumentId, MarketKind, ObsKind, Observation, PriceUpdate, SourceStatus,
+    Symbol, Venue,
 };
 use oracle_wire::feed_id;
 
@@ -63,8 +66,13 @@ fn peg_feed() -> FeedConfig {
     config
 }
 
-/// A BTC/USD feed mixing native-USD venues with USDT-quoted ones.
+/// A BTC/USD feed mixing native-USD venues with USDT-quoted ones, which needs
+/// three sources: more than the native venues alone.
 fn btc_feed(max_peg_conf_bps: &str) -> FeedConfig {
+    btc_feed_needing(max_peg_conf_bps, 3)
+}
+
+fn btc_feed_needing(max_peg_conf_bps: &str, min_sources: u32) -> FeedConfig {
     let mut sources: Vec<SourceConfig> = USD_VENUES
         .iter()
         .map(|venue| {
@@ -83,7 +91,7 @@ fn btc_feed(max_peg_conf_bps: &str) -> FeedConfig {
     }));
 
     let mut config = FeedConfig::spot(btc_symbol(), feed_id(&btc_symbol()), sources);
-    config.min_sources = 3;
+    config.min_sources = min_sources;
     config.with_conversion(QuoteConversion {
         peg_feed: feed_id(&peg_symbol()),
         max_peg_conf_bps: fixed(max_peg_conf_bps),
@@ -258,7 +266,8 @@ fn an_uncertain_peg_degrades_dependent_feeds() {
     );
 }
 
-/// No peg means no honest way to state these prices in USD.
+/// No peg means no honest way to state the USDT prices in USD. The two native
+/// venues alone are below this feed's quorum of three.
 #[test]
 fn losing_the_peg_halts_dependent_feeds_rather_than_publishing_usdt_as_usd() {
     let mut aggregator = aggregator("50");
@@ -279,7 +288,8 @@ fn losing_the_peg_halts_dependent_feeds_rather_than_publishing_usdt_as_usd() {
     );
 }
 
-/// Once the peg goes away mid-flight, the feed halts rather than drifting.
+/// Once the peg goes away mid-flight, a feed whose native venues are below its
+/// quorum halts rather than drifting.
 #[test]
 fn the_peg_going_away_halts_an_established_feed() {
     let mut aggregator = aggregator("50");
@@ -306,6 +316,52 @@ fn the_peg_going_away_halts_an_established_feed() {
         "a stale peg must halt its dependents"
     );
     assert!(!btc.is_usable());
+}
+
+/// Without a peg, the native venues still price a feed whose quorum they meet.
+/// The USDT venues quote 10 % higher here: any of them in the price would show.
+#[test]
+fn losing_the_peg_leaves_the_native_sources_and_degrades() {
+    let mut aggregator =
+        Aggregator::new(vec![btc_feed_needing("50", 2), peg_feed()]).expect("valid config");
+    let established = find(
+        &tick(&mut aggregator, START, "1", "0.00005", "64000", "64000"),
+        &btc_symbol(),
+    )
+    .expect("publishes");
+    assert_eq!(established.num_sources, 5);
+
+    // Three seconds on, the peg's sources are stale; only BTC quotes arrive.
+    let later = START + 3 * SECOND;
+    for venue in USD_VENUES {
+        aggregator.observe(&book(venue, "BTC-USD", fixed("64000"), "0.00005", later));
+    }
+    for venue in STABLE_VENUES {
+        aggregator.observe(&book(venue, "BTCUSDT", fixed("70400"), "0.00005", later));
+    }
+    let updates = aggregator.poll_all(later).0;
+
+    let btc = find(&updates, &btc_symbol()).expect("btc publishes");
+    assert_eq!(price_of(&btc), fixed("64000"), "the native venues only");
+    assert_eq!(btc.num_sources, 2);
+    assert!(btc.is_usable() && btc.flags.is_degraded());
+    assert!(!btc.flags.is_synthetic_quote(), "nothing was converted");
+    let stats = aggregator
+        .stats(feed_id(&btc_symbol()))
+        .expect("known feed");
+    assert!(stats.last_reasons.contains(Reasons::PEG_UNAVAILABLE));
+
+    // The venue report says why the USDT venues are out.
+    let reports = aggregator.poll_venues(later, |feed| feed == feed_id(&btc_symbol()));
+    let report = reports.first().expect("a report");
+    for entry in &report.entries {
+        let expected = if STABLE_VENUES.contains(&entry.venue) {
+            SourceStatus::PegUnavailable
+        } else {
+            SourceStatus::Used
+        };
+        assert_eq!(entry.status, expected, "{:?}", entry.venue);
+    }
 }
 
 /// The peg must be evaluated before its dependents, in the same tick.

@@ -42,6 +42,10 @@ path = "node/clients.json"
 [[feeds]]
 symbol = "CRYPTO.USDT/USD"
 min_sources = 1
+# A stablecoin book can stay unchanged for long. In a 2-hour run, Coinbase's
+# data was up to 39 s old and Kraken's up to 23 s; at the 2 s default the peg
+# was stale half the time. A depeg moves the quotes, so it stays fresh.
+max_age_ms = 60000
 sources = [
   { venue = "coinbase", market = "spot", symbol = "USDT-USD" },
   { venue = "kraken", market = "spot", symbol = "USDT/USD" },

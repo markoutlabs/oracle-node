@@ -34,11 +34,13 @@ pub enum SourceStatus {
     Invalid,
     /// It had a usable quote, but the feed halted.
     FeedHalted,
+    /// It is quoted in the feed's peg asset, and the peg has no usable price.
+    PegUnavailable,
 }
 
 impl SourceStatus {
     /// Every status, in wire order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Used,
         Self::Outlier,
         Self::Stale,
@@ -46,6 +48,7 @@ impl SourceStatus {
         Self::NoData,
         Self::Invalid,
         Self::FeedHalted,
+        Self::PegUnavailable,
     ];
 
     /// Returns the wire-stable index. Never renumber: signed reports carry it.
@@ -59,6 +62,7 @@ impl SourceStatus {
             Self::NoData => 4,
             Self::Invalid => 5,
             Self::FeedHalted => 6,
+            Self::PegUnavailable => 7,
         }
     }
 
@@ -73,6 +77,7 @@ impl SourceStatus {
             4 => Some(Self::NoData),
             5 => Some(Self::Invalid),
             6 => Some(Self::FeedHalted),
+            7 => Some(Self::PegUnavailable),
             _ => None,
         }
     }
@@ -88,6 +93,7 @@ impl SourceStatus {
             Self::NoData => "no_data",
             Self::Invalid => "invalid",
             Self::FeedHalted => "feed_halted",
+            Self::PegUnavailable => "peg_unavailable",
         }
     }
 }
@@ -217,7 +223,7 @@ mod tests {
             assert_eq!(SourceStatus::from_index(status.index()), Some(status));
             assert_eq!(status.as_str().parse::<SourceStatus>(), Ok(status));
         }
-        assert_eq!(SourceStatus::from_index(7), None);
+        assert_eq!(SourceStatus::from_index(8), None);
     }
 
     #[test]

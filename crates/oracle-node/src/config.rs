@@ -202,6 +202,11 @@ pub struct FeedSettings {
     /// Never publish more often than this, in milliseconds.
     #[serde(default)]
     pub min_interval_ms: Option<u64>,
+    /// Drop a venue whose newest data is older than this, in milliseconds. A
+    /// quiet book, such as a stablecoin pair, can stay unchanged far longer
+    /// than the default.
+    #[serde(default)]
+    pub max_age_ms: Option<u64>,
     /// Price each venue at the average fill for this notional, in quote units,
     /// from depth snapshots, as a decimal string. Subscribes to depth where the
     /// venue offers it.
@@ -575,6 +580,15 @@ impl NodeConfig {
             if let Some(ms) = feed.min_interval_ms {
                 config.min_interval = Duration::from_millis(ms);
             }
+            if let Some(ms) = feed.max_age_ms {
+                if ms == 0 {
+                    return Err(ConfigError::Invalid(format!(
+                        "feed `{}`: max_age_ms must be above zero",
+                        feed.symbol
+                    )));
+                }
+                config.max_age = Duration::from_millis(ms);
+            }
             if let Some(text) = &feed.impact_notional {
                 config.impact_notional = Some(text.parse().map_err(|e| {
                     ConfigError::Invalid(format!(
@@ -803,11 +817,10 @@ fn venue_connection(
         Venue::Deribit => (
             deribit::URL.to_owned(),
             deribit::subscribe_frames(with_depth(), VENUE_CHUNK),
-            // None: the ticker channel pushes every 100ms whether or not the
-            // market moves, so the socket is never idle and `idle_timeout`
-            // catches a half-open one. Deribit's own heartbeat needs a reply to
-            // each `test_request`, which this transport has no way to send.
-            None,
+            // Deribit closes a connection that sends no request for 10 minutes.
+            // Its own heartbeat needs a reply to each `test_request`, which this
+            // transport cannot send; a plain request every 30 s suffices.
+            Some((deribit::KEEPALIVE_EVERY, deribit::KEEPALIVE.to_owned())),
             deribit::decode,
         ),
         Venue::Binance => {
@@ -961,6 +974,29 @@ sources = [
         assert_eq!(funding.heartbeat, SLOW_HEARTBEAT);
         assert_eq!(funding.max_age, Duration::from_secs(90));
         assert_eq!(funding.expo, -9);
+    }
+
+    #[test]
+    fn a_quiet_feed_sets_its_own_staleness_limit() {
+        let with = |setting: &str| {
+            SAMPLE.replacen(
+                "min_sources = 1\n",
+                &format!("min_sources = 1\n{setting}\n"),
+                1,
+            )
+        };
+        let resolved = parse(&with("max_age_ms = 60000"))
+            .resolve()
+            .expect("resolves");
+        let feed = resolved.feeds.first().expect("a feed");
+        assert_eq!(feed.max_age, Duration::from_secs(60));
+        let other = resolved.feeds.get(1).expect("a second feed");
+        assert_eq!(
+            other.max_age,
+            Duration::from_secs(2),
+            "the default elsewhere"
+        );
+        assert!(parse(&with("max_age_ms = 0")).resolve().is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ import sys
 
 VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit"]
 MARKETS = ["spot", "linear_perp", "inverse_perp"]
-STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted"]
+STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted", "peg_unavailable"]
 FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4}
 BASES = ["interval", "eight_hours"]
 UNITS = ["base", "contracts", "quote"]

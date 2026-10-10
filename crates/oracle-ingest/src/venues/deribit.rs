@@ -42,6 +42,14 @@ use super::decimal_literal;
 /// The production endpoint.
 pub const URL: &str = "wss://www.deribit.com/ws/api/v2";
 
+/// A request that the session sends every [`KEEPALIVE_EVERY`]. Deribit closes a
+/// public connection after 10 minutes without a request from the client, even
+/// while it streams; tested on 2026-10-10.
+pub const KEEPALIVE: &str = r#"{"jsonrpc":"2.0","id":0,"method":"public/test"}"#;
+
+/// How often to send [`KEEPALIVE`].
+pub const KEEPALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The aggregation interval requested on the ticker channel.
 ///
 /// `100ms` rather than `raw`, which is reserved for authenticated sessions, and
@@ -530,6 +538,8 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"result":["ticker.BTC-PERPETUAL.100ms"]}"#,
             r#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#,
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params"}}"#,
+            // The reply to the keepalive, as Deribit sent it.
+            r#"{"jsonrpc":"2.0","id":2,"result":{"version":"1.2.26"},"usIn":1791613428196921,"usOut":1791613428196968,"usDiff":47,"testnet":false}"#,
         ] {
             let error = decode_payload(
                 control.as_bytes(),
