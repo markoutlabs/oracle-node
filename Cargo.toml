@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pxr64/reimagined-octo-train"
+repository = "https://github.com/markoutlabs/oracle-node"
 
 [workspace.dependencies]
 oracle-types = { path = "crates/oracle-types", version = "0.1.0" }

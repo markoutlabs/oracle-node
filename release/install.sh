@@ -1,16 +1,16 @@
 #!/bin/sh
 # Installs oracle-node from a GitHub release, after it checks the binary against
 # the release's SHA256SUMS. The web proxy has its own repo and installer:
-# https://github.com/pxr64/oracle-proxy
+# https://github.com/markoutlabs/oracle-proxy
 #
-#   curl -fsSL https://github.com/pxr64/reimagined-octo-train/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/markoutlabs/oracle-node/releases/latest/download/install.sh | sh
 #   curl -fsSL …/install.sh | sh -s -- --version v0.1.0 --to "$HOME/bin"
 #
 # Environment: ORACLE_VERSION, ORACLE_INSTALL_DIR and ORACLE_REPO set the same
 # things as --version, --to and the source repository.
 set -eu
 
-REPO="${ORACLE_REPO:-pxr64/reimagined-octo-train}"
+REPO="${ORACLE_REPO:-markoutlabs/oracle-node}"
 VERSION="${ORACLE_VERSION:-latest}"
 INSTALL_DIR="${ORACLE_INSTALL_DIR:-}"
 # The release binaries link against this glibc or a newer one.
@@ -92,7 +92,7 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       node) ;;
-      proxy) fail "oracle-proxy has its own installer: https://github.com/pxr64/oracle-proxy" ;;
+      proxy) fail "oracle-proxy has its own installer: https://github.com/markoutlabs/oracle-proxy" ;;
       --version)
         [ $# -ge 2 ] || fail "--version needs a tag"
         VERSION="$2"

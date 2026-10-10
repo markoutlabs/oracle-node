@@ -7,3 +7,5 @@ node/registry.json
 .icp/cache/
 # `oracle-node init` run from the repo root writes a key here.
 /oracle-node/
+# The design spec stays local; it is not part of the public repo.
+SPEC.md
