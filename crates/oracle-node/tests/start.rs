@@ -22,21 +22,24 @@ fn key(seed: u8) -> Signer {
 
 /// A node directory with a signed registry, a client list, a key, and a config.
 fn fixture(name: &str) -> PathBuf {
-    let dir = common::scratch(name);
-    std::fs::create_dir_all(&dir).expect("creates");
-    let governance = key(0x33);
-    let node = key(0x41);
-    let now = std::time::SystemTime::now()
+    fixture_listing(name, &key(0x41))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after 1970")
-        .as_secs();
+        .as_secs()
+}
 
+/// Writes `dir/registry.json`, signed by governance, listing `listed`.
+fn write_registry(dir: &Path, version: u64, listed: &Signer) {
     let registry = Registry::sign(
-        &governance,
-        1,
-        now,
+        &key(0x33),
+        version,
+        now(),
         vec![NodeEntry {
-            address: node.address(),
+            address: listed.address(),
             endpoints: vec!["ws://127.0.0.1:1/v2/ws".to_owned()],
             weight: 1,
         }],
@@ -46,6 +49,21 @@ fn fixture(name: &str) -> PathBuf {
         },
     )
     .expect("signs");
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&registry).expect("json"),
+    )
+    .expect("writes");
+}
+
+/// As [`fixture`], with a registry that lists `listed` rather than the node.
+fn fixture_listing(name: &str, listed: &Signer) -> PathBuf {
+    let dir = common::scratch(name);
+    std::fs::create_dir_all(&dir).expect("creates");
+    let governance = key(0x33);
+    let node = key(0x41);
+    let now = now();
+    write_registry(&dir, 1, listed);
     let clients = ClientList::sign(
         &governance,
         1,
@@ -58,10 +76,6 @@ fn fixture(name: &str) -> PathBuf {
     )
     .expect("signs");
     let write = |file: &str, text: &str| std::fs::write(dir.join(file), text).expect("writes");
-    write(
-        "registry.json",
-        &serde_json::to_string(&registry).expect("json"),
-    );
     write(
         "clients.json",
         &serde_json::to_string(&clients).expect("json"),
@@ -106,6 +120,31 @@ fn run_until_ready(dir: &Path, format: &str) -> String {
     let node = Node::spawn(start(dir, format), dir.join("node.log"));
     node.wait(READY);
     node.stop()
+}
+
+/// `init` starts a node before governance lists it. The node waits, and a
+/// signal stops it cleanly while it waits.
+#[test]
+fn an_unlisted_node_waits_for_governance() {
+    let dir = fixture_listing("unlisted", &key(0x42));
+    let node = Node::spawn(start(&dir, "plain"), dir.join("node.log"));
+    node.wait("waiting for governance to add it");
+    let log = node.stop();
+    assert!(!log.contains(READY), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The node serves at its next check after governance lists it.
+#[test]
+fn a_waiting_node_serves_once_the_registry_lists_it() {
+    let dir = fixture_listing("listed-later", &key(0x42));
+    let node = Node::spawn(start(&dir, "plain"), dir.join("node.log"));
+    node.wait("waiting for governance to add it");
+    write_registry(&dir, 2, &key(0x41));
+    node.wait("the registry lists this node");
+    node.wait(READY);
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

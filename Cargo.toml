@@ -17,7 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/markoutlabs/oracle-node"
 
 [workspace.dependencies]
@@ -71,6 +71,8 @@ getrandom = "0.3"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "x25519", "hkdfsha2", "aes"] }
 aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "alloc"] }
 hkdf = "0.12"
+# The service user of `sudo oracle-node init`.
+nix = { version = "0.31", default-features = false, features = ["user"] }
 # Book checksums (Kraken, OKX).
 crc32fast = "1"
 sha2 = "0.10"
@@ -89,6 +91,8 @@ tokio-tungstenite = { version = "0.30", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-util = "0.7"
 toml = "0.9"
+# Takes the feed tables, with their comments, out of the built-in feed files.
+toml_edit = "0.25"
 tracing-subscriber = "0.3"
 tracing = "0.1"
 

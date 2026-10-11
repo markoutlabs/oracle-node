@@ -10,6 +10,16 @@ pub(crate) fn status(text: &str) {
     let _ = text;
 }
 
+/// Gives the start `extra` more time before systemd times it out.
+pub(crate) fn extend_start(extra: std::time::Duration) {
+    #[cfg(unix)]
+    send(&[sd_notify::NotifyState::ExtendTimeoutUsec(
+        u32::try_from(extra.as_micros()).unwrap_or(u32::MAX),
+    )]);
+    #[cfg(not(unix))]
+    let _ = extra;
+}
+
 /// The node serves: `systemctl start` returns.
 pub(crate) fn ready(text: &str) {
     #[cfg(unix)]

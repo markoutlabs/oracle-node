@@ -34,9 +34,8 @@ pub(super) fn render(
     let exe = quoted(&service.exe)?;
     let config = quoted(config)?;
     Ok(format!(
-        r#"# Written by `oracle-node init`. Install with:
-#   sudo install -m 0644 oracle-node.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now oracle-node
+        r#"# Written by `oracle-node init`. After an edit:
+#   sudo systemctl daemon-reload && sudo systemctl restart oracle-node
 [Unit]
 Description=Price oracle node {address}
 # The node fetches the registry at start.

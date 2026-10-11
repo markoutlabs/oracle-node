@@ -1,9 +1,10 @@
 //! `oracle-node init`: generate a node key and everything needed to run it.
 //!
-//! At a terminal without `--out`, the wizard asks for each value. Otherwise the
-//! flags give them, and the output is plain text a script can read. The node
-//! always fetches from the registry canister: the mainnet one unless
-//! `--canister` and `--governance` name another.
+//! As root without `--out`, init installs the node as a system service: see
+//! `system`. At a terminal without `--out`, the wizard asks for each value.
+//! Otherwise the flags give them, and the output is plain text a script can
+//! read. The node always fetches from the registry canister: the mainnet one
+//! unless `--canister` and `--governance` name another.
 
 use std::path::PathBuf;
 
@@ -17,11 +18,15 @@ use oracle_wire::Address;
 
 use crate::{ui, wizard};
 
+/// The endpoint when `--endpoint` is absent, except in a system install.
+const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:8791/v2/ws";
+
 #[derive(Args)]
 pub(crate) struct InitArgs {
-    /// The WebSocket endpoint subscribers will connect to.
-    #[arg(long, default_value = "ws://127.0.0.1:8791/v2/ws")]
-    pub(crate) endpoint: Endpoint,
+    /// The WebSocket URL that clients dial [default: ws://127.0.0.1:8791/v2/ws,
+    /// except as root, where init asks].
+    #[arg(long, value_name = "URL")]
+    pub(crate) endpoint: Option<Endpoint>,
     /// Write the key, registry entry, and a starter config to DIR instead of
     /// printing the secret to the terminal. The key is encrypted at rest.
     #[arg(long, value_name = "DIR")]
@@ -48,13 +53,28 @@ pub(crate) struct InitArgs {
     pub(crate) service_user: Option<String>,
 }
 
+impl InitArgs {
+    /// `--endpoint`, or the default.
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone().unwrap_or_else(|| {
+            DEFAULT_ENDPOINT
+                .parse()
+                .expect("the default endpoint parses")
+        })
+    }
+}
+
 /// Generates a node key and prints everything needed to run it.
 pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if args.out.is_none() && oracle_node::init::system::is_root() {
+        return crate::system::run(&args);
+    }
     if args.out.is_none() && ui::interactive() {
         return wizard::run(&args);
     }
     let key = NodeKey::generate()?;
-    let entry = key.entry(&args.endpoint);
+    let entry = key.entry(&args.endpoint());
     let add_call = network(&args).ok().map(|(source, _)| {
         let compact = serde_json::to_string(&entry).expect("entry serialises");
         candid_call(
@@ -137,6 +157,7 @@ pub(crate) fn network(args: &InitArgs) -> anyhow::Result<(RegistrySource, Addres
 
 fn setup(args: InitArgs, dir: PathBuf) -> anyhow::Result<NodeSetup> {
     let (source, governance) = network(&args)?;
+    let endpoint = args.endpoint();
     let service = match args.service_user {
         Some(user) => Some(ServiceUnit {
             user,
@@ -146,7 +167,7 @@ fn setup(args: InitArgs, dir: PathBuf) -> anyhow::Result<NodeSetup> {
     };
     Ok(NodeSetup {
         dir,
-        endpoint: args.endpoint,
+        endpoint,
         source,
         governance,
         unlock: args

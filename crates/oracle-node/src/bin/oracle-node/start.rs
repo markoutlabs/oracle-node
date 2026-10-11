@@ -2,7 +2,8 @@
 //!
 //! Startup proves everything that would make the node useless before it binds
 //! the port: the key opens, the registry lists this node, the client list
-//! verifies. Then it serves until SIGTERM or SIGINT.
+//! verifies. A node that the registry does not list yet waits for governance.
+//! Then it serves until SIGTERM or SIGINT.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +44,8 @@ const CLOCK_SYNC_EVERY: Duration = Duration::from_secs(1);
 /// Normal drift is microseconds a second. A correction this large means the host
 /// clock stepped.
 const CLOCK_STEP_WARNING: u64 = 100_000_000;
+/// How often a node that the registry does not list fetches it again.
+const LISTING_POLL: Duration = Duration::from_secs(30);
 
 #[derive(Args)]
 pub(crate) struct StartArgs {
@@ -83,14 +86,18 @@ struct Node {
 }
 
 async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
-    let Node {
+    let mut signals = Signals::new()?;
+    let Some(Node {
         config,
         resolved,
         signer,
         governance,
         registry,
         clients,
-    } = load(&args.config).await?;
+    }) = load(&args.config, &mut signals).await?
+    else {
+        return Ok(());
+    };
     let address = signer.address();
     let registry_version = registry.version;
     let feeds = resolved.symbols.len();
@@ -191,7 +198,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     });
     tokio::select! {
         result = server => result?,
-        signal = shutdown_signal() => {
+        signal = signals.recv() => {
             info!(signal = signal?, "shutting down");
         }
     }
@@ -202,37 +209,25 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Loads the config and the key, and proves the registry lists this node.
-async fn load(path: &Path) -> anyhow::Result<Node> {
+/// Loads the config and the key, and waits until the registry lists this
+/// node. Returns `None` if a signal stops the wait.
+async fn load(path: &Path, signals: &mut Signals) -> anyhow::Result<Option<Node>> {
     notify::status("loading the config and the key");
     let config = NodeConfig::load(path)?;
     let resolved = config.resolve()?;
     // Both fail loudly at startup rather than at the first publish.
     let signer = Arc::new(config.load_signing_key()?);
     let governance = config.governance()?;
-    notify::status("fetching the registry");
-    let registry = config.fetch_registry().await?;
 
     info!(
         address = %signer.address(),
         feeds = resolved.feeds.len(),
         "starting"
     );
-    // The registry must list this node's signing address, or nothing it
-    // publishes will verify. Catching it here beats discovering it downstream.
-    let verified = registry.verify(governance, 0)?;
-    // A hard failure, not a warning. An unauthorised node keeps ingesting,
-    // aggregating and signing perfectly well — every node-local metric reads
-    // healthy — while every subscriber discards the output. Refusing to start is
-    // the only version of that failure anyone notices.
-    if let Err(error) = verified.authorize(signer.address()) {
-        anyhow::bail!(
-            "node {} is not listed in registry v{}: {error}. \
-             Nothing this node publishes would be accepted.",
-            signer.address(),
-            verified.version()
-        );
-    }
+    let Some(registry) = listed_registry(&config, governance, signer.address(), signals).await?
+    else {
+        return Ok(None);
+    };
 
     // Prices go only to listed clients (SPEC §6.1), so the node fails closed:
     // no client list, no start.
@@ -247,14 +242,71 @@ async fn load(path: &Path) -> anyhow::Result<Node> {
         clients = clients.clients().len(),
         "client list verified"
     );
-    Ok(Node {
+    Ok(Some(Node {
         config,
         resolved,
         signer,
         governance,
         registry,
         clients,
-    })
+    }))
+}
+
+/// Fetches the registry until it lists `address`. Returns `None` if a signal
+/// stops the wait.
+///
+/// An unlisted node does not ingest or serve. Every subscriber would discard
+/// what it signs, while each node-local metric reads healthy. `init` starts the
+/// node before governance lists it, so the node waits rather than exits.
+async fn listed_registry(
+    config: &NodeConfig,
+    governance: Address,
+    address: Address,
+    signals: &mut Signals,
+) -> anyhow::Result<Option<Registry>> {
+    notify::status("fetching the registry");
+    let mut waiting = false;
+    loop {
+        let registry = tokio::select! {
+            registry = config.fetch_registry() => registry?,
+            signal = signals.recv() => {
+                info!(signal = signal?, "shutting down before the registry lists this node");
+                return Ok(None);
+            }
+        };
+        let verified = registry.verify(governance, 0)?;
+        match verified.authorize(address) {
+            Ok(_) => {
+                if waiting {
+                    info!(version = verified.version(), "the registry lists this node");
+                }
+                return Ok(Some(registry));
+            }
+            Err(error) if !waiting => {
+                warn!(
+                    %address,
+                    version = verified.version(),
+                    %error,
+                    every_secs = LISTING_POLL.as_secs(),
+                    "the registry does not list this node; waiting for governance to add it"
+                );
+                waiting = true;
+            }
+            Err(_) => {}
+        }
+        notify::status(&format!(
+            "waiting for governance to add {address} to the registry"
+        ));
+        // Without this, systemd would time the start out after 90 s.
+        notify::extend_start(LISTING_POLL.saturating_mul(2));
+        tokio::select! {
+            () = tokio::time::sleep(LISTING_POLL) => {}
+            signal = signals.recv() => {
+                info!(signal = signal?, "shutting down before the registry lists this node");
+                return Ok(None);
+            }
+        }
+    }
 }
 
 /// Starts one task per venue. Returns their events and the connection count.
@@ -459,22 +511,43 @@ impl PipelineTask {
     }
 }
 
-/// Waits for SIGTERM, which systemd sends to stop the node, or SIGINT.
-async fn shutdown_signal() -> std::io::Result<&'static str> {
+/// SIGTERM and SIGINT, registered once at start. A signal that arrives
+/// between two waits then stays queued, and is not lost.
+struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        tokio::select! {
-            _ = terminate.recv() => Ok("SIGTERM"),
-            _ = interrupt.recv() => Ok("SIGINT"),
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-        Ok("ctrl-c")
+
+    /// Waits for the next signal, and names it.
+    async fn recv(&mut self) -> std::io::Result<&'static str> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.terminate.recv() => Ok("SIGTERM"),
+                _ = self.interrupt.recv() => Ok("SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+            Ok("ctrl-c")
+        }
     }
 }
 

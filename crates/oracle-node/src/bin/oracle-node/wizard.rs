@@ -84,7 +84,7 @@ fn ask(args: &InitArgs, source: RegistrySource, governance: Address) -> io::Resu
         .interact()?;
     let dir = resolve_path(&dir)?;
     let endpoint: Endpoint = input("Which WebSocket URL will clients dial?")
-        .default_input(&args.endpoint.to_string())
+        .default_input(&args.endpoint().to_string())
         .validate(|text: &String| parses::<Endpoint>(text))
         .interact()?;
     if let Some(warning) = ui::loopback_warning(&source, &endpoint) {
@@ -186,7 +186,7 @@ fn service(unlock: &Unlock) -> io::Result<Option<ServiceUnit>> {
 }
 
 /// The registry canister, and where it runs.
-fn registry(source: &RegistrySource) -> String {
+pub(crate) fn registry(source: &RegistrySource) -> String {
     match source {
         RegistrySource::Mainnet(canister) => format!("canister {canister} on mainnet"),
         RegistrySource::Network {
@@ -276,7 +276,7 @@ fn finish(setup: &NodeSetup, key: &NodeKey, written: &Written) -> io::Result<()>
 }
 
 /// A validator for cliclack: the text must parse as `T`.
-fn parses<T>(text: &str) -> Result<(), String>
+pub(crate) fn parses<T>(text: &str) -> Result<(), String>
 where
     T: std::str::FromStr,
     T::Err: fmt::Display,

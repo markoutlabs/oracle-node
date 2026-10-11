@@ -273,6 +273,13 @@ pub struct Written {
 }
 
 impl NodeSetup {
+    /// The port the node listens on: the endpoint's, or 8791 when the endpoint
+    /// names none, as behind a TLS proxy.
+    #[must_use]
+    pub fn listen_port(&self) -> u16 {
+        self.endpoint.port().unwrap_or(8791)
+    }
+
     /// The key file this setup writes. It must not exist yet.
     #[must_use]
     pub fn key_path(&self) -> PathBuf {

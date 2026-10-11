@@ -34,6 +34,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 tokio-util.workspace = true
 time = { workspace = true, features = ["formatting", "local-offset", "macros"] }
 toml.workspace = true
+toml_edit.workspace = true
 tracing.workspace = true
 rpassword.workspace = true
 shellexpand.workspace = true
@@ -41,6 +42,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json", "time
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+nix.workspace = true
 sd-notify.workspace = true
 
 [dev-dependencies]

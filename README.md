@@ -78,80 +78,99 @@ and how it counted), order book snapshots, and each venue's funding.
 
 | Item | Requirement |
 |---|---|
-| System | Linux on amd64 or arm64, with glibc 2.28 or newer (Debian 10, Ubuntu 20.04, RHEL 8, or later) |
+| System | Linux on amd64 or arm64. The installer supports Debian, Ubuntu, RHEL, Fedora, Alpine, openSUSE and Arch. |
 | CPU | 1 to 2 vCPUs. A node with 225 feeds uses about a quarter of one core. |
-| Memory | 1 GB for the machine. The node itself uses about 50 MB. |
+| Memory | 4 GB to build; 2 GB with swap works, more slowly. The node itself uses about 50 MB. |
 | Disk | 20 GB. A node keeps no history. |
 | Network | About 300 KB/s from the venues, plus about 0.3 MB/s for each client. One port open to clients. |
 
 ### Install
 
-The install script downloads the release binary and checks it against the
-release's `SHA256SUMS`:
+Run these two commands on the node's machine:
 
 ```bash
-curl -fsSL https://github.com/markoutlabs/oracle-node/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/markoutlabs/oracle-node/main/release/install.sh | sh
+sudo oracle-node init
 ```
+
+The first command builds the node from source. The second asks one question,
+the URL that clients connect to. Then it sets up and starts the node. The node
+serves when governance adds it to the registry.
+
+#### The install script
+
+1. If there is no C compiler, it installs one with the system's package
+   manager: apt, dnf, yum, apk, zypper or pacman.
+2. If there is no Rust 1.85 or newer, it installs Rust with `rustup`. It does
+   not change your shell profile.
+3. It builds `oracle-node` with `cargo install --locked`. This takes about 5 to
+   10 minutes. With less than 3.5 GB of memory, it builds one job at a time.
+4. It installs the binary to `/usr/local/bin`, with sudo if necessary.
+
+Put options after `sh -s --`:
 
 | Option | Effect |
 |---|---|
-| `--version v0.1.0` | Installs this release, not the latest. |
-| `--to <dir>` | Installs into this directory. The default is `/usr/local/bin`, or `~/.local/bin` without root. |
+| `--version v0.1.0` | Builds this tag. A branch or a commit also works. The default is `main`. |
+| `--to <dir>` | Installs into this directory. Without root or sudo, the default is `~/.local/bin`. |
 
-On other systems, build from source with `make node`.
+#### `sudo oracle-node init`
 
-### Create the node
-
-```bash
-oracle-node init
-```
-
-At a terminal, `init` is a wizard. It asks:
-
-1. Where to write the node's files.
-2. The public endpoint that clients connect to, such as `wss://node1.example.com/v2/ws`.
-3. How the node opens its key: with a passphrase in a `0600` file, which systemd
-   needs, or with a passphrase that you type at each start.
-4. Whether to write a systemd unit.
-
-It writes nothing until you confirm. Then it writes:
+1. It creates the system user `oracle-node`, with no login.
+2. It writes the node's files to `/var/lib/oracle-node`. Only the `oracle-node`
+   user can open this directory.
+3. It installs the systemd unit `/etc/systemd/system/oracle-node.service`,
+   enables it at boot, and starts it.
+4. If ufw or firewalld is active, it opens the node's port.
+5. It prints the `add_node` call for governance.
 
 | File | Contents |
 |---|---|
-| `signing.key` | The node's secret seed, encrypted with `age`. Keep it on this machine. |
-| `passphrase` | The key's passphrase, if you chose a file. Mode `0600`. |
-| `config.toml` | The node's config, with absolute paths. |
+| `signing.key` | The node's secret seed, encrypted with `age`. It is the only copy. Keep it on this machine. |
+| `passphrase` | The passphrase of the key. Mode `0600`. |
+| `config.toml` | The node's config, with every feed of the network. |
 | `node-entry.json` | The registry entry for governance: the node's address and endpoint. It holds no secret. |
-| `oracle-node.service` | The systemd unit, if you asked for it. |
 
-For scripts, `init --out DIR` takes every value from flags. `init` never
-overwrites a key.
+The endpoint is the URL that clients dial, such as `ws://203.0.113.7:8791/v2/ws`.
+The node listens on the port of the URL. Behind a TLS proxy, use a `wss://` URL
+without a port. The node then listens on port 8791.
+
+For a script, give the endpoint as a flag:
+
+```bash
+sudo oracle-node init --endpoint ws://203.0.113.7:8791/v2/ws
+```
+
+`init` never overwrites a key. On a machine that already has a node, it stops
+before it writes anything.
 
 ### Register with governance
 
-A node that is not in the registry signs prices that no client accepts. The node
-also refuses to start until the registry lists its address.
+A node that is not in the registry signs prices that no client accepts. So until
+the registry lists the node, the node waits. It does not connect to the venues
+or serve clients. It checks the registry every 30 seconds.
 
-Send `node-entry.json` to governance. Governance adds the node to the registry
+Send the `add_node` call that `init` printed to governance. The same entry is in
+`/var/lib/oracle-node/node-entry.json`. Governance adds the node to the registry
 canister:
 
 ```bash
 scripts/add-node.sh --identity <governance identity> --json node-entry.json
 ```
 
-### Run under systemd
+The node starts to serve at its next check.
+
+### The service
 
 ```bash
-sudo install -m 0644 oracle-node.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now oracle-node
-journalctl -u oracle-node -f
+journalctl -u oracle-node -f        # the log
+systemctl status oracle-node        # "activating" until the registry lists the node
+sudo systemctl restart oracle-node  # after a config edit
 ```
 
 The unit:
 
-- starts the node as `Type=notify`, so `systemctl start` returns when the node
-  serves;
+- starts the node as `Type=notify`, so systemd knows when the node serves;
 - stops the node with SIGTERM, for a clean shutdown;
 - restarts the node after a failure, but not after exit code 78, which is a
   config error;
@@ -161,6 +180,17 @@ The unit:
 
 To keep the passphrase encrypted on disk, use `systemd-creds encrypt` and
 `LoadCredentialEncrypted=` in the unit.
+
+### Without root
+
+Without sudo, `oracle-node init` writes the files only, to a directory that you
+choose. At a terminal, it is a wizard. It can also write a systemd unit for you
+to install. For scripts, `init --out DIR` takes every value from flags. Start
+the node with:
+
+```bash
+oracle-node start <dir>/config.toml
+```
 
 ### Logs
 
@@ -177,7 +207,7 @@ oracle-node start config.toml --tail
 ### Rotate the key
 
 ```bash
-oracle-node rotate --dir <node dir>
+sudo -u oracle-node oracle-node rotate --dir /var/lib/oracle-node
 ```
 
 `rotate` writes the next key beside the live one, and prints the
@@ -342,4 +372,8 @@ so keep the canister funded.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+Copyright 2026 Markout Labs.
+
+Licensed under the [Apache License, Version 2.0](LICENSE). You may use, change
+and distribute this code under its terms. It comes with no warranty. The
+license gives no right to use the Markout Labs name.

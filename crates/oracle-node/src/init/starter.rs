@@ -3,7 +3,10 @@
 
 use std::path::Path;
 
-use super::NodeSetup;
+use super::{NodeSetup, feeds};
+
+/// The bound below which `max_pending_feeds` never goes.
+const MIN_PENDING: usize = 512;
 
 /// Renders the config. Paths are written as given; `NodeSetup::write` passes
 /// absolute ones.
@@ -13,7 +16,7 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
     let quoted = |text: &str| toml::Value::String(text.to_owned()).to_string();
     let path = |path: &Path| quoted(&path.display().to_string());
 
-    let listen = format!("0.0.0.0:{}", setup.endpoint.port().unwrap_or(8791));
+    let listen = format!("0.0.0.0:{}", setup.listen_port());
     let passphrase_line = setup.unlock.file().map_or_else(
         || "# passphrase_file = \"/etc/oracle/passphrase\"".to_owned(),
         |file| format!("passphrase_file = {}", path(file)),
@@ -42,6 +45,13 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
         "governance_address = {}",
         quoted(&setup.governance.to_checksummed())
     );
+    let feeds = feeds::network();
+    // A slow subscriber can owe a price and a venue report for each feed.
+    let max_pending = feeds
+        .count
+        .saturating_mul(2)
+        .next_power_of_two()
+        .max(MIN_PENDING);
 
     format!(
         r#"# Heartbeats and stale venues are checked on this timer. A price move publishes
@@ -50,7 +60,7 @@ tick_interval_ms = 25
 
 [server]
 listen = {listen}
-max_pending_feeds = 512
+max_pending_feeds = {max_pending}
 
 [signing]
 # A file or an environment variable, never a command-line argument: arguments
@@ -71,20 +81,15 @@ key_file = {key_file}
 [clients]
 {clients_source}
 
-[[feeds]]
-symbol = "CRYPTO.BTC/USDT"
-min_sources = 2
-# Price each venue at the average fill for this many USDT, from depth snapshots
-# where the venue sends them. One large order at the top cannot lean it.
-impact_notional = "20000"
-sources = [
-  {{ venue = "binance", market = "spot", symbol = "BTCUSDT" }},
-  {{ venue = "bybit", market = "spot", symbol = "BTCUSDT" }},
-  {{ venue = "okx", market = "spot", symbol = "BTC-USDT" }},
-]
-"#,
+# The network's {count} feeds, from oracle-node {version}. Every node serves the
+# same feeds, so that a quorum can form on each one.
+
+{feeds}"#,
         listen = quoted(&listen),
         key_file = path(key_file),
+        count = feeds.count,
+        version = env!("CARGO_PKG_VERSION"),
+        feeds = feeds.text,
     )
 }
 
@@ -138,7 +143,9 @@ mod tests {
     fn every_network_renders_a_config_the_node_starts_from() {
         for source in sources() {
             let config = parse(&setup(source.clone()));
-            config.resolve().expect("the emitted feeds must resolve");
+            let resolved = config.resolve().expect("the emitted feeds must resolve");
+            assert_eq!(resolved.feeds.len(), feeds::network().count);
+            assert!(config.server.max_pending_feeds >= 2 * resolved.feeds.len());
             assert_eq!(
                 config.signing.key_file.as_deref(),
                 Some(Path::new("/etc/oracle/signing.key"))

@@ -11,6 +11,8 @@ mod notify;
 mod rotate;
 mod start;
 mod status;
+#[cfg(unix)]
+mod system;
 mod tail;
 mod ui;
 mod wizard;
@@ -38,7 +40,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate this node's key and print what to do with it.
+    /// Generate this node's key and print what to do with it. As root, also
+    /// install the node as a systemd service and start it.
     Init(init::InitArgs),
     /// Generate the next key for an existing node and print the registry call
     /// that swaps it in.

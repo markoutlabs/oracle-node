@@ -18,8 +18,11 @@ use zeroize::Zeroizing;
 use crate::keyfile;
 use crate::seed::{self, NodeKeys, Seed, SeedError};
 
+mod feeds;
 mod setup;
 mod starter;
+#[cfg(unix)]
+pub mod system;
 mod unit;
 
 pub use setup::{
@@ -51,6 +54,15 @@ pub enum InitError {
     /// The setup breaks a rule.
     #[error("{0}")]
     Invalid(String),
+
+    /// A system command, such as `useradd` or `systemctl`, failed.
+    #[error("`{command}` failed: {reason}")]
+    Command {
+        /// The command line.
+        command: String,
+        /// Its error.
+        reason: String,
+    },
 }
 
 /// Makes a random passphrase for a passphrase file: 32 bytes from the OS, as hex.
