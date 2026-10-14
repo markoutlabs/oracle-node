@@ -56,6 +56,11 @@ const DEFAULT_MAX_REGISTRY_AGE: Duration = Duration::from_secs(48 * 3_600);
 /// Bounds how long a de-listed node keeps its seat.
 const DEFAULT_REGISTRY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How much newer another node's book data must be before [`OracleClient::book`]
+/// leaves its node. Without it, the choice moves at nearly every frame, and each
+/// move is a full snapshot for a proxy's subscribers.
+const BOOK_SWITCH_MARGIN: Duration = Duration::from_secs(1);
+
 /// What [`OracleClient::next_event`] yields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -287,6 +292,7 @@ impl OracleClientBuilder {
             venue_symbols: HashMap::new(),
             book_symbols: HashMap::new(),
             books: HashMap::new(),
+            book_nodes: HashMap::new(),
             funding_symbols: HashMap::new(),
             all_funding: false,
             funding: HashMap::new(),
@@ -394,6 +400,8 @@ pub struct OracleClient {
     book_symbols: HashMap<FeedId, Symbol>,
     /// One book per node and venue instrument.
     books: HashMap<(Address, InstrumentId), Book>,
+    /// The node of the book that `book` last returned, per instrument.
+    book_nodes: HashMap<InstrumentId, Address>,
     /// Feeds whose perpetual sources' funding to request.
     funding_symbols: HashMap<FeedId, Symbol>,
     /// Request the funding of every perpetual.
@@ -732,21 +740,45 @@ impl OracleClient {
         self.resubscribe()
     }
 
-    /// The freshest valid book for `instrument` across the nodes, or `None` if
-    /// no node's book is valid and younger than `max_age`.
+    /// One node's valid book for `instrument`, or `None` if no node's book is
+    /// valid and younger than `max_age`.
     ///
-    /// Each node sends its own view, so two nodes' books differ by their
-    /// receipt times. This returns one node's book whole, never a mix.
-    #[must_use]
-    pub fn book(&self, instrument: &InstrumentId, now_ns: u64) -> Option<&Book> {
+    /// Each node sends its own view, so this returns one node's book whole,
+    /// never a mix. It keeps the node it returned last until that book fails,
+    /// or until another node's book data is newer by more than
+    /// [`BOOK_SWITCH_MARGIN`]. Then it takes the node with the newest data.
+    pub fn book(&mut self, instrument: &InstrumentId, now_ns: u64) -> Option<&Book> {
         let max_age = u64::try_from(self.quorum_config.max_age.as_nanos()).unwrap_or(u64::MAX);
-        self.books
-            .iter()
-            .filter(|((_, book), _)| book == instrument)
-            .map(|(_, book)| book)
-            .filter(|book| book.is_valid())
-            .filter(|book| now_ns.saturating_sub(book.publish_time_ns) <= max_age)
-            .max_by_key(|book| book.publish_time_ns)
+        let margin = u64::try_from(BOOK_SWITCH_MARGIN.as_nanos()).unwrap_or(u64::MAX);
+        let usable = |book: &&Book| {
+            book.instrument == *instrument
+                && book.is_valid()
+                && now_ns.saturating_sub(book.publish_time_ns) <= max_age
+        };
+        let Some(newest) = self
+            .books
+            .values()
+            .filter(usable)
+            .max_by_key(|book| data_time_ns(book))
+        else {
+            self.book_nodes.remove(instrument);
+            return None;
+        };
+        let current = self
+            .book_nodes
+            .get(instrument)
+            .and_then(|node| self.books.get(&(*node, instrument.clone())))
+            .filter(usable);
+        let chosen = match current {
+            Some(current)
+                if data_time_ns(newest) <= data_time_ns(current).saturating_add(margin) =>
+            {
+                current
+            }
+            _ => newest,
+        };
+        self.book_nodes.insert(instrument.clone(), chosen.node);
+        Some(chosen)
     }
 
     /// Adds feeds whose perpetual sources' funding to receive, and reconnects
@@ -1187,6 +1219,11 @@ impl Drop for OracleClient {
     }
 }
 
+/// The venue's clock is the same for every node, and receipt clocks are not.
+fn data_time_ns(book: &Book) -> u64 {
+    book.exchange_time_ns.unwrap_or(book.local_recv_ns)
+}
+
 /// Builds the subscribe control frame.
 fn subscribe_frame(
     prices: &[Symbol],
@@ -1491,7 +1528,7 @@ mod tests {
     use super::*;
     use crate::Status;
     use crate::testing::{TestNode, book_at, funding_at, registry_with, update_at};
-    use oracle_types::{MarketKind, NANOS_PER_SEC, Venue};
+    use oracle_types::{BookUpdate, MarketKind, NANOS_PER_SEC, Venue};
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
 
@@ -1530,6 +1567,82 @@ mod tests {
 
         let later = NOW + 10 * NANOS_PER_SEC;
         assert!(client.book(&instrument, later).is_none(), "too old");
+    }
+
+    #[test]
+    fn the_book_stays_with_its_node_until_another_is_clearly_newer() {
+        let nodes = nodes();
+        let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+        let mut client = OracleClient::builder(registry)
+            .build()
+            .expect("three nodes");
+        let [a, b, _] = nodes.as_slice() else {
+            panic!("three nodes");
+        };
+        let instrument = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        let ms = NANOS_PER_SEC / 1_000;
+
+        for (node, frame, at, expected, why) in [
+            (a, book_at(NOW, 1, true, 100), NOW, a, "the only book"),
+            (
+                b,
+                book_at(NOW + 200 * ms, 1, true, 200),
+                NOW + 200 * ms,
+                a,
+                "B is within the margin",
+            ),
+            (
+                b,
+                book_at(NOW + 1_500 * ms, 2, false, 300),
+                NOW + 1_500 * ms,
+                b,
+                "B is 1.5 s newer",
+            ),
+            (
+                a,
+                book_at(NOW + 1_600 * ms, 2, false, 400),
+                NOW + 1_600 * ms,
+                b,
+                "no move back",
+            ),
+        ] {
+            assert!(client.ingest_event(&node.sign_book(&frame), at).is_ok());
+            let chosen = client.book(&instrument, at).map(|book| book.node);
+            assert_eq!(chosen, Some(expected.signing_address()), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_new_choice_takes_the_newest_venue_time_not_the_newest_signature() {
+        let nodes = nodes();
+        let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+        let mut client = OracleClient::builder(registry)
+            .build()
+            .expect("three nodes");
+        let [a, b, _] = nodes.as_slice() else {
+            panic!("three nodes");
+        };
+        let instrument = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        let lagging = BookUpdate {
+            exchange_time_ns: Some(NOW - NANOS_PER_SEC),
+            ..book_at(NOW + 50, 1, true, 100)
+        };
+        let current = BookUpdate {
+            exchange_time_ns: Some(NOW),
+            ..book_at(NOW + 10, 1, true, 200)
+        };
+        assert!(
+            client
+                .ingest_event(&a.sign_book(&lagging), NOW + 50)
+                .is_ok()
+        );
+        assert!(
+            client
+                .ingest_event(&b.sign_book(&current), NOW + 50)
+                .is_ok()
+        );
+        let chosen = client.book(&instrument, NOW + 60).map(|book| book.node);
+        assert_eq!(chosen, Some(b.signing_address()));
     }
 
     fn nodes() -> Vec<TestNode> {
