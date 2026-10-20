@@ -4,10 +4,12 @@
 //! node accept, so a [`NodeSetup`] that exists is one that can be written.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use age::secrecy::{ExposeSecret as _, SecretString};
+use ipnet::IpNet;
 use oracle_client::Certification;
 use oracle_wire::{Address, EntryError, check_endpoint};
 
@@ -17,13 +19,44 @@ use super::{InitError, NodeKey, starter, unit, write_secret};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint(String);
 
+/// Why `init` refuses an endpoint.
+#[derive(Debug, thiserror::Error)]
+pub enum EndpointError {
+    /// The registry refuses it.
+    #[error(transparent)]
+    Entry(#[from] EntryError),
+    /// It names an address that exists only for examples, so no client can dial it.
+    #[error("{0} is an example address from the documentation; give this machine's public address")]
+    Example(IpAddr),
+}
+
+/// The blocks that RFC 5737 and RFC 3849 keep for examples. A listed endpoint
+/// never changes, so a copied example would make the node useless for good.
+const EXAMPLE_NETS: [&str; 4] = [
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "2001:db8::/32",
+];
+
 impl FromStr for Endpoint {
-    type Err = EntryError;
+    type Err = EndpointError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         check_endpoint(text)?;
-        Ok(Self(text.to_owned()))
+        let endpoint = Self(text.to_owned());
+        if let Some(ip) = endpoint.ip().filter(|ip| is_example(*ip)) {
+            return Err(EndpointError::Example(ip));
+        }
+        Ok(endpoint)
     }
+}
+
+fn is_example(ip: IpAddr) -> bool {
+    EXAMPLE_NETS
+        .iter()
+        .filter_map(|net| net.parse::<IpNet>().ok())
+        .any(|net| net.contains(&ip))
 }
 
 impl fmt::Display for Endpoint {
@@ -37,17 +70,25 @@ impl Endpoint {
     /// endpoint for every client, and no client elsewhere can dial it.
     #[must_use]
     pub fn is_loopback(&self) -> bool {
-        let Some(uri) = self.0.parse::<axum::http::Uri>().ok() else {
-            return false;
-        };
-        let Some(host) = uri.host() else {
-            return false;
-        };
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+        self.host()
+            .is_some_and(|host| host.eq_ignore_ascii_case("localhost"))
+            || self.ip().is_some_and(|ip| ip.is_loopback())
+    }
+
+    /// The host, without the brackets of an IPv6 address.
+    fn host(&self) -> Option<String> {
+        let uri = self.0.parse::<axum::http::Uri>().ok()?;
+        let host = uri.host()?;
+        Some(
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned(),
+        )
+    }
+
+    /// The address, when the host is one rather than a name.
+    fn ip(&self) -> Option<IpAddr> {
+        self.host()?.parse().ok()
     }
 
     /// The port the URL names, which the node listens on.
@@ -396,6 +437,27 @@ mod tests {
         for public in ["wss://node.example.com/v2/ws", "ws://10.0.0.5:8791/v2/ws"] {
             let endpoint: Endpoint = public.parse().expect("valid");
             assert!(!endpoint.is_loopback(), "{public}");
+        }
+    }
+
+    #[test]
+    fn example_addresses_are_refused() {
+        for example in [
+            "ws://203.0.113.7:8791/v2/ws",
+            "ws://192.0.2.1/v2/ws",
+            "wss://198.51.100.20/v2/ws",
+            "ws://[2001:db8::1]:8791/v2/ws",
+        ] {
+            assert!(
+                matches!(example.parse::<Endpoint>(), Err(EndpointError::Example(_))),
+                "{example}"
+            );
+        }
+        for real in [
+            "ws://46.62.144.52:8791/v2/ws",
+            "ws://[2a01:4f9::1]:8791/v2/ws",
+        ] {
+            assert!(real.parse::<Endpoint>().is_ok(), "{real}");
         }
     }
 

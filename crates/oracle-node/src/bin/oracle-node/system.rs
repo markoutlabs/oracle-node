@@ -47,7 +47,7 @@ pub(crate) fn run(args: &InitArgs) -> anyhow::Result<()> {
     } else {
         setup(args.endpoint.clone().context(
             "a system install needs --endpoint: the WebSocket URL that clients dial, \
-             such as ws://203.0.113.7:8791/v2/ws",
+             such as ws://<this machine's public IP>:8791/v2/ws",
         )?)
     };
     setup.check()?;
@@ -59,8 +59,10 @@ fn ask(args: &InitArgs, setup: impl FnOnce(Endpoint) -> NodeSetup) -> io::Result
     intro(ui::heading(" oracle-node init "))?;
     let endpoint = match &args.endpoint {
         Some(endpoint) => endpoint.clone(),
+        // TODO: suggest this machine's public address as the default. A typed
+        // address is the one part of the entry that can never change later.
         None => input("Which WebSocket URL will clients dial?")
-            .placeholder("ws://203.0.113.7:8791/v2/ws")
+            .placeholder("ws://<this machine's public IP>:8791/v2/ws")
             .validate(|text: &String| wizard::parses::<Endpoint>(text))
             .interact()?,
     };

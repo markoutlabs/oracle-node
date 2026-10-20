@@ -2682,6 +2682,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf 0.12.4",
+ "ipnet",
  "nix",
  "oracle-agg",
  "oracle-client",

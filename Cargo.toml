@@ -62,6 +62,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rpassword = "7"
 # A leading `~` in a path typed at the init wizard.
 shellexpand = "3"
+# The example address blocks that `init` refuses in an endpoint.
+ipnet = "2"
 sd-notify = "0.5"
 secp256k1 = { version = "0.31", default-features = false, features = ["std", "recovery"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
