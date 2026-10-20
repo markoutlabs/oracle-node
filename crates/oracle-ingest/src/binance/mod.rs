@@ -32,7 +32,10 @@ use crate::{
     InstrumentSpec, StreamId,
 };
 
-use streams::{MAX_STREAMS_PER_CONNECTION, StreamKind, combined_urls, stream_names};
+use streams::{
+    MAX_STREAMS_PER_CONNECTION, PERP_BOOK_TICKERS_PER_CONNECTION, StreamKind, combined_urls,
+    perp_urls, stream_names,
+};
 
 /// Binance adapter configuration.
 #[derive(Clone, Debug)]
@@ -59,6 +62,8 @@ pub struct BinanceConfig {
     pub max_session: Duration,
     /// Streams per connection.
     pub streams_per_connection: usize,
+    /// Book ticker streams per futures connection.
+    pub perp_book_tickers_per_connection: usize,
 }
 
 impl BinanceConfig {
@@ -86,6 +91,7 @@ impl Default for BinanceConfig {
             idle_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             streams_per_connection: MAX_STREAMS_PER_CONNECTION,
+            perp_book_tickers_per_connection: PERP_BOOK_TICKERS_PER_CONNECTION,
         }
     }
 }
@@ -206,21 +212,17 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
                 }));
                 names.sort_unstable();
             }
-            // Futures trades and mark prices have their own route.
-            let (market_names, names): (Vec<String>, Vec<String>) =
-                names.into_iter().partition(|name| {
-                    market == MarketKind::LinearPerp
-                        && StreamKind::from_stream_name(name)
-                            .is_some_and(StreamKind::on_market_route)
-                });
             let chunk = self.config.streams_per_connection;
-            let urls = combined_urls(base, &names, chunk)
-                .into_iter()
-                .chain(combined_urls(
+            let urls = match market {
+                MarketKind::LinearPerp => perp_urls(
+                    base,
                     &self.config.perp_market_url,
-                    &market_names,
+                    names,
                     chunk,
-                ));
+                    self.config.perp_book_tickers_per_connection,
+                ),
+                _ => combined_urls(base, &names, chunk),
+            };
             for url in urls {
                 let mut session = SessionConfig::new(StreamId::new(Venue::Binance, market), url);
                 session.idle_timeout = self.config.idle_timeout;
@@ -393,6 +395,39 @@ mod tests {
         assert!(market.starts_with(streams::FUTURES_MARKET_BASE));
         assert!(market.contains("btcusdt@markPrice@1s") && market.contains("btcusdt@aggTrade"));
         assert!(!market.contains("bookTicker"));
+    }
+
+    #[test]
+    fn perp_depth_gets_its_own_connection() {
+        let mut config = config();
+        config.perp = vec![
+            InstrumentSpec::new(
+                "BTCUSDT",
+                MarketKind::LinearPerp,
+                "CRYPTO.BTC/USDT.PERP_MARK",
+            )
+            .expect("valid")
+            .with_depth(),
+        ];
+        let adapter = BinanceAdapter::new(config, NullConnector).expect("valid");
+        let perp: Vec<String> = adapter
+            .plan()
+            .expect("plans")
+            .into_iter()
+            .filter(|(_, market, _)| *market == MarketKind::LinearPerp)
+            .map(|(session, _, _)| session.url)
+            .collect();
+        assert_eq!(
+            perp,
+            [
+                format!("{}?streams=btcusdt@depth@100ms", streams::FUTURES_BASE),
+                format!("{}?streams=btcusdt@bookTicker", streams::FUTURES_BASE),
+                format!(
+                    "{}?streams=btcusdt@aggTrade/btcusdt@markPrice@1s",
+                    streams::FUTURES_MARKET_BASE
+                ),
+            ]
+        );
     }
 
     #[test]

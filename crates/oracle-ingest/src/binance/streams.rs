@@ -22,6 +22,10 @@ pub const FUTURES_MARKET_BASE: &str = "wss://fstream.binance.com/market/stream";
 /// useful property anyway.
 pub const MAX_STREAMS_PER_CONNECTION: usize = 200;
 
+/// Book ticker streams per futures connection. A connection from Europe to
+/// Binance in Tokyo falls behind above about 150 KB/s, and Binance then closes it.
+pub const PERP_BOOK_TICKERS_PER_CONNECTION: usize = 5;
+
 /// Which streams to subscribe to for one instrument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamKind {
@@ -145,6 +149,32 @@ pub fn combined_urls(base: &str, streams: &[String], chunk: usize) -> Vec<String
         .collect()
 }
 
+/// Splits futures stream names into per-connection URLs, by route and by load.
+///
+/// Trades and mark prices go to `market_base`, `chunk` to a connection. On
+/// `public_base`, each depth stream gets its own connection and the book
+/// tickers go `book_chunk` to a connection.
+#[must_use]
+pub fn perp_urls(
+    public_base: &str,
+    market_base: &str,
+    streams: Vec<String>,
+    chunk: usize,
+    book_chunk: usize,
+) -> Vec<String> {
+    let kind = |name: &String| StreamKind::from_stream_name(name);
+    let (market, public): (Vec<String>, Vec<String>) = streams
+        .into_iter()
+        .partition(|name| kind(name).is_some_and(StreamKind::on_market_route));
+    let (depth, books): (Vec<String>, Vec<String>) = public
+        .into_iter()
+        .partition(|name| kind(name) == Some(StreamKind::Depth));
+    let mut urls = combined_urls(public_base, &depth, 1);
+    urls.extend(combined_urls(public_base, &books, book_chunk));
+    urls.extend(combined_urls(market_base, &market, chunk));
+    urls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,13 +286,45 @@ mod tests {
     }
 
     #[test]
-    fn a_realistic_config_stays_within_the_connection_budget() {
+    fn perp_streams_split_by_route_and_load() {
         let symbols: Vec<String> = (0..120).map(|i| format!("SYM{i}USDT")).collect();
-        let names = stream_names(symbols.iter().map(String::as_str), MarketKind::LinearPerp);
-        assert_eq!(names.len(), 360);
-        let urls = combined_urls(FUTURES_BASE, &names, MAX_STREAMS_PER_CONNECTION);
-        assert_eq!(urls.len(), 2);
+        let mut names = stream_names(symbols.iter().map(String::as_str), MarketKind::LinearPerp);
+        names.extend(["btcusdt@depth@100ms", "ethusdt@depth@100ms"].map(str::to_owned));
+        let urls = perp_urls(
+            FUTURES_BASE,
+            FUTURES_MARKET_BASE,
+            names,
+            MAX_STREAMS_PER_CONNECTION,
+            PERP_BOOK_TICKERS_PER_CONNECTION,
+        );
+
+        // Two depth, 120 / 5 book ticker, and 240 / 200 market connections.
+        assert_eq!(urls.len(), 2 + 24 + 2);
+        assert_eq!(
+            urls.get(..2),
+            Some(
+                [
+                    format!("{FUTURES_BASE}?streams=btcusdt@depth@100ms"),
+                    format!("{FUTURES_BASE}?streams=ethusdt@depth@100ms"),
+                ]
+                .as_slice()
+            )
+        );
         for url in &urls {
+            let (base, streams) = url.split_once("?streams=").expect("combined");
+            let kinds: Vec<_> = streams
+                .split('/')
+                .map(|name| StreamKind::from_stream_name(name).expect("known"))
+                .collect();
+            if base == FUTURES_MARKET_BASE {
+                assert!(kinds.iter().all(|kind| kind.on_market_route()), "{url}");
+            } else if kinds != [StreamKind::Depth] {
+                assert!(kinds.len() <= PERP_BOOK_TICKERS_PER_CONNECTION, "{url}");
+                assert!(
+                    kinds.iter().all(|kind| *kind == StreamKind::BookTicker),
+                    "{url}"
+                );
+            }
             assert!(
                 url.len() < 8_000,
                 "URL is long enough to worry an intermediary"
