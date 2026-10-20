@@ -91,17 +91,29 @@ pub struct TappedFrame {
 #[derive(Default)]
 pub(crate) struct Tap {
     sender: Option<mpsc::Sender<TappedFrame>>,
+    /// The kinds to copy; `None` copies every kind.
+    kinds: Option<Vec<FrameKind>>,
 }
 
 impl Tap {
-    pub(crate) fn open(&mut self, capacity: usize) -> mpsc::Receiver<TappedFrame> {
+    pub(crate) fn open(
+        &mut self,
+        capacity: usize,
+        kinds: Option<Vec<FrameKind>>,
+    ) -> mpsc::Receiver<TappedFrame> {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         self.sender = Some(sender);
+        self.kinds = kinds;
         receiver
     }
 
-    pub(crate) const fn is_open(&self) -> bool {
+    /// Returns `true` when a frame of `kind` goes to the channel.
+    pub(crate) fn wants(&self, kind: FrameKind) -> bool {
         self.sender.is_some()
+            && self
+                .kinds
+                .as_ref()
+                .is_none_or(|kinds| kinds.contains(&kind))
     }
 
     /// Offers a copy without waiting. Returns `false` when it was dropped.

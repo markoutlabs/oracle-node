@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use oracle_client::OracleClient;
 use oracle_client::testing::{TestNode, TestSource, governance, signed_registry};
+use oracle_client::{OracleClient, Subscription};
 use oracle_transport::{NodeHandshake, os_rng};
 use oracle_wire::{Address, NodeEntry, Registry};
 use tokio::net::TcpListener;
@@ -307,4 +307,44 @@ async fn subscribing_without_a_client_key_is_refused() {
         client.subscribe(&[SYMBOL]).await,
         Err(oracle_client::ClientError::NoClientKey)
     ));
+}
+
+/// One call with every list connects each node once, and a bad symbol in any
+/// list changes nothing.
+#[tokio::test]
+async fn one_subscription_connects_each_node_once() {
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let labels = ["a", "b", "c"];
+    let mut entries = Vec::new();
+    for (seed, label) in (1..=3_u8).zip(labels) {
+        let url = fake_node(label, tx.clone()).await;
+        entries.push(entry_at(&TestNode::new(seed), &url));
+    }
+    let v1 = signed_registry(1, entries);
+    let mut client = client_for(&v1, TestSource::serving(v1.clone()));
+
+    let bad = client
+        .subscribe_all(Subscription {
+            prices: &[SYMBOL],
+            venues: &["not a symbol"],
+            ..Subscription::default()
+        })
+        .await;
+    assert!(bad.is_err());
+    assert!(
+        client.view(&SYMBOL.parse().expect("valid")).is_none(),
+        "the good list was not taken either"
+    );
+
+    client
+        .subscribe_all(Subscription {
+            prices: &[SYMBOL],
+            venues: &["CRYPTO.BTC/USDT"],
+            books: &["CRYPTO.BTC/USDT"],
+            funding: &["*"],
+        })
+        .await
+        .expect("subscribes");
+    let seen = collect(&mut client, &mut events, &labels.map(Connected)).await;
+    assert_eq!(seen, sorted(labels.map(Connected).to_vec()));
 }

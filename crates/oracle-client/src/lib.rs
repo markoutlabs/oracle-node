@@ -86,7 +86,8 @@ pub mod verify;
 
 pub use book::Book;
 pub use client::{
-    ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, now_unix_nanos,
+    ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, Subscription,
+    now_unix_nanos,
 };
 pub use latency::{LatencyHistogram, LatencyReport, Percentiles};
 pub use nodes::{ConnectionState, DeliveryWindow, NodeFeed, NodeFrames, NodeReport};

@@ -15,6 +15,10 @@ pub enum VenueError {
     /// A venue bitmap contained bits with no assigned venue.
     #[error("venue bitmap {0:#010x} has unassigned bits set")]
     UnassignedBits(u32),
+
+    /// The text is not `venue:market:symbol`.
+    #[error("`{0}` is not an instrument: give venue:market:symbol")]
+    Instrument(String),
 }
 
 /// An exchange.
@@ -367,6 +371,39 @@ impl fmt::Display for InstrumentId {
     }
 }
 
+/// Parses `venue:market:symbol`, the form that [`InstrumentId`] prints. The
+/// symbol is the rest of the text, so it may hold a colon.
+impl core::str::FromStr for InstrumentId {
+    type Err = VenueError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || VenueError::Instrument(s.to_owned());
+        let mut parts = s.splitn(3, ':');
+        let venue: Venue = parts.next().ok_or_else(invalid)?.parse()?;
+        let market: MarketKind = parts.next().ok_or_else(invalid)?.parse()?;
+        let symbol = parts
+            .next()
+            .filter(|symbol| !symbol.is_empty())
+            .ok_or_else(invalid)?;
+        Ok(Self::new(venue, market, symbol))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for InstrumentId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for InstrumentId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for Venue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -494,5 +531,26 @@ mod tests {
             assert_eq!(venue.as_str().parse::<Venue>().expect("known"), venue);
         }
         assert!("ftx".parse::<Venue>().is_err());
+    }
+
+    #[test]
+    fn instrument_names_round_trip() {
+        let instrument = InstrumentId::new(Venue::Okx, MarketKind::LinearPerp, "BTC-USDT-SWAP");
+        assert_eq!(instrument.to_string().parse(), Ok(instrument));
+        let colon = InstrumentId::new(Venue::Kraken, MarketKind::Spot, "BTC:USD");
+        assert_eq!(
+            colon.to_string().parse(),
+            Ok(colon),
+            "the symbol keeps its colon"
+        );
+        for bad in [
+            "binance:spot:",
+            "nowhere:spot:BTC",
+            "binance:BTC",
+            "",
+            "binance",
+        ] {
+            assert!(bad.parse::<InstrumentId>().is_err(), "{bad}");
+        }
     }
 }

@@ -164,10 +164,22 @@ impl Fixed {
     /// Returns [`FixedError::ExponentOutOfRange`] if `expo` cannot be applied, or
     /// [`FixedError::Overflow`] if the result does not fit.
     pub fn from_scaled(mantissa: i64, expo: i32) -> Result<Self, FixedError> {
+        Self::from_scaled_wide(i128::from(mantissa), expo)
+    }
+
+    /// Builds a value from an unsigned mantissa, such as a size on the wire.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Fixed::from_scaled`].
+    pub fn from_scaled_unsigned(mantissa: u64, expo: i32) -> Result<Self, FixedError> {
+        Self::from_scaled_wide(i128::from(mantissa), expo)
+    }
+
+    fn from_scaled_wide(mantissa: i128, expo: i32) -> Result<Self, FixedError> {
         let shift = expo
             .checked_sub(SCALE_EXPO)
             .ok_or(FixedError::ExponentOutOfRange(expo))?;
-        let mantissa = i128::from(mantissa);
         if shift >= 0 {
             let factor = u32::try_from(shift)
                 .ok()

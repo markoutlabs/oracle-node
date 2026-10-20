@@ -113,10 +113,9 @@ impl Book {
     ///
     /// Returns [`FixedError`] if a mantissa does not fit the fixed-point range.
     pub fn level_fixed(level: BookLevel) -> Result<(Fixed, Fixed), FixedError> {
-        let qty = i64::try_from(level.qty).map_err(|_| FixedError::Overflow)?;
         Ok((
             Fixed::from_scaled(level.price, BOOK_EXPO)?,
-            Fixed::from_scaled(qty, BOOK_EXPO)?,
+            Fixed::from_scaled_unsigned(level.qty, BOOK_EXPO)?,
         ))
     }
 }
@@ -160,6 +159,17 @@ mod tests {
             Address::from_bytes([1; 20]),
             InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT"),
         )
+    }
+
+    #[test]
+    fn every_size_converts() {
+        let (price, qty) = Book::level_fixed(BookLevel {
+            price: 10_000_000_000,
+            qty: u64::MAX,
+        })
+        .expect("a u64 size fits");
+        assert_eq!(price.to_string(), "100");
+        assert_eq!(qty.to_string(), "184467440737.09551615");
     }
 
     #[test]

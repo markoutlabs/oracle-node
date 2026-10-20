@@ -374,6 +374,8 @@ enum Inbound {
         received_ns: u64,
     },
     Polled(Result<Registry, FetchError>),
+    /// The result of a fetch that an unknown signer or a moved node started.
+    Refreshed(Result<Registry, FetchError>),
     /// A node's endpoint now serves another address: the node probably
     /// rotated. The handshake twin of an unknown signer on a frame.
     NodeMoved {
@@ -385,6 +387,20 @@ enum Inbound {
 struct NodeConnection {
     endpoint: String,
     cancel: CancellationToken,
+}
+
+/// Every topic list of one subscription, for [`OracleClient::subscribe_all`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Subscription<'a> {
+    /// Feeds whose prices to resolve.
+    pub prices: &'a [&'a str],
+    /// Feeds whose venue reports to receive.
+    pub venues: &'a [&'a str],
+    /// Feeds whose sources' books to receive.
+    pub books: &'a [&'a str],
+    /// Feeds whose perpetual sources' funding to receive, or `"*"` for every
+    /// perpetual.
+    pub funding: &'a [&'a str],
 }
 
 /// Verifies signed updates from many nodes and resolves them into one price.
@@ -508,7 +524,17 @@ impl OracleClient {
     /// it: when it is full, a copy is dropped and counted in
     /// [`ClientStats::tap_dropped`]. A second call replaces the first channel.
     pub fn frames(&mut self, capacity: usize) -> mpsc::Receiver<TappedFrame> {
-        self.tap.open(capacity)
+        self.tap.open(capacity, None)
+    }
+
+    /// Like [`OracleClient::frames`], but copies only the frames of `kinds`.
+    /// [`ClientStats::tap_dropped`] then counts only those.
+    pub fn frames_of(
+        &mut self,
+        capacity: usize,
+        kinds: &[FrameKind],
+    ) -> mpsc::Receiver<TappedFrame> {
+        self.tap.open(capacity, Some(kinds.to_vec()))
     }
 
     /// Returns the quorum rules the client resolves with.
@@ -688,10 +714,36 @@ impl OracleClient {
     /// [`ClientError::InvalidSymbol`] for an unparseable symbol, or
     /// [`ClientError::NoEndpoints`] if the registry lists none.
     pub async fn subscribe(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
+        self.subscribe_all(Subscription {
+            prices: symbols,
+            ..Subscription::default()
+        })
+        .await
+    }
+
+    /// Subscribes to every list of `subscription` with one reconnect of each
+    /// node. A bad symbol in any list changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`OracleClient::subscribe`].
+    pub async fn subscribe_all(
+        &mut self,
+        subscription: Subscription<'_>,
+    ) -> Result<(), ClientError> {
         if self.client_key.is_none() {
             return Err(ClientError::NoClientKey);
         }
-        for symbol in parse_symbols(symbols)? {
+        let prices = parse_symbols(subscription.prices)?;
+        let venues = parse_symbols(subscription.venues)?;
+        let books = parse_symbols(subscription.books)?;
+        let (all, named): (Vec<&str>, Vec<&str>) = subscription
+            .funding
+            .iter()
+            .partition(|symbol| **symbol == "*");
+        let funding = parse_symbols(&named)?;
+
+        for symbol in prices {
             let id = feed_id(&symbol);
             if symbol.kind().is_slow() {
                 self.verifier.mark_slow(id);
@@ -700,6 +752,20 @@ impl OracleClient {
             self.views
                 .entry(id)
                 .or_insert_with(|| FeedView::with_kind(id, symbol.kind()));
+        }
+        for symbol in venues {
+            let id = feed_id(&symbol);
+            if symbol.kind().is_slow() {
+                self.verifier.mark_slow(id);
+            }
+            self.venue_symbols.insert(id, symbol);
+        }
+        for symbol in books {
+            self.book_symbols.insert(feed_id(&symbol), symbol);
+        }
+        self.all_funding |= !all.is_empty();
+        for symbol in funding {
+            self.funding_symbols.insert(feed_id(&symbol), symbol);
         }
         self.resubscribe()
     }
@@ -711,17 +777,11 @@ impl OracleClient {
     ///
     /// The same as [`OracleClient::subscribe`].
     pub async fn subscribe_venues(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
-        if self.client_key.is_none() {
-            return Err(ClientError::NoClientKey);
-        }
-        for symbol in parse_symbols(symbols)? {
-            let id = feed_id(&symbol);
-            if symbol.kind().is_slow() {
-                self.verifier.mark_slow(id);
-            }
-            self.venue_symbols.insert(id, symbol);
-        }
-        self.resubscribe()
+        self.subscribe_all(Subscription {
+            venues: symbols,
+            ..Subscription::default()
+        })
+        .await
     }
 
     /// Adds feeds whose sources' books to receive, and reconnects every node
@@ -731,13 +791,11 @@ impl OracleClient {
     ///
     /// The same as [`OracleClient::subscribe`].
     pub async fn subscribe_books(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
-        if self.client_key.is_none() {
-            return Err(ClientError::NoClientKey);
-        }
-        for symbol in parse_symbols(symbols)? {
-            self.book_symbols.insert(feed_id(&symbol), symbol);
-        }
-        self.resubscribe()
+        self.subscribe_all(Subscription {
+            books: symbols,
+            ..Subscription::default()
+        })
+        .await
     }
 
     /// One node's valid book for `instrument`, or `None` if no node's book is
@@ -789,16 +847,11 @@ impl OracleClient {
     ///
     /// The same as [`OracleClient::subscribe`].
     pub async fn subscribe_funding(&mut self, symbols: &[&str]) -> Result<(), ClientError> {
-        if self.client_key.is_none() {
-            return Err(ClientError::NoClientKey);
-        }
-        let (all, named): (Vec<&str>, Vec<&str>) =
-            symbols.iter().partition(|symbol| **symbol == "*");
-        self.all_funding |= !all.is_empty();
-        for symbol in parse_symbols(&named)? {
-            self.funding_symbols.insert(feed_id(&symbol), symbol);
-        }
-        self.resubscribe()
+        self.subscribe_all(Subscription {
+            funding: symbols,
+            ..Subscription::default()
+        })
+        .await
     }
 
     /// The freshest funding frame for `perpetual` across the nodes, or `None`
@@ -999,15 +1052,56 @@ impl OracleClient {
         outcome
     }
 
+    /// Accepts a frame now. An unknown signer starts a registry fetch on its
+    /// own task, and this frame stays refused.
+    fn ingest_now<T>(
+        &mut self,
+        frame: &[u8],
+        received_ns: u64,
+        now_ns: u64,
+        accept: fn(&mut Self, &[u8], u64, u64) -> Result<T, RejectReason>,
+    ) -> Result<T, RejectReason> {
+        let outcome = accept(self, frame, received_ns, now_ns);
+        if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { .. })) = &outcome {
+            self.refresh_in_background(now_ns);
+        }
+        self.record(frame, received_ns, &outcome);
+        outcome
+    }
+
+    /// Starts a registry fetch off the frame path, at most once in
+    /// `refresh_interval`. The result comes back as [`Inbound::Refreshed`].
+    fn refresh_in_background(&mut self, now_ns: u64) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        if !self.refresh_due(now_ns) {
+            return;
+        }
+        self.last_refresh_attempt_ns = Some(now_ns);
+        self.stats.refreshes = self.stats.refreshes.saturating_add(1);
+        let tx = self.inbound_tx.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let fetched = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                fetched = source.fetch() => fetched,
+            };
+            let _ = tx.send(Inbound::Refreshed(fetched)).await;
+        });
+    }
+
     /// Copies a frame whose signature verified to [`OracleClient::frames`].
     fn copy(&mut self, frame: &[u8], signer: Address, received_ns: u64, verdict: Verdict) {
-        if !self.tap.is_open() {
+        let kind = FrameKind::of(frame);
+        if !self.tap.wants(kind) {
             return;
         }
         let copied = TappedFrame {
             bytes: frame.to_vec(),
             signer,
-            kind: FrameKind::of(frame),
+            kind,
             received_ns,
             verdict,
         };
@@ -1131,10 +1225,10 @@ impl OracleClient {
     /// Returns the next resolved price.
     ///
     /// Yields one resolution per accepted frame, so a consumer sees the feed
-    /// state change as soon as any node reports. Returns `None` once every node
-    /// connection has ended.
-    /// Scheduled registry fetches are adopted here, so keep calling it. It skips
-    /// venue reports; [`OracleClient::next_event`] yields them.
+    /// state change as soon as any node reports. Returns `None` after
+    /// [`OracleClient::shutdown`]. Registry fetches are adopted here, so keep
+    /// calling it. It skips the other events; [`OracleClient::next_event`]
+    /// yields them.
     pub async fn next(&mut self) -> Option<Resolved> {
         loop {
             if let Event::Price(resolved) = self.next_event().await? {
@@ -1143,12 +1237,19 @@ impl OracleClient {
         }
     }
 
-    /// Returns the next resolved price or verified venue report.
+    /// Returns the next resolved price, venue report, book frame or funding
+    /// frame.
     ///
-    /// Returns `None` once every node connection has ended.
+    /// It is cancel-safe: a dropped call loses no frame, and a registry fetch
+    /// runs on its own task. It returns `None` after [`OracleClient::shutdown`].
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
-            let (frame, received_ns) = match self.inbound_rx.recv().await? {
+            let inbound = tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return None,
+                inbound = self.inbound_rx.recv() => inbound?,
+            };
+            let (frame, received_ns) = match inbound {
                 Inbound::Frame { frame, received_ns } => (frame, received_ns),
                 Inbound::Polled(fetched) => {
                     self.stats.polls = self.stats.polls.saturating_add(1);
@@ -1159,24 +1260,25 @@ impl OracleClient {
                     }
                     continue;
                 }
+                Inbound::Refreshed(fetched) => {
+                    match self.adopt_fetched(fetched) {
+                        Ok(Some(version)) => info!(version, "adopted a newer registry"),
+                        Ok(None) => debug!("registry unchanged; the signer stays unknown"),
+                        Err(error) => warn!(%error, "registry refresh failed"),
+                    }
+                    continue;
+                }
                 Inbound::NodeMoved { got } => {
                     // A retired address is the node before its restart: the
                     // registry is already ahead of it.
-                    let now_ns = now_unix_nanos();
-                    if !self.verifier.is_retired(got) && self.refresh_due(now_ns) {
-                        self.last_refresh_attempt_ns = Some(now_ns);
-                        if let Err(error) = self.refresh_from_source().await {
-                            warn!(%error, "registry refresh failed");
-                        }
+                    if !self.verifier.is_retired(got) {
+                        self.refresh_in_background(now_unix_nanos());
                     }
                     continue;
                 }
             };
             let now_ns = now_unix_nanos();
-            match self
-                .ingest_received(&frame, received_ns, now_ns, Self::try_ingest)
-                .await
-            {
+            match self.ingest_now(&frame, received_ns, now_ns, Self::try_ingest) {
                 Ok(event) => {
                     if let Event::Price(_) = event {
                         self.latency.resolved(received_ns, now_unix_nanos());

@@ -73,3 +73,26 @@ async fn a_full_channel_drops_and_counts_but_never_blocks() {
         Ok(Verdict::Accepted)
     );
 }
+
+/// An archive that keeps one kind asks for that kind only, so the drop counter
+/// counts only copies it would keep.
+#[tokio::test]
+async fn a_kind_filter_copies_and_counts_only_that_kind() {
+    let node = TestNode::new(1);
+    let mut client = client(&[&node]);
+    let mut venues = client.frames_of(1, &[FrameKind::VenueReport]);
+    let at = now_unix_nanos();
+    for seq in 1..=3 {
+        client
+            .ingest(&node.sign(&update_at(at, seq)), at)
+            .expect("accepted");
+    }
+    assert!(venues.try_recv().is_err(), "no price copy");
+    assert_eq!(client.stats().tap_dropped, 0, "a skipped kind is no loss");
+
+    let mut prices = client.frames_of(1, &[FrameKind::Price]);
+    client
+        .ingest(&node.sign(&update_at(at, 4)), at)
+        .expect("accepted");
+    assert_eq!(prices.try_recv().expect("a copy").kind, FrameKind::Price);
+}
