@@ -699,8 +699,10 @@ fn apply_endpoints(
                 Some(&mut binance.spot_base_url)
             }
             (Venue::Binance, MarketKind::LinearPerp) if !binance.perp.is_empty() => {
-                // One override serves both futures routes.
+                // One override serves both futures routes. It names no REST host,
+                // so the node does not ask the real Binance for the intervals.
                 binance.perp_market_url.clone_from(&endpoint.url);
+                binance.perp_funding_info_url.clear();
                 Some(&mut binance.perp_base_url)
             }
             (Venue::Binance, _) => None,

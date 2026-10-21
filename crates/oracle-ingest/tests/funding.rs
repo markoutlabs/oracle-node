@@ -5,7 +5,7 @@ use oracle_ingest::binance::BinanceHandler;
 use oracle_ingest::book::Books;
 use oracle_ingest::session::MessageHandler as _;
 use oracle_ingest::venues::{bybit, deribit, kraken_futures, okx};
-use oracle_ingest::{InstrumentMap, InstrumentSpec};
+use oracle_ingest::{DecodeError, InstrumentMap, InstrumentSpec};
 use oracle_types::{
     Fixed, FundingBasis, FundingInfo, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
     OpenInterestUnit, Venue,
@@ -76,6 +76,56 @@ fn binance_sends_the_rate_and_the_next_funding_time() {
             next_funding_time_ns: ms(1_791_561_600_000),
             ..FundingInfo::new(FundingBasis::Interval)
         }
+    );
+}
+
+/// The interval list was captured on 2026-10-21 and cut to four perpetuals:
+/// BTCUSDT pays every 8 hours, HYPEUSDT and GTCUSDT every 4, ERAUSDT every hour.
+#[test]
+fn binance_states_the_interval_from_the_funding_info_list() {
+    let specs = ["BTCUSDT", "HYPEUSDT", "ERAUSDT", "XYZUSDT"].map(|symbol| {
+        let feed = format!("CRYPTO.{}/USDT.PERP_MARK", symbol.trim_end_matches("USDT"));
+        InstrumentSpec::new(symbol, MarketKind::LinearPerp, &feed).expect("a valid spec")
+    });
+    let map = InstrumentMap::new(Venue::Binance, MarketKind::LinearPerp, &specs).expect("a map");
+    let mut handler = BinanceHandler::new(map);
+    let mark_price = fixture("binance-mark-price.json");
+    let interval = |handler: &mut BinanceHandler, symbol: &str| {
+        let payload = mark_price.replace("BTCUSDT", symbol);
+        let mut out = Vec::new();
+        handler
+            .on_payload(payload.as_bytes(), RECV_NS, &mut out)
+            .expect("decodes");
+        funding(&out).1.interval_ns
+    };
+
+    assert_eq!(interval(&mut handler, "BTCUSDT"), None, "no list yet");
+    handler
+        .on_payload(
+            fixture("binance-funding-info.json").as_bytes(),
+            RECV_NS,
+            &mut Vec::new(),
+        )
+        .expect("decodes the list");
+    assert_eq!(interval(&mut handler, "BTCUSDT"), Some(8 * HOUR_NS));
+    assert_eq!(interval(&mut handler, "HYPEUSDT"), Some(4 * HOUR_NS));
+    assert_eq!(interval(&mut handler, "ERAUSDT"), Some(HOUR_NS));
+    assert_eq!(
+        interval(&mut handler, "XYZUSDT"),
+        Some(8 * HOUR_NS),
+        "a perpetual the list leaves out pays every 8 hours"
+    );
+
+    let failed = r#"{"stream":"!fundingInfo","error":"HTTP status server error (503)"}"#;
+    let error = handler
+        .on_payload(failed.as_bytes(), RECV_NS, &mut Vec::new())
+        .expect_err("a failed fetch");
+    assert!(!error.is_benign());
+    assert!(!matches!(error, DecodeError::Resync(_)), "the socket stays");
+    assert_eq!(
+        interval(&mut handler, "HYPEUSDT"),
+        Some(4 * HOUR_NS),
+        "a failed fetch keeps the last list"
     );
 }
 

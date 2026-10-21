@@ -4,9 +4,12 @@
 //! no async. That is what lets the tests below run against captured payloads
 //! rather than a live exchange.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use oracle_types::{Fixed, FundingBasis, FundingInfo, Level, MarketKind, ObsKind, Observation};
+use oracle_types::{
+    Fixed, FundingBasis, FundingInfo, Level, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -17,7 +20,7 @@ use super::book::{Applied, BinanceBooks, Diff};
 use super::streams::StreamKind;
 
 /// The combined-stream envelope: `{"stream":"btcusdt@bookTicker","data":{…}}`.
-/// A snapshot that could not be fetched carries `error` instead of `data`.
+/// A REST frame that could not be fetched carries `error` instead of `data`.
 #[derive(Deserialize)]
 struct Envelope<'a> {
     #[serde(borrow)]
@@ -58,23 +61,82 @@ struct DepthSnapshot<'a> {
     asks: Vec<[&'a str; 2]>,
 }
 
+#[derive(Deserialize)]
+struct AdjustedFunding<'a> {
+    #[serde(borrow)]
+    symbol: &'a str,
+    #[serde(rename = "fundingIntervalHours", default)]
+    interval_hours: Option<u64>,
+}
+
+const HOUR_NS: u64 = 3_600 * NANOS_PER_SEC;
+/// A perpetual that the list leaves out pays every 8 hours.
+const DEFAULT_INTERVAL_NS: u64 = 8 * HOUR_NS;
+
+/// The funding interval of each perpetual, from the list that
+/// `super::snapshot` delivers.
+#[derive(Debug, Default)]
+pub(crate) struct FundingIntervals {
+    /// Nanoseconds, by uppercase symbol. `None` until the first list arrives.
+    by_symbol: Option<HashMap<String, u64>>,
+}
+
+impl FundingIntervals {
+    fn interval_ns(&self, symbol: &str) -> Option<u64> {
+        let by_symbol = self.by_symbol.as_ref()?;
+        // Uppercase only on a miss, as `InstrumentMap::lookup` does.
+        let listed = by_symbol
+            .get(symbol)
+            .or_else(|| by_symbol.get(&symbol.to_ascii_uppercase()));
+        Some(listed.copied().unwrap_or(DEFAULT_INTERVAL_NS))
+    }
+
+    fn apply(&mut self, envelope: &Envelope<'_>) -> Result<(), DecodeError> {
+        // A failed fetch keeps the last list: the next fetch comes within a minute.
+        if let Some(error) = envelope.error {
+            return Err(DecodeError::Malformed(format!(
+                "{}: fetch failed: {error}",
+                envelope.stream
+            )));
+        }
+        let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
+        let list: Vec<AdjustedFunding<'_>> = serde_json::from_slice(data.get().as_bytes())
+            .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        self.by_symbol = Some(
+            list.into_iter()
+                .filter_map(|entry| {
+                    let hours = entry.interval_hours.filter(|hours| *hours > 0)?;
+                    Some((
+                        entry.symbol.to_ascii_uppercase(),
+                        hours.checked_mul(HOUR_NS)?,
+                    ))
+                })
+                .collect(),
+        );
+        Ok(())
+    }
+}
+
 fn levels(raw: &[[&str; 2]]) -> Result<Vec<Level>, DecodeError> {
     raw.iter()
         .map(|[price, qty]| crate::depth::level(price, qty))
         .collect()
 }
 
-/// The session's entry point: depth streams are kept in `books`; every other
-/// stream goes to [`decode_payload`].
+/// The session's entry point: depth streams are kept in `books`, and mark
+/// prices get their interval from `intervals`. Every other stream goes to
+/// [`decode_payload`].
 ///
 /// # Errors
 ///
 /// As [`decode_payload`], and [`DecodeError::Resync`] when a diff does not
 /// follow the book, or its snapshot could not be fetched.
+/// [`DecodeError::Malformed`] when the funding intervals could not be fetched.
 pub(crate) fn decode(
     payload: &[u8],
     map: &InstrumentMap,
     books: &mut BinanceBooks,
+    intervals: &mut FundingIntervals,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
@@ -82,8 +144,14 @@ pub(crate) fn decode(
         return decode_payload(payload, map, local_recv_ns, out);
     };
     let kind = StreamKind::from_stream_name(envelope.stream);
-    if !matches!(kind, Some(StreamKind::Depth | StreamKind::DepthSnapshot)) {
-        return decode_payload(payload, map, local_recv_ns, out);
+    match kind {
+        Some(StreamKind::FundingInfo) => return intervals.apply(&envelope),
+        Some(StreamKind::MarkPrice) => {
+            let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
+            return decode_mark_price(data.get().as_bytes(), map, intervals, local_recv_ns, out);
+        }
+        Some(StreamKind::Depth | StreamKind::DepthSnapshot) => {}
+        _ => return decode_payload(payload, map, local_recv_ns, out),
     }
     if let Some(error) = envelope.error {
         return Err(DecodeError::Resync(format!(
@@ -204,7 +272,8 @@ fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeError> {
     })
 }
 
-/// Decodes one combined-stream payload.
+/// Decodes one combined-stream payload. Funding observations get no interval
+/// here: it comes from the list that only a session has.
 ///
 /// The `map` carries the market it serves, which is what disambiguates symbols
 /// listed on both spot and perpetuals — every major pair is. A session must
@@ -233,7 +302,7 @@ pub fn decode_payload(
 
     let kind = StreamKind::from_stream_name(envelope.stream)
         .ok_or_else(|| DecodeError::UnhandledStream(envelope.stream.to_owned()))?;
-    // Only a snapshot frame carries `error`, and `decode` handles those.
+    // Only a REST frame carries `error`, and `decode` handles those.
     let data = envelope
         .data
         .ok_or(DecodeError::MissingField("data"))?
@@ -243,9 +312,11 @@ pub fn decode_payload(
     match kind {
         StreamKind::BookTicker => decode_book_ticker(data, map, local_recv_ns, out),
         StreamKind::AggTrade => decode_agg_trade(data, map, local_recv_ns, out),
-        StreamKind::MarkPrice => decode_mark_price(data, map, local_recv_ns, out),
-        // Book streams need the connection's books; see `decode`.
-        StreamKind::Depth | StreamKind::DepthSnapshot => {
+        StreamKind::MarkPrice => {
+            decode_mark_price(data, map, &FundingIntervals::default(), local_recv_ns, out)
+        }
+        // These need the session's state; see `decode`.
+        StreamKind::Depth | StreamKind::DepthSnapshot | StreamKind::FundingInfo => {
             Err(DecodeError::UnhandledStream(envelope.stream.to_owned()))
         }
     }
@@ -342,6 +413,7 @@ fn decode_agg_trade(
 fn decode_mark_price(
     data: &[u8],
     map: &InstrumentMap,
+    intervals: &FundingIntervals,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
@@ -375,11 +447,8 @@ fn decode_mark_price(
         push(ObsKind::IndexPrice, decimal("i", index)?, None);
     }
     if let Some(rate) = update.funding_rate {
-        // Emitted raw, over whatever interval Binance uses for this contract —
-        // 8 hours for most, 4 for some, and the message does not say which. The
-        // interval has to come from instrument metadata before this can be
-        // normalized to the `FUNDING_8H` feed. See SPEC.md §13, open question 3.
         let info = FundingInfo {
+            interval_ns: intervals.interval_ns(update.symbol),
             next_funding_time_ns: update
                 .next_funding_time_ms
                 .filter(|ms| *ms > 0)
@@ -457,8 +526,15 @@ mod tests {
         let mut depths = Vec::new();
         for line in RECORDED_DEPTH.lines() {
             let mut out = Vec::new();
-            super::decode(line.as_bytes(), &map, &mut books, RECV_NS, &mut out)
-                .unwrap_or_else(|error| panic!("{error}: {line}"));
+            super::decode(
+                line.as_bytes(),
+                &map,
+                &mut books,
+                &mut FundingIntervals::default(),
+                RECV_NS,
+                &mut out,
+            )
+            .unwrap_or_else(|error| panic!("{error}: {line}"));
             depths.extend(out);
         }
         assert!(depths.len() >= 25, "{}", depths.len());
@@ -475,6 +551,7 @@ mod tests {
                 failed.as_bytes(),
                 &depth_map(),
                 &mut BinanceBooks::default(),
+                &mut FundingIntervals::default(),
                 RECV_NS,
                 &mut Vec::new()
             ),

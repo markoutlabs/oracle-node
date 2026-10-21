@@ -14,6 +14,9 @@ pub const FUTURES_BASE: &str = "wss://fstream.binance.com/public/stream";
 /// USD-margined futures endpoint for trades and the mark price.
 pub const FUTURES_MARKET_BASE: &str = "wss://fstream.binance.com/market/stream";
 
+/// The name of the frame of the adjusted funding intervals, for every perpetual.
+pub const FUNDING_INFO_STREAM: &str = "!fundingInfo";
+
 /// Streams per connection.
 ///
 /// Binance permits far more, but a combined-stream URL is a GET request line and
@@ -40,6 +43,8 @@ pub enum StreamKind {
     Depth,
     /// The REST snapshot, delivered as a frame. Not a stream Binance serves.
     DepthSnapshot,
+    /// The REST list of funding intervals, delivered as a frame; see `super::snapshot`.
+    FundingInfo,
 }
 
 impl StreamKind {
@@ -78,6 +83,8 @@ impl StreamKind {
             Self::MarkPrice => "@markPrice@1s",
             Self::Depth => "@depth@100ms",
             Self::DepthSnapshot => "@depthSnapshot",
+            // The whole name: the list is not for one symbol.
+            Self::FundingInfo => FUNDING_INFO_STREAM,
         }
     }
 
@@ -86,7 +93,9 @@ impl StreamKind {
     pub fn from_stream_name(stream: &str) -> Option<Self> {
         // Checked longest-first: "@markPrice@1s" also ends with nothing else,
         // but an unqualified "@markPrice" must still match.
-        if stream.ends_with("@bookTicker") {
+        if stream == FUNDING_INFO_STREAM {
+            Some(Self::FundingInfo)
+        } else if stream.ends_with("@bookTicker") {
             Some(Self::BookTicker)
         } else if stream.ends_with("@aggTrade") {
             Some(Self::AggTrade)
@@ -255,6 +264,10 @@ mod tests {
         assert_eq!(
             StreamKind::from_stream_name("btcusdt@markPrice"),
             Some(StreamKind::MarkPrice)
+        );
+        assert_eq!(
+            StreamKind::from_stream_name(FUNDING_INFO_STREAM),
+            Some(StreamKind::FundingInfo)
         );
         assert_eq!(StreamKind::from_stream_name("btcusdt@kline_1m"), None);
         assert_eq!(StreamKind::from_stream_name(""), None);

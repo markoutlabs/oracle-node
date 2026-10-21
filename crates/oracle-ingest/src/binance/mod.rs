@@ -54,6 +54,8 @@ pub struct BinanceConfig {
     pub spot_rest_url: String,
     /// The REST endpoint futures depth snapshots come from.
     pub perp_rest_url: String,
+    /// The REST endpoint of the adjusted funding intervals. Empty: no fetch.
+    pub perp_funding_info_url: String,
     /// Reconnect if nothing arrives for this long. The session probes a quiet
     /// connection (`SessionConfig::probe_after`), so this only has to cover a
     /// slow pong.
@@ -76,6 +78,18 @@ impl BinanceConfig {
             (self.perp_base_url.clone(), self.perp_rest_url.clone()),
         ]
     }
+
+    /// The routes for [`snapshot::SnapshotConnector::with_funding_info`]; none without a REST URL.
+    #[must_use]
+    pub fn funding_info_routes(&self) -> Vec<(String, String)> {
+        if self.perp_funding_info_url.is_empty() {
+            return Vec::new();
+        }
+        vec![(
+            self.perp_market_url.clone(),
+            self.perp_funding_info_url.clone(),
+        )]
+    }
 }
 
 impl Default for BinanceConfig {
@@ -88,6 +102,7 @@ impl Default for BinanceConfig {
             perp_market_url: streams::FUTURES_MARKET_BASE.to_owned(),
             spot_rest_url: snapshot::SPOT_REST.to_owned(),
             perp_rest_url: snapshot::FUTURES_REST.to_owned(),
+            perp_funding_info_url: snapshot::FUTURES_FUNDING_INFO_REST.to_owned(),
             idle_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             streams_per_connection: MAX_STREAMS_PER_CONNECTION,
@@ -103,6 +118,7 @@ impl Default for BinanceConfig {
 pub struct BinanceHandler {
     map: InstrumentMap,
     books: book::BinanceBooks,
+    intervals: decode::FundingIntervals,
 }
 
 impl BinanceHandler {
@@ -112,6 +128,7 @@ impl BinanceHandler {
         Self {
             map,
             books: book::BinanceBooks::default(),
+            intervals: decode::FundingIntervals::default(),
         }
     }
 }
@@ -123,10 +140,18 @@ impl MessageHandler for BinanceHandler {
         local_recv_ns: u64,
         out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError> {
-        decode::decode(payload, &self.map, &mut self.books, local_recv_ns, out)
+        decode::decode(
+            payload,
+            &self.map,
+            &mut self.books,
+            &mut self.intervals,
+            local_recv_ns,
+            out,
+        )
     }
 
     fn on_connect(&mut self) {
+        // The intervals stay: the new connection fetches them again.
         self.books.clear();
     }
 }

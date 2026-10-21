@@ -8,15 +8,20 @@
 //! frame, `{"stream":"<symbol>@depthSnapshot","data":{…}}`, among the changes.
 //! It sits under the recorder, so a recording holds the snapshot and a replay
 //! never calls REST.
+//!
+//! The mark price stream does not say how often a perpetual pays funding. A
+//! connection that carries mark prices therefore also gets the list of adjusted
+//! funding intervals, `{"stream":"!fundingInfo","data":[…]}`, when it opens and
+//! each hour after.
 
 use std::time::Duration;
 
 use futures_util::FutureExt as _;
-use futures_util::future::BoxFuture;
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
 use serde_json::value::RawValue;
+use tracing::warn;
 
-use super::streams::StreamKind;
+use super::streams::{FUNDING_INFO_STREAM, StreamKind};
 use crate::transport::{Connector, Frame, Transport, TransportError};
 
 /// Levels requested per side.
@@ -28,15 +33,23 @@ pub const SPOT_REST: &str = "https://api.binance.com/api/v3/depth";
 /// USD-margined futures' REST depth endpoint.
 pub const FUTURES_REST: &str = "https://fapi.binance.com/fapi/v1/depth";
 
+/// USD-margined futures' REST endpoint of the adjusted funding intervals.
+pub const FUTURES_FUNDING_INFO_REST: &str = "https://fapi.binance.com/fapi/v1/fundingInfo";
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wraps a connector: a Binance connection that subscribes to depth also gets
-/// each depth stream's snapshot. Every other connection passes through.
+/// Binance changes an interval rarely, and announces it ahead.
+const FUNDING_INFO_EVERY: Duration = Duration::from_secs(3_600);
+const FUNDING_INFO_RETRY: Duration = Duration::from_secs(60);
+
+/// Wraps a connector: it adds the REST frames that a Binance connection needs.
 #[derive(Clone)]
 pub struct SnapshotConnector<C> {
     inner: C,
     /// Socket base URL, and the REST endpoint its snapshots come from.
     routes: Vec<(String, String)>,
+    /// Socket base URL, and the REST endpoint of its funding intervals.
+    funding_info: Vec<(String, String)>,
     client: reqwest::Client,
 }
 
@@ -59,25 +72,52 @@ impl<C> SnapshotConnector<C> {
         Ok(Self {
             inner,
             routes,
+            funding_info: Vec::new(),
             client,
         })
     }
 
-    fn rest_for(&self, url: &str) -> Option<&str> {
-        self.routes
-            .iter()
-            .find(|(socket, _)| url.starts_with(socket.as_str()))
-            .map(|(_, rest)| rest.as_str())
+    /// Adds the funding intervals to mark-price connections: socket base URL, REST endpoint.
+    #[must_use]
+    pub fn with_funding_info(mut self, routes: Vec<(String, String)>) -> Self {
+        self.funding_info = routes;
+        self
     }
+
+    fn rest_for(&self, url: &str) -> Option<&str> {
+        route(&self.routes, url)
+    }
+
+    fn funding_info_for(&self, url: &str) -> Option<&str> {
+        let marks = streams(url)
+            .iter()
+            .any(|stream| StreamKind::from_stream_name(stream) == Some(StreamKind::MarkPrice));
+        route(&self.funding_info, url).filter(|_| marks)
+    }
+}
+
+fn route<'a>(routes: &'a [(String, String)], url: &str) -> Option<&'a str> {
+    routes
+        .iter()
+        .find(|(socket, _)| url.starts_with(socket.as_str()))
+        .map(|(_, rest)| rest.as_str())
+}
+
+/// The streams that a combined-stream URL subscribes to.
+fn streams(url: &str) -> Vec<String> {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return Vec::new();
+    };
+    url.query_pairs()
+        .filter(|(key, _)| key == "streams")
+        .flat_map(|(_, value)| value.split('/').map(str::to_owned).collect::<Vec<_>>())
+        .collect()
 }
 
 /// The symbols of the depth streams a combined-stream URL subscribes to.
 fn depth_symbols(url: &str) -> Vec<String> {
-    let Some((_, streams)) = url.split_once("streams=") else {
-        return Vec::new();
-    };
-    streams
-        .split('/')
+    streams(url)
+        .iter()
         .filter(|stream| StreamKind::from_stream_name(stream) == Some(StreamKind::Depth))
         .filter_map(|stream| stream.split('@').next())
         .map(str::to_owned)
@@ -96,11 +136,15 @@ impl<C: Connector> Connector for SnapshotConnector<C> {
                 .collect(),
             None => Vec::new(),
         };
+        let mut pending = SelectAll::new();
+        if let Some(rest) = self.funding_info_for(url) {
+            pending.push(funding_info(self.client.clone(), rest.to_owned()));
+        }
         Ok(SnapshotTransport {
             inner: conn,
             client: self.client.clone(),
             awaiting,
-            pending: FuturesUnordered::new(),
+            pending,
         })
     }
 }
@@ -112,7 +156,8 @@ pub struct SnapshotTransport<T> {
     /// Depth symbols whose first change has not arrived, with their REST
     /// endpoint.
     awaiting: Vec<(String, String)>,
-    pending: FuturesUnordered<BoxFuture<'static, Frame>>,
+    /// One frame for each depth fetch; the funding intervals never end.
+    pending: SelectAll<BoxStream<'static, Frame>>,
 }
 
 impl<T> SnapshotTransport<T> {
@@ -133,8 +178,11 @@ impl<T> SnapshotTransport<T> {
         let symbol = stream.split('@').next().unwrap_or(stream);
         if let Some(index) = self.awaiting.iter().position(|(s, _)| s == symbol) {
             let (symbol, rest) = self.awaiting.swap_remove(index);
-            self.pending
-                .push(fetch(self.client.clone(), rest, symbol).boxed());
+            self.pending.push(
+                depth(self.client.clone(), rest, symbol)
+                    .into_stream()
+                    .boxed(),
+            );
         }
     }
 }
@@ -175,7 +223,7 @@ impl<T: Transport> Transport for SnapshotTransport<T> {
 
 /// Fetches one snapshot. A failure becomes a frame too, so the decoder can ask
 /// for a resync rather than wait for a snapshot that will never come.
-async fn fetch(client: reqwest::Client, rest: String, symbol: String) -> Frame {
+async fn depth(client: reqwest::Client, rest: String, symbol: String) -> Frame {
     let stream = format!(
         "{}{}",
         symbol.to_ascii_lowercase(),
@@ -185,22 +233,47 @@ async fn fetch(client: reqwest::Client, rest: String, symbol: String) -> Frame {
         "{rest}?symbol={}&limit={SNAPSHOT_LIMIT}",
         symbol.to_ascii_uppercase()
     );
+    frame(&stream, fetch(&client, &url).await)
+}
+
+/// The funding intervals now, then each hour, or a minute after a failed fetch.
+fn funding_info(client: reqwest::Client, rest: String) -> BoxStream<'static, Frame> {
+    stream::unfold(Duration::ZERO, move |wait| {
+        let (client, rest) = (client.clone(), rest.clone());
+        async move {
+            tokio::time::sleep(wait).await;
+            let fetched = fetch(&client, &rest).await;
+            let next = match &fetched {
+                Ok(_) => FUNDING_INFO_EVERY,
+                Err(error) => {
+                    // The decoder only counts the frame, so this is the one visible sign.
+                    warn!(%error, "the Binance funding intervals could not be fetched");
+                    FUNDING_INFO_RETRY
+                }
+            };
+            Some((frame(FUNDING_INFO_STREAM, fetched), next))
+        }
+    })
+    .boxed()
+}
+
+/// One REST reply, as JSON.
+async fn fetch(client: &reqwest::Client, url: &str) -> Result<Box<RawValue>, String> {
     let body = async {
-        let response = client.get(&url).send().await?.error_for_status()?;
+        let response = client.get(url).send().await?.error_for_status()?;
         response.text().await
     };
-    let text = match body.await {
-        Ok(body) => match serde_json::from_str::<Box<RawValue>>(&body) {
-            Ok(data) => serde_json::json!({ "stream": stream, "data": data }).to_string(),
-            Err(error) => {
-                serde_json::json!({ "stream": stream, "error": error.to_string() }).to_string()
-            }
-        },
-        Err(error) => {
-            serde_json::json!({ "stream": stream, "error": error.to_string() }).to_string()
-        }
+    let body = body.await.map_err(|error| error.to_string())?;
+    serde_json::from_str(&body).map_err(|error| error.to_string())
+}
+
+/// A reply as a frame of `stream`: `data`, or `error` when the fetch failed.
+fn frame(stream: &str, fetched: Result<Box<RawValue>, String>) -> Frame {
+    let text = match fetched {
+        Ok(data) => serde_json::json!({ "stream": stream, "data": data }),
+        Err(error) => serde_json::json!({ "stream": stream, "error": error }),
     };
-    Frame::Text(text)
+    Frame::Text(text.to_string())
 }
 
 #[cfg(test)]
@@ -214,6 +287,33 @@ mod tests {
             Some("btcusdt@depth@100ms")
         );
         assert_eq!(stream_name(r#"{"result":null,"id":1}"#), None);
+    }
+
+    #[test]
+    fn only_a_mark_price_connection_gets_the_funding_intervals() {
+        let connector = SnapshotConnector::new((), Vec::new())
+            .expect("a client")
+            .with_funding_info(vec![(
+                "wss://fstream.binance.com/market/stream".to_owned(),
+                FUTURES_FUNDING_INFO_REST.to_owned(),
+            )]);
+        let market = "wss://fstream.binance.com/market/stream?streams=";
+        for marks in ["btcusdt@aggTrade/btcusdt@markPrice@1s", "btcusdt@markPrice"] {
+            assert_eq!(
+                connector.funding_info_for(&format!("{market}{marks}")),
+                Some(FUTURES_FUNDING_INFO_REST)
+            );
+        }
+        assert_eq!(
+            connector.funding_info_for(&format!("{market}btcusdt@aggTrade")),
+            None
+        );
+        assert_eq!(
+            connector.funding_info_for(
+                "wss://fstream.binance.com/public/stream?streams=btcusdt@markPrice@1s"
+            ),
+            None
+        );
     }
 
     #[test]

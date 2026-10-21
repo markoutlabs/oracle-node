@@ -197,14 +197,15 @@ sources = [
 # is a fraction over a fixed 8h window whatever its settlement cadence.
 #
 # Every other venue reports a fraction over ITS OWN interval — hourly on Kraken
-# Futures, 8h or 4h on Binance depending on the contract, and the message does
-# not say which. Adding them would take a median across incomparable numbers and
+# Futures, 8h, 4h or 1h on Binance depending on the contract. The node's funding
+# frames state the interval, but the aggregator that builds this feed does not
+# convert by it. Adding them would take a median across incomparable numbers and
 # publish a confidently wrong figure without halting or degrading. Run with
 # --tail and compare Deribit's `funding` against Kraken's: same contract, same
 # instant, roughly 25x apart.
 #
-# See SPEC.md §13 open question 3. Do not add sources here until the interval
-# metadata fetch exists.
+# See SPEC.md §13 open question 3. Do not add sources here until the aggregator
+# converts by interval.
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD.FUNDING_8H"
