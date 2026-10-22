@@ -15,11 +15,16 @@ oracle-wire.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+governor.workspace = true
 hex.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "net"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tower.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -11,7 +11,7 @@ use oracle_client::{OracleClient, now_unix_nanos};
 use oracle_server::testing::{
     client_key, governance_key, sample_update, signing_key, test_registry, test_transport,
 };
-use oracle_server::{ServerState, router};
+use oracle_server::{Limits, ServerState, router};
 use oracle_types::{NANOS_PER_SEC, Symbol};
 use oracle_wire::{NodeEntry, Quorum, Registry, VerifiedRegistry, feed_id};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -32,7 +32,7 @@ async fn start_node(publish: bool) -> SocketAddr {
     let state = ServerState::new(&[btc()], test_registry(), test_transport());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("bound");
-    let app = router(Arc::clone(&state));
+    let app = router(Arc::clone(&state), &Limits::default());
     tokio::spawn(async move { axum::serve(listener, app).await });
     if publish {
         tokio::spawn(async move {

@@ -2,16 +2,17 @@
 //! deadlines and revocation. The cryptography is in `oracle-transport`.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use oracle_transport::{
     BroadcastSealer, CloseReason, EpochKey, HandshakeMessage, NodeHandshake, NodeKeySchedule,
     Opener, Sealer, Tick, TransportError, eligible, os_rng, session_deadline,
 };
 use oracle_wire::{Address, Signer, VerifiedClientList};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::hub::{Hub, Subscriber};
@@ -20,13 +21,10 @@ use crate::hub::{Hub, Subscriber};
 /// far behind on control messages is closed rather than buffered.
 const OUTBOX_CAPACITY: usize = 64;
 
-/// Limits for the transport.
+/// How fresh the client list must be. The network limits are in
+/// [`crate::Limits`].
 #[derive(Clone, Copy, Debug)]
 pub struct TransportConfig {
-    /// Handshakes in progress at once. Further upgrades get 503.
-    pub max_handshakes: usize,
-    /// Time from upgrade to `auth_ok`.
-    pub handshake_timeout: Duration,
     /// Refuse new sessions when no fetch has confirmed the client list for
     /// this long, seconds.
     pub admit_within: u64,
@@ -38,8 +36,6 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
-            max_handshakes: 256,
-            handshake_timeout: Duration::from_secs(10),
             admit_within: 3 * 3_600,
             serve_within: 24 * 3_600,
         }
@@ -96,7 +92,6 @@ pub struct NodeTransport {
     /// When a fetch last proved the client list current, unix seconds.
     confirmed_at: AtomicU64,
     keys: Mutex<Keys>,
-    handshakes: Arc<Semaphore>,
     config: TransportConfig,
 }
 
@@ -131,7 +126,6 @@ impl NodeTransport {
                 schedule,
                 sessions: HashMap::new(),
             }),
-            handshakes: Arc::new(Semaphore::new(config.max_handshakes.max(1))),
             config,
         })
     }
@@ -152,12 +146,6 @@ impl NodeTransport {
     #[must_use]
     pub const fn config(&self) -> TransportConfig {
         self.config
-    }
-
-    /// Returns the handshake gate.
-    #[must_use]
-    pub fn handshakes(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.handshakes)
     }
 
     /// Returns the open session count.
@@ -198,7 +186,8 @@ impl NodeTransport {
         NodeHandshake::start(self.signer.address(), &mut os_rng())
     }
 
-    /// Checks a client's `Auth` and, if it passes, opens the session.
+    /// Checks a client's `Auth` and, if it passes, opens the session. A client
+    /// may have at most `max_sessions` at once.
     ///
     /// Runs under the client-list read guard and the key lock, so a list swap
     /// or a rotation lands either wholly before the session or wholly after it.
@@ -211,6 +200,7 @@ impl NodeTransport {
         handshake: NodeHandshake,
         auth: &HandshakeMessage,
         now: u64,
+        max_sessions: NonZeroUsize,
     ) -> Result<(HandshakeMessage, Established), TransportError> {
         let clients = self.read_clients();
         if self.unconfirmed_for(now) > self.config.admit_within {
@@ -221,8 +211,21 @@ impl NodeTransport {
         let admitted = handshake.verify(auth, &clients, now)?;
 
         let mut keys = self.lock_keys();
-        let offered = keys.schedule.keys_for(admitted.deadline());
         let client = admitted.client();
+        // After the signature: a stranger who names a client's public key
+        // cannot take that client's places.
+        let open = keys
+            .sessions
+            .values()
+            .filter(|session| session.client == client)
+            .count();
+        if open >= max_sessions.get() {
+            return Err(TransportError::TooManySessions {
+                client,
+                max: max_sessions.get(),
+            });
+        }
+        let offered = keys.schedule.keys_for(admitted.deadline());
         let deadline = admitted.deadline();
         let (auth_ok, session) = admitted.accept(&self.signer, &offered, &mut os_rng())?;
 

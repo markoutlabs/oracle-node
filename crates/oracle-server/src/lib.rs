@@ -22,7 +22,9 @@
 
 pub mod app;
 pub mod hub;
+pub mod limit;
 pub mod protocol;
+pub mod serve;
 pub mod testing;
 pub mod transport;
 
@@ -31,5 +33,7 @@ pub use hub::{
     Channel, Hub, Outgoing, PreparedBook, PreparedFunding, PreparedUpdate, PreparedVenues,
     Subscriber,
 };
+pub use limit::Limits;
 pub use protocol::{ClientMessage, ServerMessage};
+pub use serve::serve;
 pub use transport::{NodeTransport, TransportConfig, unix_now};

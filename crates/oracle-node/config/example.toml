@@ -14,6 +14,23 @@ listen = "0.0.0.0:8080"
 # lagged. Fanout conflates per feed, so this is a breadth limit, not a depth one.
 max_pending_feeds = 512
 
+# What one peer can cost the node. Each value is above 0; these are the defaults.
+# A peer counts by its IPv4 address or its IPv6 /64. Loopback counts only in the
+# totals, because a TLS proxy on the same host brings every client from there.
+# [server.limits]
+# max_sockets = 1024            # open TCP sockets, in total
+# sockets_per_ip = 16
+# sockets_per_minute = 60       # new sockets from one address
+# header_timeout_ms = 10000     # to send a request head; also the keep-alive idle limit
+# max_handshakes = 256          # in progress, in total
+# handshakes_per_ip = 4
+# handshakes_per_minute = 30
+# handshake_timeout_ms = 5000   # from the upgrade to auth_ok
+# sessions_per_client = 8       # open at once for one client key, from any address
+# messages_per_second = 10      # control messages from one session
+# requests_per_minute = 60      # /v2/feeds, /v2/registry, /v2/health from one address
+# limit_loopback = false
+
 [signing]
 # A file or an environment variable, never a command-line argument: arguments are
 # visible in `ps` to every user on the box. The key file is an `age` file written

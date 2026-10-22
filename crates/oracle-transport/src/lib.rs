@@ -71,6 +71,14 @@ pub enum TransportError {
     /// The client's signature does not match its key and this transcript.
     #[error("client signature does not verify")]
     BadSignature,
+    /// The client already has as many sessions on this node as it may.
+    #[error("client {client} already has {max} sessions on this node")]
+    TooManySessions {
+        /// The client's address.
+        client: oracle_wire::Address,
+        /// The sessions one client may have.
+        max: usize,
+    },
     /// The node's signature does not come from the dialled address.
     #[error("auth_ok is signed by {found}, expected the node {expected}")]
     UntrustedNode {

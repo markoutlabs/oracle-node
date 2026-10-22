@@ -16,7 +16,7 @@ use oracle_client::{
     ConnectionState, NodeFeedState, OracleClient, Status, testing as client_testing,
 };
 use oracle_server::testing::{client_key, sample_update, signing_key, test_transport};
-use oracle_server::{ServerState, router};
+use oracle_server::{Limits, ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
 use oracle_wire::{Registry, Signer, VerifiedRegistry, feed_id};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -94,7 +94,7 @@ async fn start_node() -> Node {
     let verified = registry.verify(governance.address(), 0).expect("verifies");
 
     let state = ServerState::new(&[symbol()], registry, test_transport());
-    let app = router(Arc::clone(&state));
+    let app = router(Arc::clone(&state), &Limits::default());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

@@ -36,6 +36,9 @@ use crate::tail::{log_observation, log_update};
 /// growing without limit. Dropping the socket is recoverable; running out of
 /// memory is not.
 const INGEST_CAPACITY: usize = 8_192;
+/// Open files beyond the client sockets and the venue connections: logs,
+/// recordings, the runtime.
+const SPARE_FILES: usize = 256;
 /// Events applied before the changed feeds are evaluated. A burst then costs one
 /// pass over the feeds it touched, not one per event, and stays bounded.
 const BATCH_MAX: usize = 256;
@@ -128,7 +131,6 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         TransportConfig {
             admit_within: u64::MAX,
             serve_within: u64::MAX,
-            ..TransportConfig::default()
         }
     } else {
         TransportConfig::default()
@@ -175,6 +177,16 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         .run(),
     );
 
+    #[cfg(unix)]
+    raise_open_files(
+        config
+            .server
+            .limits
+            .max_sockets
+            .get()
+            .saturating_add(connections)
+            .saturating_add(SPARE_FILES),
+    );
     let listener = tokio::net::TcpListener::bind(&config.server.listen).await?;
     let summary = Summary {
         listen: listener.local_addr()?,
@@ -192,12 +204,10 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     summary.log();
     notify::ready(&format!("serving on {}", summary.listen));
 
-    let server = axum::serve(listener, router(state)).with_graceful_shutdown({
-        let shutdown = shutdown.clone();
-        async move { shutdown.cancelled().await }
-    });
+    let limits = config.server.limits.clone();
+    let server = oracle_server::serve(listener, router(state, &limits), limits, shutdown.clone());
     tokio::select! {
-        result = server => result?,
+        () = server => {},
         signal = signals.recv() => {
             info!(signal = signal?, "shutting down");
         }
@@ -207,6 +217,34 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     shutdown.cancel();
     let _ = pipeline_task.await;
     Ok(())
+}
+
+/// Raises the open-file limit to its ceiling, and warns when it is still below
+/// `needed`: past it, the node cannot accept clients or reach venues.
+#[cfg(unix)]
+fn raise_open_files(needed: usize) {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return;
+    };
+    let needed = nix::libc::rlim_t::try_from(needed).unwrap_or(nix::libc::rlim_t::MAX);
+    // macOS refuses an unlimited soft limit, so the second try asks only for `needed`.
+    let limit = [hard, needed]
+        .into_iter()
+        .find(|&target| {
+            target > soft
+                && target <= hard
+                && setrlimit(Resource::RLIMIT_NOFILE, target, hard).is_ok()
+        })
+        .unwrap_or(soft);
+    if limit < needed {
+        warn!(
+            limit,
+            needed,
+            "the open-file limit is below what server.limits.max_sockets and the venues need; \
+             raise LimitNOFILE or lower max_sockets"
+        );
+    }
 }
 
 /// Loads the config and the key, and waits until the registry lists this
@@ -627,4 +665,18 @@ fn spawn_transport_tasks(
             }
         }
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use nix::sys::resource::{Resource, getrlimit};
+
+    #[test]
+    fn the_open_file_limit_rises_to_what_the_node_needs() {
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("readable");
+        raise_open_files(2_048);
+        let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).expect("readable");
+        assert!(soft >= hard.min(2_048), "soft {soft}, hard {hard}");
+    }
 }

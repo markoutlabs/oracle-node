@@ -52,9 +52,14 @@ time = { version = "0.3", default-features = false, features = ["parsing", "std"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The node's per-address limits on sockets, handshakes and requests.
+governor = "0.10"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # Latency percentiles in the SDK and the node.
 hdrhistogram = { version = "7", default-features = false }
+# The node's accept loop: axum::serve sets no timer, so it has no header timeout.
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
 # `rustls-no-provider`, not `rustls`: the workspace already pins rustls to the
 # `ring` provider through tokio-tungstenite, and a second provider makes
 # `ClientConfig::builder()` refuse to pick one at runtime.
@@ -74,7 +79,7 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "x2551
 aes-gcm-siv = { version = "0.12", default-features = false, features = ["aes", "alloc"] }
 hkdf = "0.12"
 # The service user of `sudo oracle-node init`.
-nix = { version = "0.31", default-features = false, features = ["user"] }
+nix = { version = "0.31", default-features = false, features = ["user", "resource"] }
 # Book checksums (Kraken, OKX).
 crc32fast = "1"
 sha2 = "0.10"
@@ -92,6 +97,7 @@ tokio = { version = "1", default-features = false }
 tokio-tungstenite = { version = "0.30", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-util = "0.7"
+tower = { version = "0.5", default-features = false }
 toml = "0.9"
 # Takes the feed tables, with their comments, out of the built-in feed files.
 toml_edit = "0.25"

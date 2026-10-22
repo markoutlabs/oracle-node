@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_server::testing::{governance_key, sample_update, signing_key, test_registry};
-use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
+use oracle_server::{Limits, NodeTransport, ServerState, TransportConfig, router, unix_now};
 use oracle_transport::{
     ClientHandshake, ClientSession, CloseReason, Control, HandshakeMessage, TYPE_CONTROL,
     TYPE_FRAME,
@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_util::sync::CancellationToken;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -57,6 +58,15 @@ async fn start(list: &ClientList, config: TransportConfig) -> Node {
 }
 
 async fn start_confirmed_at(list: &ClientList, config: TransportConfig, confirmed_at: u64) -> Node {
+    start_limited(list, config, Limits::default(), confirmed_at).await
+}
+
+async fn start_limited(
+    list: &ClientList,
+    config: TransportConfig,
+    limits: Limits,
+    confirmed_at: u64,
+) -> Node {
     let verified = list
         .verify(governance_key().address(), 0)
         .expect("verifies");
@@ -67,10 +77,13 @@ async fn start_confirmed_at(list: &ClientList, config: TransportConfig, confirme
     let state = ServerState::with_books(&symbols, books, test_registry(), Arc::clone(&transport));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("bound");
-    let app = router(Arc::clone(&state));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let app = router(Arc::clone(&state), &limits);
+    tokio::spawn(oracle_server::serve(
+        listener,
+        app,
+        limits,
+        CancellationToken::new(),
+    ));
     Node {
         addr,
         state,
@@ -337,11 +350,12 @@ async fn unknown_clients_and_plaintext_are_refused_before_any_subscriber_exists(
 
 #[tokio::test]
 async fn a_silent_or_oversized_handshake_is_cut_off() {
-    let config = TransportConfig {
-        handshake_timeout: Duration::from_millis(200),
-        ..TransportConfig::default()
+    let limits = Limits {
+        handshake_timeout_ms: 200.try_into().expect("non-zero"),
+        ..Limits::default()
     };
-    let node = start(&client_list(1, 60, &[(1, unix_now() + 3_600)]), config).await;
+    let list = client_list(1, 60, &[(1, unix_now() + 3_600)]);
+    let node = start_limited(&list, TransportConfig::default(), limits, unix_now()).await;
 
     let mut silent = open(&node).await;
     let _ = next_handshake(&mut silent).await;
@@ -359,11 +373,12 @@ async fn a_silent_or_oversized_handshake_is_cut_off() {
 
 #[tokio::test]
 async fn handshakes_beyond_the_cap_get_503() {
-    let config = TransportConfig {
-        max_handshakes: 1,
-        ..TransportConfig::default()
+    let limits = Limits {
+        max_handshakes: 1.try_into().expect("non-zero"),
+        ..Limits::default()
     };
-    let node = start(&client_list(1, 60, &[(1, unix_now() + 3_600)]), config).await;
+    let list = client_list(1, 60, &[(1, unix_now() + 3_600)]);
+    let node = start_limited(&list, TransportConfig::default(), limits, unix_now()).await;
     let mut first = open(&node).await;
     let _ = next_handshake(&mut first).await;
     let second = connect_async(format!("ws://{}/v2/ws", node.addr)).await;
@@ -371,6 +386,34 @@ async fn handshakes_beyond_the_cap_get_503() {
         panic!("the second upgrade must be refused");
     };
     assert_eq!(response.status(), 503);
+}
+
+#[tokio::test]
+async fn a_session_over_the_message_rate_is_closed() {
+    let limits = Limits {
+        messages_per_second: 2.try_into().expect("non-zero"),
+        ..Limits::default()
+    };
+    let list = client_list(1, 60, &[(1, unix_now() + 3_600)]);
+    let node = start_limited(&list, TransportConfig::default(), limits, unix_now()).await;
+    let (mut socket, mut session) = connect(&node, &key(1)).await;
+    subscribe(&mut socket, &mut session).await;
+    for id in 0..4 {
+        send_app(
+            &mut socket,
+            &mut session,
+            &format!(r#"{{"op":"ping","id":{id}}}"#),
+        )
+        .await;
+    }
+    let ended = tokio::time::timeout(WAIT, async {
+        while !matches!(receive(&mut socket, &mut session).await, Received::Closed) {}
+    })
+    .await;
+    assert!(ended.is_ok(), "the node closes the session");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(node.transport.session_count(), 0);
+    assert_eq!(node.state.hub().subscriber_count(), 0);
 }
 
 /// Check 7 over real sockets: B is revoked, A gets the rotated key, and B can
@@ -512,7 +555,6 @@ async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
         TransportConfig {
             admit_within: 1_000,
             serve_within: 1_000,
-            ..TransportConfig::default()
         },
     )
     .await;
@@ -556,4 +598,82 @@ async fn an_unconfirmed_client_list_stops_admissions_then_sessions() {
     };
     assert_eq!(reason, CloseReason::Stale);
     assert_eq!(node.transport.session_count(), 0);
+}
+
+#[tokio::test]
+async fn a_client_past_its_session_share_is_refused_until_one_closes() {
+    let limits = Limits {
+        sessions_per_client: 1.try_into().expect("non-zero"),
+        ..Limits::default()
+    };
+    let expires = unix_now() + 3_600;
+    let list = client_list(1, 60, &[(1, expires), (2, expires)]);
+    let node = start_limited(&list, TransportConfig::default(), limits, unix_now()).await;
+    let (first, _) = connect(&node, &key(1)).await;
+    let _other_client = connect(&node, &key(2)).await;
+
+    let mut second = open(&node).await;
+    let challenge = next_handshake(&mut second).await.expect("challenge");
+    let (auth, _) = ClientHandshake::new(signing_key().address(), &mut oracle_transport::os_rng())
+        .respond(&challenge, &key(1))
+        .expect("responds");
+    send_json(&mut second, &auth).await;
+    let Some(HandshakeMessage::Refused { reason }) = next_handshake(&mut second).await else {
+        panic!("the second session of one client must be refused");
+    };
+    assert!(reason.contains("sessions"), "{reason}");
+
+    drop(first);
+    tokio::time::timeout(WAIT, async {
+        while node.transport.session_count() > 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the node sees the close");
+    let _again = connect(&node, &key(1)).await;
+}
+
+#[tokio::test]
+async fn a_peer_that_pings_instead_of_authenticating_is_cut_off() {
+    let limits = Limits {
+        handshake_timeout_ms: 60_000.try_into().expect("non-zero"),
+        ..Limits::default()
+    };
+    let list = client_list(1, 60, &[(1, unix_now() + 3_600)]);
+    let node = start_limited(&list, TransportConfig::default(), limits, unix_now()).await;
+
+    let mut patient = open(&node).await;
+    let challenge = next_handshake(&mut patient).await.expect("challenge");
+    for _ in 0..4 {
+        patient
+            .send(Message::Ping(Default::default()))
+            .await
+            .expect("sends");
+    }
+    let (auth, _) = ClientHandshake::new(signing_key().address(), &mut oracle_transport::os_rng())
+        .respond(&challenge, &key(1))
+        .expect("responds");
+    send_json(&mut patient, &auth).await;
+    loop {
+        match next(&mut patient).await {
+            Some(Message::Pong(_)) => {}
+            Some(Message::Text(text)) => {
+                assert!(text.contains("auth_ok"), "{text}");
+                break;
+            }
+            other => panic!("a few pings are fine: {other:?}"),
+        }
+    }
+
+    let mut pinger = open(&node).await;
+    let _ = next_handshake(&mut pinger).await.expect("challenge");
+    for _ in 0..5 {
+        let _ = pinger.send(Message::Ping(Default::default())).await;
+    }
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(Message::Pong(_))) = pinger.next().await {}
+    })
+    .await;
+    assert!(ended.is_ok(), "closed long before the handshake timeout");
 }

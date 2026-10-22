@@ -53,6 +53,9 @@ RestartSec=10s
 RestartPreventExitStatus=78
 TimeoutStopSec=20s
 
+# Each client socket and venue connection is a file: room for server.limits.max_sockets.
+LimitNOFILE=65536
+
 # The key is in memory: no core dumps, no swap (SPEC §9.2).
 LimitCORE=0
 MemorySwapMax=0
@@ -131,6 +134,7 @@ mod tests {
             "User=oracle",
             r#"ExecStart="/usr/local/bin/oracle-node" start "/home/oracle/node 1/config.toml""#,
             "RestartPreventExitStatus=78",
+            "LimitNOFILE=65536",
             "LimitCORE=0",
             "MemorySwapMax=0",
             "ProtectSystem=strict",

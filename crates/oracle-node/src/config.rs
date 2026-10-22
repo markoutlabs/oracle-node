@@ -104,6 +104,9 @@ pub struct ServerSettings {
     /// Distinct feeds a subscriber may have outstanding before it is disconnected.
     #[serde(default = "default_max_pending")]
     pub max_pending_feeds: usize,
+    /// What one peer can cost the node: sockets, handshakes, requests, messages.
+    #[serde(default)]
+    pub limits: oracle_server::Limits,
 }
 
 /// Where the hot signing key comes from.
@@ -895,6 +898,23 @@ sources = [
 
     fn parse(text: &str) -> NodeConfig {
         toml::from_str(text).expect("parses")
+    }
+
+    #[test]
+    fn the_server_limits_have_defaults_and_refuse_zero_and_unknown_keys() {
+        assert_eq!(
+            parse(SAMPLE).server.limits,
+            oracle_server::Limits::default()
+        );
+        let set = SAMPLE.replace(
+            "listen = \"127.0.0.1:8080\"\n",
+            "listen = \"127.0.0.1:8080\"\n\n[server.limits]\nsockets_per_ip = 4\n",
+        );
+        assert_eq!(parse(&set).server.limits.sockets_per_ip.get(), 4);
+        for bad in ["sockets_per_ip = 0", "sockets_per_hour = 4"] {
+            let text = set.replace("sockets_per_ip = 4", bad);
+            assert!(toml::from_str::<NodeConfig>(&text).is_err(), "{bad}");
+        }
     }
 
     /// The playground config shows every feed kind this build serves; it must
