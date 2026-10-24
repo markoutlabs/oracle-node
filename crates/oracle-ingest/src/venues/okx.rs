@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation};
+use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenInterestUnit};
 use serde::Deserialize;
 
 use crate::book::{Books, LocalBook, Side};
@@ -30,7 +30,13 @@ pub const KEEPALIVE_PAYLOAD: &str = "ping";
 
 /// Channels subscribed per instrument.
 const SPOT_CHANNELS: [&str; 2] = ["bbo-tbt", "trades"];
-const SWAP_CHANNELS: [&str; 4] = ["bbo-tbt", "trades", "mark-price", "funding-rate"];
+const SWAP_CHANNELS: [&str; 5] = [
+    "bbo-tbt",
+    "trades",
+    "mark-price",
+    "funding-rate",
+    "open-interest",
+];
 /// The book: a 400-level snapshot, then the changes every 100ms.
 const DEPTH_CHANNEL: &str = "books";
 
@@ -173,6 +179,18 @@ struct FundingRate<'a> {
     ts: Option<&'a str>,
 }
 
+/// One `open-interest` entry. `oiCcy` is the open interest in the base
+/// currency; `oi` is in contracts.
+#[derive(Deserialize)]
+struct OpenInterest<'a> {
+    #[serde(rename = "instId", borrow)]
+    inst_id: &'a str,
+    #[serde(rename = "oiCcy", borrow)]
+    oi_ccy: &'a str,
+    #[serde(borrow, default)]
+    ts: Option<&'a str>,
+}
+
 /// The funding fields of one `funding-rate` entry.
 fn funding_info(funding: &FundingRate<'_>) -> Result<FundingInfo, DecodeError> {
     fn present(value: Option<&str>) -> Option<&str> {
@@ -245,7 +263,7 @@ pub fn decode(
         serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let is_books = envelope.arg.is_some_and(|arg| arg.channel == DEPTH_CHANNEL);
     if !is_books || envelope.data.is_none() {
-        return decode_payload(payload, map, local_recv_ns, out);
+        return decode_channel(payload, map, Some(books), local_recv_ns, out);
     }
     let message: BooksMessage<'_> =
         serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
@@ -320,6 +338,18 @@ pub fn decode_payload(
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
+    decode_channel(payload, map, None, local_recv_ns, out)
+}
+
+/// The funding rate and the open interest come on two channels, so `books`
+/// keeps the last of each; without it, a funding update carries no open interest.
+fn decode_channel(
+    payload: &[u8],
+    map: &InstrumentMap,
+    books: Option<&mut Books>,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
     // The keepalive reply is the bare word `pong`, not JSON.
     if payload == b"pong" {
         return Err(DecodeError::Control);
@@ -339,7 +369,8 @@ pub fn decode_payload(
         }
         "trades" => decode_trades(data, map, local_recv_ns, out),
         "mark-price" => decode_mark_price(data, map, local_recv_ns, out),
-        "funding-rate" => decode_funding(data, map, local_recv_ns, out),
+        "funding-rate" => decode_funding(data, map, books, local_recv_ns, out),
+        "open-interest" => decode_open_interest(data, map, books, local_recv_ns, out),
         other => Err(DecodeError::UnhandledStream(other.to_owned())),
     }
 }
@@ -483,6 +514,7 @@ fn decode_mark_price(
 fn decode_funding(
     data: &[u8],
     map: &InstrumentMap,
+    mut books: Option<&mut Books>,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
@@ -493,22 +525,25 @@ fn decode_funding(
         let Some(entry) = map.lookup(funding.inst_id) else {
             continue;
         };
-        let info = funding_info(&funding)?;
-        out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind: ObsKind::Funding,
-            price: decimal("fundingRate", funding.funding_rate)?,
-            bid: None,
-            ask: None,
-            bid_qty: None,
-            ask_qty: None,
-            depth_notional_1bp: None,
-            exchange_time_ns: stamp(funding.ts),
+        let mut info = funding_info(&funding)?;
+        let rate = decimal("fundingRate", funding.funding_rate)?;
+        if let Some(books) = books.as_deref_mut() {
+            let last = books.funding(funding.inst_id);
+            last.rate = Some(rate);
+            last.interval_ns = info.interval_ns;
+            last.next_funding_time_ns = info.next_funding_time_ns;
+            last.predicted = info.predicted;
+            last.settled = info.settled;
+            info.open_interest = last.open_interest.map(|oi| (oi, OpenInterestUnit::Base));
+        }
+        push_funding(
+            entry.instrument.clone(),
+            rate,
+            info,
+            stamp(funding.ts),
             local_recv_ns,
-            seq: None,
-            book: None,
-            funding: Some(Arc::new(info)),
-        });
+            out,
+        );
         emitted = true;
     }
     if emitted {
@@ -516,6 +551,81 @@ fn decode_funding(
     } else {
         Err(DecodeError::Control)
     }
+}
+
+/// A new open interest repeats the last funding update with it. Before the
+/// first rate there is nothing to repeat, so the value only waits.
+fn decode_open_interest(
+    data: &[u8],
+    map: &InstrumentMap,
+    books: Option<&mut Books>,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let entries: Vec<OpenInterest<'_>> =
+        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let Some(books) = books else {
+        return Err(DecodeError::Control);
+    };
+    let mut emitted = false;
+    for interest in entries {
+        let Some(entry) = map.lookup(interest.inst_id) else {
+            continue;
+        };
+        let open_interest = decimal("oiCcy", interest.oi_ccy)?;
+        let last = books.funding(interest.inst_id);
+        last.open_interest = Some(open_interest);
+        let Some(rate) = last.rate else {
+            continue;
+        };
+        let info = FundingInfo {
+            predicted: last.predicted,
+            interval_ns: last.interval_ns,
+            next_funding_time_ns: last.next_funding_time_ns,
+            settled: last.settled,
+            open_interest: Some((open_interest, OpenInterestUnit::Base)),
+            ..FundingInfo::new(FundingBasis::Interval)
+        };
+        push_funding(
+            entry.instrument.clone(),
+            rate,
+            info,
+            stamp(interest.ts),
+            local_recv_ns,
+            out,
+        );
+        emitted = true;
+    }
+    if emitted {
+        Ok(())
+    } else {
+        Err(DecodeError::Control)
+    }
+}
+
+fn push_funding(
+    instrument: oracle_types::InstrumentId,
+    rate: Fixed,
+    info: FundingInfo,
+    exchange_time_ns: Option<u64>,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) {
+    out.push(Observation {
+        instrument,
+        kind: ObsKind::Funding,
+        price: rate,
+        bid: None,
+        ask: None,
+        bid_qty: None,
+        ask_qty: None,
+        depth_notional_1bp: None,
+        exchange_time_ns,
+        local_recv_ns,
+        seq: None,
+        book: None,
+        funding: Some(Arc::new(info)),
+    });
 }
 
 #[cfg(test)]
@@ -641,6 +751,50 @@ mod tests {
         let swap = subscribe_frames([("BTC-USDT-SWAP", false)].into_iter(), 100);
         assert!(swap[0].contains("mark-price"));
         assert!(swap[0].contains("funding-rate"));
+        assert!(swap[0].contains("open-interest"));
+    }
+
+    const OPEN_INTEREST: &str = r#"{"arg":{"channel":"open-interest","instId":"BTC-USDT-SWAP"},
+        "data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","oi":"3048419.34","oiCcy":"30484.1934",
+        "oiUsd":"2455651150.9","ts":"1754582400456"}]}"#;
+
+    /// The rate and the open interest come on two channels; each funding
+    /// update carries the last of both.
+    #[test]
+    fn the_open_interest_joins_the_funding_update() {
+        let map = map(MarketKind::LinearPerp, "BTC-USDT-SWAP");
+        let mut books = Books::default();
+        let mut out = Vec::new();
+        // Before the first rate, the open interest only waits.
+        let error = super::decode(OPEN_INTEREST.as_bytes(), &map, &mut books, RECV, &mut out)
+            .expect_err("nothing to repeat yet");
+        assert!(error.is_benign());
+        assert!(out.is_empty());
+
+        super::decode(FUNDING.as_bytes(), &map, &mut books, RECV, &mut out).expect("decodes");
+        let info = out[0].funding.as_deref().expect("funding info");
+        assert_eq!(
+            info.open_interest,
+            Some(("30484.1934".parse().expect("valid"), OpenInterestUnit::Base))
+        );
+        assert_eq!(info.predicted, Some("0.0001".parse().expect("valid")));
+
+        out.clear();
+        let later = OPEN_INTEREST.replace("30484.1934", "30500");
+        super::decode(later.as_bytes(), &map, &mut books, RECV, &mut out).expect("decodes");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, ObsKind::Funding);
+        assert_eq!(out[0].price, "-0.000125".parse().expect("valid"));
+        let info = out[0].funding.as_deref().expect("funding info");
+        assert_eq!(
+            info.open_interest,
+            Some(("30500".parse().expect("valid"), OpenInterestUnit::Base))
+        );
+        assert_eq!(
+            info.predicted,
+            Some("0.0001".parse().expect("valid")),
+            "the rate's fields stay"
+        );
     }
 
     #[test]

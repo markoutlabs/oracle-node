@@ -36,11 +36,18 @@ pub const FUTURES_REST: &str = "https://fapi.binance.com/fapi/v1/depth";
 /// USD-margined futures' REST endpoint of the adjusted funding intervals.
 pub const FUTURES_FUNDING_INFO_REST: &str = "https://fapi.binance.com/fapi/v1/fundingInfo";
 
+/// USD-margined futures' REST endpoint of one perpetual's open interest.
+/// Binance has no stream for it.
+pub const FUTURES_OPEN_INTEREST_REST: &str = "https://fapi.binance.com/fapi/v1/openInterest";
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Binance changes an interval rarely, and announces it ahead.
 const FUNDING_INFO_EVERY: Duration = Duration::from_secs(3_600);
 const FUNDING_INFO_RETRY: Duration = Duration::from_secs(60);
+/// Each perpetual's open interest, in turn, once a minute. 150 perpetuals are
+/// 150 requests a minute, far under Binance's 2,400 a minute.
+const OPEN_INTEREST_EVERY: Duration = Duration::from_secs(60);
 
 /// Wraps a connector: it adds the REST frames that a Binance connection needs.
 #[derive(Clone)]
@@ -48,6 +55,8 @@ pub struct SnapshotConnector<C> {
     inner: C,
     /// Socket base URL, and the REST endpoint its snapshots come from.
     routes: Vec<(String, String)>,
+    /// Socket base URL, and the REST endpoint of the open interest.
+    open_interest: Vec<(String, String)>,
     /// Socket base URL, and the REST endpoint of its funding intervals.
     funding_info: Vec<(String, String)>,
     client: reqwest::Client,
@@ -73,6 +82,7 @@ impl<C> SnapshotConnector<C> {
             inner,
             routes,
             funding_info: Vec::new(),
+            open_interest: Vec::new(),
             client,
         })
     }
@@ -84,8 +94,19 @@ impl<C> SnapshotConnector<C> {
         self
     }
 
+    /// Adds the open interest to mark-price connections: socket base URL, REST endpoint.
+    #[must_use]
+    pub fn with_open_interest(mut self, routes: Vec<(String, String)>) -> Self {
+        self.open_interest = routes;
+        self
+    }
+
     fn rest_for(&self, url: &str) -> Option<&str> {
         route(&self.routes, url)
+    }
+
+    fn open_interest_for(&self, url: &str) -> Option<&str> {
+        route(&self.open_interest, url).filter(|_| !mark_symbols(url).is_empty())
     }
 
     fn funding_info_for(&self, url: &str) -> Option<&str> {
@@ -116,9 +137,18 @@ fn streams(url: &str) -> Vec<String> {
 
 /// The symbols of the depth streams a combined-stream URL subscribes to.
 fn depth_symbols(url: &str) -> Vec<String> {
+    symbols_of(url, StreamKind::Depth)
+}
+
+/// The symbols of the mark-price streams a combined-stream URL subscribes to.
+fn mark_symbols(url: &str) -> Vec<String> {
+    symbols_of(url, StreamKind::MarkPrice)
+}
+
+fn symbols_of(url: &str, kind: StreamKind) -> Vec<String> {
     streams(url)
         .iter()
-        .filter(|stream| StreamKind::from_stream_name(stream) == Some(StreamKind::Depth))
+        .filter(|stream| StreamKind::from_stream_name(stream) == Some(kind))
         .filter_map(|stream| stream.split('@').next())
         .map(str::to_owned)
         .collect()
@@ -139,6 +169,13 @@ impl<C: Connector> Connector for SnapshotConnector<C> {
         let mut pending = SelectAll::new();
         if let Some(rest) = self.funding_info_for(url) {
             pending.push(funding_info(self.client.clone(), rest.to_owned()));
+        }
+        if let Some(rest) = self.open_interest_for(url) {
+            pending.push(open_interest(
+                self.client.clone(),
+                rest.to_owned(),
+                mark_symbols(url),
+            ));
         }
         Ok(SnapshotTransport {
             inner: conn,
@@ -257,6 +294,34 @@ fn funding_info(client: reqwest::Client, rest: String) -> BoxStream<'static, Fra
     .boxed()
 }
 
+/// The open interest of each symbol in turn, so that the whole list comes
+/// round once in [`OPEN_INTEREST_EVERY`]. A failed fetch is a frame too, which
+/// the decoder counts; the last value stays.
+fn open_interest(
+    client: reqwest::Client,
+    rest: String,
+    symbols: Vec<String>,
+) -> BoxStream<'static, Frame> {
+    let wait = OPEN_INTEREST_EVERY / u32::try_from(symbols.len().max(1)).unwrap_or(u32::MAX);
+    stream::unfold(0_usize, move |index| {
+        let (client, rest) = (client.clone(), rest.clone());
+        let symbol = symbols.get(index).cloned();
+        let next = (index + 1) % symbols.len().max(1);
+        async move {
+            let symbol = symbol?;
+            tokio::time::sleep(wait).await;
+            let url = format!("{rest}?symbol={}", symbol.to_ascii_uppercase());
+            let stream = format!(
+                "{}{}",
+                symbol.to_ascii_lowercase(),
+                StreamKind::OpenInterest.suffix()
+            );
+            Some((frame(&stream, fetch(&client, &url).await), next))
+        }
+    })
+    .boxed()
+}
+
 /// One REST reply, as JSON.
 async fn fetch(client: &reqwest::Client, url: &str) -> Result<Box<RawValue>, String> {
     let body = async {
@@ -312,6 +377,29 @@ mod tests {
             connector.funding_info_for(
                 "wss://fstream.binance.com/public/stream?streams=btcusdt@markPrice@1s"
             ),
+            None
+        );
+    }
+
+    /// The open interest comes by REST, one symbol at a time, for the
+    /// mark-price symbols of the connection.
+    #[test]
+    fn only_a_mark_price_connection_polls_the_open_interest() {
+        let connector = SnapshotConnector::new((), Vec::new())
+            .expect("a client")
+            .with_open_interest(vec![(
+                "wss://fstream.binance.com/market/stream".to_owned(),
+                FUTURES_OPEN_INTEREST_REST.to_owned(),
+            )]);
+        let market = "wss://fstream.binance.com/market/stream?streams=";
+        let url = format!("{market}btcusdt@aggTrade/btcusdt@markPrice@1s/ethusdt@markPrice@1s");
+        assert_eq!(
+            connector.open_interest_for(&url),
+            Some(FUTURES_OPEN_INTEREST_REST)
+        );
+        assert_eq!(mark_symbols(&url), ["btcusdt", "ethusdt"]);
+        assert_eq!(
+            connector.open_interest_for(&format!("{market}btcusdt@aggTrade")),
             None
         );
     }

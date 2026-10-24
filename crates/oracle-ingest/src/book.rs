@@ -139,6 +139,10 @@ pub struct LastFunding {
     pub interval_ns: Option<u64>,
     /// The next funding time, in unix nanoseconds.
     pub next_funding_time_ns: Option<u64>,
+    /// The venue's prediction of the next rate.
+    pub predicted: Option<Fixed>,
+    /// The last rate that the venue settled, and when.
+    pub settled: Option<(Fixed, u64)>,
     /// The open interest, in the venue's unit.
     pub open_interest: Option<Fixed>,
 }

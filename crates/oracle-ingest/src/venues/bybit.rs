@@ -397,6 +397,8 @@ fn decode_ticker(
             .open_interest
             .map(|oi| decimal("openInterest", oi))
             .transpose()?,
+        predicted: None,
+        settled: None,
     };
     let changed = fresh != LastFunding::default();
     if let Some(books) = books {

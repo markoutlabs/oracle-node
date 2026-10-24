@@ -45,6 +45,8 @@ pub enum StreamKind {
     DepthSnapshot,
     /// The REST list of funding intervals, delivered as a frame; see `super::snapshot`.
     FundingInfo,
+    /// The REST open interest of one perpetual, delivered as a frame; see `super::snapshot`.
+    OpenInterest,
 }
 
 impl StreamKind {
@@ -85,6 +87,7 @@ impl StreamKind {
             Self::DepthSnapshot => "@depthSnapshot",
             // The whole name: the list is not for one symbol.
             Self::FundingInfo => FUNDING_INFO_STREAM,
+            Self::OpenInterest => "@openInterest",
         }
     }
 
@@ -101,6 +104,8 @@ impl StreamKind {
             Some(Self::AggTrade)
         } else if stream.contains("@markPrice") {
             Some(Self::MarkPrice)
+        } else if stream.ends_with("@openInterest") {
+            Some(Self::OpenInterest)
         } else if stream.ends_with("@depthSnapshot") {
             Some(Self::DepthSnapshot)
         } else if stream.contains("@depth") {
@@ -264,6 +269,10 @@ mod tests {
         assert_eq!(
             StreamKind::from_stream_name("btcusdt@markPrice"),
             Some(StreamKind::MarkPrice)
+        );
+        assert_eq!(
+            StreamKind::from_stream_name("btcusdt@openInterest"),
+            Some(StreamKind::OpenInterest)
         );
         assert_eq!(
             StreamKind::from_stream_name(FUNDING_INFO_STREAM),

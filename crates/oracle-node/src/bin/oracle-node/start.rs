@@ -362,7 +362,8 @@ fn spawn_ingest(
     // snapshot connector sits under the recorder, so a recording holds Binance's
     // REST snapshots and funding intervals, and a replay never calls REST.
     let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?
-        .with_funding_info(binance.funding_info_routes());
+        .with_funding_info(binance.funding_info_routes())
+        .with_open_interest(binance.open_interest_routes());
     let adapters = match record {
         Some(path) => {
             info!(path = %path.display(), "recording raw venue frames");

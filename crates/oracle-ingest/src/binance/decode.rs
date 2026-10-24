@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use oracle_types::{
     Fixed, FundingBasis, FundingInfo, Level, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
+    OpenInterestUnit,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -79,9 +80,44 @@ const DEFAULT_INTERVAL_NS: u64 = 8 * HOUR_NS;
 pub(crate) struct FundingIntervals {
     /// Nanoseconds, by uppercase symbol. `None` until the first list arrives.
     by_symbol: Option<HashMap<String, u64>>,
+    /// The last open interest of each perpetual, by uppercase symbol.
+    open_interest: HashMap<String, Fixed>,
+}
+
+/// One `openInterest` REST reply.
+#[derive(Deserialize)]
+struct OpenInterestReply<'a> {
+    #[serde(borrow)]
+    symbol: &'a str,
+    #[serde(rename = "openInterest", borrow)]
+    open_interest: &'a str,
 }
 
 impl FundingIntervals {
+    fn open_interest(&self, symbol: &str) -> Option<Fixed> {
+        self.open_interest
+            .get(symbol)
+            .or_else(|| self.open_interest.get(&symbol.to_ascii_uppercase()))
+            .copied()
+    }
+
+    fn apply_open_interest(&mut self, envelope: &Envelope<'_>) -> Result<(), DecodeError> {
+        if let Some(error) = envelope.error {
+            return Err(DecodeError::Malformed(format!(
+                "{}: fetch failed: {error}",
+                envelope.stream
+            )));
+        }
+        let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
+        let reply: OpenInterestReply<'_> = serde_json::from_slice(data.get().as_bytes())
+            .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        let open_interest = decimal("openInterest", reply.open_interest)?;
+        self.open_interest
+            .insert(reply.symbol.to_ascii_uppercase(), open_interest);
+        // The value reaches the next mark price; this frame alone is no observation.
+        Err(DecodeError::Control)
+    }
+
     fn interval_ns(&self, symbol: &str) -> Option<u64> {
         let by_symbol = self.by_symbol.as_ref()?;
         // Uppercase only on a miss, as `InstrumentMap::lookup` does.
@@ -146,6 +182,7 @@ pub(crate) fn decode(
     let kind = StreamKind::from_stream_name(envelope.stream);
     match kind {
         Some(StreamKind::FundingInfo) => return intervals.apply(&envelope),
+        Some(StreamKind::OpenInterest) => return intervals.apply_open_interest(&envelope),
         Some(StreamKind::MarkPrice) => {
             let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
             return decode_mark_price(data.get().as_bytes(), map, intervals, local_recv_ns, out);
@@ -316,9 +353,10 @@ pub fn decode_payload(
             decode_mark_price(data, map, &FundingIntervals::default(), local_recv_ns, out)
         }
         // These need the session's state; see `decode`.
-        StreamKind::Depth | StreamKind::DepthSnapshot | StreamKind::FundingInfo => {
-            Err(DecodeError::UnhandledStream(envelope.stream.to_owned()))
-        }
+        StreamKind::Depth
+        | StreamKind::DepthSnapshot
+        | StreamKind::FundingInfo
+        | StreamKind::OpenInterest => Err(DecodeError::UnhandledStream(envelope.stream.to_owned())),
     }
 }
 
@@ -453,6 +491,9 @@ fn decode_mark_price(
                 .next_funding_time_ms
                 .filter(|ms| *ms > 0)
                 .map(millis_to_nanos),
+            open_interest: intervals
+                .open_interest(update.symbol)
+                .map(|oi| (oi, OpenInterestUnit::Base)),
             ..FundingInfo::new(FundingBasis::Interval)
         };
         push(ObsKind::Funding, decimal("r", rate)?, Some(Arc::new(info)));
@@ -623,6 +664,64 @@ mod tests {
                 "64310".parse().expect("valid"),
                 "0.0001".parse().expect("valid"),
             ]
+        );
+    }
+
+    /// Binance has no open-interest stream, so a REST frame holds the value
+    /// until the next mark price carries it.
+    #[test]
+    fn the_open_interest_frame_reaches_the_next_funding_update() {
+        let map = perp_map();
+        let mut books = BinanceBooks::default();
+        let mut intervals = FundingIntervals::default();
+        let mut out = Vec::new();
+        let frame = r#"{"stream":"btcusdt@openInterest","data":{"symbol":"BTCUSDT","openInterest":"93697.961","time":1754582400000}}"#;
+        let error = super::decode(
+            frame.as_bytes(),
+            &map,
+            &mut books,
+            &mut intervals,
+            RECV_NS,
+            &mut out,
+        )
+        .expect_err("no observation of its own");
+        assert!(error.is_benign());
+        assert!(out.is_empty());
+
+        super::decode(
+            MARK_PRICE.as_bytes(),
+            &map,
+            &mut books,
+            &mut intervals,
+            RECV_NS,
+            &mut out,
+        )
+        .expect("decodes");
+        let funding = out
+            .iter()
+            .find(|o| o.kind == ObsKind::Funding)
+            .expect("funding");
+        let info = funding.funding.as_deref().expect("funding info");
+        assert_eq!(
+            info.open_interest,
+            Some(("93697.961".parse().expect("valid"), OpenInterestUnit::Base))
+        );
+
+        // A failed fetch is counted, and the last value stays.
+        let failed = r#"{"stream":"btcusdt@openInterest","error":"HTTP status 429"}"#;
+        let error = super::decode(
+            failed.as_bytes(),
+            &map,
+            &mut books,
+            &mut intervals,
+            RECV_NS,
+            &mut Vec::new(),
+        )
+        .expect_err("a failed fetch");
+        assert!(!error.is_benign());
+        assert_eq!(
+            intervals.open_interest("BTCUSDT"),
+            Some("93697.961".parse().expect("valid"))
         );
     }
 

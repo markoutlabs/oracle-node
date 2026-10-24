@@ -56,6 +56,8 @@ pub struct BinanceConfig {
     pub perp_rest_url: String,
     /// The REST endpoint of the adjusted funding intervals. Empty: no fetch.
     pub perp_funding_info_url: String,
+    /// The REST endpoint of a perpetual's open interest. Empty: no fetch.
+    pub perp_open_interest_url: String,
     /// Reconnect if nothing arrives for this long. The session probes a quiet
     /// connection (`SessionConfig::probe_after`), so this only has to cover a
     /// slow pong.
@@ -90,6 +92,19 @@ impl BinanceConfig {
             self.perp_funding_info_url.clone(),
         )]
     }
+
+    /// The mark-price socket base URL with the REST endpoint of the open
+    /// interest, for [`snapshot::SnapshotConnector`].
+    #[must_use]
+    pub fn open_interest_routes(&self) -> Vec<(String, String)> {
+        if self.perp_open_interest_url.is_empty() {
+            return Vec::new();
+        }
+        vec![(
+            self.perp_market_url.clone(),
+            self.perp_open_interest_url.clone(),
+        )]
+    }
 }
 
 impl Default for BinanceConfig {
@@ -103,6 +118,7 @@ impl Default for BinanceConfig {
             spot_rest_url: snapshot::SPOT_REST.to_owned(),
             perp_rest_url: snapshot::FUTURES_REST.to_owned(),
             perp_funding_info_url: snapshot::FUTURES_FUNDING_INFO_REST.to_owned(),
+            perp_open_interest_url: snapshot::FUTURES_OPEN_INTEREST_REST.to_owned(),
             idle_timeout: Duration::from_secs(10),
             max_session: Duration::from_secs(23 * 3_600),
             streams_per_connection: MAX_STREAMS_PER_CONNECTION,

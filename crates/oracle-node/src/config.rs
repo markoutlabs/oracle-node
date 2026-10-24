@@ -713,6 +713,7 @@ fn apply_endpoints(
                 // so the node does not ask the real Binance for the intervals.
                 binance.perp_market_url.clone_from(&endpoint.url);
                 binance.perp_funding_info_url.clear();
+                binance.perp_open_interest_url.clear();
                 Some(&mut binance.perp_base_url)
             }
             (Venue::Binance, _) => None,
