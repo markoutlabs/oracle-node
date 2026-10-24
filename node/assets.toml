@@ -8,7 +8,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SOLUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SOLUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SOL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SOL-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # ZEC: rank 4, $2,157M a day
@@ -29,7 +29,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ZECUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ZECUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ZEC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ZEC-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # MAGIC: rank 5, $1,805M a day
@@ -50,7 +50,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MAGICUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MAGICUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MAGIC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MAGIC-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # NEAR: rank 6, $1,414M a day
@@ -72,7 +72,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "NEARUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "NEARUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "NEAR-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "NEAR-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # XRP: rank 7, $1,249M a day
@@ -94,7 +94,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "XRPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "XRPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "XRP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "XRP-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # US: rank 8, $773M a day
@@ -125,7 +125,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "STRKUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "STRKUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "STRK-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "STRK-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # HYPE: rank 10, $634M a day
@@ -147,7 +147,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "HYPEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "HYPEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "HYPE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "HYPE-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # KAIA: rank 11, $618M a day
@@ -188,7 +188,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "WLDUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "WLDUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "WLD-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "WLD-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # DOGE: rank 13, $554M a day
@@ -210,7 +210,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "DOGEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "DOGEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "DOGE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "DOGE-USDT-SWAP", kinds = ["mark_price"], contract_size = "1000" },
 ]
 
 # SUI: rank 14, $516M a day
@@ -232,7 +232,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SUIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SUIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SUI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SUI-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # RLC: rank 15, $496M a day
@@ -263,7 +263,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ADAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ADAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ADA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ADA-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # PUMP: rank 17, $460M a day
@@ -284,7 +284,7 @@ symbol = "CRYPTO.PUMP/USDT.PERP_MARK"
 min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PUMPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PUMP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PUMP-USDT-SWAP", kinds = ["mark_price"], contract_size = "1000" },
 ]
 
 # ENA: rank 18, $360M a day
@@ -306,7 +306,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ENAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ENAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ENA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ENA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # UNI: rank 19, $348M a day
@@ -328,7 +328,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "UNIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "UNIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "UNI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "UNI-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # BNB: rank 20, $318M a day
@@ -349,7 +349,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BNBUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BNBUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BNB-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BNB-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # FIL: rank 21, $307M a day
@@ -371,7 +371,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "FILUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "FILUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "FIL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "FIL-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # ONDO: rank 22, $298M a day
@@ -393,7 +393,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ONDOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ONDOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ONDO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ONDO-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # PEPE: rank 23, $261M a day
@@ -427,7 +427,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AAVEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AAVEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AAVE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AAVE-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # OGN: rank 25, $244M a day
@@ -458,7 +458,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AVAXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AVAXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AVAX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AVAX-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # QNT: rank 27, $232M a day
@@ -500,7 +500,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "DOTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "DOTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "DOT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "DOT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # ATOM: rank 29, $221M a day
@@ -522,7 +522,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ATOMUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ATOMUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ATOM-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ATOM-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # OP: rank 30, $205M a day
@@ -544,7 +544,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "OPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "OPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "OP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "OP-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # BAT: rank 31, $204M a day
@@ -566,7 +566,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BATUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BATUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BAT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BAT-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # CAP: rank 32, $198M a day
@@ -586,7 +586,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "CAPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "CAPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "CAP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "CAP-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # MINA: rank 33, $168M a day
@@ -607,7 +607,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MINAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MINAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MINA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MINA-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # SAND: rank 34, $167M a day
@@ -627,7 +627,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SANDUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SANDUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SAND-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SAND-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # LINK: rank 35, $167M a day
@@ -649,7 +649,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LINKUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LINKUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LINK-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LINK-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # TAO: rank 36, $162M a day
@@ -670,7 +670,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "TAOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "TAOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "TAO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "TAO-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # ARB: rank 37, $146M a day
@@ -692,7 +692,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ARBUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ARBUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ARB-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ARB-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # ZRO: rank 38, $142M a day
@@ -714,7 +714,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ZROUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ZROUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ZRO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ZRO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # LIT: rank 39, $130M a day
@@ -724,7 +724,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LITUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LITUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LIT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LIT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # BCH: rank 40, $130M a day
@@ -745,7 +745,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BCHUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BCHUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BCH-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BCH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # APT: rank 41, $129M a day
@@ -766,7 +766,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "APTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "APTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "APT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "APT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # LTC: rank 42, $125M a day
@@ -788,7 +788,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LTCUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LTCUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LTC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LTC-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # TIA: rank 43, $120M a day
@@ -809,7 +809,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "TIAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "TIAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "TIA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "TIA-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # TRUMP: rank 44, $118M a day
@@ -830,7 +830,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "TRUMPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "TRUMPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "TRUMP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "TRUMP-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # ZK: rank 45, $115M a day
@@ -851,7 +851,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ZKUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ZKUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ZK-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ZK-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # GRAM: rank 46, $112M a day
@@ -871,7 +871,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "GRAMUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "GRAMUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "GRAM-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "GRAM-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # MET: rank 47, $101M a day
@@ -892,7 +892,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "METUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "METUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MET-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MET-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # PIXEL: rank 48, $101M a day
@@ -922,7 +922,7 @@ symbol = "CRYPTO.FET/USDT.PERP_MARK"
 min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "FETUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "FET-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "FET-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # HBAR: rank 50, $91M a day
@@ -944,7 +944,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "HBARUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "HBARUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "HBAR-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "HBAR-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # PENGU: rank 51, $90M a day
@@ -966,7 +966,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PENGUUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "PENGUUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PENGU-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PENGU-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # JUP: rank 52, $85M a day
@@ -987,7 +987,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "JUPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "JUPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "JUP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "JUP-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # VVV: rank 53, $79M a day
@@ -1008,7 +1008,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "VVVUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "VVVUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "VVV-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "VVV-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # CRV: rank 54, $77M a day
@@ -1030,7 +1030,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "CRVUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "CRVUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "CRV-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "CRV-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # XLM: rank 55, $77M a day
@@ -1052,7 +1052,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "XLMUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "XLMUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "XLM-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "XLM-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # XMR: rank 56, $75M a day
@@ -1082,7 +1082,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "INJUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "INJUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "INJ-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "INJ-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # XPL: rank 58, $71M a day
@@ -1102,7 +1102,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "XPLUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "XPLUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "XPL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "XPL-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # TRX: rank 59, $70M a day
@@ -1123,7 +1123,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "TRXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "TRXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "TRX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "TRX-USDT-SWAP", kinds = ["mark_price"], contract_size = "1000" },
 ]
 
 # ASTER: rank 60, $69M a day
@@ -1143,7 +1143,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ASTERUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ASTERUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ASTER-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ASTER-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # WLFI: rank 61, $69M a day
@@ -1164,7 +1164,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "WLFIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "WLFIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "WLFI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "WLFI-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # GMT: rank 62, $67M a day
@@ -1174,7 +1174,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "GMTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "GMTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "GMT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "GMT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # PYTH: rank 63, $66M a day
@@ -1194,7 +1194,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PYTHUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "PYTHUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PYTH-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PYTH-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # LPT: rank 64, $65M a day
@@ -1204,7 +1204,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LPTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LPTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LPT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LPT-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # PONS: rank 65, $65M a day
@@ -1214,7 +1214,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PONSUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "PONSUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PONS-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PONS-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # POL: rank 66, $65M a day
@@ -1235,7 +1235,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "POLUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "POLUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "POL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "POL-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # ICP: rank 67, $63M a day
@@ -1257,7 +1257,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ICPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ICPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ICP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ICP-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # XAUT: rank 68, $63M a day
@@ -1304,7 +1304,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "USELESSUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "USELESSUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "USELESS-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "USELESS-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # W: rank 72, $58M a day
@@ -1324,7 +1324,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "WUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "WUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "W-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "W-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # NIGHT: rank 73, $56M a day
@@ -1345,7 +1345,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "NIGHTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "NIGHTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "NIGHT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "NIGHT-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # ALGO: rank 74, $54M a day
@@ -1366,7 +1366,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ALGOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ALGOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ALGO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ALGO-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # AERO: rank 75, $50M a day
@@ -1386,7 +1386,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AEROUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AEROUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AERO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AERO-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # STX: rank 76, $49M a day
@@ -1406,7 +1406,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "STXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "STXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "STX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "STX-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # CT: rank 77, $49M a day
@@ -1416,7 +1416,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "CTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "CTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "CT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "CT-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # MUBARAK: rank 78, $47M a day
@@ -1426,7 +1426,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MUBARAKUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MUBARAKUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MUBARAK-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MUBARAK-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # GRASS: rank 79, $47M a day
@@ -1436,7 +1436,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "GRASSUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "GRASSUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "GRASS-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "GRASS-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # ETHFI: rank 80, $46M a day
@@ -1456,7 +1456,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETHFIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ETHFIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ETHFI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ETHFI-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # SENT: rank 81, $45M a day
@@ -1477,7 +1477,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SENTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SENTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SENT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SENT-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # JTO: rank 82, $44M a day
@@ -1498,7 +1498,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "JTOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "JTOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "JTO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "JTO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # VIRTUAL: rank 83, $42M a day
@@ -1518,7 +1518,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "VIRTUALUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "VIRTUALUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "VIRTUAL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "VIRTUAL-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # ETC: rank 84, $42M a day
@@ -1528,7 +1528,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETCUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ETCUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ETC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ETC-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # GALA: rank 85, $40M a day
@@ -1538,7 +1538,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "GALAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "GALAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "GALA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "GALA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # DASH: rank 86, $38M a day
@@ -1548,7 +1548,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "DASHUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "DASHUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "DASH-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "DASH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # AKE: rank 87, $38M a day
@@ -1558,7 +1558,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AKEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AKEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AKE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AKE-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # S: rank 88, $37M a day
@@ -1568,7 +1568,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "S-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "S-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # EIGEN: rank 89, $37M a day
@@ -1588,7 +1588,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "EIGENUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "EIGENUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "EIGEN-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "EIGEN-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # LDO: rank 90, $36M a day
@@ -1608,7 +1608,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LDOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LDOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LDO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LDO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # FARTCOIN: rank 91, $36M a day
@@ -1618,7 +1618,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "FARTCOINUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "FARTCOINUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "FARTCOIN-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "FARTCOIN-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # API3: rank 92, $36M a day
@@ -1628,7 +1628,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "API3USDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "API3USDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "API3-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "API3-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # RENDER: rank 93, $35M a day
@@ -1649,7 +1649,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "RENDERUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "RENDERUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "RENDER-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "RENDER-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # AXS: rank 94, $34M a day
@@ -1659,7 +1659,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AXSUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AXSUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AXS-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AXS-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # SEI: rank 95, $34M a day
@@ -1669,7 +1669,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SEIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SEIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SEI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SEI-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # MON: rank 96, $32M a day
@@ -1689,7 +1689,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MONUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MONUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MON-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MON-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # WIF: rank 97, $32M a day
@@ -1709,7 +1709,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "WIFUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "WIFUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "WIF-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "WIF-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # BOME: rank 98, $32M a day
@@ -1719,7 +1719,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BOMEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BOMEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BOME-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BOME-USDT-SWAP", kinds = ["mark_price"], contract_size = "1000" },
 ]
 
 # NMR: rank 99, $31M a day
@@ -1729,7 +1729,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "NMRUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "NMRUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "NMR-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "NMR-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # LAB: rank 100, $31M a day
@@ -1739,7 +1739,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LABUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LABUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LAB-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LAB-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # CC: rank 101, $28M a day
@@ -1759,7 +1759,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "CCUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "CCUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "CC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "CC-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # HUMA: rank 102, $28M a day
@@ -1769,7 +1769,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "HUMAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "HUMAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "HUMA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "HUMA-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # RAY: rank 103, $28M a day
@@ -1790,7 +1790,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "CHIPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "CHIPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "CHIP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "CHIP-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # ORDI: rank 105, $25M a day
@@ -1800,7 +1800,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ORDIUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ORDIUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ORDI-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ORDI-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # 0G: rank 106, $24M a day
@@ -1810,7 +1810,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "0GUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "0GUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "0G-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "0G-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # PENDLE: rank 108, $22M a day
@@ -1820,7 +1820,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PENDLEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "PENDLEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PENDLE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PENDLE-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # IMX: rank 109, $22M a day
@@ -1830,7 +1830,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "IMXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "IMXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "IMX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "IMX-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # APE: rank 110, $21M a day
@@ -1840,7 +1840,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "APEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "APEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "APE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "APE-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # ZAMA: rank 111, $20M a day
@@ -1850,7 +1850,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ZAMAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ZAMAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ZAMA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ZAMA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # APR: rank 112, $19M a day
@@ -1860,7 +1860,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "APRUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "APRUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "APR-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "APR-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # PLUME: rank 113, $18M a day
@@ -1870,7 +1870,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "PLUMEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "PLUMEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "PLUME-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "PLUME-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # YGG: rank 114, $17M a day
@@ -1880,7 +1880,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "YGGUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "YGGUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "YGG-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "YGG-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # MORPHO: rank 115, $17M a day
@@ -1890,7 +1890,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MORPHOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MORPHOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MORPHO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MORPHO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # SOON: rank 116, $17M a day
@@ -1900,7 +1900,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SOONUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SOONUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SOON-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SOON-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # AR: rank 117, $17M a day
@@ -1910,7 +1910,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ARUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ARUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AR-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AR-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # OPN: rank 118, $16M a day
@@ -1920,7 +1920,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "OPNUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "OPNUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "OPN-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "OPN-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # MANA: rank 120, $15M a day
@@ -1930,7 +1930,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MANAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MANAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MANA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MANA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # H: rank 121, $14M a day
@@ -1940,7 +1940,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "HUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "HUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "H-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "H-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # O: rank 122, $14M a day
@@ -1950,7 +1950,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "OUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "OUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "O-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "O-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # SKY: rank 123, $14M a day
@@ -1960,7 +1960,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "SKYUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "SKYUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "SKY-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "SKY-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # ENJ: rank 124, $13M a day
@@ -1970,7 +1970,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ENJUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ENJUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ENJ-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ENJ-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # BREV: rank 125, $13M a day
@@ -1980,7 +1980,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BREVUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BREVUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BREV-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BREV-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # OPG: rank 126, $13M a day
@@ -1990,7 +1990,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "OPGUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "OPGUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "OPG-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "OPG-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # JASMY: rank 127, $13M a day
@@ -2009,7 +2009,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "RIVERUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "RIVERUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "RIVER-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "RIVER-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # 2Z: rank 129, $12M a day
@@ -2019,7 +2019,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "2ZUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "2ZUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "2Z-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "2Z-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # COMP: rank 130, $12M a day
@@ -2029,7 +2029,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "COMPUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "COMPUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "COMP-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "COMP-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # EDGE: rank 131, $11M a day
@@ -2039,7 +2039,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "EDGEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "EDGEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "EDGE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "EDGE-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # LIGHT: rank 132, $11M a day
@@ -2049,7 +2049,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LIGHTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LIGHTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LIGHT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LIGHT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # LA: rank 133, $11M a day
@@ -2059,7 +2059,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "LAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "LAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "LA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "LA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # BILL: rank 134, $11M a day
@@ -2069,7 +2069,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BILLUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BILLUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BILL-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BILL-USDT-SWAP", kinds = ["mark_price"], contract_size = "100" },
 ]
 
 # AVNT: rank 135, $10M a day
@@ -2079,7 +2079,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "AVNTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "AVNTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "AVNT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "AVNT-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # KAITO: rank 136, $10M a day
@@ -2089,7 +2089,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "KAITOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "KAITOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "KAITO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "KAITO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # THETA: rank 137, $10M a day
@@ -2099,7 +2099,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "THETAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "THETAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "THETA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "THETA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # DYDX: rank 138, $10M a day
@@ -2109,7 +2109,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "DYDXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "DYDXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "DYDX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "DYDX-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # MEGA: rank 139, $10M a day
@@ -2119,7 +2119,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "MEGAUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "MEGAUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "MEGA-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "MEGA-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # BEAT: rank 140, $10M a day
@@ -2129,7 +2129,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BEATUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BEATUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BEAT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BEAT-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # ENSO: rank 141, $8M a day
@@ -2139,7 +2139,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ENSOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ENSOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ENSO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ENSO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # BICO: rank 142, $8M a day
@@ -2149,7 +2149,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BICOUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BICOUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BICO-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BICO-USDT-SWAP", kinds = ["mark_price"], contract_size = "1" },
 ]
 
 # RAVE: rank 143, $7M a day
@@ -2159,7 +2159,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "RAVEUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "RAVEUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "RAVE-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "RAVE-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # ARX: rank 144, $7M a day
@@ -2169,7 +2169,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ARXUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ARXUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ARX-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ARX-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]
 
 # GRVT: rank 145, $5M a day
@@ -2179,5 +2179,5 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "GRVTUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "GRVTUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "GRVT-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "GRVT-USDT-SWAP", kinds = ["mark_price"], contract_size = "10" },
 ]

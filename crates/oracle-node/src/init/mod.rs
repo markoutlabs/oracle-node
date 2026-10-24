@@ -25,6 +25,7 @@ mod starter;
 pub mod system;
 mod unit;
 
+pub use feeds::{FeedUpdate, update_feeds};
 pub use setup::{
     CanisterId, Endpoint, Gateway, NodeSetup, RegistrySource, RootKey, ServiceUnit, Unlock,
     Written, resolve_path,

@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import urllib.request
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -79,9 +80,10 @@ def markets():
     """Each market: venue, kind, venue symbol, raw base, quote, 24 h USD volume."""
     rows = []
 
-    def add(venue, kind, symbol, base, quote, usd):
+    def add(venue, kind, symbol, base, quote, usd, contract=None):
         if base and usd > 0:
-            rows.append(dict(venue=venue, kind=kind, symbol=symbol, raw=base.upper(), quote=quote, usd=usd))
+            rows.append(dict(venue=venue, kind=kind, symbol=symbol, raw=base.upper(), quote=quote, usd=usd,
+                             contract=contract))
 
     # A halted Binance market keeps its last day's ticker; its close time shows it.
     recent_ms = (time.time() - 3600) * 1000
@@ -102,11 +104,15 @@ def markets():
         base, quote = t["instId"].split("-")[:2]
         if quote == "USDT":
             add("okx", "spot", t["instId"], base, quote, number(t["volCcy24h"]))
+    # An OKX swap counts in contracts; the node needs the coins in one to report coins.
+    contracts = {i["instId"]: Decimal(i["ctVal"]) * Decimal(i["ctMult"])
+                 for i in get("https://www.okx.com/api/v5/public/instruments?instType=SWAP")["data"]}
     for t in get("https://www.okx.com/api/v5/market/tickers?instType=SWAP")["data"]:
         base, quote = t["instId"].split("-")[:2]
-        if quote == "USDT":
+        if quote == "USDT" and t["instId"] in contracts:
             # A swap's volCcy24h is in the base currency.
-            add("okx", "perp", t["instId"], base, quote, number(t["volCcy24h"]) * number(t["last"]))
+            add("okx", "perp", t["instId"], base, quote, number(t["volCcy24h"]) * number(t["last"]),
+                contract=contracts[t["instId"]])
     # The node reads Coinbase's Exchange feed, which refuses a whole
     # subscription for one unknown product, so only its live USD products count.
     exchange = {p["id"] for p in get("https://api.exchange.coinbase.com/products")
@@ -218,6 +224,8 @@ def main():
             market = "linear_perp" if perpetual else "spot"
             extra = ', kinds = ["mark_price"]' if perpetual else (
                 ", converted = true" if m["quote"] == "USDT" else "")
+            if m["contract"] is not None:
+                extra += f', contract_size = "{m["contract"].normalize():f}"'
             lines.append(f'  {{ venue = "{m["venue"]}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},')
         lines.append("]")
         lines.append("")

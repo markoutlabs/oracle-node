@@ -15,6 +15,7 @@ mod status;
 mod system;
 mod tail;
 mod ui;
+mod update_feeds;
 mod wizard;
 
 /// `EX_CONFIG` from sysexits.h. The unit file tells systemd not to restart on
@@ -48,6 +49,9 @@ enum Command {
     Rotate(rotate::RotateArgs),
     /// Run the node: ingest, aggregate, sign, serve.
     Start(start::StartArgs),
+    /// Write the network's feeds of this binary into an existing config, so
+    /// that the node serves the same feeds as the others.
+    UpdateFeeds(update_feeds::UpdateFeedsArgs),
 }
 
 fn main() -> ExitCode {
@@ -80,6 +84,7 @@ fn dispatch() -> anyhow::Result<()> {
         Command::Init(args) => init::run(args),
         Command::Rotate(args) => rotate::run(args),
         Command::Start(args) => start::run(args),
+        Command::UpdateFeeds(args) => update_feeds::run(args),
     }
 }
 

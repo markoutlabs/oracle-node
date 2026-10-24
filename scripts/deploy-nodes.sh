@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds a commit of oracle-node and rolls it out to node hosts over SSH, one
-# host at a time. Each host keeps its previous binary as `<binary>.prev`.
+# host at a time. Before each restart, the new binary writes its network feeds
+# into the node's config. The old binary and config stay for a rollback.
 #
 #   scripts/deploy-nodes.sh --health-url https://feeds.example.com/health node-a node-b node-c
 #   scripts/deploy-nodes.sh --commit 38952c4 --yes node-a
@@ -86,14 +87,23 @@ needs_glibc() {
 # A glibc version as one number: 2.39 is 2039.
 glibc_number() { echo $((${1%%.*} * 1000 + 10#${1#*.})); }
 
+# Swaps in the staged binary, updates the config's feeds, and restarts. It first
+# writes `<stage>/rollback.sh`, which puts the old binary and config back.
 swap() {
   on "$1" bash -s -- "$STAGE" <<'REMOTE'
 set -eu
 stage=$1
-bin=$(systemctl show -p ExecStart oracle-node | grep -o 'path=[^ ;]*' | head -n 1 | cut -d = -f 2)
-[ -n "$bin" ] || { echo "cannot read the unit's binary" >&2; exit 1; }
+start=$(systemctl show -p ExecStart oracle-node)
+bin=$(grep -o 'path=[^ ;]*' <<<"$start" | head -n 1 | cut -d = -f 2)
+argv=$(sed -n 's/.*argv\[\]=\([^;]*\) ;.*/\1/p' <<<"$start")
+config=${argv#* start }
+[ -n "$bin" ] && [ -f "$config" ] || { echo "cannot read the unit's binary and config" >&2; exit 1; }
 cp -p "$bin" "$bin.prev"
+cp -p "$config" "$stage/config.before"
+printf "install -m 0755 '%s' '%s' && cp -p '%s' '%s' && systemctl restart oracle-node\n" \
+  "$bin.prev" "$bin" "$stage/config.before" "$config" >"$stage/rollback.sh"
 install -m 0755 "$stage/oracle-node" "$bin"
+"$bin" update-feeds "$config"
 systemctl restart oracle-node
 systemctl is-active --quiet oracle-node
 REMOTE
@@ -199,8 +209,9 @@ say "4. Restart one host at a time"
 quorum
 for host in "${HOSTS[@]}"; do
   say "  $host: swap and restart"
-  swap "$host" || die "$host: the restart failed; roll back with: ssh $host 'install -m 0755 /usr/local/bin/oracle-node.prev /usr/local/bin/oracle-node && systemctl restart oracle-node'"
-  node_ready "$host" | sed 's/^/    /' || die "$host: not healthy; roll back with: ssh $host 'install -m 0755 /usr/local/bin/oracle-node.prev /usr/local/bin/oracle-node && systemctl restart oracle-node'"
+  rollback="roll back with: ssh $host 'sh $STAGE/rollback.sh'"
+  swap "$host" | sed 's/^/    /' || die "$host: the swap failed; if $STAGE/rollback.sh exists there, $rollback"
+  node_ready "$host" | sed 's/^/    /' || die "$host: not healthy; $rollback"
   quorum
 done
 say "Done: ${#HOSTS[@]} nodes run $SHA."

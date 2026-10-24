@@ -5,9 +5,6 @@ use std::path::Path;
 
 use super::{NodeSetup, feeds};
 
-/// The bound below which `max_pending_feeds` never goes.
-const MIN_PENDING: usize = 512;
-
 /// Renders the config. Paths are written as given; `NodeSetup::write` passes
 /// absolute ones.
 pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
@@ -46,12 +43,7 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
         quoted(&setup.governance.to_checksummed())
     );
     let feeds = feeds::network();
-    // A slow subscriber can owe a price and a venue report for each feed.
-    let max_pending = feeds
-        .count
-        .saturating_mul(2)
-        .next_power_of_two()
-        .max(MIN_PENDING);
+    let max_pending = feeds::max_pending(feeds.count);
 
     format!(
         r#"# Heartbeats and stale venues are checked on this timer. A price move publishes
@@ -81,14 +73,12 @@ key_file = {key_file}
 [clients]
 {clients_source}
 
-# The network's {count} feeds, from oracle-node {version}. Every node serves the
-# same feeds, so that a quorum can form on each one.
+{header}
 
 {feeds}"#,
         listen = quoted(&listen),
         key_file = path(key_file),
-        count = feeds.count,
-        version = env!("CARGO_PKG_VERSION"),
+        header = feeds::header(feeds.count),
         feeds = feeds.text,
     )
 }

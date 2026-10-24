@@ -204,6 +204,19 @@ To see what each venue sends, start the node with `--tail`:
 oracle-node start config.toml --tail
 ```
 
+### Update the feeds
+
+`init` writes the feeds of its own version into the config. After you install a
+new version, write its feeds into the config, and restart the node:
+
+```bash
+sudo oracle-node update-feeds /var/lib/oracle-node/config.toml
+sudo systemctl restart oracle-node
+```
+
+The old config stays as `config.toml.prev`. `scripts/deploy-nodes.sh` does
+this on each host before the restart.
+
 ### Rotate the key
 
 ```bash

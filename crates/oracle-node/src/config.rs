@@ -536,12 +536,13 @@ impl NodeConfig {
                         feed.symbol
                     )));
                 }
-                // An OKX swap's book is in contracts: priced without the size,
-                // its depth would read a hundred times too deep or too thin.
-                if depth && venue == Venue::Okx && market.is_perp() && contract_size.is_none() {
+                // An OKX swap counts in contracts, and venue reports count in coins.
+                // Without the size, a book would also read a hundred times too deep or too thin.
+                if venue == Venue::Okx && market.is_perp() && contract_size.is_none() {
                     return Err(ConfigError::Invalid(format!(
                         "feed `{}`: OKX swap {} needs contract_size (`ctVal` on OKX's \
-                         instruments endpoint) to read its book",
+                         instruments endpoint); `oracle-node update-feeds` writes the \
+                         network's feeds with it",
                         feed.symbol, source.symbol
                     )));
                 }
@@ -557,12 +558,8 @@ impl NodeConfig {
                 }
                 sources.push(config);
 
-                instruments
+                let spec = instruments
                     .entry((venue, market, source.symbol.clone()))
-                    .and_modify(|spec| {
-                        spec.depth |= depth;
-                        spec.contract_size = spec.contract_size.or(contract_size);
-                    })
                     .or_insert_with(|| InstrumentSpec {
                         venue_symbol: source.symbol.clone(),
                         market,
@@ -570,6 +567,15 @@ impl NodeConfig {
                         depth,
                         contract_size,
                     });
+                // One subscription serves every feed of the instrument, so its sizes
+                // convert one way.
+                if spec.contract_size != contract_size {
+                    return Err(ConfigError::Invalid(format!(
+                        "feed `{}`: {} has another contract_size in an earlier feed",
+                        feed.symbol, source.symbol
+                    )));
+                }
+                spec.depth |= depth;
             }
 
             let id = feed_id(&symbol);
@@ -1254,31 +1260,55 @@ sources = [
         assert!(resolved.binance.perp.iter().all(|spec| !spec.depth));
     }
 
-    /// An OKX swap's book is in contracts; without the contract size its depth
-    /// would be wrong by the contract's factor, so the config is refused.
+    /// An OKX swap counts in contracts, and a venue report counts in coins.
+    /// Without the contract size, the sizes and the depth would be wrong by the
+    /// contract's factor, so the config is refused, also for a mark-only source.
     #[test]
-    fn an_okx_swap_book_needs_its_contract_size() {
-        let feed = |extra: &str| {
+    fn an_okx_swap_needs_its_contract_size() {
+        let feed = |symbol: &str, kinds: &str, extra: &str| {
             format!(
-                r#"{SAMPLE}
+                r#"
 [[feeds]]
-symbol = "CRYPTO.BTC/USDT.PERP_MID"
+symbol = "{symbol}"
 min_sources = 1
-impact_notional = "20000"
 sources = [
-  {{ venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP"{extra} }},
+  {{ venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP"{kinds}{extra} }},
 ]
 "#
             )
         };
-        let Err(error) = parse(&feed("")).resolve() else {
-            panic!("a swap book without a contract size must be refused");
+        let mark = |extra: &str| {
+            feed(
+                "CRYPTO.BTC/USDT.PERP_MARK",
+                r#", kinds = ["mark_price"]"#,
+                extra,
+            )
         };
-        assert!(error.to_string().contains("contract_size"), "{error}");
+        let mid = |extra: &str| feed("CRYPTO.BTC/USDT.PERP_MID", "", extra);
+        for text in [mark(""), mid("")] {
+            let Err(error) = parse(&format!("{SAMPLE}{text}")).resolve() else {
+                panic!("a swap without a contract size must be refused: {text}");
+            };
+            assert!(error.to_string().contains("contract_size"), "{error}");
+        }
+        let size = r#", contract_size = "0.01""#;
         assert!(
-            parse(&feed(r#", contract_size = "0.01""#))
+            parse(&format!("{SAMPLE}{}{}", mark(size), mid(size)))
                 .resolve()
                 .is_ok()
+        );
+        // One subscription serves both feeds, so two sizes cannot both be right.
+        let Err(error) = parse(&format!(
+            "{SAMPLE}{}{}",
+            mark(size),
+            mid(r#", contract_size = "0.1""#)
+        ))
+        .resolve() else {
+            panic!("two contract sizes for one swap must be refused");
+        };
+        assert!(
+            error.to_string().contains("another contract_size"),
+            "{error}"
         );
     }
 

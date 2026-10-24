@@ -152,7 +152,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 [[feeds]]
@@ -161,7 +161,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
-  { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"] },
+  { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
 ]
 
 # -------------------------------------------------- perpetual mid, USDT

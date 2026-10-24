@@ -28,8 +28,9 @@ pub mod seed;
 pub use adapters::{Adapters, build_adapters};
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
 pub use init::{
-    CanisterId, Endpoint, Gateway, InitError, NodeKey, NodeSetup, RegistrySource, RootKey,
-    Rotation, ServiceUnit, Unlock, Written, candid_call, generate_passphrase, resolve_path,
+    CanisterId, Endpoint, FeedUpdate, Gateway, InitError, NodeKey, NodeSetup, RegistrySource,
+    RootKey, Rotation, ServiceUnit, Unlock, Written, candid_call, generate_passphrase,
+    resolve_path, update_feeds,
 };
 pub use keyfile::{KeyFileError, PassphraseSource};
 pub use logging::LogFormat;
