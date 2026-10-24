@@ -214,8 +214,7 @@ sudo oracle-node update-feeds /var/lib/oracle-node/config.toml
 sudo systemctl restart oracle-node
 ```
 
-The old config stays as `config.toml.prev`. `scripts/deploy-nodes.sh` does
-this on each host before the restart.
+The old config stays as `config.toml.prev`.
 
 ### Rotate the key
 
