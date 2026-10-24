@@ -13,9 +13,8 @@ commodity perpetuals are left out. The top assets by 24 h volume get:
   CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit and OKX perpetuals
 
 Each feed takes only venue markets with $1M or more a day. A spot feed needs
-three, so that one quiet venue cannot halt it: Coinbase's ticker moves only
-on a trade, and a small coin can go a minute without one. A perpetual's mark
-moves each second, so two do. A perpetual priced per 1000 units
+three, so that one venue that stops cannot halt it. A perpetual's mark moves
+each second, so two do. A perpetual priced per 1000 units
 (1000PEPEUSDT) is left out, so that no feed mixes two scales. Feeds that node/all-feeds.toml has already are skipped.
 Volumes move each day, so a new run gives a new list.
 """

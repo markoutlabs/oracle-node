@@ -186,6 +186,48 @@ impl Books {
         local_recv_ns: u64,
         out: &mut Vec<Observation>,
     ) -> Result<(), DecodeError> {
+        self.emit_as(
+            ObsKind::Depth,
+            symbol,
+            instrument,
+            exchange_time_ns,
+            local_recv_ns,
+            out,
+        )
+    }
+
+    /// Emits only the best bid and ask, for an instrument that wants no depth.
+    ///
+    /// # Errors
+    ///
+    /// As [`Books::emit`].
+    pub fn emit_top(
+        &self,
+        symbol: &str,
+        instrument: InstrumentId,
+        exchange_time_ns: Option<u64>,
+        local_recv_ns: u64,
+        out: &mut Vec<Observation>,
+    ) -> Result<(), DecodeError> {
+        self.emit_as(
+            ObsKind::BookTop,
+            symbol,
+            instrument,
+            exchange_time_ns,
+            local_recv_ns,
+            out,
+        )
+    }
+
+    fn emit_as(
+        &self,
+        kind: ObsKind,
+        symbol: &str,
+        instrument: InstrumentId,
+        exchange_time_ns: Option<u64>,
+        local_recv_ns: u64,
+        out: &mut Vec<Observation>,
+    ) -> Result<(), DecodeError> {
         let Some(book) = self.by_symbol.get(symbol) else {
             return Ok(());
         };
@@ -194,10 +236,9 @@ impl Books {
                 "{symbol}: the book is crossed"
             )));
         }
-        let (bids, asks) = (
-            book.top(Side::Bid, DEPTH_LEVELS),
-            book.top(Side::Ask, DEPTH_LEVELS),
-        );
+        let depth = kind == ObsKind::Depth;
+        let levels = if depth { DEPTH_LEVELS } else { 1 };
+        let (bids, asks) = (book.top(Side::Bid, levels), book.top(Side::Ask, levels));
         let (Some(best_bid), Some(best_ask)) = (bids.first().copied(), asks.first().copied())
         else {
             return Ok(());
@@ -209,7 +250,7 @@ impl Books {
             .unwrap_or(best_bid.price);
         out.push(Observation {
             instrument,
-            kind: ObsKind::Depth,
+            kind,
             price: mid,
             bid: Some(best_bid.price),
             ask: Some(best_ask.price),
@@ -219,7 +260,7 @@ impl Books {
             exchange_time_ns,
             local_recv_ns,
             seq: book.last_id,
-            book: Some(Arc::new(BookDepth { bids, asks })),
+            book: depth.then(|| Arc::new(BookDepth { bids, asks })),
             funding: None,
         });
         Ok(())

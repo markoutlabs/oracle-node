@@ -651,9 +651,10 @@ impl NodeConfig {
         for ((venue, market), instruments) in by_venue {
             let connection = venue_connection(venue, market, &instruments)?;
             venues.entry(venue).or_default().push(connection);
-            if let Some(book) = book_connection(venue, market, &instruments) {
-                venues.entry(venue).or_default().push(book);
-            }
+            venues
+                .entry(venue)
+                .or_default()
+                .extend(book_connections(venue, market, &instruments));
         }
         apply_endpoints(&self.endpoints, &mut binance, &mut venues)?;
 
@@ -723,39 +724,37 @@ fn apply_endpoints(
     Ok(())
 }
 
-/// A second connection for venues whose book lives on another endpoint:
-/// Coinbase's, on Advanced Trade. Only the instruments that want depth.
-fn book_connection(
+/// More connections for venues whose book lives on another endpoint:
+/// Coinbase's, on Advanced Trade. Every instrument needs one, because the book
+/// gives the top of book.
+fn book_connections(
     venue: Venue,
     market: MarketKind,
     instruments: &[InstrumentSpec],
-) -> Option<VenueConnection> {
+) -> Vec<VenueConnection> {
     if venue != Venue::Coinbase {
-        return None;
+        return Vec::new();
     }
-    let books: Vec<InstrumentSpec> = instruments
-        .iter()
-        .filter(|spec| spec.depth)
-        .cloned()
-        .collect();
-    if books.is_empty() {
-        return None;
-    }
-    let product_ids = books.iter().map(|spec| spec.venue_symbol.as_str());
-    Some(VenueConnection {
-        spec: VenueSpec {
-            venue,
-            market,
-            url: coinbase::BOOK_URL.to_owned(),
-            subscribe: coinbase::book_subscribe_frames(product_ids),
-            keepalive: None,
-            idle_timeout: VENUE_IDLE_TIMEOUT,
-            resubscribe_after: Some(VENUE_RESUBSCRIBE_AFTER),
-            max_session: VENUE_MAX_SESSION,
-            decode: coinbase::decode_book,
-        },
-        instruments: books,
-    })
+    instruments
+        .chunks(coinbase::BOOK_PRODUCTS)
+        .map(|books| {
+            let product_ids = books.iter().map(|spec| spec.venue_symbol.as_str());
+            VenueConnection {
+                spec: VenueSpec {
+                    venue,
+                    market,
+                    url: coinbase::BOOK_URL.to_owned(),
+                    subscribe: coinbase::book_subscribe_frames(product_ids),
+                    keepalive: None,
+                    idle_timeout: VENUE_IDLE_TIMEOUT,
+                    resubscribe_after: Some(VENUE_RESUBSCRIBE_AFTER),
+                    max_session: VENUE_MAX_SESSION,
+                    decode: coinbase::decode_book,
+                },
+                instruments: books.to_vec(),
+            }
+        })
+        .collect()
 }
 
 /// Builds one venue connection from its instruments.
@@ -1448,6 +1447,50 @@ sources = [
             matches!(&error, ConfigError::Invalid(m) if m.contains("credentials")),
             "got {error:?}"
         );
+    }
+
+    /// Coinbase sends a ticker only on a trade, so each product's top comes from
+    /// a level2 book. Coinbase allows at most 30 of those on one connection.
+    #[test]
+    fn every_coinbase_product_gets_a_book_in_connections_of_at_most_25() {
+        let bases: Vec<String> = ('A'..='C')
+            .flat_map(|first| ('A'..='T').map(move |second| format!("{first}{second}")))
+            .collect();
+        let mut text = SAMPLE.to_owned();
+        for base in &bases {
+            text.push_str(&format!(
+                "\n[[feeds]]\nsymbol = \"CRYPTO.{base}/USD\"\nmin_sources = 1\nsources = [\
+                 {{ venue = \"coinbase\", market = \"spot\", symbol = \"{base}-USD\" }}]\n"
+            ));
+        }
+        let resolved = parse(&text).resolve().expect("resolves");
+        let (_, connections) = resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Coinbase)
+            .expect("coinbase");
+        let (tickers, books): (Vec<_>, Vec<_>) = connections
+            .iter()
+            .partition(|connection| connection.spec.url == coinbase::URL);
+        let [ticker] = tickers.as_slice() else {
+            panic!("one ticker connection, got {}", tickers.len());
+        };
+        assert_eq!(ticker.instruments.len(), bases.len());
+        let sizes: Vec<usize> = books.iter().map(|book| book.instruments.len()).collect();
+        assert_eq!(sizes, [25, 25, 10]);
+        let mut covered = Vec::new();
+        for book in &books {
+            assert_eq!(book.spec.url, coinbase::BOOK_URL);
+            let level2 = book.spec.subscribe.first().expect("a level2 frame");
+            assert!(level2.contains(r#""channel":"level2""#));
+            for spec in &book.instruments {
+                assert!(level2.contains(&format!("\"{}\"", spec.venue_symbol)));
+                covered.push(spec.venue_symbol.clone());
+            }
+        }
+        covered.sort();
+        covered.dedup();
+        assert_eq!(covered.len(), bases.len());
     }
 
     #[test]

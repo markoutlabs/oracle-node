@@ -1,18 +1,18 @@
-//! Coinbase Exchange public feed.
+//! Coinbase: trades from the Exchange feed, books from Advanced Trade.
 //!
-//! Uses `ws-feed.exchange.coinbase.com` rather than the Advanced Trade endpoint,
-//! which now requires a JWT that has to be minted and refreshed. This feed is
-//! public, and market data does not need an identity.
+//! The Exchange feed's `ticker` gives the trades. Coinbase sends a ticker only
+//! on a trade, so its best bid and ask go stale on a quiet coin.
 //!
-//! One `ticker` message carries both a trade print and the top of book, so a
-//! single channel gives everything the aggregator needs.
+//! Each product's top of book therefore comes from the keyless Advanced Trade
+//! `level2` book, which changes with every order. A product that wants depth
+//! gets the book's top levels, and any other product gets its best bid and ask.
 //!
 //! **Coinbase quotes natively in USD.** With Kraken it is one of only two such
 //! venues in scope, which makes losing both a distinct failure class rather than
 //! just "two of five sources down" — every stablecoin-quoted price then has no
 //! peg to convert through.
 
-use oracle_types::{Fixed, ObsKind, Observation};
+use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 
 use crate::book::{Books, Side};
@@ -28,6 +28,10 @@ pub const URL: &str = "wss://ws-feed.exchange.coinbase.com";
 /// missed message could not be detected. Advanced Trade's `level2` is keyless
 /// and numbers every message on the connection.
 pub const BOOK_URL: &str = "wss://advanced-trade-ws.coinbase.com";
+
+/// The most products on one book connection. Coinbase refuses more than 30
+/// with "too many L2 streams requested in a single session".
+pub const BOOK_PRODUCTS: usize = 25;
 
 /// Builds the subscribe frames for the book connection: `level2`, and the
 /// heartbeats that keep a quiet product's connection open.
@@ -67,14 +71,6 @@ struct Message<'a> {
     product_id: Option<&'a str>,
     #[serde(borrow, default)]
     price: Option<&'a str>,
-    #[serde(rename = "best_bid", borrow, default)]
-    best_bid: Option<&'a str>,
-    #[serde(rename = "best_bid_size", borrow, default)]
-    best_bid_size: Option<&'a str>,
-    #[serde(rename = "best_ask", borrow, default)]
-    best_ask: Option<&'a str>,
-    #[serde(rename = "best_ask_size", borrow, default)]
-    best_ask_size: Option<&'a str>,
     #[serde(borrow, default)]
     time: Option<&'a str>,
     #[serde(default)]
@@ -167,7 +163,13 @@ pub fn decode_book(
             let level = crate::depth::level(update.price_level, update.new_quantity)?;
             book.set(side, level.price, level.qty);
         }
-        books.emit(
+        let emit = if entry.depth {
+            Books::emit
+        } else {
+            Books::emit_top
+        };
+        emit(
+            books,
             event.product_id,
             entry.instrument.clone(),
             exchange_time_ns,
@@ -193,10 +195,8 @@ pub fn decode(
     decode_payload(payload, map, local_recv_ns, out)
 }
 
-/// Decodes one Coinbase payload.
-///
-/// A `ticker` yields up to two observations: the book, and the trade that
-/// triggered it.
+/// Decodes one Coinbase Exchange payload: a `ticker` yields its trade. Its best
+/// bid and ask are left out, because they are only as new as the last trade.
 ///
 /// # Errors
 ///
@@ -227,60 +227,25 @@ pub fn decode_payload(
     let entry = map
         .lookup(product_id)
         .ok_or_else(|| DecodeError::UnknownInstrument(product_id.to_owned()))?;
-    let exchange_time_ns = message.time.and_then(rfc3339_to_unix_nanos);
-
-    if let (Some(bid), Some(bid_size), Some(ask), Some(ask_size)) = (
-        message.best_bid,
-        message.best_bid_size,
-        message.best_ask,
-        message.best_ask_size,
-    ) {
-        let bid = decimal("best_bid", bid)?;
-        let ask = decimal("best_ask", ask)?;
-        let mid = bid
-            .checked_add(ask)
-            .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-            .unwrap_or(bid);
-        out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind: ObsKind::BookTop,
-            price: mid,
-            bid: Some(bid),
-            ask: Some(ask),
-            bid_qty: Some(decimal("best_bid_size", bid_size)?),
-            ask_qty: Some(decimal("best_ask_size", ask_size)?),
-            depth_notional_1bp: None,
-            exchange_time_ns,
-            local_recv_ns,
-            seq: message.sequence,
-            book: None,
-            funding: None,
-        });
-    }
-
-    if let Some(price) = message.price {
-        out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind: ObsKind::Trade,
-            price: decimal("price", price)?,
-            bid: None,
-            ask: None,
-            bid_qty: None,
-            ask_qty: None,
-            depth_notional_1bp: None,
-            exchange_time_ns,
-            local_recv_ns,
-            seq: message.sequence,
-            book: None,
-            funding: None,
-        });
-    }
-
-    if out.is_empty() {
-        Err(DecodeError::Control)
-    } else {
-        Ok(())
-    }
+    let Some(price) = message.price else {
+        return Err(DecodeError::Control);
+    };
+    out.push(Observation {
+        instrument: entry.instrument.clone(),
+        kind: ObsKind::Trade,
+        price: decimal("price", price)?,
+        bid: None,
+        ask: None,
+        bid_qty: None,
+        ask_qty: None,
+        depth_notional_1bp: None,
+        exchange_time_ns: message.time.and_then(rfc3339_to_unix_nanos),
+        local_recv_ns,
+        seq: message.sequence,
+        book: None,
+        funding: None,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,21 +281,16 @@ mod tests {
         "side":"buy","time":"2026-08-07T16:00:00.123456Z","trade_id":999,
         "last_size":"0.01"}"#;
 
+    /// The ticker's best bid and ask are as old as the last trade, so they must
+    /// not reach the book slot: the level2 book gives the top.
     #[test]
-    fn a_ticker_yields_both_a_book_and_a_trade() {
+    fn a_ticker_yields_only_its_trade() {
         let observations = decode(TICKER);
-        assert_eq!(observations.len(), 2, "one channel gives both");
-        let kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
-        assert_eq!(kinds, [ObsKind::BookTop, ObsKind::Trade]);
-
-        let book = &observations[0];
-        assert_eq!(book.bid, Some("64312".parse().expect("valid")));
-        assert_eq!(book.ask, Some("64313".parse().expect("valid")));
-        assert_eq!(book.price, "64312.5".parse().expect("valid"));
-        assert_eq!(book.seq, Some(12_345));
-
-        let trade = &observations[1];
+        assert_eq!(observations.len(), 1);
+        let trade = &observations[0];
+        assert_eq!(trade.kind, ObsKind::Trade);
         assert_eq!(trade.price, "64312.1".parse().expect("valid"));
+        assert_eq!(trade.seq, Some(12_345));
         assert!(trade.bid.is_none());
     }
 
@@ -411,6 +371,40 @@ mod tests {
         InstrumentMap::new(Venue::Coinbase, MarketKind::Spot, &specs).expect("valid")
     }
 
+    fn replay(map: &InstrumentMap) -> (Books, Vec<Observation>) {
+        let mut books = Books::default();
+        let mut all = Vec::new();
+        for line in RECORDED_BOOK.lines() {
+            let mut out = Vec::new();
+            match decode_book(line.as_bytes(), map, &mut books, RECV, &mut out) {
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+            all.extend(out);
+        }
+        (books, all)
+    }
+
+    /// A product without depth still gets its top from the book, on every book
+    /// change, so a quiet coin with no trades keeps a live quote.
+    #[test]
+    fn a_book_without_depth_yields_its_best_bid_and_ask() {
+        let (mut books, observations) = replay(&map());
+        assert!(observations.len() >= 20, "{}", observations.len());
+        assert!(
+            observations
+                .iter()
+                .all(|o| o.kind == ObsKind::BookTop && o.book.is_none())
+        );
+        let last = observations.last().expect("one");
+        let book = books.book("BTC-USD");
+        assert_eq!(last.bid, Some(book.top(Side::Bid, 1)[0].price));
+        assert_eq!(last.ask, Some(book.top(Side::Ask, 1)[0].price));
+        assert_eq!(last.bid_qty, Some(book.top(Side::Bid, 1)[0].qty));
+        assert!(last.bid < last.ask);
+    }
+
     #[test]
     fn book_subscriptions_name_level2_and_heartbeats() {
         let frames = book_subscribe_frames(["BTC-USD"].into_iter());
@@ -421,19 +415,13 @@ mod tests {
 
     #[test]
     fn a_recorded_book_follows_its_message_numbers() {
-        let map = book_map();
-        let mut books = Books::default();
-        let mut depths = 0;
-        for line in RECORDED_BOOK.lines() {
-            let mut out = Vec::new();
-            match decode_book(line.as_bytes(), &map, &mut books, RECV, &mut out) {
-                Ok(()) => {}
-                Err(error) if error.is_benign() => {}
-                Err(error) => panic!("{error}: {line}"),
-            }
-            depths += out.len();
-        }
-        assert!(depths >= 20, "{depths}");
+        let (mut books, observations) = replay(&book_map());
+        assert!(observations.len() >= 20, "{}", observations.len());
+        assert!(
+            observations
+                .iter()
+                .all(|o| o.kind == ObsKind::Depth && o.book.is_some())
+        );
         let book = books.book("BTC-USD");
         assert!(book.top(Side::Bid, 1)[0].price < book.top(Side::Ask, 1)[0].price);
     }
