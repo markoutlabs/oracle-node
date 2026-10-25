@@ -17,6 +17,8 @@ pub mod deribit;
 pub mod hyperliquid;
 pub mod kraken;
 pub mod kraken_futures;
+pub mod kucoin;
+pub mod kucoin_connect;
 pub mod okx;
 
 pub use adapter::{DecodeFn, VenueAdapter, VenueHandler, VenueSpec};

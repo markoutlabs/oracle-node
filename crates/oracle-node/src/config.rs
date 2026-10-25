@@ -15,7 +15,7 @@ use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
     DecodeFn, VenueSpec, bitfinex, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures,
-    okx,
+    kucoin, okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -547,6 +547,14 @@ impl NodeConfig {
                         feed.symbol, source.symbol
                     )));
                 }
+                if venue == Venue::Kucoin && market.is_perp() && contract_size.is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "feed `{}`: KuCoin perpetual {} needs contract_size (`multiplier` on \
+                         KuCoin's contracts endpoint); `oracle-node update-feeds` writes the \
+                         network's feeds with it",
+                        feed.symbol, source.symbol
+                    )));
+                }
                 let mut config = SourceConfig::new(instrument, kinds);
                 if source.converted {
                     config = config.converted();
@@ -772,6 +780,7 @@ fn book_connections(
 const fn markets_per_connection(venue: Venue) -> usize {
     match venue {
         Venue::Bitfinex => bitfinex::MARKETS_PER_CONNECTION,
+        Venue::Kucoin => kucoin::MARKETS_PER_CONNECTION,
         _ => usize::MAX,
     }
 }
@@ -861,6 +870,24 @@ fn venue_connection(
                 hyperliquid::KEEPALIVE.to_owned(),
             )),
             hyperliquid::decode,
+        ),
+        Venue::Kucoin if market == MarketKind::InversePerp => {
+            return Err(ConfigError::Invalid(
+                "kucoin inverse perpetuals are not supported; use the USDT-margined `…USDTM` ones"
+                    .to_owned(),
+            ));
+        }
+        Venue::Kucoin if market.is_perp() => (
+            kucoin::futures_url(symbols()),
+            kucoin::futures_frames(with_depth()),
+            Some((kucoin::KEEPALIVE_EVERY, kucoin::KEEPALIVE.to_owned())),
+            kucoin::decode_futures,
+        ),
+        Venue::Kucoin => (
+            kucoin::SPOT_TOKEN.to_owned(),
+            kucoin::spot_frames(with_depth()),
+            Some((kucoin::KEEPALIVE_EVERY, kucoin::KEEPALIVE.to_owned())),
+            kucoin::decode_spot,
         ),
         Venue::Bitfinex => (
             bitfinex::URL.to_owned(),
@@ -1479,6 +1506,58 @@ sources = [
                 "{:?}",
                 spec.subscribe
             );
+        }
+    }
+
+    /// KuCoin connects through its token URL; a perpetual names its contracts
+    /// there and needs its contract size.
+    #[test]
+    fn kucoin_connects_through_its_token_url_and_a_perp_needs_its_contract_size() {
+        let config = |size: &str| {
+            format!(
+                r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 1
+sources = [{{ venue = "kucoin", market = "spot", symbol = "BTC-USDT" }}]
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [{{ venue = "kucoin", market = "linear_perp", symbol = "XBTUSDTM", kinds = ["mark_price"]{size} }}]
+"#
+            )
+        };
+        let Err(error) = parse(&config("")).resolve() else {
+            panic!("a KuCoin perpetual without its contract size resolves");
+        };
+        assert!(error.to_string().contains("contract_size"), "{error}");
+        let resolved = parse(&config(r#", contract_size = "0.001""#))
+            .resolve()
+            .expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Kucoin)
+            .expect("kucoin")
+            .1;
+        let urls: Vec<&str> = connections.iter().map(|c| c.spec.url.as_str()).collect();
+        assert!(urls.contains(&kucoin::SPOT_TOKEN), "{urls:?}");
+        assert!(
+            urls.contains(
+                &"https://api-futures.kucoin.com/api/v1/bullet-public?contracts=XBTUSDTM"
+            ),
+            "{urls:?}"
+        );
+        for connection in connections {
+            assert!(connection.spec.keepalive.is_some());
+            assert!(!connection.spec.subscribe.is_empty());
         }
     }
 

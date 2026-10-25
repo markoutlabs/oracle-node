@@ -17,6 +17,7 @@ use oracle_ingest::IngestEvent;
 use oracle_ingest::binance::snapshot::SnapshotConnector;
 use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
 use oracle_ingest::transport::WebSocketConnector;
+use oracle_ingest::venues::kucoin_connect::KucoinConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
 use oracle_server::{Channel, NodeTransport, ServerState, TransportConfig, router, unix_now};
@@ -360,10 +361,12 @@ fn spawn_ingest(
 ) -> anyhow::Result<(mpsc::Receiver<IngestEvent>, usize)> {
     // The same adapters either way; `--record` only wraps the transport. The
     // snapshot connector sits under the recorder, so a recording holds Binance's
-    // REST snapshots and funding intervals, and a replay never calls REST.
+    // REST snapshots and funding intervals, and a replay never calls REST. The
+    // KuCoin connector sits there too, for its tokens and contract records.
     let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?
         .with_funding_info(binance.funding_info_routes())
         .with_open_interest(binance.open_interest_routes());
+    let snapshots = KucoinConnector::new(snapshots)?;
     let adapters = match record {
         Some(path) => {
             info!(path = %path.display(), "recording raw venue frames");
