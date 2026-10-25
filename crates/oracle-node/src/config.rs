@@ -14,7 +14,8 @@ use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
-    DecodeFn, VenueSpec, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures, okx,
+    DecodeFn, VenueSpec, bitfinex, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures,
+    okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -655,8 +656,10 @@ impl NodeConfig {
 
         let mut venues: BTreeMap<Venue, Vec<VenueConnection>> = BTreeMap::new();
         for ((venue, market), instruments) in by_venue {
-            let connection = venue_connection(venue, market, &instruments)?;
-            venues.entry(venue).or_default().push(connection);
+            for chunk in instruments.chunks(markets_per_connection(venue)) {
+                let connection = venue_connection(venue, market, chunk)?;
+                venues.entry(venue).or_default().push(connection);
+            }
             venues
                 .entry(venue)
                 .or_default()
@@ -764,6 +767,15 @@ fn book_connections(
         .collect()
 }
 
+/// The most markets on one connection of a venue. A venue that refuses more
+/// channels than a limit gets its markets split over several connections.
+const fn markets_per_connection(venue: Venue) -> usize {
+    match venue {
+        Venue::Bitfinex => bitfinex::MARKETS_PER_CONNECTION,
+        _ => usize::MAX,
+    }
+}
+
 /// Builds one venue connection from its instruments.
 fn venue_connection(
     venue: Venue,
@@ -849,6 +861,12 @@ fn venue_connection(
                 hyperliquid::KEEPALIVE.to_owned(),
             )),
             hyperliquid::decode,
+        ),
+        Venue::Bitfinex => (
+            bitfinex::URL.to_owned(),
+            bitfinex::subscribe_frames(with_depth(), market.is_perp()),
+            Some((bitfinex::KEEPALIVE_EVERY, bitfinex::KEEPALIVE.to_owned())),
+            bitfinex::decode,
         ),
         Venue::Binance => {
             return Err(ConfigError::Invalid(
@@ -1461,6 +1479,46 @@ sources = [
                 "{:?}",
                 spec.subscribe
             );
+        }
+    }
+
+    /// Bitfinex refuses more than about 30 channels on one connection, so its
+    /// markets go over several connections.
+    #[test]
+    fn bitfinex_markets_are_split_over_connections() {
+        let sources: String = (0..14)
+            .map(|i| {
+                format!("  {{ venue = \"bitfinex\", market = \"spot\", symbol = \"tC{i}USD\" }},\n")
+            })
+            .collect();
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USD"
+min_sources = 1
+sources = [
+{sources}]
+"#
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Bitfinex)
+            .expect("bitfinex")
+            .1;
+        let sizes: Vec<usize> = connections.iter().map(|c| c.instruments.len()).collect();
+        assert_eq!(sizes, [6, 6, 2]);
+        for connection in connections {
+            assert!(connection.spec.subscribe.len() <= 30);
+            assert!(connection.spec.url.contains("api-pub.bitfinex.com"));
         }
     }
 

@@ -46,7 +46,7 @@ pub enum Venue {
     Deribit = 5,
     /// Hyperliquid (USDC-quoted perpetuals and spot).
     Hyperliquid = 6,
-    /// Bitfinex (spot, natively USD-quoted). Reserved; no adapter yet.
+    /// Bitfinex v2 (spot in USD and Tether; Tether-margined `F0` perpetuals).
     Bitfinex = 7,
     /// MEXC (spot and USDT perpetuals). Reserved; no adapter yet.
     Mexc = 8,

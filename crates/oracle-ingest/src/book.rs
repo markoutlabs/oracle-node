@@ -155,6 +155,9 @@ pub struct Books {
     /// The last sequence number on the connection, for venues that number
     /// every message rather than each book.
     pub sequence: Option<u64>,
+    /// The channel and the venue symbol of each channel id, for venues that
+    /// name a subscription by a number the server picks (Bitfinex).
+    pub channels: HashMap<u64, (String, String)>,
     funding: HashMap<String, LastFunding>,
 }
 
@@ -163,6 +166,7 @@ impl Books {
     pub fn clear(&mut self) {
         self.by_symbol.clear();
         self.sequence = None;
+        self.channels.clear();
         self.funding.clear();
     }
 

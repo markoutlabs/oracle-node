@@ -10,6 +10,7 @@
 //! reconnect, backoff, staleness, invalidation — is [`crate::Session`].
 
 pub mod adapter;
+pub mod bitfinex;
 pub mod bybit;
 pub mod coinbase;
 pub mod deribit;
