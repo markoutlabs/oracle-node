@@ -1,4 +1,4 @@
-# Every feed kind this build can actually serve, across all eight venues.
+# Every feed kind this build can actually serve, across all nine venues.
 #
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
@@ -72,6 +72,7 @@ sources = [
   { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
   { venue = "bitfinex", market = "spot", symbol = "tBTCUST", converted = true },
+  { venue = "kucoin", market = "spot", symbol = "BTC-USDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
 ]
 
@@ -87,6 +88,7 @@ sources = [
   { venue = "bybit", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "ETH-USDT", converted = true },
   { venue = "bitfinex", market = "spot", symbol = "tETHUST", converted = true },
+  { venue = "kucoin", market = "spot", symbol = "ETH-USDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
 ]
 
@@ -101,6 +103,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "SOL-USDT", converted = true },
+  { venue = "kucoin", market = "spot", symbol = "SOL-USDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
 ]
 
@@ -117,6 +120,7 @@ sources = [
   { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
   { venue = "okx", market = "spot", symbol = "BTC-USDT" },
   { venue = "bitfinex", market = "spot", symbol = "tBTCUST" },
+  { venue = "kucoin", market = "spot", symbol = "BTC-USDT" },
 ]
 
 # --------------------------------------------------- perpetual mark, USD
@@ -154,9 +158,10 @@ sources = [
 
 # -------------------------------------------------- perpetual mark, USDT
 #
-# Binance, Bybit and OKX perps are USDT-margined, so they belong under a /USDT
-# symbol rather than being converted into the /USD one. Hyperliquid's are
-# USDC-margined, taken at par.
+# Binance, Bybit, OKX, Bitfinex and KuCoin perps are USDT-margined, so they
+# belong under a /USDT symbol rather than being converted into the /USD one.
+# Hyperliquid's are USDC-margined, taken at par. A KuCoin contract is
+# `multiplier` coins on KuCoin's contracts endpoint (0.001 BTC, 0.01 ETH).
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT.PERP_MARK"
@@ -167,6 +172,7 @@ sources = [
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "BTC", kinds = ["mark_price"] },
   { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0", kinds = ["mark_price"] },
+  { venue = "kucoin", market = "linear_perp", symbol = "XBTUSDTM", kinds = ["mark_price"], contract_size = "0.001" },
 ]
 
 [[feeds]]
@@ -178,6 +184,7 @@ sources = [
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "ETH", kinds = ["mark_price"] },
   { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0", kinds = ["mark_price"] },
+  { venue = "kucoin", market = "linear_perp", symbol = "ETHUSDTM", kinds = ["mark_price"], contract_size = "0.01" },
 ]
 
 # -------------------------------------------------- perpetual mid, USDT
@@ -196,6 +203,7 @@ sources = [
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", contract_size = "0.01" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "BTC" },
   { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0" },
+  { venue = "kucoin", market = "linear_perp", symbol = "XBTUSDTM", contract_size = "0.001" },
 ]
 
 [[feeds]]
@@ -208,6 +216,7 @@ sources = [
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", contract_size = "0.1" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "ETH" },
   { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0" },
+  { venue = "kucoin", market = "linear_perp", symbol = "ETHUSDTM", contract_size = "0.01" },
 ]
 
 # --------------------------------------------------------------- funding

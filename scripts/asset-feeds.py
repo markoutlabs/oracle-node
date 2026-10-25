@@ -10,10 +10,10 @@ Stablecoins, fiat, wrapped and staked copies, leveraged tokens, and stock or
 commodity perpetuals are left out. The top assets by 24 h volume get:
 
   CRYPTO.<ASSET>/USD             spot: Coinbase and Kraken in USD, Binance,
-                                 Bybit, OKX and Bitfinex in USDT through the peg, and
-                                 Hyperliquid in USDC at par
-  CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX and
-                                 Hyperliquid perpetuals
+                                 Bybit, OKX, Bitfinex and KuCoin in USDT through
+                                 the peg, and Hyperliquid in USDC at par
+  CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX, Hyperliquid,
+                                 Bitfinex and KuCoin perpetuals
 
 Each feed takes only venue markets with $1M or more a day. A spot feed needs
 three, so that one venue that stops cannot halt it. A perpetual's mark moves
@@ -167,6 +167,17 @@ def markets():
         # Coinbase or Kraken, so only the Tether books are taken.
         if quote == "USDT":
             add("bitfinex", "spot", symbol, BITFINEX.get(base, base), quote, usd)
+    # KuCoin: spot `BTC-USDT`; perpetuals `XBTUSDTM`, which count in contracts of
+    # `multiplier` coins, priced per coin.
+    for t in get("https://api.kucoin.com/api/v1/market/allTickers")["data"]["ticker"]:
+        base, _, quote = t["symbol"].partition("-")
+        if quote == "USDT":
+            add("kucoin", "spot", t["symbol"], base, quote, number(t.get("volValue")))
+    for c in get("https://api-futures.kucoin.com/api/v1/contracts/active")["data"]:
+        if (c["symbol"].endswith("USDTM") and c.get("quoteCurrency") == "USDT" and not c.get("isInverse")
+                and c.get("status") == "Open"):
+            add("kucoin", "perp", c["symbol"], c["baseCurrency"], "USDT", number(c.get("turnoverOf24h")),
+                contract=Decimal(str(c["multiplier"])))
     spot_meta, spot_ctxs = hyperliquid({"type": "spotMetaAndAssetCtxs"})
     tokens = {t["index"]: t for t in spot_meta["tokens"]}
     volumes = {c["coin"]: number(c.get("dayNtlVlm")) for c in spot_ctxs}
@@ -220,6 +231,8 @@ def merge(path, venue, rows):
             # A Tether book in a USD feed goes through the peg, as the full run writes it.
             extra = ', kinds = ["mark_price"]' if symbol[1] == "perp" else (
                 ", converted = true" if m["quote"] == "USDT" else "")
+            if m["contract"] is not None:
+                extra += f', contract_size = "{m["contract"].normalize():f}"'
             note = f'  # {m["raw"]}/USDC' if venue == "hyperliquid" and m["symbol"].startswith("@") else ""
             out.append(f'  {{ venue = "{venue}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},{note}')
             added += 1
