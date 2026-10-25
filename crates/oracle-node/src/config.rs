@@ -14,7 +14,7 @@ use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
-    DecodeFn, VenueSpec, bybit, coinbase, deribit, kraken, kraken_futures, okx,
+    DecodeFn, VenueSpec, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures, okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -839,6 +839,17 @@ fn venue_connection(
             Some((deribit::KEEPALIVE_EVERY, deribit::KEEPALIVE.to_owned())),
             deribit::decode,
         ),
+        // One socket serves perpetuals and spot; a perpetual also takes its
+        // context channel, so the market decides the frames.
+        Venue::Hyperliquid => (
+            hyperliquid::URL.to_owned(),
+            hyperliquid::subscribe_frames(with_depth(), market.is_perp()),
+            Some((
+                hyperliquid::KEEPALIVE_EVERY,
+                hyperliquid::KEEPALIVE.to_owned(),
+            )),
+            hyperliquid::decode,
+        ),
         Venue::Binance => {
             return Err(ConfigError::Invalid(
                 "binance is configured through its own adapter".to_owned(),
@@ -1451,6 +1462,34 @@ sources = [
                 spec.subscribe
             );
         }
+    }
+
+    #[test]
+    fn hyperliquid_perps_take_the_context_channel_and_spot_does_not() {
+        let perp = one_source("hyperliquid", "linear_perp", "BTC").expect("resolves");
+        let spec = spec_for(&perp, Venue::Hyperliquid);
+        assert!(spec.url.contains("api.hyperliquid.xyz"), "{}", spec.url);
+        assert!(spec.subscribe.iter().any(|f| f.contains("activeAssetCtx")));
+        assert!(
+            spec.keepalive
+                .as_ref()
+                .is_some_and(|(_, text)| text.contains("ping"))
+        );
+
+        let spot = one_source("hyperliquid", "spot", "@142").expect("resolves");
+        let spot_spec = spec_for(&spot, Venue::Hyperliquid);
+        assert!(
+            !spot_spec
+                .subscribe
+                .iter()
+                .any(|f| f.contains("activeAssetCtx"))
+        );
+        assert!(
+            spot_spec
+                .subscribe
+                .iter()
+                .any(|f| f.contains(r#""coin":"@142""#))
+        );
     }
 
     /// Deribit has no spot book worth pricing from, so asking for one is a
