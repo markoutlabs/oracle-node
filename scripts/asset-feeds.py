@@ -2,6 +2,7 @@
 """Writes node/assets.toml: feeds for the most traded crypto assets.
 
     scripts/asset-feeds.py [--top 150] [--out node/assets.toml]
+    scripts/asset-feeds.py --merge hyperliquid    # only adds that venue's markets to the current feeds
 
 It reads each venue's public 24 h tickers, the venues the node supports, and
 keeps an asset when at least three venues trade it with $1M or more a day.
@@ -180,6 +181,32 @@ def tradfi():
     return found
 
 
+def merge(path, venue, rows):
+    """Adds `venue`'s deep markets as sources to the feeds that `path` has, and nothing else."""
+    deep = {}
+    for m in rows:
+        if m["venue"] == venue and m["usd"] >= MIN_MARKET_USD:
+            deep[(norm(m["raw"]), m["kind"])] = m
+    text = path.read_text()
+    out, added = [], 0
+    symbol = None
+    for line in text.splitlines():
+        found = re.match(r'^symbol = "CRYPTO\.([A-Z0-9]+)/(USD|USDT\.PERP_MARK)"$', line)
+        if found:
+            symbol = (found.group(1), "perp" if found.group(2).endswith("PERP_MARK") else "spot")
+        if line == "]" and symbol and symbol in deep and f'venue = "{venue}"' not in "\n".join(out[-12:]):
+            m = deep[symbol]
+            market = "linear_perp" if symbol[1] == "perp" else "spot"
+            extra = ', kinds = ["mark_price"]' if symbol[1] == "perp" else ""
+            note = f'  # {m["raw"]}/USDC' if venue == "hyperliquid" and m["symbol"].startswith("@") else ""
+            out.append(f'  {{ venue = "{venue}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},{note}')
+            added += 1
+        out.append(line)
+    path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""))
+    print(f"{added} {venue} sources added to {path.relative_to(ROOT) if path.is_relative_to(ROOT) else path}",
+          file=sys.stderr)
+
+
 def existing_symbols():
     text = (ROOT / "node/all-feeds.toml").read_text()
     return set(re.findall(r'^symbol = "([^"]+)"', text, re.M))
@@ -189,9 +216,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--top", type=int, default=150)
     parser.add_argument("--out", type=Path, default=ROOT / "node/assets.toml")
+    parser.add_argument("--merge", metavar="VENUE",
+                        help="keep the feeds of --out as they are; add this venue's deep markets to them")
     args = parser.parse_args()
 
     rows = markets()
+    if args.merge:
+        merge(args.out, args.merge, rows)
+        return
     excluded = tradfi()
     assets = {}
     for row in rows:
