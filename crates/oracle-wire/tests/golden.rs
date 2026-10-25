@@ -272,6 +272,7 @@ fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
         Venue::Coinbase => "BTC-USD",
         Venue::Kraken => "BTC/USD",
         Venue::Deribit => "BTC-PERPETUAL",
+        Venue::Hyperliquid => "BTC",
         // A venue added later; these vectors never use it.
         _ => "OTHER",
     };
@@ -296,10 +297,19 @@ fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
 }
 
 fn sample_venue_reports() -> Vec<(&'static str, VenueReport)> {
+    // The six venues these vectors were minted with; `Venue::ALL` grows.
+    const MINTED: [Venue; 6] = [
+        Venue::Binance,
+        Venue::Bybit,
+        Venue::Okx,
+        Venue::Coinbase,
+        Venue::Kraken,
+        Venue::Deribit,
+    ];
     let usdt: Symbol = "CRYPTO.BTC/USDT".parse().expect("valid symbol");
     let every_status = SourceStatus::ALL
         .into_iter()
-        .zip(Venue::ALL.into_iter().cycle())
+        .zip(MINTED.into_iter().cycle())
         .map(|(status, venue)| VenueEntry {
             weight_bps: 10_000,
             bid: Some(i64::MAX),

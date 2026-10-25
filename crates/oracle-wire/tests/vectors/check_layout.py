@@ -13,7 +13,7 @@ import struct
 import subprocess
 import sys
 
-VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit"]
+VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit", "hyperliquid"]
 MARKETS = ["spot", "linear_perp", "inverse_perp"]
 STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted", "peg_unavailable"]
 FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4}
