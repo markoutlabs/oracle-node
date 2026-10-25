@@ -46,7 +46,7 @@ pub enum Venue {
     Deribit = 5,
     /// Hyperliquid (USDC-quoted perpetuals and spot).
     Hyperliquid = 6,
-    /// Bitfinex v2 (spot in USD and Tether; Tether-margined `F0` perpetuals).
+    /// Bitfinex v2 (Tether spot and Tether-margined `F0` perpetuals).
     Bitfinex = 7,
     /// MEXC (spot and USDT perpetuals). Reserved; no adapter yet.
     Mexc = 8,
@@ -138,9 +138,11 @@ impl Venue {
     /// These venues are the anchor for [`crate::Symbol`]s whose quote asset is
     /// `USD`; without at least one of them live, every stablecoin-quoted price
     /// must be converted through a peg feed and carries that feed's uncertainty.
+    /// Bitfinex has USD books, but a Bitfinex dollar is a balance at Bitfinex that
+    /// trades about 15 bp apart from a dollar on Coinbase or Kraken.
     #[must_use]
     pub const fn quotes_native_usd(self) -> bool {
-        matches!(self, Self::Coinbase | Self::Kraken | Self::Bitfinex)
+        matches!(self, Self::Coinbase | Self::Kraken)
     }
 }
 
@@ -534,6 +536,7 @@ mod tests {
         assert!(Venue::Coinbase.quotes_native_usd());
         assert!(Venue::Kraken.quotes_native_usd());
         assert!(!Venue::Binance.quotes_native_usd());
+        assert!(!Venue::Bitfinex.quotes_native_usd());
 
         let stablecoin_only: VenueSet = [Venue::Binance, Venue::Bybit, Venue::Okx]
             .into_iter()

@@ -9,8 +9,8 @@ keeps an asset when at least three venues trade it with $1M or more a day.
 Stablecoins, fiat, wrapped and staked copies, leveraged tokens, and stock or
 commodity perpetuals are left out. The top assets by 24 h volume get:
 
-  CRYPTO.<ASSET>/USD             spot: Coinbase, Kraken and Bitfinex in USD, Binance,
-                                 Bybit and OKX in USDT through the peg, and
+  CRYPTO.<ASSET>/USD             spot: Coinbase and Kraken in USD, Binance,
+                                 Bybit, OKX and Bitfinex in USDT through the peg, and
                                  Hyperliquid in USDC at par
   CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX and
                                  Hyperliquid perpetuals
@@ -163,7 +163,9 @@ def markets():
             continue
         base, quote = name.split(":") if ":" in name else (name[:-3], name[-3:])
         quote = {"UST": "USDT"}.get(quote, quote)
-        if quote in ("USD", "USDT"):
+        # A Bitfinex dollar is a balance at Bitfinex and trades apart from a dollar on
+        # Coinbase or Kraken, so only the Tether books are taken.
+        if quote == "USDT":
             add("bitfinex", "spot", symbol, BITFINEX.get(base, base), quote, usd)
     spot_meta, spot_ctxs = hyperliquid({"type": "spotMetaAndAssetCtxs"})
     tokens = {t["index"]: t for t in spot_meta["tokens"]}
