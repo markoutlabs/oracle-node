@@ -46,11 +46,17 @@ pub enum Venue {
     Deribit = 5,
     /// Hyperliquid (USDC-quoted perpetuals and spot).
     Hyperliquid = 6,
+    /// Bitfinex (spot, natively USD-quoted). Reserved; no adapter yet.
+    Bitfinex = 7,
+    /// MEXC (spot and USDT perpetuals). Reserved; no adapter yet.
+    Mexc = 8,
+    /// KuCoin (spot and USDT perpetuals). Reserved; no adapter yet.
+    Kucoin = 9,
 }
 
 impl Venue {
     /// Every venue, in discriminant order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Binance,
         Self::Bybit,
         Self::Okx,
@@ -58,6 +64,9 @@ impl Venue {
         Self::Kraken,
         Self::Deribit,
         Self::Hyperliquid,
+        Self::Bitfinex,
+        Self::Mexc,
+        Self::Kucoin,
     ];
 
     /// Returns the wire-stable index.
@@ -76,6 +85,9 @@ impl Venue {
             Self::Kraken => 4,
             Self::Deribit => 5,
             Self::Hyperliquid => 6,
+            Self::Bitfinex => 7,
+            Self::Mexc => 8,
+            Self::Kucoin => 9,
         }
     }
 
@@ -97,6 +109,9 @@ impl Venue {
             4 => Some(Self::Kraken),
             5 => Some(Self::Deribit),
             6 => Some(Self::Hyperliquid),
+            7 => Some(Self::Bitfinex),
+            8 => Some(Self::Mexc),
+            9 => Some(Self::Kucoin),
             _ => None,
         }
     }
@@ -112,6 +127,9 @@ impl Venue {
             Self::Kraken => "kraken",
             Self::Deribit => "deribit",
             Self::Hyperliquid => "hyperliquid",
+            Self::Bitfinex => "bitfinex",
+            Self::Mexc => "mexc",
+            Self::Kucoin => "kucoin",
         }
     }
 
@@ -122,7 +140,7 @@ impl Venue {
     /// must be converted through a peg feed and carries that feed's uncertainty.
     #[must_use]
     pub const fn quotes_native_usd(self) -> bool {
-        matches!(self, Self::Coinbase | Self::Kraken)
+        matches!(self, Self::Coinbase | Self::Kraken | Self::Bitfinex)
     }
 }
 
@@ -470,6 +488,9 @@ mod tests {
         assert_eq!(Venue::Kraken.index(), 4);
         assert_eq!(Venue::Deribit.index(), 5);
         assert_eq!(Venue::Hyperliquid.index(), 6);
+        assert_eq!(Venue::Bitfinex.index(), 7);
+        assert_eq!(Venue::Mexc.index(), 8);
+        assert_eq!(Venue::Kucoin.index(), 9);
         for venue in Venue::ALL {
             assert_eq!(Venue::from_index(venue.index()), Some(venue));
         }
@@ -504,8 +525,8 @@ mod tests {
     fn venue_set_rejects_unassigned_bits() {
         assert!(VenueSet::from_bits(1 << 31).is_err());
         // Every assigned bit, and the first one past them.
-        assert!(VenueSet::from_bits(0b111_1111).is_ok());
-        assert!(VenueSet::from_bits(0b1000_0000).is_err());
+        assert!(VenueSet::from_bits(0b11_1111_1111).is_ok());
+        assert!(VenueSet::from_bits(0b100_0000_0000).is_err());
     }
 
     #[test]

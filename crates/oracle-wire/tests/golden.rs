@@ -273,6 +273,9 @@ fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
         Venue::Kraken => "BTC/USD",
         Venue::Deribit => "BTC-PERPETUAL",
         Venue::Hyperliquid => "BTC",
+        Venue::Bitfinex => "tBTCUSD",
+        Venue::Mexc => "BTCUSDT",
+        Venue::Kucoin => "BTC-USDT",
         // A venue added later; these vectors never use it.
         _ => "OTHER",
     };
