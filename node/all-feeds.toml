@@ -1,4 +1,4 @@
-# Every feed kind this build can actually serve, across all six venues.
+# Every feed kind this build can actually serve, across all seven venues.
 #
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
@@ -53,7 +53,9 @@ sources = [
 #
 # Native-USD venues price directly; USDT-quoted venues are converted through the
 # peg above. The peg's own uncertainty propagates in quadrature, so a wobbling
-# peg widens the whole catalogue instead of silently mispricing it.
+# peg widens the whole catalogue instead of silently mispricing it. Hyperliquid
+# quotes in USDC, taken at par: there is no USDC peg, and its weight is small.
+# Its spot pair is named by its index, the only name its socket takes.
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD"
@@ -66,6 +68,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
+  { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
 ]
 
 [[feeds]]
@@ -79,6 +82,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "ETH-USDT", converted = true },
+  { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
 ]
 
 [[feeds]]
@@ -92,6 +96,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "SOL-USDT", converted = true },
+  { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
 ]
 
 # ----------------------------------------------------------- spot, USDT
@@ -144,7 +149,8 @@ sources = [
 # -------------------------------------------------- perpetual mark, USDT
 #
 # Binance, Bybit and OKX perps are USDT-margined, so they belong under a /USDT
-# symbol rather than being converted into the /USD one.
+# symbol rather than being converted into the /USD one. Hyperliquid's are
+# USDC-margined, taken at par.
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT.PERP_MARK"
@@ -153,6 +159,7 @@ sources = [
   { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
+  { venue = "hyperliquid", market = "linear_perp", symbol = "BTC", kinds = ["mark_price"] },
 ]
 
 [[feeds]]
@@ -162,6 +169,7 @@ sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
   { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
+  { venue = "hyperliquid", market = "linear_perp", symbol = "ETH", kinds = ["mark_price"] },
 ]
 
 # -------------------------------------------------- perpetual mid, USDT
@@ -178,6 +186,7 @@ sources = [
   { venue = "binance", market = "linear_perp", symbol = "BTCUSDT" },
   { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT" },
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", contract_size = "0.01" },
+  { venue = "hyperliquid", market = "linear_perp", symbol = "BTC" },
 ]
 
 [[feeds]]
@@ -188,6 +197,7 @@ sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETHUSDT" },
   { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT" },
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", contract_size = "0.1" },
+  { venue = "hyperliquid", market = "linear_perp", symbol = "ETH" },
 ]
 
 # --------------------------------------------------------------- funding

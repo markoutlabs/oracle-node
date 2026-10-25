@@ -9,8 +9,10 @@ Stablecoins, fiat, wrapped and staked copies, leveraged tokens, and stock or
 commodity perpetuals are left out. The top assets by 24 h volume get:
 
   CRYPTO.<ASSET>/USD             spot: Coinbase and Kraken in USD, Binance,
-                                 Bybit and OKX in USDT through the peg
-  CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit and OKX perpetuals
+                                 Bybit and OKX in USDT through the peg, and
+                                 Hyperliquid in USDC at par
+  CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX and
+                                 Hyperliquid perpetuals
 
 Each feed takes only venue markets with $1M or more a day. A spot feed needs
 three, so that one venue that stops cannot halt it. A perpetual's mark moves
@@ -135,7 +137,34 @@ def markets():
         symbol = t.get("symbol", "")
         if symbol.startswith("PF_") and symbol.endswith("USD"):
             add("kraken", "perp", symbol, symbol[3:-3], "USD", number(t.get("volumeQuote")))
+    # Hyperliquid quotes in USDC, taken at par: the node has no USDC peg, and the
+    # venue's weight is small. A perp is named by its coin; `kPEPE` and the like
+    # are priced per 1000 coins and left out. A spot pair is named by its index,
+    # `@142`, the only name its socket takes; a Unit token is the coin itself,
+    # bridged, so `UBTC` is BTC.
+    perp_meta, perp_ctxs = hyperliquid({"type": "metaAndAssetCtxs"})
+    for u, c in zip(perp_meta["universe"], perp_ctxs):
+        if not u.get("isDelisted") and not re.match(r"^k[A-Z]", u["name"]):
+            add("hyperliquid", "perp", u["name"], u["name"], "USDC", number(c.get("dayNtlVlm")))
+    spot_meta, spot_ctxs = hyperliquid({"type": "spotMetaAndAssetCtxs"})
+    tokens = {t["index"]: t for t in spot_meta["tokens"]}
+    volumes = {c["coin"]: number(c.get("dayNtlVlm")) for c in spot_ctxs}
+    for pair in spot_meta["universe"]:
+        base, quote = (tokens[i] for i in pair["tokens"])
+        if quote["name"] != "USDC":
+            continue
+        unit = (base.get("fullName") or "").startswith("Unit ")
+        if unit or base.get("isCanonical"):
+            name = base["name"][1:] if unit else base["name"]
+            add("hyperliquid", "spot", pair["name"], name, "USDC", volumes.get(pair["name"], 0.0))
     return rows
+
+
+def hyperliquid(body):
+    request = urllib.request.Request("https://api.hyperliquid.xyz/info", data=json.dumps(body).encode(),
+                                     headers={**UA, "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
 
 
 def tradfi():
@@ -226,13 +255,16 @@ def main():
                 ", converted = true" if m["quote"] == "USDT" else "")
             if m["contract"] is not None:
                 extra += f', contract_size = "{m["contract"].normalize():f}"'
-            lines.append(f'  {{ venue = "{m["venue"]}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},')
+            # A Hyperliquid spot pair's index says nothing to a reader; name the coin.
+            note = f'  # {m["raw"]}/USDC' if m["venue"] == "hyperliquid" and m["symbol"].startswith("@") else ""
+            lines.append(f'  {{ venue = "{m["venue"]}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},{note}')
         lines.append("]")
         lines.append("")
     args.out.write_text("\n".join(lines))
     spot_count = sum(1 for f in feeds if not f[3])
+    out = args.out.relative_to(ROOT) if args.out.is_relative_to(ROOT) else args.out
     print(f"{len(top)} assets: {spot_count} spot feeds, {len(feeds) - spot_count} perp feeds "
-          f"-> {args.out.relative_to(ROOT)}", file=sys.stderr)
+          f"-> {out}", file=sys.stderr)
     print(f"skipped for too few deep markets: {len(skipped)}", file=sys.stderr)
 
 
