@@ -79,6 +79,18 @@ pub enum DecodeError {
     Resync(String),
 }
 
+impl From<serde_json::Error> for DecodeError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Malformed(error.to_string())
+    }
+}
+
+impl From<prost::DecodeError> for DecodeError {
+    fn from(error: prost::DecodeError) -> Self {
+        Self::Malformed(error.to_string())
+    }
+}
+
 impl DecodeError {
     /// Returns `true` if this outcome is routine and should not be logged as a fault.
     ///

@@ -48,9 +48,9 @@ pub enum Venue {
     Hyperliquid = 6,
     /// Bitfinex v2 (Tether spot and Tether-margined `F0` perpetuals).
     Bitfinex = 7,
-    /// MEXC (spot and USDT perpetuals). Reserved; no adapter yet.
+    /// MEXC (spot over protobuf, and USDT-margined perpetuals in contracts).
     Mexc = 8,
-    /// KuCoin (spot and USDT perpetuals). Reserved; no adapter yet.
+    /// KuCoin (spot, and USDT-margined perpetuals in contracts; sockets open with a token).
     Kucoin = 9,
 }
 

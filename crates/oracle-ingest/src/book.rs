@@ -147,6 +147,17 @@ pub struct LastFunding {
     pub open_interest: Option<Fixed>,
 }
 
+impl LastFunding {
+    /// Stores a repeated venue's rate and open interest, and says whether either
+    /// changed, so that a message that repeats each second goes out only on a change.
+    pub fn update(&mut self, rate: Option<Fixed>, open_interest: Option<Fixed>) -> bool {
+        let changed = rate != self.rate || open_interest != self.open_interest;
+        self.rate = rate;
+        self.open_interest = open_interest;
+        changed
+    }
+}
+
 /// Every book on one connection, by venue symbol. Emptied on each connect, so
 /// nothing from before a gap survives it.
 #[derive(Clone, Debug, Default)]

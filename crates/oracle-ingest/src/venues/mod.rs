@@ -19,13 +19,111 @@ pub mod kraken;
 pub mod kraken_futures;
 pub mod kucoin;
 pub mod kucoin_connect;
+pub mod mexc;
+pub mod mexc_connect;
 pub mod okx;
+pub mod rest_frames;
 
 pub use adapter::{DecodeFn, VenueAdapter, VenueHandler, VenueSpec};
 
-use oracle_types::Fixed;
+use std::sync::Arc;
+
+use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenInterestUnit};
 
 use crate::DecodeError;
+use crate::book::LastFunding;
+use crate::instrument::InstrumentEntry;
+
+/// An observation of `kind` at `price`, with nothing else set.
+pub(crate) fn observation(
+    entry: &InstrumentEntry,
+    kind: ObsKind,
+    price: Fixed,
+    local_recv_ns: u64,
+) -> Observation {
+    Observation {
+        instrument: entry.instrument.clone(),
+        kind,
+        price,
+        bid: None,
+        ask: None,
+        bid_qty: None,
+        ask_qty: None,
+        depth_notional_1bp: None,
+        exchange_time_ns: None,
+        local_recv_ns,
+        seq: None,
+        book: None,
+        funding: None,
+    }
+}
+
+/// A JSON value parsed from its raw text.
+pub(crate) fn parse<'a, T: serde::Deserialize<'a>>(
+    raw: &'a serde_json::value::RawValue,
+) -> Result<T, DecodeError> {
+    Ok(serde_json::from_str(raw.get())?)
+}
+
+/// The mid of a quote, or the bid when the sum overflows.
+pub(crate) fn mid(bid: Fixed, ask: Fixed) -> Fixed {
+    bid.checked_add(ask)
+        .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
+        .unwrap_or(bid)
+}
+
+/// A size in coins: contracts times the contract size, where the venue counts
+/// in contracts.
+pub(crate) fn base_units(size: Fixed, contract_size: Option<Fixed>) -> Fixed {
+    contract_size
+        .and_then(|contract| size.checked_mul(contract))
+        .unwrap_or(size)
+}
+
+/// A best bid and ask as a book top, priced at the mid. A side at zero or
+/// below is an empty book, not a quote.
+pub(crate) fn book_top(
+    entry: &InstrumentEntry,
+    (bid, ask): (Fixed, Fixed),
+    (bid_qty, ask_qty): (Fixed, Fixed),
+    exchange_time_ns: Option<u64>,
+    local_recv_ns: u64,
+) -> Result<Observation, DecodeError> {
+    if !bid.is_positive() || !ask.is_positive() {
+        return Err(DecodeError::Control);
+    }
+    Ok(Observation {
+        bid: Some(bid),
+        ask: Some(ask),
+        bid_qty: Some(bid_qty),
+        ask_qty: Some(ask_qty),
+        exchange_time_ns,
+        ..observation(entry, ObsKind::BookTop, mid(bid, ask), local_recv_ns)
+    })
+}
+
+/// The funding state of a venue that pays over its own interval, once a rate
+/// is known. The open interest is in coins.
+pub(crate) fn interval_funding(
+    entry: &InstrumentEntry,
+    state: &LastFunding,
+    local_recv_ns: u64,
+) -> Option<Observation> {
+    let rate = state.rate?;
+    let info = FundingInfo {
+        interval_ns: state.interval_ns,
+        next_funding_time_ns: state.next_funding_time_ns,
+        settled: state.settled,
+        open_interest: state
+            .open_interest
+            .map(|coins| (coins, OpenInterestUnit::Base)),
+        ..FundingInfo::new(FundingBasis::Interval)
+    };
+    Some(Observation {
+        funding: Some(Arc::new(info)),
+        ..observation(entry, ObsKind::Funding, rate, local_recv_ns)
+    })
+}
 
 /// Parses a decimal that arrived as a JSON string.
 pub(crate) fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeError> {

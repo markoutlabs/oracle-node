@@ -17,7 +17,7 @@ use crate::book::{Books, LocalBook, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::{decimal, integer};
+use super::{base_units, decimal, integer};
 
 /// The public endpoint.
 pub const URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
@@ -227,14 +227,6 @@ fn funding_info(funding: &FundingRate<'_>) -> Result<FundingInfo, DecodeError> {
         settled,
         ..FundingInfo::new(FundingBasis::Interval)
     })
-}
-
-/// A size in base units: contracts times the contract size on a swap, as sent
-/// on spot.
-fn base_units(size: Fixed, contract_size: Option<Fixed>) -> Fixed {
-    contract_size
-        .and_then(|contract| size.checked_mul(contract))
-        .unwrap_or(size)
 }
 
 /// OKX sends timestamps as millisecond counts inside strings.

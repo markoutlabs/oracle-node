@@ -20,19 +20,20 @@
 //!
 //! Checked against the live sockets and REST on 2026-10-25.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenInterestUnit};
+use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, LastFunding, Side};
+use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
 
-use super::{decimal, decimal_literal, integer};
+use super::{
+    base_units, book_top, decimal, decimal_literal, integer, interval_funding, observation, parse,
+};
 
 pub use super::kucoin_connect::{FUTURES_TOKEN, SPOT_TOKEN, futures_url};
 
@@ -210,69 +211,6 @@ struct Contract<'a> {
     open_interest: Option<&'a str>,
 }
 
-fn malformed(error: &serde_json::Error) -> DecodeError {
-    DecodeError::Malformed(error.to_string())
-}
-
-fn parse<'a, T: Deserialize<'a>>(raw: &'a RawValue) -> Result<T, DecodeError> {
-    serde_json::from_str(raw.get()).map_err(|e| malformed(&e))
-}
-
-fn observation(
-    entry: &InstrumentEntry,
-    kind: ObsKind,
-    price: Fixed,
-    local_recv_ns: u64,
-) -> Observation {
-    Observation {
-        instrument: entry.instrument.clone(),
-        kind,
-        price,
-        bid: None,
-        ask: None,
-        bid_qty: None,
-        ask_qty: None,
-        depth_notional_1bp: None,
-        exchange_time_ns: None,
-        local_recv_ns,
-        seq: None,
-        book: None,
-        funding: None,
-    }
-}
-
-/// A size in coins: contracts times the contract size on a perpetual.
-fn coins(size: Fixed, entry: &InstrumentEntry) -> Fixed {
-    entry
-        .contract_size
-        .and_then(|contract| size.checked_mul(contract))
-        .unwrap_or(size)
-}
-
-fn quote(
-    entry: &InstrumentEntry,
-    (bid, ask): (Fixed, Fixed),
-    (bid_qty, ask_qty): (Fixed, Fixed),
-    exchange_time_ns: Option<u64>,
-    local_recv_ns: u64,
-) -> Result<Observation, DecodeError> {
-    if !bid.is_positive() || !ask.is_positive() {
-        return Err(DecodeError::Control);
-    }
-    let mid = bid
-        .checked_add(ask)
-        .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-        .unwrap_or(bid);
-    Ok(Observation {
-        bid: Some(bid),
-        ask: Some(ask),
-        bid_qty: Some(bid_qty),
-        ask_qty: Some(ask_qty),
-        exchange_time_ns,
-        ..observation(entry, ObsKind::BookTop, mid, local_recv_ns)
-    })
-}
-
 /// Replaces the book with a whole snapshot, and emits it.
 fn depth(
     data: &RawValue,
@@ -288,7 +226,7 @@ fn depth(
     for (side, levels) in [(Side::Ask, &snapshot.asks), (Side::Bid, &snapshot.bids)] {
         for (price, size) in levels {
             let price = decimal_literal("depth price", price)?;
-            let size = coins(decimal_literal("depth size", size)?, entry);
+            let size = base_units(decimal_literal("depth size", size)?, entry.contract_size);
             book.set(side, price, size);
         }
     }
@@ -320,7 +258,7 @@ fn route<'a>(
 /// The envelope of a market message, or the error that ends the decode of a
 /// control message.
 fn envelope(payload: &[u8]) -> Result<Envelope<'_>, DecodeError> {
-    let envelope: Envelope<'_> = serde_json::from_slice(payload).map_err(|e| malformed(&e))?;
+    let envelope: Envelope<'_> = serde_json::from_slice(payload)?;
     match envelope.kind {
         "message" | "rest" => Ok(envelope),
         "error" => Err(DecodeError::Malformed(format!(
@@ -357,7 +295,7 @@ pub fn decode_spot(
                 decimal("bestBidSize", ticker.best_bid_size)?,
                 decimal("bestAskSize", ticker.best_ask_size)?,
             );
-            out.push(quote(
+            out.push(book_top(
                 &entry,
                 prices,
                 sizes,
@@ -414,16 +352,16 @@ pub fn decode_futures(
                 decimal("bestAskPrice", ticker.best_ask_price)?,
             );
             let sizes = (
-                coins(
+                base_units(
                     decimal_literal("bestBidSize", ticker.best_bid_size)?,
-                    &entry,
+                    entry.contract_size,
                 ),
-                coins(
+                base_units(
                     decimal_literal("bestAskSize", ticker.best_ask_size)?,
-                    &entry,
+                    entry.contract_size,
                 ),
             );
-            out.push(quote(&entry, prices, sizes, ticker.ts, local_recv_ns)?);
+            out.push(book_top(&entry, prices, sizes, ticker.ts, local_recv_ns)?);
             Ok(())
         }
         ("/contractMarket/level2Depth50", _) => {
@@ -459,7 +397,11 @@ pub fn decode_futures(
         ("/contract/instrument", "funding.rate") => {
             let rate: FundingRate<'_> = parse(data)?;
             books.funding(symbol).rate = Some(decimal_literal("fundingRate", rate.funding_rate)?);
-            emit_funding(&entry, books.funding(symbol), local_recv_ns, out);
+            out.extend(interval_funding(
+                &entry,
+                books.funding(symbol),
+                local_recv_ns,
+            ));
             Ok(())
         }
         ("/rest", "funding.current") => {
@@ -475,45 +417,25 @@ pub fn decode_futures(
                 )),
                 None => None,
             };
-            emit_funding(&entry, state, local_recv_ns, out);
+            out.extend(interval_funding(&entry, state, local_recv_ns));
             Ok(())
         }
         ("/rest", "contract") => {
             let contract: Contract<'_> = parse(data)?;
             if let Some(open_interest) = contract.open_interest {
                 let contracts = decimal("openInterest", open_interest)?;
-                books.funding(symbol).open_interest = Some(coins(contracts, &entry));
+                books.funding(symbol).open_interest =
+                    Some(base_units(contracts, entry.contract_size));
             }
-            emit_funding(&entry, books.funding(symbol), local_recv_ns, out);
+            out.extend(interval_funding(
+                &entry,
+                books.funding(symbol),
+                local_recv_ns,
+            ));
             Ok(())
         }
         (other, _) => Err(DecodeError::UnhandledStream(other.to_owned())),
     }
-}
-
-/// The funding state as an observation, once a rate is known.
-fn emit_funding(
-    entry: &InstrumentEntry,
-    state: &LastFunding,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) {
-    let Some(rate) = state.rate else {
-        return;
-    };
-    let info = FundingInfo {
-        interval_ns: state.interval_ns,
-        next_funding_time_ns: state.next_funding_time_ns,
-        settled: state.settled,
-        open_interest: state
-            .open_interest
-            .map(|coins| (coins, OpenInterestUnit::Base)),
-        ..FundingInfo::new(FundingBasis::Interval)
-    };
-    out.push(Observation {
-        funding: Some(Arc::new(info)),
-        ..observation(entry, ObsKind::Funding, rate, local_recv_ns)
-    });
 }
 
 #[cfg(test)]
@@ -524,7 +446,7 @@ fn emit_funding(
 mod tests {
     use super::*;
     use crate::InstrumentSpec;
-    use oracle_types::{MarketKind, Venue};
+    use oracle_types::{Fixed, MarketKind, OpenInterestUnit, Venue};
 
     const RECV: u64 = 1_792_936_300_000_000_000;
     /// Recorded from KuCoin on 2026-10-25: the BTC and ETH spot quotes, BTC's

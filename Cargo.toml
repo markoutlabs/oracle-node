@@ -51,6 +51,8 @@ ctrlc = "3"
 time = { version = "0.3", default-features = false, features = ["parsing", "std"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 bytes = "1"
+# MEXC's spot socket sends only protobuf.
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The node's per-address limits on sockets, handshakes and requests.
 governor = "0.10"

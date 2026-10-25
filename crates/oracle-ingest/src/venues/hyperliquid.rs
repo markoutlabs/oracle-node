@@ -13,19 +13,16 @@
 //! - Every number is a JSON string. Checked against the live socket on
 //!   2026-10-25.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{
-    Fixed, FundingBasis, FundingInfo, NANOS_PER_SEC, ObsKind, Observation, OpenInterestUnit,
-};
+use oracle_types::{Fixed, NANOS_PER_SEC, ObsKind, Observation};
 use serde::Deserialize;
 
 use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal;
+use super::{decimal, interval_funding};
 
 /// The production endpoint.
 pub const URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -284,36 +281,16 @@ pub fn decode(
             // The context repeats each second; the rate goes out when it or the
             // open interest changed.
             let last = books.funding(message.coin);
-            let changed = rate != last.rate || open_interest != last.open_interest;
-            last.rate = rate;
-            last.open_interest = open_interest;
-            if let (true, Some(rate)) = (changed, rate) {
-                let next_hour = local_recv_ns
+            if last.update(rate, open_interest) {
+                last.interval_ns = Some(HOUR_NS);
+                last.next_funding_time_ns = local_recv_ns
                     .checked_div(HOUR_NS)
                     .and_then(|hours| hours.checked_add(1))
                     .and_then(|hours| hours.checked_mul(HOUR_NS));
-                let info = FundingInfo {
-                    interval_ns: Some(HOUR_NS),
-                    next_funding_time_ns: next_hour,
-                    open_interest: open_interest.map(|oi| (oi, OpenInterestUnit::Base)),
-                    ..FundingInfo::new(FundingBasis::Interval)
-                };
-                out.push(Observation {
-                    instrument: entry.instrument.clone(),
-                    kind: ObsKind::Funding,
-                    price: rate,
-                    bid: None,
-                    ask: None,
-                    bid_qty: None,
-                    ask_qty: None,
-                    depth_notional_1bp: None,
-                    exchange_time_ns: None,
-                    local_recv_ns,
-                    seq: None,
-                    book: None,
-                    funding: Some(Arc::new(info)),
-                });
-                emitted = true;
+                if let Some(funding) = interval_funding(entry, last, local_recv_ns) {
+                    out.push(funding);
+                    emitted = true;
+                }
             }
             if emitted {
                 Ok(())
@@ -332,6 +309,7 @@ pub fn decode(
 mod tests {
     use super::*;
     use crate::InstrumentSpec;
+    use oracle_types::{FundingBasis, OpenInterestUnit};
     use oracle_types::{MarketKind, Venue};
 
     /// 2026-10-25 07:29:54 UTC, inside the hour of the fixtures.

@@ -14,12 +14,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use tracing::warn;
 
-use crate::transport::{Connector, Frame, Transport, TransportError};
+use super::rest_frames::{self, Read, RestTransport};
+use crate::transport::{Connector, TransportError};
 
 /// The token endpoint of the spot socket.
 pub const SPOT_TOKEN: &str = "https://api.kucoin.com/api/v1/bullet-public";
@@ -32,14 +31,9 @@ const FUTURES_REST: &str = "https://api-futures.kucoin.com";
 /// KuCoin's success code.
 const OK: &str = "200000";
 
-const TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Each contract's two records once in this period: about 2 requests a second
 /// for 50 contracts.
 const CONTRACTS_EVERY: Duration = Duration::from_secs(60);
-
-/// A token or one contract's record is a few kilobytes.
-const MAX_BODY: usize = 256 * 1024;
 
 /// Numbers each connection, so that KuCoin's `connectId` differs between them.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -67,50 +61,47 @@ impl<C> KucoinConnector<C> {
     /// Returns [`TransportError::Connect`] if the HTTP client cannot be built,
     /// which means TLS is misconfigured in this binary.
     pub fn new(inner: C) -> Result<Self, TransportError> {
-        // reqwest leaves the crypto provider to the binary; tungstenite already
-        // brings `ring`.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| TransportError::Connect(e.to_string()))?;
-        Ok(Self { inner, client })
+        Ok(Self {
+            inner,
+            client: rest_frames::client()?,
+        })
     }
 }
 
 impl<C: Connector> Connector for KucoinConnector<C> {
-    type Conn = KucoinTransport<C::Conn>;
+    type Conn = RestTransport<C::Conn>;
 
     async fn connect(&self, url: &str) -> Result<Self::Conn, TransportError> {
         let (base, query) = url.split_once('?').unwrap_or((url, ""));
         if base != SPOT_TOKEN && base != FUTURES_TOKEN {
-            return Ok(KucoinTransport {
-                inner: self.inner.connect(url).await?,
-                pending: SelectAll::new(),
-            });
+            return Ok(RestTransport::plain(self.inner.connect(url).await?));
         }
         let socket = socket_url(&self.client, base).await?;
         let inner = self.inner.connect(&socket).await?;
-        let mut pending = SelectAll::new();
-        let contracts = contracts_of(query);
-        if base == FUTURES_TOKEN && !contracts.is_empty() {
-            pending.push(records(self.client.clone(), contracts));
+        let contracts = rest_frames::contracts_of(query);
+        if base != FUTURES_TOKEN || contracts.is_empty() {
+            return Ok(RestTransport::plain(inner));
         }
-        Ok(KucoinTransport { inner, pending })
+        let reads: Vec<Read> = contracts
+            .iter()
+            .flat_map(|contract| {
+                [
+                    (
+                        contract.clone(),
+                        "funding.current",
+                        format!("{FUTURES_REST}/api/v1/funding-rate/{contract}/current"),
+                    ),
+                    (
+                        contract.clone(),
+                        "contract",
+                        format!("{FUTURES_REST}/api/v1/contracts/{contract}"),
+                    ),
+                ]
+            })
+            .collect();
+        let records = rest_frames::records(self.client.clone(), reads, CONTRACTS_EVERY, data_of);
+        Ok(RestTransport::with(inner, records))
     }
-}
-
-/// The contracts of a futures token URL's query. A name that is not plain
-/// letters and digits is left out, as it goes into a REST path.
-fn contracts_of(query: &str) -> Vec<String> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.strip_prefix("contracts="))
-        .flat_map(|list| list.split(','))
-        .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()))
-        .map(str::to_owned)
-        .collect()
 }
 
 #[derive(Deserialize)]
@@ -120,6 +111,19 @@ struct Reply {
     msg: Option<String>,
     #[serde(default)]
     data: Option<Box<RawValue>>,
+}
+
+/// The `data` of a KuCoin reply whose code is a success.
+fn data_of(body: &[u8]) -> Result<Box<RawValue>, String> {
+    let reply: Reply = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if reply.code != OK {
+        return Err(format!(
+            "code {}: {}",
+            reply.code,
+            reply.msg.unwrap_or_default()
+        ));
+    }
+    reply.data.ok_or_else(|| "no data in the reply".to_owned())
 }
 
 #[derive(Deserialize)]
@@ -137,7 +141,9 @@ struct Server {
 /// Asks `token_url` for a token, and gives the socket URL with it.
 async fn socket_url(client: &reqwest::Client, token_url: &str) -> Result<String, TransportError> {
     let failed = |error: String| TransportError::Connect(format!("kucoin token: {error}"));
-    let data = read(client.post(token_url)).await.map_err(failed)?;
+    let data = rest_frames::read(client.post(token_url), data_of)
+        .await
+        .map_err(failed)?;
     let token: Token = serde_json::from_str(data.get()).map_err(|e| failed(e.to_string()))?;
     let server = token
         .instance_servers
@@ -163,107 +169,6 @@ fn endpoint(text: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-/// Sends a request, and gives the `data` of a successful KuCoin reply.
-async fn read(request: reqwest::RequestBuilder) -> Result<Box<RawValue>, String> {
-    let response = request
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| e.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > MAX_BODY))
-    {
-        return Err("the reply is too large".to_owned());
-    }
-    let body = response.bytes().await.map_err(|e| e.to_string())?;
-    if body.len() > MAX_BODY {
-        return Err("the reply is too large".to_owned());
-    }
-    let reply: Reply = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-    if reply.code != OK {
-        return Err(format!(
-            "code {}: {}",
-            reply.code,
-            reply.msg.unwrap_or_default()
-        ));
-    }
-    reply.data.ok_or_else(|| "no data in the reply".to_owned())
-}
-
-/// The two REST records of each contract in turn, spread over
-/// [`CONTRACTS_EVERY`], with the first records at once.
-fn records(client: reqwest::Client, contracts: Vec<String>) -> BoxStream<'static, Frame> {
-    let steps = contracts.len().saturating_mul(2).max(1);
-    let wait = CONTRACTS_EVERY / u32::try_from(steps).unwrap_or(u32::MAX);
-    stream::unfold(0_usize, move |step| {
-        let client = client.clone();
-        let contract = contracts.get(step / 2).cloned();
-        async move {
-            let contract = contract?;
-            if step >= 2 {
-                tokio::time::sleep(wait).await;
-            }
-            let (subject, path) = if step % 2 == 0 {
-                (
-                    "funding.current",
-                    format!("/api/v1/funding-rate/{contract}/current"),
-                )
-            } else {
-                ("contract", format!("/api/v1/contracts/{contract}"))
-            };
-            let fetched = read(client.get(format!("{FUTURES_REST}{path}"))).await;
-            if let Err(error) = &fetched {
-                warn!(%contract, %error, "a KuCoin contract record could not be read");
-            }
-            Some((frame(subject, &contract, fetched), (step + 1) % steps))
-        }
-    })
-    .boxed()
-}
-
-/// A REST record as a frame: `data`, or `error` when the read failed.
-fn frame(subject: &str, contract: &str, fetched: Result<Box<RawValue>, String>) -> Frame {
-    let topic = format!("/rest:{contract}");
-    let text = match fetched {
-        Ok(data) => {
-            serde_json::json!({ "type": "rest", "subject": subject, "topic": topic, "data": data })
-        }
-        Err(error) => {
-            serde_json::json!({ "type": "rest", "subject": subject, "topic": topic, "error": error })
-        }
-    };
-    Frame::Text(text.to_string())
-}
-
-/// A KuCoin connection whose REST records arrive among its frames.
-pub struct KucoinTransport<T> {
-    inner: T,
-    pending: SelectAll<BoxStream<'static, Frame>>,
-}
-
-impl<T: Transport> Transport for KucoinTransport<T> {
-    async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
-        if self.pending.is_empty() {
-            return self.inner.recv().await;
-        }
-        // Both arms are cancel-safe: the socket's `recv` is, and a pending read
-        // stays in the set until it completes.
-        tokio::select! {
-            Some(frame) = self.pending.next() => Ok(Some(frame)),
-            result = self.inner.recv() => result,
-        }
-    }
-
-    async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
-        self.inner.send_text(text).await
-    }
-
-    async fn send_ping(&mut self) -> Result<(), TransportError> {
-        self.inner.send_ping().await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,35 +189,20 @@ mod tests {
     }
 
     #[test]
-    fn a_futures_url_carries_its_contracts_and_drops_odd_names() {
+    fn a_futures_url_carries_its_contracts() {
         let url = futures_url(["XBTUSDTM", "ETHUSDTM"].into_iter());
         assert_eq!(
             url,
             "https://api-futures.kucoin.com/api/v1/bullet-public?contracts=XBTUSDTM,ETHUSDTM"
         );
         let (_, query) = url.split_once('?').expect("a query");
-        assert_eq!(contracts_of(query), ["XBTUSDTM", "ETHUSDTM"]);
-        assert_eq!(
-            contracts_of("contracts=XBTUSDTM,../x,ETH%2FM"),
-            ["XBTUSDTM"]
-        );
+        assert_eq!(rest_frames::contracts_of(query), ["XBTUSDTM", "ETHUSDTM"]);
     }
 
     #[test]
-    fn a_record_frame_holds_its_data_or_its_error() {
-        let data = RawValue::from_string(r#"{"value":0.0001}"#.to_owned()).expect("json");
-        let Frame::Text(text) = frame("funding.current", "XBTUSDTM", Ok(data)) else {
-            panic!("a text frame");
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
-        let field = |name: &str| parsed.get(name).and_then(serde_json::Value::as_str);
-        assert_eq!(field("type"), Some("rest"));
-        assert_eq!(field("subject"), Some("funding.current"));
-        assert_eq!(field("topic"), Some("/rest:XBTUSDTM"));
-        assert!(text.contains(r#""data":{"value":0.0001}"#), "{text}");
-        let Frame::Text(text) = frame("contract", "XBTUSDTM", Err("timeout".to_owned())) else {
-            panic!("a text frame");
-        };
-        assert!(text.contains(r#""error":"timeout""#), "{text}");
+    fn only_a_success_code_gives_data() {
+        assert!(data_of(br#"{"code":"200000","data":{"a":1}}"#).is_ok());
+        assert!(data_of(br#"{"code":"400100","msg":"bad"}"#).is_err());
+        assert!(data_of(br#"{"code":"200000"}"#).is_err());
     }
 }

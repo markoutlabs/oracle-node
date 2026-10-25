@@ -15,7 +15,7 @@ use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
     DecodeFn, VenueSpec, bitfinex, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures,
-    kucoin, okx,
+    kucoin, mexc, okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -537,21 +537,15 @@ impl NodeConfig {
                         feed.symbol
                     )));
                 }
-                // An OKX swap counts in contracts, and venue reports count in coins.
+                // These perpetuals count in contracts, and venue reports count in coins.
                 // Without the size, a book would also read a hundred times too deep or too thin.
-                if venue == Venue::Okx && market.is_perp() && contract_size.is_none() {
+                if let Some(field) = contract_size_field(venue)
+                    && market.is_perp()
+                    && contract_size.is_none()
+                {
                     return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: OKX swap {} needs contract_size (`ctVal` on OKX's \
-                         instruments endpoint); `oracle-node update-feeds` writes the \
-                         network's feeds with it",
-                        feed.symbol, source.symbol
-                    )));
-                }
-                if venue == Venue::Kucoin && market.is_perp() && contract_size.is_none() {
-                    return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: KuCoin perpetual {} needs contract_size (`multiplier` on \
-                         KuCoin's contracts endpoint); `oracle-node update-feeds` writes the \
-                         network's feeds with it",
+                        "feed `{}`: the {venue} perpetual {} needs contract_size ({field}); \
+                         `oracle-node update-feeds` writes the network's feeds with it",
                         feed.symbol, source.symbol
                     )));
                 }
@@ -664,7 +658,7 @@ impl NodeConfig {
 
         let mut venues: BTreeMap<Venue, Vec<VenueConnection>> = BTreeMap::new();
         for ((venue, market), instruments) in by_venue {
-            for chunk in instruments.chunks(markets_per_connection(venue)) {
+            for chunk in instruments.chunks(markets_per_connection(venue, market)) {
                 let connection = venue_connection(venue, market, chunk)?;
                 venues.entry(venue).or_default().push(connection);
             }
@@ -728,14 +722,30 @@ fn apply_endpoints(
                 Some(&mut binance.perp_base_url)
             }
             (Venue::Binance, _) => None,
-            _ => venues
-                .get_mut(&venue)
-                .and_then(|connections| {
-                    connections
-                        .iter_mut()
-                        .find(|connection| connection.spec.market == market)
-                })
-                .map(|connection| &mut connection.spec.url),
+            _ => {
+                // A market split over several connections moves whole. A
+                // connection keeps its own query, such as MEXC's `?contracts=`.
+                let mut moved = 0;
+                for connection in venues.get_mut(&venue).into_iter().flatten() {
+                    if connection.spec.market != market {
+                        continue;
+                    }
+                    let query = connection
+                        .spec
+                        .url
+                        .split_once('?')
+                        .map(|(_, q)| q.to_owned());
+                    connection.spec.url = match query {
+                        Some(query) => format!("{}?{query}", endpoint.url),
+                        None => endpoint.url.clone(),
+                    };
+                    moved += 1;
+                }
+                if moved == 0 {
+                    return Err(invalid("no feed reads this market".to_owned()));
+                }
+                continue;
+            }
         };
         *url.ok_or_else(|| invalid("no feed reads this market".to_owned()))? = endpoint.url.clone();
     }
@@ -777,11 +787,23 @@ fn book_connections(
 
 /// The most markets on one connection of a venue. A venue that refuses more
 /// channels than a limit gets its markets split over several connections.
-const fn markets_per_connection(venue: Venue) -> usize {
-    match venue {
-        Venue::Bitfinex => bitfinex::MARKETS_PER_CONNECTION,
-        Venue::Kucoin => kucoin::MARKETS_PER_CONNECTION,
+const fn markets_per_connection(venue: Venue, market: MarketKind) -> usize {
+    match (venue, market) {
+        (Venue::Bitfinex, _) => bitfinex::MARKETS_PER_CONNECTION,
+        (Venue::Kucoin, _) => kucoin::MARKETS_PER_CONNECTION,
+        (Venue::Mexc, MarketKind::Spot) => mexc::SPOT_MARKETS_PER_CONNECTION,
+        (Venue::Mexc, _) => mexc::FUTURES_MARKETS_PER_CONNECTION,
         _ => usize::MAX,
+    }
+}
+
+/// Where a venue whose perpetuals count in contracts states the coins in one.
+const fn contract_size_field(venue: Venue) -> Option<&'static str> {
+    match venue {
+        Venue::Okx => Some("`ctVal` on OKX's instruments endpoint"),
+        Venue::Kucoin => Some("`multiplier` on KuCoin's contracts endpoint"),
+        Venue::Mexc => Some("`contractSize` on MEXC's contract detail endpoint"),
+        _ => None,
     }
 }
 
@@ -871,12 +893,24 @@ fn venue_connection(
             )),
             hyperliquid::decode,
         ),
-        Venue::Kucoin if market == MarketKind::InversePerp => {
-            return Err(ConfigError::Invalid(
-                "kucoin inverse perpetuals are not supported; use the USDT-margined `…USDTM` ones"
-                    .to_owned(),
-            ));
+
+        Venue::Kucoin | Venue::Mexc if market == MarketKind::InversePerp => {
+            return Err(ConfigError::Invalid(format!(
+                "{venue} inverse perpetuals are not supported; use the USDT-margined ones"
+            )));
         }
+        Venue::Mexc if market.is_perp() => (
+            mexc::futures_url(symbols()),
+            mexc::futures_frames(with_depth()),
+            Some((mexc::KEEPALIVE_EVERY, mexc::FUTURES_KEEPALIVE.to_owned())),
+            mexc::decode_futures,
+        ),
+        Venue::Mexc => (
+            mexc::SPOT_URL.to_owned(),
+            mexc::spot_frames(with_depth()),
+            Some((mexc::KEEPALIVE_EVERY, mexc::SPOT_KEEPALIVE.to_owned())),
+            mexc::decode_spot,
+        ),
         Venue::Kucoin if market.is_perp() => (
             kucoin::futures_url(symbols()),
             kucoin::futures_frames(with_depth()),
@@ -1507,6 +1541,63 @@ sources = [
                 spec.subscribe
             );
         }
+    }
+
+    /// MEXC spot takes 30 channels on one connection, and a perpetual needs its
+    /// contract size and names its contracts in the socket URL.
+    #[test]
+    fn mexc_splits_spot_by_its_channel_limit_and_a_perp_needs_its_contract_size() {
+        let config = |size: &str| {
+            let spot: String = (0..12)
+                .map(|i| {
+                    format!("{{ venue = \"mexc\", market = \"spot\", symbol = \"C{i}USDT\" }},")
+                })
+                .collect();
+            format!(
+                r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 1
+sources = [{spot}]
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [{{ venue = "mexc", market = "linear_perp", symbol = "BTC_USDT", kinds = ["mark_price"]{size} }}]
+"#
+            )
+        };
+        let Err(error) = parse(&config("")).resolve() else {
+            panic!("a MEXC perpetual without its contract size resolves");
+        };
+        assert!(error.to_string().contains("contractSize"), "{error}");
+        let resolved = parse(&config(r#", contract_size = "0.0001""#))
+            .resolve()
+            .expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Mexc)
+            .expect("mexc")
+            .1;
+        let mut spot: Vec<usize> = connections
+            .iter()
+            .filter(|c| c.spec.market == MarketKind::Spot)
+            .map(|c| c.instruments.len())
+            .collect();
+        spot.sort_unstable();
+        assert_eq!(spot, [2, 10]);
+        assert!(
+            connections
+                .iter()
+                .any(|c| c.spec.url == "wss://contract.mexc.com/edge?contracts=BTC_USDT")
+        );
     }
 
     /// KuCoin connects through its token URL; a perpetual names its contracts

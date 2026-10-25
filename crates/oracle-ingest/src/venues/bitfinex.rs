@@ -20,12 +20,9 @@
 //!   venue's own digits reach the aggregator. Checked against the live socket
 //!   and the docs on 2026-10-25.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use oracle_types::{
-    Fixed, FundingBasis, FundingInfo, NANOS_PER_SEC, ObsKind, Observation, OpenInterestUnit,
-};
+use oracle_types::{Fixed, NANOS_PER_SEC, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -33,7 +30,7 @@ use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal_literal;
+use super::{decimal_literal, interval_funding, observation};
 
 /// The public endpoint.
 pub const URL: &str = "wss://api-pub.bitfinex.com/ws/2";
@@ -112,29 +109,6 @@ fn number(field: &'static str, raw: Option<&&RawValue>) -> Result<Option<Fixed>,
     match raw {
         Some(raw) if raw.get() != "null" => decimal_literal(field, raw).map(Some),
         _ => Ok(None),
-    }
-}
-
-fn observation(
-    entry: &crate::instrument::InstrumentEntry,
-    kind: ObsKind,
-    price: Fixed,
-    local_recv_ns: u64,
-) -> Observation {
-    Observation {
-        instrument: entry.instrument.clone(),
-        kind,
-        price,
-        bid: None,
-        ask: None,
-        bid_qty: None,
-        ask_qty: None,
-        depth_notional_1bp: None,
-        exchange_time_ns: None,
-        local_recv_ns,
-        seq: None,
-        book: None,
-        funding: None,
     }
 }
 
@@ -313,22 +287,14 @@ pub fn decode(
             let set_at = next_ns.and_then(|next| next.checked_sub(EIGHT_HOURS_NS));
             // The status repeats each second: the rate goes out when it or the open interest changed.
             let last = books.funding(&symbol);
-            let changed = rate != last.rate || open_interest != last.open_interest;
-            last.rate = rate;
-            last.open_interest = open_interest;
-            if let (true, Some(rate)) = (changed, rate) {
-                let info = FundingInfo {
-                    interval_ns: Some(EIGHT_HOURS_NS),
-                    next_funding_time_ns: next_ns,
-                    settled: set.zip(set_at),
-                    open_interest: open_interest.map(|oi| (oi, OpenInterestUnit::Base)),
-                    ..FundingInfo::new(FundingBasis::Interval)
-                };
-                out.push(Observation {
-                    funding: Some(Arc::new(info)),
-                    ..observation(&entry, ObsKind::Funding, rate, local_recv_ns)
-                });
-                emitted = true;
+            if last.update(rate, open_interest) {
+                last.interval_ns = Some(EIGHT_HOURS_NS);
+                last.next_funding_time_ns = next_ns;
+                last.settled = set.zip(set_at);
+                if let Some(funding) = interval_funding(&entry, last, local_recv_ns) {
+                    out.push(funding);
+                    emitted = true;
+                }
             }
             if emitted {
                 Ok(())
@@ -348,6 +314,7 @@ pub fn decode(
 mod tests {
     use super::*;
     use crate::InstrumentSpec;
+    use oracle_types::OpenInterestUnit;
     use oracle_types::{MarketKind, Venue};
 
     const RECV: u64 = 1_792_928_910_000_000_000;
