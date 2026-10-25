@@ -1,4 +1,4 @@
-# Every feed kind this build can actually serve, across all seven venues.
+# Every feed kind this build can actually serve, across all eight venues.
 #
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
@@ -36,8 +36,8 @@ path = "node/clients.json"
 # USDT-quoted venue would be circular: it would report 1.0 by construction on
 # exactly the day it stopped being true. §12.4.
 #
-# Coinbase and Kraken are the only two native-USD venues in scope, which makes
-# losing both a distinct failure class rather than "two of six sources down".
+# Coinbase, Kraken and Bitfinex are the native-USD venues in scope. Bitfinex
+# names Tether `UST`, so its USDT/USD book is `tUSTUSD`.
 
 [[feeds]]
 symbol = "CRYPTO.USDT/USD"
@@ -47,6 +47,7 @@ min_sources = 1
 sources = [
   { venue = "coinbase", market = "spot", symbol = "USDT-USD" },
   { venue = "kraken", market = "spot", symbol = "USDT/USD" },
+  { venue = "bitfinex", market = "spot", symbol = "tUSTUSD" },
 ]
 
 # ------------------------------------------------------------ spot, USD
@@ -65,6 +66,7 @@ min_sources = 2
 sources = [
   { venue = "coinbase", market = "spot", symbol = "BTC-USD" },
   { venue = "kraken", market = "spot", symbol = "BTC/USD" },
+  { venue = "bitfinex", market = "spot", symbol = "tBTCUSD" },
   { venue = "binance", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
@@ -79,6 +81,7 @@ min_sources = 2
 sources = [
   { venue = "coinbase", market = "spot", symbol = "ETH-USD" },
   { venue = "kraken", market = "spot", symbol = "ETH/USD" },
+  { venue = "bitfinex", market = "spot", symbol = "tETHUSD" },
   { venue = "binance", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "ETH-USDT", converted = true },
@@ -111,6 +114,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "BTCUSDT" },
   { venue = "bybit", market = "spot", symbol = "BTCUSDT" },
   { venue = "okx", market = "spot", symbol = "BTC-USDT" },
+  { venue = "bitfinex", market = "spot", symbol = "tBTCUST" },
 ]
 
 # --------------------------------------------------- perpetual mark, USD
@@ -160,6 +164,7 @@ sources = [
   { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.01" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "BTC", kinds = ["mark_price"] },
+  { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0", kinds = ["mark_price"] },
 ]
 
 [[feeds]]
@@ -170,6 +175,7 @@ sources = [
   { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", kinds = ["mark_price"], contract_size = "0.1" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "ETH", kinds = ["mark_price"] },
+  { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0", kinds = ["mark_price"] },
 ]
 
 # -------------------------------------------------- perpetual mid, USDT
@@ -187,6 +193,7 @@ sources = [
   { venue = "bybit", market = "linear_perp", symbol = "BTCUSDT" },
   { venue = "okx", market = "linear_perp", symbol = "BTC-USDT-SWAP", contract_size = "0.01" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "BTC" },
+  { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0" },
 ]
 
 [[feeds]]
@@ -198,6 +205,7 @@ sources = [
   { venue = "bybit", market = "linear_perp", symbol = "ETHUSDT" },
   { venue = "okx", market = "linear_perp", symbol = "ETH-USDT-SWAP", contract_size = "0.1" },
   { venue = "hyperliquid", market = "linear_perp", symbol = "ETH" },
+  { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0" },
 ]
 
 # --------------------------------------------------------------- funding

@@ -9,7 +9,7 @@ keeps an asset when at least three venues trade it with $1M or more a day.
 Stablecoins, fiat, wrapped and staked copies, leveraged tokens, and stock or
 commodity perpetuals are left out. The top assets by 24 h volume get:
 
-  CRYPTO.<ASSET>/USD             spot: Coinbase and Kraken in USD, Binance,
+  CRYPTO.<ASSET>/USD             spot: Coinbase, Kraken and Bitfinex in USD, Binance,
                                  Bybit and OKX in USDT through the peg, and
                                  Hyperliquid in USDC at par
   CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX and
@@ -40,6 +40,9 @@ MIN_PERP_SOURCES = 2
 UA = {"User-Agent": "price-oracle asset-feeds"}
 
 ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
+# Bitfinex's own short names of some coins.
+BITFINEX = {"UST": "USDT", "UDC": "USDC", "ALG": "ALGO", "ATO": "ATOM", "DSH": "DASH", "IOT": "IOTA",
+            "MNA": "MANA", "QTM": "QTUM"}
 STABLE = set("""USDT USDC FDUSD DAI TUSD USDP BUSD USDE USDS PYUSD USD1 RLUSD USDD FRAX LUSD GUSD
 EURC EURT EURI AEUR EUR GBP AUD TRY BRL JPY CAD CHF MXN ARS ZAR PLN UAH RUB IDR COP CZK BFUSD USDG
 USDQ USDR XUSD USDX GHO CRVUSD DOLA MIM EURQ EUROP USDO USDF USDA USD0 LISUSD SUSDE SUSDS USDB
@@ -147,6 +150,21 @@ def markets():
     for u, c in zip(perp_meta["universe"], perp_ctxs):
         if not u.get("isDelisted") and not re.match(r"^k[A-Z]", u["name"]):
             add("hyperliquid", "perp", u["name"], u["name"], "USDC", number(c.get("dayNtlVlm")))
+    # Bitfinex: `tBTCUSD` or `tDOGE:USD` in USD, `tBTCUST` in Tether, which it
+    # calls UST, and `tBTCF0:USTF0` for a Tether-margined perpetual.
+    for t in get("https://api-pub.bitfinex.com/v2/tickers?symbols=ALL"):
+        symbol = t[0]
+        if not symbol.startswith("t") or len(t) < 11 or "TEST" in symbol:
+            continue
+        name = symbol[1:]
+        usd = number(t[7]) * number(t[8])
+        if name.endswith("F0:USTF0"):
+            add("bitfinex", "perp", symbol, BITFINEX.get(name[:-8], name[:-8]), "USDT", usd)
+            continue
+        base, quote = name.split(":") if ":" in name else (name[:-3], name[-3:])
+        quote = {"UST": "USDT"}.get(quote, quote)
+        if quote in ("USD", "USDT"):
+            add("bitfinex", "spot", symbol, BITFINEX.get(base, base), quote, usd)
     spot_meta, spot_ctxs = hyperliquid({"type": "spotMetaAndAssetCtxs"})
     tokens = {t["index"]: t for t in spot_meta["tokens"]}
     volumes = {c["coin"]: number(c.get("dayNtlVlm")) for c in spot_ctxs}
@@ -197,7 +215,9 @@ def merge(path, venue, rows):
         if line == "]" and symbol and symbol in deep and f'venue = "{venue}"' not in "\n".join(out[-12:]):
             m = deep[symbol]
             market = "linear_perp" if symbol[1] == "perp" else "spot"
-            extra = ', kinds = ["mark_price"]' if symbol[1] == "perp" else ""
+            # A Tether book in a USD feed goes through the peg, as the full run writes it.
+            extra = ', kinds = ["mark_price"]' if symbol[1] == "perp" else (
+                ", converted = true" if m["quote"] == "USDT" else "")
             note = f'  # {m["raw"]}/USDC' if venue == "hyperliquid" and m["symbol"].startswith("@") else ""
             out.append(f'  {{ venue = "{venue}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},{note}')
             added += 1

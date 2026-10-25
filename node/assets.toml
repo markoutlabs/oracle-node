@@ -89,6 +89,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "XRPUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "XRPUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "XRP-USDT", converted = true },
+  { venue = "bitfinex", market = "spot", symbol = "tXRPUSD" },
 ]
 
 [[feeds]]
@@ -1312,6 +1313,7 @@ sources = [
   { venue = "binance", market = "spot", symbol = "XAUTUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "XAUTUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "XAUT-USDT", converted = true },
+  { venue = "bitfinex", market = "spot", symbol = "tXAUT:UST", converted = true },
 ]
 
 [[feeds]]
