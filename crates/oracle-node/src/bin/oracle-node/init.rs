@@ -51,6 +51,10 @@ pub(crate) struct InitArgs {
     /// Also write a systemd unit that runs the node as USER.
     #[arg(long, value_name = "USER", requires_all = ["out", "passphrase_file"])]
     pub(crate) service_user: Option<String>,
+    /// As root: leave the firewall alone. Init then neither installs nor
+    /// turns one on, and does not open the port.
+    #[arg(long, conflicts_with = "out")]
+    pub(crate) no_firewall: bool,
 }
 
 impl InitArgs {

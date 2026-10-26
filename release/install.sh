@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds oracle-node from source and installs it. When the build needs a tool
 # that is missing, it installs it: a C compiler through the system's package
-# manager, and Rust through rustup. The web proxy has its own repo.
+# manager, and Rust through rustup. The build is pinned to one commit, which
+# the binary reports in --version. The web proxy has its own repo.
 #
 #   curl -fsSL https://raw.githubusercontent.com/markoutlabs/oracle-node/main/release/install.sh | sh
 #   sudo oracle-node init
@@ -84,6 +85,34 @@ fetch() {
     run wget --https-only -q -O "$2" "$1"
   else
     fail "needs curl or wget"
+  fi
+}
+
+# Prints $1 over HTTPS only, with the Accept header $2.
+get() {
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -fsSL -H "Accept: $2" "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --https-only -q -O - --header="Accept: $2" "$1"
+  else
+    fail "needs curl or wget"
+  fi
+}
+
+# Sets COMMIT to the commit that $VERSION names, through GitHub. A tag or a
+# branch can move; the commit cannot. Without an answer, cargo resolves the
+# name itself and the binary reports no commit.
+resolve_commit() {
+  COMMIT="$(get "https://api.github.com/repos/$REPO/commits/$VERSION" \
+    application/vnd.github.sha 2>/dev/null || true)"
+  case "$COMMIT" in
+    *[!0-9a-f]* | "") COMMIT="" ;;
+  esac
+  if [ "${#COMMIT}" -ne 40 ]; then
+    COMMIT=""
+    say "  GitHub did not resolve $VERSION to a commit; cargo resolves it"
+  else
+    say "  $VERSION is commit $COMMIT"
   fi
 }
 
@@ -197,13 +226,22 @@ build() {
     say "  Less than 3.5 GB of memory: one job at a time, which is slower."
     export CARGO_BUILD_JOBS=1
   fi
+  resolve_commit
+  if [ -n "$COMMIT" ]; then
+    flag=--rev
+    ref="$COMMIT"
+  else
+    flag="$(source_flag)"
+    ref="$VERSION"
+  fi
   # On the PATH only so that cargo does not warn about a PATH without it.
   (
     # shellcheck disable=SC2030 # Only the build sees it.
     PATH="$tmp/root/bin:$PATH"
+    export ORACLE_COMMIT="$COMMIT"
     # shellcheck disable=SC2086 # CARGO can be a command with arguments.
     run $CARGO install --locked --git "https://github.com/$REPO" \
-      "$(source_flag)" "$VERSION" --root "$tmp/root" oracle-node
+      "$flag" "$ref" --root "$tmp/root" oracle-node
   )
   step_done
 }

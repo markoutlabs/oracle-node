@@ -29,7 +29,7 @@ const EXIT_CANCELLED: u8 = 130;
 #[derive(Parser)]
 #[command(
     name = "oracle-node",
-    version,
+    version = env!("ORACLE_VERSION"),
     after_help = "`oracle-node start <CONFIG> --tail` logs every decoded observation going into \
                   the aggregator and every signed update coming out, which is how you see what \
                   a venue is actually sending."
