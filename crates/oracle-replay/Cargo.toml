@@ -16,7 +16,7 @@ oracle-agg.workspace = true
 oracle-ingest.workspace = true
 oracle-node.workspace = true
 oracle-types = { workspace = true, features = ["serde"] }
-oracle-wire.workspace = true
+oracle-wire = { workspace = true, features = ["libsecp"] }
 
 clap.workspace = true
 serde_json.workspace = true

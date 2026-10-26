@@ -9,11 +9,11 @@ repository.workspace = true
 
 [dependencies]
 oracle-agg.workspace = true
-oracle-client.workspace = true
+oracle-client = { workspace = true, features = ["libsecp"] }
 oracle-ingest.workspace = true
 oracle-server.workspace = true
 oracle-types.workspace = true
-oracle-wire.workspace = true
+oracle-wire = { workspace = true, features = ["libsecp"] }
 
 age.workspace = true
 anyhow.workspace = true

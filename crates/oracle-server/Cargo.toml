@@ -28,7 +28,7 @@ tower.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oracle-client.workspace = true
+oracle-client = { workspace = true, features = ["libsecp"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-tungstenite = { workspace = true, features = ["connect"] }
 

@@ -84,6 +84,14 @@ pub mod tap;
 pub mod testing;
 pub mod verify;
 
+/// The shared types, at the SDK's own version: `Fixed`, `Symbol`, `InstrumentId`.
+pub use oracle_types as types;
+/// The signing types, at the SDK's own version: `Signer`, `Address`, `Registry`.
+pub use oracle_wire as wire;
+
+pub use oracle_types::{Fixed, InstrumentId, Symbol};
+pub use oracle_wire::{Address, Registry, Signer};
+
 pub use book::Book;
 pub use client::{
     ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, Subscription,
