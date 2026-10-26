@@ -29,7 +29,7 @@ use crate::book::Book;
 use crate::latency::{Latency, LatencyReport};
 use crate::nodes::{ConnectionState, Links, NodeFeed, NodeReport, Tally, rejected_node};
 use crate::quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
-use crate::source::{FetchError, RegistrySource};
+use crate::source::{FetchError, HttpRegistrySource, RegistrySource};
 use crate::tap::{FrameKind, Tap, TappedFrame, Verdict};
 use crate::verify::{
     AcceptedBook, AcceptedFunding, AcceptedVenues, FUNDING_MAX_AGE, RejectReason, Verifier,
@@ -468,6 +468,26 @@ impl OracleClient {
             max_registry_age: DEFAULT_MAX_REGISTRY_AGE,
             idle_timeout: IDLE_TIMEOUT,
         }
+    }
+
+    /// Starts building a client against the mainnet registry, from the trust
+    /// root this crate knows: the registry canister and the governance address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Fetch`] if this build has no mainnet trust root or
+    /// the registry cannot be fetched, or [`ClientError::Registry`] if the
+    /// document is not signed by governance.
+    pub async fn mainnet() -> Result<OracleClientBuilder, ClientError> {
+        let missing =
+            |what: &str| FetchError::Settings(format!("this build has no mainnet {what}"));
+        let canister = crate::mainnet::CANISTER_ID.ok_or_else(|| missing("canister"))?;
+        let governance: Address = crate::mainnet::GOVERNANCE_ADDRESS
+            .ok_or_else(|| missing("governance address"))?
+            .parse()
+            .map_err(|error| FetchError::Settings(format!("governance address: {error}")))?;
+        let source = Arc::new(HttpRegistrySource::canister(canister)?);
+        Self::builder_from_source(source, governance).await
     }
 
     /// Fetches the registry from `source`, verifies it against `governance`,
