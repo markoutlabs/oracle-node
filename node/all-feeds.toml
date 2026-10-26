@@ -127,6 +127,205 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "BTCUSDT" },
 ]
 
+# ------------------------------------------------- spot, stablecoin pairs
+#
+# The books between Tether, USD Coin and the dollar. With them a cycle of
+# trades can cross from one quote currency to another.
+
+[[feeds]]
+symbol = "CRYPTO.USDC/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "USDCUSDT" },
+  { venue = "bybit", market = "spot", symbol = "USDCUSDT" },
+  { venue = "okx", market = "spot", symbol = "USDC-USDT" },
+  { venue = "kucoin", market = "spot", symbol = "USDC-USDT" },
+  { venue = "mexc", market = "spot", symbol = "USDCUSDT" },
+  { venue = "kraken", market = "spot", symbol = "USDC/USDT" },
+  { venue = "bitfinex", market = "spot", symbol = "tUDCUST" },
+]
+
+# Kraken has the one native-USD book: Coinbase keeps no USDC book. The Bitfinex
+# and Binance USD books are left out, as for the peg. The Tether books count
+# through the peg, as for BTC/USD.
+[[feeds]]
+symbol = "CRYPTO.USDC/USD"
+peg = "CRYPTO.USDT/USD"
+min_sources = 2
+sources = [
+  { venue = "kraken", market = "spot", symbol = "USDC/USD" },
+  { venue = "binance", market = "spot", symbol = "USDCUSDT", converted = true },
+  { venue = "bybit", market = "spot", symbol = "USDCUSDT", converted = true },
+  { venue = "okx", market = "spot", symbol = "USDC-USDT", converted = true },
+  { venue = "kucoin", market = "spot", symbol = "USDC-USDT", converted = true },
+  { venue = "mexc", market = "spot", symbol = "USDCUSDT", converted = true },
+  { venue = "kraken", market = "spot", symbol = "USDC/USDT", converted = true },
+]
+
+# ----------------------------------------------------------- spot, USDC
+#
+# The coins' USD Coin books, priced as what they are. With USDC/USDT, a cycle
+# of three trades can stay on one venue. A venue below about $0.1M a day is
+# left out.
+
+[[feeds]]
+symbol = "CRYPTO.BTC/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BTCUSDC" },
+  { venue = "bybit", market = "spot", symbol = "BTCUSDC" },
+  { venue = "okx", market = "spot", symbol = "BTC-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "BTC-USDC" },
+  { venue = "mexc", market = "spot", symbol = "BTCUSDC" },
+  { venue = "kraken", market = "spot", symbol = "BTC/USDC" },
+  { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
+]
+
+[[feeds]]
+symbol = "CRYPTO.ETH/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ETHUSDC" },
+  { venue = "bybit", market = "spot", symbol = "ETHUSDC" },
+  { venue = "okx", market = "spot", symbol = "ETH-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "ETH-USDC" },
+  { venue = "mexc", market = "spot", symbol = "ETHUSDC" },
+  { venue = "kraken", market = "spot", symbol = "ETH/USDC" },
+  { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
+]
+
+[[feeds]]
+symbol = "CRYPTO.SOL/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "SOLUSDC" },
+  { venue = "bybit", market = "spot", symbol = "SOLUSDC" },
+  { venue = "okx", market = "spot", symbol = "SOL-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "SOL-USDC" },
+  { venue = "mexc", market = "spot", symbol = "SOLUSDC" },
+  { venue = "kraken", market = "spot", symbol = "SOL/USDC" },
+  { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
+]
+
+[[feeds]]
+symbol = "CRYPTO.XRP/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "XRPUSDC" },
+  { venue = "bybit", market = "spot", symbol = "XRPUSDC" },
+  { venue = "okx", market = "spot", symbol = "XRP-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "XRP-USDC" },
+  { venue = "mexc", market = "spot", symbol = "XRPUSDC" },
+  { venue = "kraken", market = "spot", symbol = "XRP/USDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.BNB/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BNBUSDC" },
+  { venue = "bybit", market = "spot", symbol = "BNBUSDC" },
+  { venue = "okx", market = "spot", symbol = "BNB-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "BNB-USDC" },
+  { venue = "mexc", market = "spot", symbol = "BNBUSDC" },
+  { venue = "kraken", market = "spot", symbol = "BNB/USDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ZEC/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ZECUSDC" },
+  { venue = "okx", market = "spot", symbol = "ZEC-USDC" },
+  { venue = "mexc", market = "spot", symbol = "ZECUSDC" },
+  { venue = "hyperliquid", market = "spot", symbol = "@272" },  # ZEC/USDC
+]
+
+[[feeds]]
+symbol = "CRYPTO.SUI/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "SUIUSDC" },
+  { venue = "bybit", market = "spot", symbol = "SUIUSDC" },
+  { venue = "okx", market = "spot", symbol = "SUI-USDC" },
+  { venue = "mexc", market = "spot", symbol = "SUIUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.LINK/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "LINKUSDC" },
+  { venue = "okx", market = "spot", symbol = "LINK-USDC" },
+  { venue = "kucoin", market = "spot", symbol = "LINK-USDC" },
+  { venue = "mexc", market = "spot", symbol = "LINKUSDC" },
+  { venue = "kraken", market = "spot", symbol = "LINK/USDC" },
+]
+
+# ------------------------------------------------------ spot, BTC and ETH
+#
+# Books quoted in a coin, for cycles of trades between coins. Prices have 8
+# decimals, so XRP/BTC and TRX/BTC are left out: one step is 6 and 24 bp.
+
+[[feeds]]
+symbol = "CRYPTO.ETH/BTC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ETHBTC" },
+  { venue = "bybit", market = "spot", symbol = "ETHBTC" },
+  { venue = "okx", market = "spot", symbol = "ETH-BTC" },
+  { venue = "kucoin", market = "spot", symbol = "ETH-BTC" },
+  { venue = "mexc", market = "spot", symbol = "ETHBTC" },
+  { venue = "kraken", market = "spot", symbol = "ETH/BTC" },
+  { venue = "coinbase", market = "spot", symbol = "ETH-BTC" },
+  { venue = "bitfinex", market = "spot", symbol = "tETHBTC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.SOL/BTC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "SOLBTC" },
+  { venue = "bybit", market = "spot", symbol = "SOLBTC" },
+  { venue = "okx", market = "spot", symbol = "SOL-BTC" },
+  { venue = "kraken", market = "spot", symbol = "SOL/BTC" },
+  { venue = "coinbase", market = "spot", symbol = "SOL-BTC" },
+  { venue = "bitfinex", market = "spot", symbol = "tSOLBTC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.BNB/BTC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "BNBBTC" },
+  { venue = "kucoin", market = "spot", symbol = "BNB-BTC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ZEC/BTC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ZECBTC" },
+  { venue = "kucoin", market = "spot", symbol = "ZEC-BTC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.SOL/ETH"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "SOLETH" },
+  { venue = "kraken", market = "spot", symbol = "SOL/ETH" },
+  { venue = "coinbase", market = "spot", symbol = "SOL-ETH" },
+]
+
+# Only Binance lists BNB/ETH with volume, so one source makes the price.
+[[feeds]]
+symbol = "CRYPTO.BNB/ETH"
+min_sources = 1
+sources = [
+  { venue = "binance", market = "spot", symbol = "BNBETH" },
+]
+
 # --------------------------------------------------- perpetual mark, USD
 #
 # Deribit's BTC-PERPETUAL is inverse (coin-margined) but USD-quoted; Kraken
