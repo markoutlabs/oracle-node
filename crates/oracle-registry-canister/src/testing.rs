@@ -278,6 +278,21 @@ impl Harness {
         )
     }
 
+    /// Governance sets the price window, in seconds.
+    pub fn set_price_window(&self, secs: u64) -> Result<(), String> {
+        self.update(
+            self.governance,
+            "set_price_window",
+            Encode!(&secs).expect("encodes"),
+        )
+    }
+
+    /// The price window, in seconds.
+    #[must_use]
+    pub fn price_window(&self) -> u64 {
+        self.query("get_price_window", Encode!().expect("encodes"))
+    }
+
     /// Governance sets the priced feeds.
     pub fn set_feeds(&self, symbols: &[&str]) -> Result<(), String> {
         let symbols: Vec<String> = symbols.iter().map(|symbol| (*symbol).to_owned()).collect();

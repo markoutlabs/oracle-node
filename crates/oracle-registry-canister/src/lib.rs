@@ -176,6 +176,15 @@ fn push(frames: Vec<ByteBuf>) -> Result<Vec<Verdict>, String> {
     Ok(verdicts)
 }
 
+/// Governance sets how long a node's latest update counts toward the quorum,
+/// in seconds. About three push intervals: 25 for pushes every 7 s.
+#[ic_cdk::update(guard = "governance_only")]
+fn set_price_window(secs: u64) -> Result<(), String> {
+    with_prices(|prices| prices.set_window(std::time::Duration::from_secs(secs)))?;
+    certify_documents();
+    Ok(())
+}
+
 /// Governance sets the feeds that the canister prices, as canonical symbols.
 /// A feed that stays keeps its frames.
 #[ic_cdk::update(guard = "governance_only")]
@@ -321,6 +330,12 @@ fn get_feeds() -> Vec<FeedInfo> {
     })
 }
 
+/// How long a node's latest update counts toward the quorum, in seconds.
+#[ic_cdk::query]
+fn get_price_window() -> u64 {
+    read_prices(|prices| prices.window().as_secs())
+}
+
 /// One feed's price, resolved now, by its 32-byte feed id.
 #[ic_cdk::query]
 fn get_price(feed_id: ByteBuf) -> Option<PriceRecord> {
@@ -426,7 +441,7 @@ mod tests {
             .zip(source.lines().skip(1))
             .filter(|(attribute, _)| attribute.starts_with("#[ic_cdk::update"))
             .collect();
-        assert_eq!(updates.len(), 12);
+        assert_eq!(updates.len(), 13);
         for (attribute, signature) in updates {
             let guard = if signature.starts_with("fn push(") {
                 "anonymous_only"

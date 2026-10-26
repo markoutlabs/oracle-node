@@ -257,3 +257,23 @@ fn a_removed_node_loses_its_seat_at_once() {
     assert_eq!((btc.status, btc.nodes), (PriceStatus::Halted, 2));
     assert!(h.push(&[frame(&h, &nodes[2], BTC, 2, 1)]).is_err());
 }
+
+#[test]
+fn governance_sets_the_price_window() {
+    let (h, nodes) = three_nodes();
+    assert_eq!(h.price_window(), 75, "the default");
+    push_btc(&h, &nodes, 1);
+    assert_eq!(h.set_price_window(25), Ok(()));
+    assert_eq!(h.price_window(), 25);
+    assert!(h.set_price_window(5).is_err(), "below the minimum");
+    h.pass_time(20);
+    assert_eq!(h.price(BTC).expect("listed").status, PriceStatus::Ok);
+    h.pass_time(10);
+    assert_eq!(
+        h.price(BTC).expect("listed").status,
+        PriceStatus::Halted,
+        "no push for 30 s, past the 25 s window"
+    );
+    h.upgrade();
+    assert_eq!(h.price_window(), 25, "an upgrade keeps it");
+}

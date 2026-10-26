@@ -108,7 +108,8 @@ pub struct PublishSettings {
     #[serde(default = "default_publish_gateway")]
     pub gateway: String,
     /// Seconds after which a feed is pushed even when its price did not move.
-    /// At most 60: the canister counts a frame for 75 s.
+    /// At most 60, and less than half the canister's price window
+    /// (`get_price_window`), or a quiet feed drops out of its quorum.
     #[serde(default = "default_publish_heartbeat_secs")]
     pub heartbeat_secs: u64,
     /// A price move this large since the last push, in basis points, pushes

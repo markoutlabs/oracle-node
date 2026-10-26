@@ -140,6 +140,7 @@ async fn run(
                 Ok(feeds) => {
                     planner.set_feeds(feeds);
                     read_feeds_at = Instant::now() + FEEDS_EVERY;
+                    check_window(&agent, &canister, target.policy.heartbeat).await;
                 }
                 Err(error) => {
                     minute.failed(format!("get_feeds: {error}"));
@@ -207,6 +208,27 @@ fn agent(target: &PushTarget) -> Result<Agent, ic_agent::AgentError> {
         agent.set_root_key(root_key.clone());
     }
     Ok(agent)
+}
+
+/// Warns when a quiet feed could drop out of the canister's quorum: its node
+/// pushes it only once each heartbeat.
+async fn check_window(agent: &Agent, canister: &Principal, heartbeat: Duration) {
+    let Ok(arg) = Encode!() else { return };
+    let reply = agent
+        .query(canister, "get_price_window")
+        .with_arg(arg)
+        .call()
+        .await;
+    let Some(window) = reply.ok().and_then(|reply| Decode!(&reply, u64).ok()) else {
+        return;
+    };
+    if heartbeat.as_secs().saturating_mul(2) > window {
+        warn!(
+            heartbeat_secs = heartbeat.as_secs(),
+            window_secs = window,
+            "the canister counts an update for less than two heartbeats; lower publish.heartbeat_secs"
+        );
+    }
 }
 
 async fn feeds(agent: &Agent, canister: &Principal) -> Result<Vec<FeedId>, String> {

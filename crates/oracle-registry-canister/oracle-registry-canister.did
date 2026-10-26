@@ -212,6 +212,8 @@ service : (InitArgs) -> {
   get_node_listing : (text) -> (opt text) query;
   // One feed's price, resolved now, by its 32-byte feed id.
   get_price : (blob) -> (opt PriceRecord) query;
+  // How long a node's latest update counts toward the quorum, in seconds.
+  get_price_window : () -> (nat64) query;
   // Every listed feed's price, resolved now.
   get_prices : () -> (vec PriceRecord) query;
   // The last published registry document as JSON, if any.
@@ -244,6 +246,9 @@ service : (InitArgs) -> {
   // Governance sets the feeds that the canister prices, as canonical symbols.
   // A feed that stays keeps its frames.
   set_feeds : (vec text) -> (Result_3);
+  // Governance sets how long a node's latest update counts toward the quorum,
+  // in seconds. About three push intervals: 25 for pushes every 7 s.
+  set_price_window : (nat64) -> (Result_3);
   // Governance changes the quorum guidance. Returns the new version.
   set_quorum : (nat16, nat16) -> (Result);
 }

@@ -290,7 +290,8 @@ let btc: Option<PriceRecord> = reply.candid()?;
 ```
 
 The price is `price × 10^expo`. Use it only when the status is `Ok` or
-`Degraded`. A feed whose nodes stop pushing goes `Halted` after 75 s.
+`Degraded`. A feed whose nodes stop pushing goes `Halted` after the canister's
+price window, 75 s by default (`get_price_window`).
 `get_feeds` lists the priced feeds and their ids.
 
 ### Certified, over HTTPS

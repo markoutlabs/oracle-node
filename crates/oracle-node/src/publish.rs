@@ -21,7 +21,8 @@ pub const MAX_UPDATES_PER_PUSH: usize = oracle_wire::MAX_BATCH_UPDATES;
 /// means the feed stopped, and a push of it would only be refused.
 pub const MAX_FRAME_AGE: Duration = Duration::from_secs(25);
 
-/// The canister counts a frame for 75 s, so a longer heartbeat halts the feed.
+/// The longest heartbeat. The canister's price window must hold two of them;
+/// the node warns when it does not.
 const MAX_HEARTBEAT_SECS: u64 = 60;
 
 /// When to push a feed.
@@ -79,7 +80,7 @@ impl PushTarget {
             .map_err(|error| invalid(format!("registry.root_key: {error}")))?;
         if !(1..=MAX_HEARTBEAT_SECS).contains(&publish.heartbeat_secs) {
             return Err(invalid(format!(
-                "heartbeat_secs must be 1 to {MAX_HEARTBEAT_SECS}: the canister counts a frame for 75 s"
+                "heartbeat_secs must be 1 to {MAX_HEARTBEAT_SECS}"
             )));
         }
         if !(1..=publish.heartbeat_secs).contains(&publish.min_interval_secs) {

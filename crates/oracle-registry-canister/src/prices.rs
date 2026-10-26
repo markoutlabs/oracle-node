@@ -31,9 +31,15 @@ pub const ACCEPT_MAX_AGE: Duration = Duration::from_secs(30);
 /// wall time.
 pub const ACCEPT_MAX_SKEW: Duration = Duration::from_secs(10);
 
-/// How long a node's last frame counts toward the quorum: two push
-/// heartbeats of 30 s and a margin for ingress.
-pub const RESOLVE_MAX_AGE: Duration = Duration::from_secs(75);
+/// How long a node's latest update counts toward the quorum, until governance
+/// sets it: two push heartbeats of 30 s and a margin for ingress.
+pub const DEFAULT_PRICE_WINDOW: Duration = Duration::from_secs(75);
+
+/// The shortest price window: ingress alone takes some seconds.
+pub const MIN_PRICE_WINDOW: Duration = Duration::from_secs(10);
+
+/// The longest price window.
+pub const MAX_PRICE_WINDOW: Duration = Duration::from_secs(600);
 
 /// What `push` did with one frame.
 #[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +158,8 @@ pub struct StoredPrices {
     pub feeds: Vec<String>,
     /// Each frame or batch that holds a node's latest update of a feed.
     pub frames: Vec<ByteBuf>,
+    /// The price window in seconds, when governance set one.
+    pub window_secs: Option<u64>,
 }
 
 /// A frame or a batch that holds a node's latest update of some feeds.
@@ -170,6 +178,7 @@ pub struct Source<'a> {
 pub struct Prices {
     verifier: Option<Verifier>,
     quorum: usize,
+    window: Option<Duration>,
     feeds: BTreeMap<FeedId, Feed>,
 }
 
@@ -367,11 +376,36 @@ impl Prices {
         }
     }
 
+    /// Sets how long a node's latest update counts toward the quorum. About
+    /// three push intervals keeps a feed live through one lost push.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for a window outside [`MIN_PRICE_WINDOW`] to
+    /// [`MAX_PRICE_WINDOW`].
+    pub fn set_window(&mut self, window: Duration) -> Result<(), String> {
+        if !(MIN_PRICE_WINDOW..=MAX_PRICE_WINDOW).contains(&window) {
+            return Err(format!(
+                "the price window must be {} to {} s",
+                MIN_PRICE_WINDOW.as_secs(),
+                MAX_PRICE_WINDOW.as_secs()
+            ));
+        }
+        self.window = Some(window);
+        Ok(())
+    }
+
+    /// How long a node's latest update counts toward the quorum.
+    #[must_use]
+    pub fn window(&self) -> Duration {
+        self.window.unwrap_or(DEFAULT_PRICE_WINDOW)
+    }
+
     fn quorum_config(&self) -> QuorumConfig {
         QuorumConfig {
             quorum: self.quorum.max(1),
-            max_age: RESOLVE_MAX_AGE,
-            slow_max_age: RESOLVE_MAX_AGE,
+            max_age: self.window(),
+            slow_max_age: self.window(),
             ..QuorumConfig::default()
         }
     }
@@ -440,6 +474,7 @@ impl Prices {
                 .into_iter()
                 .map(|source| ByteBuf::from(source.bytes.to_vec()))
                 .collect(),
+            window_secs: self.window.map(|window| window.as_secs()),
         }
     }
 
@@ -453,6 +488,9 @@ impl Prices {
             .collect();
         let mut prices = Self::default();
         prices.set_feeds(&symbols);
+        if let Some(secs) = stored.window_secs {
+            let _ = prices.set_window(Duration::from_secs(secs));
+        }
         if let Some(registry) = registry {
             prices.set_registry(registry);
         }
@@ -610,7 +648,7 @@ mod tests {
 
         prices.push(&[frame(&nodes[2], NOW, 1, 1)], NOW);
         assert_eq!(btc_price(&prices, NOW).status, PriceStatus::Ok);
-        let later = NOW + nanos(RESOLVE_MAX_AGE) + 1;
+        let later = NOW + nanos(DEFAULT_PRICE_WINDOW) + 1;
         assert_eq!(btc_price(&prices, later).status, PriceStatus::Halted);
     }
 
@@ -755,6 +793,40 @@ mod tests {
         let older = nodes[0].sign_batch(&[update("CRYPTO.ETH/USD", later, 4, 1)]);
         assert_eq!(restored.push(&[&older], later), [Verdict::Replayed]);
         assert_eq!(restored.to_stored(), stored);
+    }
+
+    #[test]
+    fn governance_sets_the_price_window() {
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        prices.push(&[frame(&node, NOW, 1, 1)], NOW);
+        let at = |secs: u64| NOW + secs * NANOS_PER_SEC;
+        assert_eq!(
+            btc_price(&prices, at(60)).status,
+            PriceStatus::Ok,
+            "75 s by default"
+        );
+
+        prices
+            .set_window(Duration::from_secs(25))
+            .expect("in range");
+        assert_eq!(btc_price(&prices, at(25)).status, PriceStatus::Ok);
+        assert_eq!(btc_price(&prices, at(26)).status, PriceStatus::Halted);
+        for out_of_range in [9, 601] {
+            assert!(
+                prices
+                    .set_window(Duration::from_secs(out_of_range))
+                    .is_err()
+            );
+        }
+        assert_eq!(prices.window(), Duration::from_secs(25));
+
+        let restored = Prices::restore(&prices.to_stored(), Some(registry_with(&[&node])));
+        assert_eq!(
+            restored.window(),
+            Duration::from_secs(25),
+            "an upgrade keeps it"
+        );
     }
 
     /// The current mainnet canister saved one value. The new one reads a
