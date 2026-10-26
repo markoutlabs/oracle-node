@@ -8,18 +8,31 @@ use oracle_client::testing::{TestNode, update_at};
 use oracle_client::{Certification, HttpDocumentSource};
 use oracle_registry_canister::prices::{PriceStatus, Verdict};
 use oracle_registry_canister::testing::Harness;
-use oracle_types::Symbol;
+use oracle_types::{PriceUpdate, Symbol};
 use oracle_wire::feed_id;
 
 const BTC: &str = "CRYPTO.BTC/USD";
 const ETH: &str = "CRYPTO.ETH/USD";
 
-fn frame(h: &Harness, node: &TestNode, symbol: &str, seq: u64, price: i64) -> Vec<u8> {
+fn update(h: &Harness, symbol: &str, seq: u64, price: i64) -> PriceUpdate {
     let symbol: Symbol = symbol.parse().expect("a valid symbol");
     let mut update = update_at(h.now_ns(), seq);
     update.feed_id = feed_id(&symbol);
     update.price = price;
-    node.sign(&update)
+    update
+}
+
+fn frame(h: &Harness, node: &TestNode, symbol: &str, seq: u64, price: i64) -> Vec<u8> {
+    node.sign(&update(h, symbol, seq, price))
+}
+
+/// One node's push of these feeds as one batch.
+fn batch(h: &Harness, node: &TestNode, symbols: &[&str], seq: u64) -> Vec<u8> {
+    let updates: Vec<PriceUpdate> = symbols
+        .iter()
+        .map(|symbol| update(h, symbol, seq, 6_400_000_000_000))
+        .collect();
+    node.sign_batch(&updates)
 }
 
 /// Three listed nodes and two priced feeds.
@@ -78,12 +91,22 @@ fn a_push_with_nothing_new_never_reaches_the_canister() {
         Ok(vec![Verdict::Accepted])
     );
 
-    let before = h.cycles();
     let stranger = frame(&h, &TestNode::new(9), BTC, 1, 1);
     let unlisted = frame(&h, &nodes[0], "CRYPTO.SOL/USD", 1, 1);
     let older = frame(&h, &nodes[0], BTC, 0, 1);
+    let pushed = batch(&h, &nodes[1], &[BTC, ETH], 1);
+    assert_eq!(
+        h.push(std::slice::from_ref(&pushed)),
+        Ok(vec![Verdict::Accepted; 2])
+    );
+    let before = h.cycles();
     for (label, frames) in [
         ("a replay", vec![accepted.clone()]),
+        ("a batch replay", vec![pushed]),
+        (
+            "a stranger's batch",
+            vec![batch(&h, &TestNode::new(9), &[BTC], 1)],
+        ),
         ("an older sequence", vec![older]),
         ("a stranger's frame", vec![stranger]),
         ("an unlisted feed", vec![unlisted]),
@@ -125,31 +148,46 @@ fn a_mixed_push_gets_a_verdict_for_each_frame() {
 }
 
 #[test]
-fn a_push_of_fourteen_frames_stays_cheap() {
+fn a_batch_costs_one_signature_for_all_its_updates() {
     let h = Harness::new(1, "dfx_test_key", None);
     let node = TestNode::new(1);
     h.add_node(&node.entry()).expect("listed");
     let symbols: Vec<String> = [
-        "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT", "LTC", "BCH", "UNI",
-        "ATOM", "NEAR",
+        "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "TRX", "AVAX", "LINK", "DOT", "LTC",
+        "BCH", "UNI",
     ]
     .iter()
     .map(|asset| format!("CRYPTO.{asset}/USD"))
     .collect();
     let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
     h.set_feeds(&refs).expect("governance sets the feeds");
-    let frames: Vec<Vec<u8>> = refs
-        .iter()
-        .map(|symbol| frame(&h, &node, symbol, 1, 1))
-        .collect();
 
-    let before = h.cycles();
-    let verdicts = h.push(&frames).expect("accepted");
-    let cost = before - h.cycles();
-    eprintln!("one push of 14 frames: {cost} cycles");
-    assert_eq!(verdicts, vec![Verdict::Accepted; 14]);
-    // About $0.0007 at 1 XDR per trillion cycles: the plan's upper estimate.
-    assert!(cost < 500_000_000, "a push of 14 frames cost {cost} cycles");
+    let first = refs.get(..1).expect("14 feeds");
+    let ten_feeds = refs.get(..10).expect("14 feeds");
+    let cost = |pushed: Vec<Vec<u8>>, updates: usize| {
+        let before = h.cycles();
+        let verdicts = h.push(&pushed).expect("accepted");
+        assert_eq!(verdicts, vec![Verdict::Accepted; updates]);
+        before - h.cycles()
+    };
+    let one = cost(vec![batch(&h, &node, first, 1)], 1);
+    let ten = cost(vec![batch(&h, &node, ten_feeds, 2)], 10);
+    let fourteen = cost(vec![batch(&h, &node, &refs, 3)], 14);
+    let singles: Vec<Vec<u8>> = ten_feeds
+        .iter()
+        .map(|symbol| frame(&h, &node, symbol, 4, 1))
+        .collect();
+    let ten_frames = cost(singles, 10);
+    eprintln!(
+        "one batch of 1 update: {one} cycles; of 10: {ten}; of 14: {fourteen}; \
+         10 single frames: {ten_frames}"
+    );
+    // One recovery for the batch: its updates add bytes and bookkeeping only.
+    assert!(ten < 40_000_000, "a batch of 10 cost {ten} cycles");
+    assert!(
+        ten * 3 < ten_frames,
+        "a batch of 10 must cost far less than 10 frames"
+    );
 }
 
 #[test]
@@ -185,11 +223,12 @@ fn the_prices_are_certified_through_the_gateway() {
         .and_then(serde_json::Value::as_array)
         .expect("a list");
     assert_eq!(frames.len(), 3);
-    assert!(
-        frames
-            .iter()
-            .all(|frame| frame.pointer("/symbol").and_then(serde_json::Value::as_str) == Some(BTC))
-    );
+    assert!(frames.iter().all(|frame| {
+        frame
+            .pointer("/symbols/0")
+            .and_then(serde_json::Value::as_str)
+            == Some(BTC)
+    }));
 }
 
 #[test]

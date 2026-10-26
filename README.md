@@ -303,8 +303,8 @@ The gateway checks the canister's certificate before it serves the document.
 To check it yourself, fetch from the `raw` domain and verify it with
 `ic-response-verification`, as the SDK does for `/registry.json`. The document
 is resolved when the last frame arrived, so also check `resolved_at_ns`.
-`/frames.json` holds the nodes' signed frames, for a client that checks the
-nodes itself.
+`/frames.json` holds the nodes' signed batches and frames, for a client that
+checks the nodes itself.
 
 ### From a browser
 
@@ -424,8 +424,9 @@ make governance ENV=ic IDENTITY=<identity>    # prints the canister id and gover
 ```
 
 The canister signs with the `key_1` threshold key. Each signature costs cycles,
-and so does each push from a node: about 12T cycles a month for each node on a
-quiet market (SPEC §3.7). Keep the canister funded.
+and so does each push from a node. A node signs each push as one batch, so the
+canister checks one signature for it: about 21M cycles a push, or 1.9T cycles a
+month for each node at the 30 s heartbeat (SPEC §3.7). Keep the canister funded.
 
 On an installed canister, `make deploy` upgrades it and keeps every node,
 client and price. After the first upgrade with prices, governance lists the

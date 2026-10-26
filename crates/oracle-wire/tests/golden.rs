@@ -40,9 +40,9 @@ use oracle_types::{
 };
 use oracle_wire::{
     NodeEntry, Quorum, Registry, Signer, UnverifiedBookFrame, UnverifiedFrame,
-    UnverifiedFundingFrame, UnverifiedVenueFrame, decode_book_update, decode_funding_update,
-    decode_venue_report, domain, encode_book_update, encode_funding_update, encode_price_update,
-    encode_venue_report, feed_id,
+    UnverifiedFundingFrame, UnverifiedPriceBatch, UnverifiedVenueFrame, decode_book_update,
+    decode_funding_update, decode_price_batch, decode_venue_report, domain, encode_book_update,
+    encode_funding_update, encode_price_batch, encode_price_update, encode_venue_report, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,19 @@ struct GoldenFile {
     venue_reports: Vec<VenueReportVector>,
     book_updates: Vec<BookUpdateVector>,
     funding_updates: Vec<FundingUpdateVector>,
+    price_batches: Vec<PriceBatchVector>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct PriceBatchVector {
+    name: String,
+    secret_key: String,
+    signer: String,
+    updates: Vec<PriceUpdate>,
+    payload: String,
+    digest: String,
+    signature: String,
+    frame: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -636,6 +649,36 @@ fn build() -> GoldenFile {
         })
         .collect();
 
+    let update = |name: &str| {
+        sample_updates()
+            .into_iter()
+            .find(|(sample, _, _)| *sample == name)
+            .map(|(_, _, update)| update)
+            .expect("a sample update")
+    };
+    let price_batches = [
+        (
+            "btc_and_funding",
+            vec![update("btc_usd_healthy"), update("funding_rate_negative")],
+        ),
+        ("one_halted_update", vec![update("btc_usd_halted")]),
+    ]
+    .into_iter()
+    .map(|(name, updates)| {
+        let signed = node.sign_price_batch(&updates).expect("encodes");
+        PriceBatchVector {
+            name: name.to_owned(),
+            secret_key: hex0x(&node_secret),
+            signer: node.address().to_string(),
+            updates,
+            payload: hex0x(signed.payload()),
+            digest: hex0x(&domain::digest(signed.payload())),
+            signature: signed.signature().to_string(),
+            frame: hex0x(&signed.encode_frame()),
+        }
+    })
+    .collect();
+
     GoldenFile {
         note: "Frozen protocol vectors. A diff here means the wire format changed \
                and previously-issued signatures no longer verify."
@@ -658,6 +701,7 @@ fn build() -> GoldenFile {
         venue_reports,
         book_updates,
         funding_updates,
+        price_batches,
     }
 }
 
@@ -760,6 +804,10 @@ fn golden_vectors_are_unchanged() {
         generated.funding_updates, expected.funding_updates,
         "funding update encoding changed"
     );
+    assert_eq!(
+        generated.price_batches, expected.price_batches,
+        "price batch encoding changed"
+    );
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.
@@ -814,6 +862,14 @@ fn stored_frames_verify_against_the_stored_registry() {
             .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
         assert_eq!(verified.update(), &vector.update);
     }
+    for vector in &file.price_batches {
+        let frame = hex::decode(vector.frame.trim_start_matches("0x")).expect("valid hex");
+        let verified = UnverifiedPriceBatch::parse(&frame)
+            .expect("frame parses")
+            .verify(&registry)
+            .unwrap_or_else(|e| panic!("`{}` does not verify: {e}", vector.name));
+        assert_eq!(verified.updates(), vector.updates.as_slice());
+    }
 }
 
 /// Decoding the stored payload must reproduce the stored logical update, and
@@ -854,6 +910,17 @@ fn stored_payloads_round_trip() {
         assert_eq!(decoded, vector.update, "`{}`", vector.name);
         assert_eq!(
             hex0x(&encode_book_update(&decoded).expect("encodes")),
+            vector.payload,
+            "`{}` did not re-encode identically",
+            vector.name
+        );
+    }
+    for vector in file.price_batches {
+        let bytes = hex::decode(vector.payload.trim_start_matches("0x")).expect("valid hex");
+        let decoded = decode_price_batch(&bytes).expect("decodes");
+        assert_eq!(decoded, vector.updates, "`{}`", vector.name);
+        assert_eq!(
+            hex0x(&encode_price_batch(&decoded).expect("encodes")),
             vector.payload,
             "`{}` did not re-encode identically",
             vector.name

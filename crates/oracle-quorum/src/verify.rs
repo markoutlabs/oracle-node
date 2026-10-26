@@ -23,7 +23,7 @@ use oracle_types::{
 };
 use oracle_wire::{
     Address, NodeListing, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
-    UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
+    UnverifiedPriceBatch, UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
 };
 
 /// Freshness policy.
@@ -183,6 +183,17 @@ pub struct Accepted {
     pub node_index: usize,
 }
 
+/// A price batch whose signature passed, with the checks of each update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedBatch {
+    /// The node that signed it: the address its key recovered to.
+    pub signer: Address,
+    /// That node's index in the registry it was verified against.
+    pub node_index: usize,
+    /// Each update, or why it was refused, in the batch's order.
+    pub updates: Vec<Result<PriceUpdate, RejectReason>>,
+}
+
 /// Verifies frames against a pinned registry and a freshness policy.
 ///
 /// Holds the per-`(node, feed)` sequence high-water marks, so it must persist
@@ -291,7 +302,55 @@ impl Verifier {
         let update = *verified.update();
         let signer = verified.signer();
         let node_index = verified.node_index();
+        let update = self.check_update(signer, update, now_ns)?;
+        Ok(Accepted {
+            update,
+            signer,
+            node_index,
+        })
+    }
 
+    /// Verifies a price batch: one signature for every update, then the
+    /// checks of [`Self::accept`] on each update alone. Each update shares the
+    /// sequence marks of the node's single price frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`] for the whole batch when it is malformed or its
+    /// signer is not a listed node.
+    pub fn accept_batch(
+        &mut self,
+        frame: &[u8],
+        now_ns: u64,
+    ) -> Result<AcceptedBatch, RejectReason> {
+        let parsed = UnverifiedPriceBatch::parse(frame).map_err(VerifyError::from)?;
+        let verified = match parsed.verify(&self.registry) {
+            Ok(verified) => verified,
+            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
+                return Err(RejectReason::RetiredKey { signer });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let signer = verified.signer();
+        let node_index = verified.node_index();
+        let updates = verified
+            .into_updates()
+            .into_iter()
+            .map(|update| self.check_update(signer, update, now_ns))
+            .collect();
+        Ok(AcceptedBatch {
+            signer,
+            node_index,
+            updates,
+        })
+    }
+
+    fn check_update(
+        &mut self,
+        signer: Address,
+        update: PriceUpdate,
+        now_ns: u64,
+    ) -> Result<PriceUpdate, RejectReason> {
         if update.observation_time_ns > update.publish_time_ns {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
@@ -309,11 +368,7 @@ impl Verifier {
             update.seq,
             signer,
         )?;
-        Ok(Accepted {
-            update,
-            signer,
-            node_index,
-        })
+        Ok(update)
     }
 
     /// Verifies one venue report frame, with the same checks as a price frame.
@@ -552,6 +607,60 @@ mod tests {
 
     fn verifier(node: &TestNode) -> Verifier {
         Verifier::new(registry_with(&[node]), VerifyConfig::default())
+    }
+
+    fn on_feed(update: PriceUpdate, feed: u8) -> PriceUpdate {
+        PriceUpdate {
+            feed_id: FeedId::from_bytes([feed; 32]),
+            ..update
+        }
+    }
+
+    #[test]
+    fn a_batch_checks_one_signature_and_each_update_alone() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let stale = on_feed(update_at(NOW - 3 * NANOS_PER_SEC, 5), 2);
+        let batch = node.sign_batch(&[update_at(NOW, 5), stale]);
+        let accepted = verifier
+            .accept_batch(&batch, NOW)
+            .expect("the signature passes");
+        assert_eq!(accepted.signer, node.signing_address());
+        let [fresh, old] = accepted.updates.as_slice() else {
+            panic!("two verdicts: {:?}", accepted.updates);
+        };
+        assert_eq!(fresh.as_ref().map(|update| update.seq), Ok(5));
+        assert!(matches!(old, Err(RejectReason::TooOld { .. })), "{old:?}");
+    }
+
+    #[test]
+    fn a_batch_shares_the_sequence_of_single_frames() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let batch = node.sign_batch(&[update_at(NOW, 5)]);
+        assert!(verifier.accept_batch(&batch, NOW).is_ok());
+        assert!(matches!(
+            verifier.accept(&node.sign(&update_at(NOW, 5)), NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
+        let again = verifier
+            .accept_batch(&batch, NOW)
+            .expect("the signature passes");
+        assert!(matches!(
+            again.updates.as_slice(),
+            [Err(RejectReason::Replayed { .. })]
+        ));
+    }
+
+    #[test]
+    fn a_batch_from_a_stranger_is_refused_whole() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let batch = TestNode::new(9).sign_batch(&[update_at(NOW, 1)]);
+        assert!(matches!(
+            verifier.accept_batch(&batch, NOW),
+            Err(RejectReason::Untrusted(VerifyError::UnknownSigner { .. }))
+        ));
     }
 
     #[test]

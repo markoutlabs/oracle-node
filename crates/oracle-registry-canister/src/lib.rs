@@ -160,7 +160,8 @@ fn accepts_push() -> bool {
         && with_prices(|prices| prices.accepts_any(&frames, now_ns()))
 }
 
-/// A node pushes its latest frames. Returns one verdict for each, in order.
+/// A node pushes its latest updates as one batch, or as single frames.
+/// Returns one verdict for each update, in order.
 #[ic_cdk::update(guard = "anonymous_only")]
 fn push(frames: Vec<ByteBuf>) -> Result<Vec<Verdict>, String> {
     if frames.len() > MAX_FRAMES_PER_PUSH {
@@ -340,17 +341,25 @@ pub(crate) fn prices_document() -> String {
     serde_json::json!({ "resolved_at_ns": now.to_string(), "prices": prices }).to_string()
 }
 
-/// `/frames.json`: each node's latest frame of each feed, for clients that
-/// verify the nodes themselves.
+/// `/frames.json`: each frame or batch that holds a node's latest update of a
+/// feed, for clients that verify the nodes themselves.
 pub(crate) fn frames_document() -> String {
     let frames: Vec<serde_json::Value> = read_prices(|prices| {
         prices
-            .frames()
-            .map(|(symbol, node, bytes)| {
+            .sources()
+            .into_iter()
+            .map(|source| {
+                let kind = if source.bytes.first() == Some(&oracle_wire::FRAME_TYPE_PRICE_BATCH) {
+                    "batch"
+                } else {
+                    "price"
+                };
+                let symbols: Vec<String> = source.symbols.iter().map(ToString::to_string).collect();
                 serde_json::json!({
-                    "symbol": symbol.to_string(),
-                    "node": node.to_checksummed(),
-                    "bytes": format!("0x{}", hex::encode(bytes)),
+                    "node": source.node.to_checksummed(),
+                    "kind": kind,
+                    "symbols": symbols,
+                    "bytes": format!("0x{}", hex::encode(source.bytes)),
                 })
             })
             .collect()

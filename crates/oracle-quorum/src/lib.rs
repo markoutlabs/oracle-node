@@ -11,6 +11,6 @@ pub mod verify;
 
 pub use quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 pub use verify::{
-    Accepted, AcceptedBook, AcceptedFunding, AcceptedVenues, RejectReason, Verifier, VerifyConfig,
-    verify_historical,
+    Accepted, AcceptedBatch, AcceptedBook, AcceptedFunding, AcceptedVenues, RejectReason, Verifier,
+    VerifyConfig, verify_historical,
 };

@@ -72,6 +72,7 @@
 mod address;
 mod auth;
 mod backend;
+mod batch;
 mod books;
 mod clients;
 mod codec;
@@ -93,6 +94,10 @@ pub use auth::{
     client_auth_payload, client_auth_transcript,
 };
 pub use backend::name as backend_name;
+pub use batch::{
+    FRAME_TYPE_PRICE_BATCH, MAX_BATCH_UPDATES, SignedPriceBatch, UnverifiedPriceBatch,
+    VerifiedPriceBatch, decode_price_batch, encode_price_batch,
+};
 pub use books::{
     FRAME_TYPE_BOOK_UPDATE, MAX_BOOK_PAYLOAD, SignedBookUpdate, UnverifiedBookFrame,
     VerifiedBookUpdate, decode_book_update, encode_book_update,
@@ -109,8 +114,8 @@ pub use funding::{
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
     KIND_BOOK_UPDATE, KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_FUNDING_UPDATE, KIND_NODE_AUTH_OK,
-    KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_VENUE_REPORT, PAYLOAD_VERSION, PRICE_UPDATE_SIZE,
-    decode_price_update, encode_price_update, feed_id,
+    KIND_PRICE_BATCH, KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_VENUE_REPORT, PAYLOAD_VERSION,
+    PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
 };
 pub use registry::{
     EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, NodeEntry, NodeListing, Quorum,

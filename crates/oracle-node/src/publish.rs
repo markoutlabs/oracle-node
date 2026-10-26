@@ -1,9 +1,9 @@
-//! Which frames the node pushes to the registry canister, and when.
+//! Which updates the node pushes to the registry canister, and when.
 //!
 //! The canister resolves each listed feed to the median of the nodes. A node
 //! pushes a feed when its price moved, when its flags changed, or when a
 //! heartbeat passed, and pushes at most once per interval: each push costs
-//! the canister cycles.
+//! the canister cycles. The due updates go out as one signed batch.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -14,11 +14,11 @@ use oracle_types::{FeedId, Flags, PriceUpdate};
 
 use crate::config::{ConfigError, NodeConfig};
 
-/// The canister refuses a push with more frames.
-pub const MAX_FRAMES_PER_PUSH: usize = 32;
+/// The most updates in one push: one batch holds this many.
+pub const MAX_UPDATES_PER_PUSH: usize = oracle_wire::MAX_BATCH_UPDATES;
 
-/// The canister refuses a frame older than 30 s. An older latest frame means
-/// the feed stopped, and a push of it would only be refused.
+/// The canister refuses an update older than 30 s. An older latest update
+/// means the feed stopped, and a push of it would only be refused.
 pub const MAX_FRAME_AGE: Duration = Duration::from_secs(25);
 
 /// The canister counts a frame for 75 s, so a longer heartbeat halts the feed.
@@ -103,15 +103,6 @@ impl PushTarget {
     }
 }
 
-/// A frame that is due, with the update it carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Due {
-    /// The signed update.
-    pub update: PriceUpdate,
-    /// The 182-byte frame.
-    pub frame: Vec<u8>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Pushed {
     price: i64,
@@ -120,7 +111,7 @@ struct Pushed {
     at_ns: u64,
 }
 
-/// Decides which of the node's latest frames to push.
+/// Decides which of the node's latest updates to push.
 #[derive(Debug)]
 pub struct PushPlanner {
     policy: PushPolicy,
@@ -153,13 +144,13 @@ impl PushPlanner {
         self.feeds.len()
     }
 
-    /// The frames to push at `now_ns`, at most [`MAX_FRAMES_PER_PUSH`].
+    /// The updates to push at `now_ns`, at most [`MAX_UPDATES_PER_PUSH`].
     /// Empty within `min_interval` of the last attempt.
     pub fn due<'a>(
         &self,
-        latest: impl IntoIterator<Item = (&'a PriceUpdate, &'a [u8])>,
+        latest: impl IntoIterator<Item = &'a PriceUpdate>,
         now_ns: u64,
-    ) -> Vec<Due> {
+    ) -> Vec<PriceUpdate> {
         let since = |at_ns: u64| Duration::from_nanos(now_ns.saturating_sub(at_ns));
         if self
             .last_attempt_ns
@@ -169,9 +160,9 @@ impl PushPlanner {
         }
         latest
             .into_iter()
-            .filter(|(update, _)| self.feeds.contains(&update.feed_id))
-            .filter(|(update, _)| since(update.publish_time_ns) <= MAX_FRAME_AGE)
-            .filter(|(update, _)| match self.pushed.get(&update.feed_id) {
+            .filter(|update| self.feeds.contains(&update.feed_id))
+            .filter(|update| since(update.publish_time_ns) <= MAX_FRAME_AGE)
+            .filter(|update| match self.pushed.get(&update.feed_id) {
                 None => true,
                 Some(last) => {
                     update.seq > last.seq
@@ -180,11 +171,8 @@ impl PushPlanner {
                             || since(last.at_ns) >= self.policy.heartbeat)
                 }
             })
-            .take(MAX_FRAMES_PER_PUSH)
-            .map(|(update, frame)| Due {
-                update: *update,
-                frame: frame.to_vec(),
-            })
+            .take(MAX_UPDATES_PER_PUSH)
+            .copied()
             .collect()
     }
 
@@ -198,14 +186,14 @@ impl PushPlanner {
         self.last_attempt_ns = Some(now_ns);
     }
 
-    /// Records a frame that the canister now holds, or holds a newer one of.
-    pub fn landed(&mut self, due: &Due, now_ns: u64) {
+    /// Records an update that the canister now holds, or holds a newer one of.
+    pub fn landed(&mut self, update: &PriceUpdate, now_ns: u64) {
         self.pushed.insert(
-            due.update.feed_id,
+            update.feed_id,
             Pushed {
-                price: due.update.price,
-                flags: due.update.flags,
-                seq: due.update.seq,
+                price: update.price,
+                flags: update.flags,
+                seq: update.seq,
                 at_ns: now_ns,
             },
         );
@@ -231,21 +219,21 @@ mod tests {
         planner
     }
 
-    fn at(published: u64, seq: u64, price: i64) -> (PriceUpdate, Vec<u8>) {
+    fn at(published: u64, seq: u64, price: i64) -> PriceUpdate {
         let mut update = update_at(published, seq);
         update.price = price;
-        (update, vec![1; 182])
+        update
     }
 
-    fn due(planner: &PushPlanner, latest: &(PriceUpdate, Vec<u8>), now: u64) -> usize {
-        planner.due([(&latest.0, latest.1.as_slice())], now).len()
+    fn due(planner: &PushPlanner, latest: &PriceUpdate, now: u64) -> usize {
+        planner.due([latest], now).len()
     }
 
-    fn push(planner: &mut PushPlanner, latest: &(PriceUpdate, Vec<u8>), now: u64) {
-        let due = planner.due([(&latest.0, latest.1.as_slice())], now);
+    fn push(planner: &mut PushPlanner, latest: &PriceUpdate, now: u64) {
+        let due = planner.due([latest], now);
         planner.attempted(now);
-        for frame in &due {
-            planner.landed(frame, now);
+        for update in &due {
+            planner.landed(update, now);
         }
     }
 
@@ -274,7 +262,7 @@ mod tests {
         let first = at(T0, 1, 1_000_000);
         push(&mut planner, &first, T0);
         let mut halted = at(T0 + 6 * SEC, 2, 1_000_000);
-        halted.0.flags = Flags::HALTED;
+        halted.flags = Flags::HALTED;
         assert_eq!(due(&planner, &halted, T0 + 6 * SEC), 1);
     }
 
@@ -297,24 +285,22 @@ mod tests {
         let old = at(T0, 1, 1_000_000);
         assert_eq!(due(&planner, &old, T0 + 26 * SEC), 0);
         let mut other = at(T0, 1, 1_000_000);
-        other.0.feed_id = FeedId::from_bytes([8; 32]);
+        other.feed_id = FeedId::from_bytes([8; 32]);
         assert_eq!(due(&planner, &other, T0), 0);
     }
 
     #[test]
-    fn a_push_carries_at_most_the_canisters_limit() {
+    fn a_push_carries_at_most_one_batch() {
         let mut planner = planner();
         let ids: Vec<FeedId> = (0..40).map(|n| FeedId::from_bytes([n; 32])).collect();
         planner.set_feeds(ids.iter().copied());
-        let latest: Vec<(PriceUpdate, Vec<u8>)> = ids
+        let latest: Vec<PriceUpdate> = ids
             .iter()
-            .map(|id| {
-                let mut frame = at(T0, 1, 1);
-                frame.0.feed_id = *id;
-                frame
+            .map(|id| PriceUpdate {
+                feed_id: *id,
+                ..at(T0, 1, 1)
             })
             .collect();
-        let due = planner.due(latest.iter().map(|(u, f)| (u, f.as_slice())), T0);
-        assert_eq!(due.len(), MAX_FRAMES_PER_PUSH);
+        assert_eq!(planner.due(&latest, T0).len(), MAX_UPDATES_PER_PUSH);
     }
 }

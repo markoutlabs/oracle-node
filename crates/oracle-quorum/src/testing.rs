@@ -92,6 +92,20 @@ impl TestNode {
         self.signing.sign_update(update).encode_frame().to_vec()
     }
 
+    /// Signs price updates as one batch with the current key and returns the
+    /// wire frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updates cannot form a batch, such as one feed twice.
+    #[must_use]
+    pub fn sign_batch(&self, updates: &[PriceUpdate]) -> Vec<u8> {
+        self.signing
+            .sign_price_batch(updates)
+            .expect("the updates form a batch")
+            .encode_frame()
+    }
+
     /// Signs a venue report with the current key and returns the wire frame.
     ///
     /// # Panics

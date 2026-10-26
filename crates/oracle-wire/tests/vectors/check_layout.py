@@ -16,7 +16,7 @@ import sys
 VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit", "hyperliquid", "bitfinex", "mexc", "kucoin"]
 MARKETS = ["spot", "linear_perp", "inverse_perp"]
 STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted", "peg_unavailable"]
-FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4}
+FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4, "batch": 5}
 BASES = ["interval", "eight_hours"]
 UNITS = ["base", "contracts", "quote"]
 
@@ -50,6 +50,11 @@ def price_update(u: dict) -> bytes:
         u["num_sources"],
         u["sources"],
     )
+
+
+def price_batch(updates: list) -> bytes:
+    """SPEC §3.4: a 4-byte header, then each update's 96 bytes."""
+    return struct.pack(">BBH", 1, 2, len(updates)) + b"".join(price_update(u) for u in updates)
 
 
 SLOTS = [
@@ -196,6 +201,9 @@ def main() -> int:
         count += 1
     for vector in golden["funding_updates"]:
         errors += check("funding", vector, funding_update(vector["update"]), separator)
+        count += 1
+    for vector in golden["price_batches"]:
+        errors += check("batch", vector, price_batch(vector["updates"]), separator)
         count += 1
     for error in errors:
         print(error)

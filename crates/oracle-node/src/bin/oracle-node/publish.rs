@@ -1,8 +1,9 @@
-//! Pushes the node's latest frames to the registry canister.
+//! Pushes the node's latest updates to the registry canister.
 //!
-//! The node calls `push` as the anonymous identity: the signed frames are the
-//! credential, and the node holds no Internet Computer key. One push is in
-//! flight at a time, and a line each minute says how the pushes went.
+//! The node signs the due updates as one batch, so the canister checks one
+//! signature for the push, and calls `push` as the anonymous identity: the
+//! signature is the credential, and the node holds no Internet Computer key.
+//! One push is in flight at a time, and a line each minute says how it went.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,9 +12,10 @@ use candid::{CandidType, Decode, Deserialize, Encode};
 use ic_agent::Agent;
 use ic_agent::export::Principal;
 use oracle_ingest::clock::wall_clock_unix_nanos;
-use oracle_node::publish::{Due, PushPlanner, PushTarget};
+use oracle_node::publish::{PushPlanner, PushTarget};
 use oracle_server::ServerState;
-use oracle_types::FeedId;
+use oracle_types::{FeedId, PriceUpdate};
+use oracle_wire::Signer;
 use serde_bytes::ByteBuf;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -93,11 +95,21 @@ impl Minute {
 }
 
 /// Starts the pushes. The task stops with `shutdown`.
-pub(crate) fn spawn(state: Arc<ServerState>, target: PushTarget, shutdown: CancellationToken) {
-    tokio::spawn(run(state, target, shutdown));
+pub(crate) fn spawn(
+    state: Arc<ServerState>,
+    signer: Arc<Signer>,
+    target: PushTarget,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(run(state, signer, target, shutdown));
 }
 
-async fn run(state: Arc<ServerState>, target: PushTarget, shutdown: CancellationToken) {
+async fn run(
+    state: Arc<ServerState>,
+    signer: Arc<Signer>,
+    target: PushTarget,
+    shutdown: CancellationToken,
+) {
     let agent = match agent(&target) {
         Ok(agent) => agent,
         Err(error) => {
@@ -136,41 +148,43 @@ async fn run(state: Arc<ServerState>, target: PushTarget, shutdown: Cancellation
             }
         }
 
-        let latest: Vec<_> = state
+        let latest: Vec<PriceUpdate> = state
             .hub()
             .latest_all()
             .iter()
-            .map(|prepared| (*prepared.signed().update(), prepared.binary()))
+            .map(|prepared| *prepared.signed().update())
             .collect();
         let now = wall_clock_unix_nanos();
-        let due = planner.due(
-            latest
-                .iter()
-                .map(|(update, frame)| (update, frame.as_ref())),
-            now,
-        );
+        let due = planner.due(&latest, now);
         if due.is_empty() {
             continue;
         }
         planner.attempted(now);
-        let verdicts = match tokio::time::timeout(PUSH_TIMEOUT, push(&agent, &canister, &due)).await
-        {
-            Ok(Ok(verdicts)) => verdicts,
-            Ok(Err(error)) => {
-                minute.failed(error);
-                continue;
-            }
-            Err(_) => {
-                minute.failed(format!("no reply in {} s", PUSH_TIMEOUT.as_secs()));
+        let batch = match signer.sign_price_batch(&due) {
+            Ok(batch) => batch.encode_frame(),
+            Err(error) => {
+                minute.failed(format!("cannot sign the batch: {error}"));
                 continue;
             }
         };
+        let verdicts =
+            match tokio::time::timeout(PUSH_TIMEOUT, push(&agent, &canister, batch)).await {
+                Ok(Ok(verdicts)) => verdicts,
+                Ok(Err(error)) => {
+                    minute.failed(error);
+                    continue;
+                }
+                Err(_) => {
+                    minute.failed(format!("no reply in {} s", PUSH_TIMEOUT.as_secs()));
+                    continue;
+                }
+            };
         minute.pushes = minute.pushes.saturating_add(1);
-        for (frame, verdict) in due.iter().zip(verdicts) {
+        for (update, verdict) in due.iter().zip(verdicts) {
             match verdict {
-                // A replay means the canister holds this frame or a newer one.
+                // A replay means the canister holds this update or a newer one.
                 Verdict::Accepted | Verdict::Replayed => {
-                    planner.landed(frame, now);
+                    planner.landed(update, now);
                     if verdict == Verdict::Accepted {
                         minute.accepted = minute.accepted.saturating_add(1);
                     }
@@ -211,12 +225,8 @@ async fn feeds(agent: &Agent, canister: &Principal) -> Result<Vec<FeedId>, Strin
         .collect())
 }
 
-async fn push(agent: &Agent, canister: &Principal, due: &[Due]) -> Result<Vec<Verdict>, String> {
-    let frames: Vec<ByteBuf> = due
-        .iter()
-        .map(|due| ByteBuf::from(due.frame.clone()))
-        .collect();
-    let arg = Encode!(&frames).map_err(|error| error.to_string())?;
+async fn push(agent: &Agent, canister: &Principal, batch: Vec<u8>) -> Result<Vec<Verdict>, String> {
+    let arg = Encode!(&vec![ByteBuf::from(batch)]).map_err(|error| error.to_string())?;
     let reply = agent
         .update(canister, "push")
         .with_arg(arg)

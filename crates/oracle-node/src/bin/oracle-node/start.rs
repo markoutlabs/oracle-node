@@ -139,6 +139,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     } else {
         TransportConfig::default()
     };
+    let push_signer = Arc::clone(&signer);
     let transport = NodeTransport::new(
         signer,
         clients,
@@ -155,7 +156,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     );
     if let Some(target) = push {
         info!(canister = %target.canister, gateway = %target.gateway, "pushing frames to the registry canister");
-        crate::publish::spawn(Arc::clone(&state), target, shutdown.clone());
+        crate::publish::spawn(Arc::clone(&state), push_signer, target, shutdown.clone());
     }
 
     // One clock for receipt times and publish times, so a resync moves both.

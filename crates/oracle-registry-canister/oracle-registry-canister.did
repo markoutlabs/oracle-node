@@ -221,7 +221,8 @@ service : (InitArgs) -> {
   // Serves `/registry.json`, `/clients.json`, `/prices.json`, `/frames.json`,
   // and a 404 for every other path, as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
-  // A node pushes its latest frames. Returns one verdict for each, in order.
+  // A node pushes its latest updates as one batch, or as single frames.
+  // Returns one verdict for each update, in order.
   push : (vec blob) -> (Result_1);
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.
