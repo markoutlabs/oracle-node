@@ -241,6 +241,14 @@ impl RegistrySource {
         }
     }
 
+    /// The gateway of the local network. Mainnet's API is the node's default.
+    pub(super) const fn gateway(&self) -> Option<&Gateway> {
+        match self {
+            Self::Network { gateway, .. } => Some(gateway),
+            Self::Mainnet(_) => None,
+        }
+    }
+
     pub(super) fn root_key(&self) -> Option<&str> {
         match self {
             Self::Network { root_key, .. } => Some(root_key.0.as_str()),

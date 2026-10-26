@@ -1,0 +1,31 @@
+[package]
+name = "oracle-quorum"
+description = "Verify signed oracle frames and resolve one price from many nodes. No I/O, so it builds for wasm32."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["pure-rust"]
+# The pure-Rust secp256k1 backend. wasm32 always uses it.
+pure-rust = ["oracle-wire/pure-rust"]
+# The C `libsecp256k1` backend, native only.
+libsecp = ["oracle-wire/libsecp"]
+
+[dependencies]
+oracle-agg.workspace = true
+oracle-types.workspace = true
+# Not the workspace entry: its `os-rng` pulls getrandom, which does not build
+# for wasm32.
+oracle-wire = { path = "../oracle-wire", version = "0.1.0", default-features = false }
+
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ use oracle_node::{ConfigError, KeyFileError};
 
 mod init;
 mod notify;
+mod publish;
 mod rotate;
 mod start;
 mod status;

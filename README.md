@@ -262,6 +262,50 @@ Add the SDK to a project:
 oracle-client = { git = "https://github.com/markoutlabs/oracle-node", tag = "v0.1.0" }
 ```
 
+### From a canister
+
+The nodes push their signed prices to the registry canister, which checks each
+signature and serves the median of the nodes. A canister calls `get_price` with
+the feed's 32-byte id, keccak256 of its symbol:
+
+```rust
+use candid::{CandidType, Deserialize, Principal};
+use ic_cdk::call::Call;
+use serde_bytes::ByteBuf;
+
+#[derive(CandidType, Deserialize)]
+enum PriceStatus { Ok, Degraded, Halted }
+
+/// The fields you need. Candid ignores the others.
+#[derive(CandidType, Deserialize)]
+struct PriceRecord { status: PriceStatus, price: Option<i64>, expo: i32, publish_time_ns: u64 }
+
+// CRYPTO.BTC/USD
+let feed_id = hex::decode("0523e79c7ed211911a19afaa4def68c896bc72d674bf33c5c64d4d7089e320e2")?;
+let oracle = Principal::from_text("xb5gv-diaaa-aaaaf-qg5qa-cai")?;
+let reply = Call::bounded_wait(oracle, "get_price")
+    .with_arg(ByteBuf::from(feed_id))
+    .await?;
+let btc: Option<PriceRecord> = reply.candid()?;
+```
+
+The price is `price × 10^expo`. Use it only when the status is `Ok` or
+`Degraded`. A feed whose nodes stop pushing goes `Halted` after 75 s.
+`get_feeds` lists the priced feeds and their ids.
+
+### Certified, over HTTPS
+
+```bash
+curl https://xb5gv-diaaa-aaaaf-qg5qa-cai.icp0.io/prices.json
+```
+
+The gateway checks the canister's certificate before it serves the document.
+To check it yourself, fetch from the `raw` domain and verify it with
+`ic-response-verification`, as the SDK does for `/registry.json`. The document
+is resolved when the last frame arrived, so also check `resolved_at_ns`.
+`/frames.json` holds the nodes' signed frames, for a client that checks the
+nodes itself.
+
 ### From a browser
 
 A web page cannot keep a client key secret, so browsers do not connect to the
@@ -380,7 +424,16 @@ make governance ENV=ic IDENTITY=<identity>    # prints the canister id and gover
 ```
 
 The canister signs with the `key_1` threshold key. Each signature costs cycles,
-so keep the canister funded.
+and so does each push from a node: about 12T cycles a month for each node on a
+quiet market (SPEC §3.7). Keep the canister funded.
+
+On an installed canister, `make deploy` upgrades it and keeps every node,
+client and price. After the first upgrade with prices, governance lists the
+priced feeds. The 14 defaults are in the install arguments in `icp.yaml`:
+
+```bash
+icp canister call oracle_registry set_feeds '(vec { "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD" })' -e ic
+```
 
 ## License
 

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use oracle_wire::{
     Address, ClientEntry, ClientList, CompressedPublicKey, MAX_CLIENTS, MAX_NODES, NodeEntry,
-    NodeListing, Quorum, Registry, Signature, WireError,
+    NodeListing, Quorum, Registry, Signature, VerifiedRegistry, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -469,6 +469,14 @@ impl State {
         });
         self.clients_version = list.version;
         Ok(self.clients_version)
+    }
+
+    /// The published document, verified against the governance key. The
+    /// price checks use it.
+    #[must_use]
+    pub fn verified_registry(&self) -> Option<VerifiedRegistry> {
+        let governance = self.governance_key?.address().ok()?;
+        self.published.as_ref()?.verify(governance, 0).ok()
     }
 
     /// When a node address was listed, whether it still is or not.

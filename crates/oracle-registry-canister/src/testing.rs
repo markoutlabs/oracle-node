@@ -22,7 +22,8 @@ use oracle_wire::{Address, NodeEntry, NodeListing, Registry};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 use serde::de::DeserializeOwned;
 
-use crate::InitArgs;
+use crate::prices::{PriceRecord, Verdict};
+use crate::{FeedInfo, InitArgs};
 
 /// The canister wasm, built with cargo once for each test binary.
 pub static WASM: LazyLock<Vec<u8>> = LazyLock::new(|| {
@@ -86,6 +87,7 @@ impl Harness {
             min_nodes,
             recommended: 3,
             epoch_secs,
+            feeds: None,
         })
         .expect("encodes");
         pic.install_canister(canister, WASM.clone(), args, Some(governance));
@@ -127,6 +129,12 @@ impl Harness {
     #[must_use]
     pub fn certification(&self) -> Certification {
         Certification::new(&self.canister.to_text(), &self.root_key()).expect("valid")
+    }
+
+    /// The instance's clock, unix nanoseconds.
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        self.pic.get_time().as_nanos_since_unix_epoch()
     }
 
     /// The instance's clock, unix seconds.
@@ -259,5 +267,82 @@ impl Harness {
             Encode!(&node.to_checksummed()).expect("encodes"),
         );
         json.map(|json| serde_json::from_str(&json).expect("parses"))
+    }
+
+    /// Governance changes the quorum guidance. Returns the registry version published.
+    pub fn set_quorum(&self, min_nodes: u16, recommended: u16) -> Result<u64, String> {
+        self.update(
+            self.governance,
+            "set_quorum",
+            Encode!(&min_nodes, &recommended).expect("encodes"),
+        )
+    }
+
+    /// Governance sets the priced feeds.
+    pub fn set_feeds(&self, symbols: &[&str]) -> Result<(), String> {
+        let symbols: Vec<String> = symbols.iter().map(|symbol| (*symbol).to_owned()).collect();
+        self.update(
+            self.governance,
+            "set_feeds",
+            Encode!(&symbols).expect("encodes"),
+        )
+    }
+
+    /// A push as the anonymous identity, as a node makes it. `Err` holds the
+    /// reason the IC or the canister refused the whole push.
+    pub fn push(&self, frames: &[Vec<u8>]) -> Result<Vec<Verdict>, String> {
+        self.push_as(Principal::anonymous(), frames)
+    }
+
+    /// A push from another caller.
+    pub fn push_as(&self, caller: Principal, frames: &[Vec<u8>]) -> Result<Vec<Verdict>, String> {
+        let frames: Vec<serde_bytes::ByteBuf> = frames
+            .iter()
+            .map(|frame| serde_bytes::ByteBuf::from(frame.clone()))
+            .collect();
+        let args = Encode!(&frames).expect("encodes");
+        let message = self
+            .pic
+            .submit_call(self.canister, caller, "push", args)
+            .map_err(|error| error.to_string())?;
+        let reply = if self.pic.auto_progress_enabled() {
+            self.pic.await_call_no_ticks(message)
+        } else {
+            self.pic.await_call(message)
+        };
+        let bytes = reply.map_err(|error| error.to_string())?;
+        Decode!(&bytes, Result<Vec<Verdict>, String>).expect("the reply decodes")
+    }
+
+    /// The listed feeds.
+    #[must_use]
+    pub fn feeds(&self) -> Vec<FeedInfo> {
+        self.query("get_feeds", Encode!().expect("encodes"))
+    }
+
+    /// One feed's price, by symbol.
+    #[must_use]
+    pub fn price(&self, symbol: &str) -> Option<PriceRecord> {
+        let symbol: oracle_types::Symbol = symbol.parse().expect("a valid symbol");
+        let id = serde_bytes::ByteBuf::from(oracle_wire::feed_id(&symbol).as_bytes().to_vec());
+        self.query("get_price", Encode!(&id).expect("encodes"))
+    }
+
+    /// Upgrades the canister to the same wasm, with no arguments.
+    pub fn upgrade(&self) {
+        self.pic
+            .upgrade_canister(
+                self.canister,
+                WASM.clone(),
+                Encode!().expect("encodes"),
+                Some(self.governance),
+            )
+            .expect("the upgrade succeeds");
+    }
+
+    /// The canister's cycle balance.
+    #[must_use]
+    pub fn cycles(&self) -> u128 {
+        self.pic.cycle_balance(self.canister)
     }
 }

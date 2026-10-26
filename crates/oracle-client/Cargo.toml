@@ -11,12 +11,13 @@ repository.workspace = true
 default = ["pure-rust"]
 # The pure-Rust secp256k1 backend: no C compiler needed. The node turns it off
 # and takes the C one; a build with both uses the pure one.
-pure-rust = ["oracle-wire/pure-rust"]
+pure-rust = ["oracle-wire/pure-rust", "oracle-quorum/pure-rust"]
 # The C `libsecp256k1` backend, the fastest.
-libsecp = ["oracle-wire/libsecp"]
+libsecp = ["oracle-wire/libsecp", "oracle-quorum/libsecp"]
 
 [dependencies]
 oracle-agg.workspace = true
+oracle-quorum.workspace = true
 oracle-transport.workspace = true
 oracle-types.workspace = true
 oracle-wire.workspace = true

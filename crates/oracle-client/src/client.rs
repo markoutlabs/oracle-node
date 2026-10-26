@@ -363,6 +363,8 @@ impl ClientStats {
             RejectReason::IncoherentTimestamps { .. } => {
                 self.incoherent = self.incoherent.saturating_add(1);
             }
+            // Non-exhaustive outside oracle-quorum: a reason added there is not counted.
+            _ => {}
         }
     }
 }

@@ -11,7 +11,7 @@
   the EIP-55 rendering in `oracle-wire` (alloy is too heavy for wasm32), and
   the `HALF_CURVE_ORDER` byte compare (backend-independent).
 - Code that must build for `wasm32-unknown-unknown` (`oracle-wire`,
-  `oracle-registry-canister`) chooses pure-Rust crates.
+  `oracle-quorum`, `oracle-registry-canister`) chooses pure-Rust crates.
 
 ## Code comments
 

@@ -3,7 +3,7 @@
 use std::cell::Cell;
 
 use crate::certify::certify_documents;
-use crate::runtime::{STATE, now_secs, read_state};
+use crate::runtime::{STATE, adopt_registry, now_secs, read_state};
 use crate::signing::{ensure_governance_key, sign};
 use crate::state::{State, StateError};
 
@@ -64,6 +64,7 @@ async fn round(
         }
     };
     STATE.with(|cell| *cell.borrow_mut() = Some(next));
+    adopt_registry();
     certify_documents();
     Ok(version)
 }

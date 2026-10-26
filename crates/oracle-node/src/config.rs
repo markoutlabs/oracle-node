@@ -94,6 +94,46 @@ pub struct NodeConfig {
     /// Venue endpoints in place of the built-in ones.
     #[serde(default)]
     pub endpoints: Vec<EndpointSettings>,
+    /// Pushes to the registry canister, which resolves the median on-chain.
+    /// No section, no pushes.
+    #[serde(default)]
+    pub publish: Option<PublishSettings>,
+}
+
+/// When the node pushes its frames to the registry canister.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishSettings {
+    /// The Internet Computer API that takes the pushes. Mainnet's by default.
+    #[serde(default = "default_publish_gateway")]
+    pub gateway: String,
+    /// Seconds after which a feed is pushed even when its price did not move.
+    /// At most 60: the canister counts a frame for 75 s.
+    #[serde(default = "default_publish_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+    /// A price move this large since the last push, in basis points, pushes
+    /// the feed at once.
+    #[serde(default = "default_publish_deviation_bps")]
+    pub deviation_bps: u32,
+    /// Seconds between two pushes, at least. Each push costs the canister cycles.
+    #[serde(default = "default_publish_min_interval_secs")]
+    pub min_interval_secs: u64,
+}
+
+fn default_publish_gateway() -> String {
+    "https://icp-api.io".to_owned()
+}
+
+const fn default_publish_heartbeat_secs() -> u64 {
+    30
+}
+
+const fn default_publish_deviation_bps() -> u32 {
+    10
+}
+
+const fn default_publish_min_interval_secs() -> u64 {
+    5
 }
 
 /// Subscriber-facing server settings.

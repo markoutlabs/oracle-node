@@ -60,12 +60,12 @@ impl Default for VerifyConfig {
 
 /// Two slow heartbeats and a margin, so one lost heartbeat does not make a slow
 /// feed stale.
-pub(crate) const SLOW_MAX_AGE: Duration = Duration::from_secs(25);
+pub const SLOW_MAX_AGE: Duration = Duration::from_secs(25);
 const _: () = assert!(SLOW_MAX_AGE.as_secs() > 2 * SLOW_HEARTBEAT.as_secs());
 
 /// How old a funding frame may be. A new subscriber gets the node's latest
 /// frame, which can be a whole heartbeat old.
-pub(crate) const FUNDING_MAX_AGE: Duration = FUNDING_HEARTBEAT.saturating_mul(2);
+pub const FUNDING_MAX_AGE: Duration = FUNDING_HEARTBEAT.saturating_mul(2);
 
 /// Why an update was refused.
 ///

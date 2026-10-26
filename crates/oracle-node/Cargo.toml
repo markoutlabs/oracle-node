@@ -18,6 +18,9 @@ oracle-wire = { workspace = true, features = ["libsecp"] }
 age.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+candid.workspace = true
+ic-agent.workspace = true
+serde_bytes.workspace = true
 getrandom.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true

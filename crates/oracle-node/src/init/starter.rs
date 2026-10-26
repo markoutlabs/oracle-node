@@ -38,6 +38,9 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
          poll_secs = 30",
         quoted(&source.url("clients.json"))
     );
+    let publish_gateway = source.gateway().map_or_else(String::new, |gateway| {
+        format!("gateway = {}\n", quoted(&gateway.to_string()))
+    });
     let governance = format!(
         "governance_address = {}",
         quoted(&setup.governance.to_checksummed())
@@ -72,6 +75,14 @@ key_file = {key_file}
 # these clients, encrypted, over /v2/ws, and refuses to start without the list.
 [clients]
 {clients_source}
+
+# Pushes this node's frames to the registry canister, which serves each listed
+# feed's median to other canisters and as the certified /prices.json. Each push
+# costs the canister cycles. Remove the section to stop the pushes.
+[publish]
+{publish_gateway}heartbeat_secs = 30
+deviation_bps = 10
+min_interval_secs = 5
 
 {header}
 
@@ -151,6 +162,12 @@ mod tests {
             let clients = config.clients.as_ref().expect("a [clients] section");
             assert_eq!(clients.url, Some(source.url("clients.json")));
             assert_eq!(clients.poll_secs, 30);
+            let push = crate::publish::PushTarget::from_config(&config)
+                .expect("a valid [publish] section")
+                .expect("a [publish] section");
+            let local = matches!(source, RegistrySource::Network { .. });
+            assert_eq!(push.gateway == "http://127.0.0.1:8000", local);
+            assert_eq!(push.root_key.is_some(), local);
         }
     }
 

@@ -6,12 +6,19 @@
 //! list. The governance address consumers pin is the address of that key, so
 //! no consumer needs an Internet Computer agent.
 //!
+//! It also takes the nodes' signed price frames and resolves each listed feed
+//! to the median of the nodes, with the SDK's own checks. Clients fetch the
+//! certified `/prices.json`; other canisters call `get_price`.
+//!
 //! # Roles
 //!
 //! **Governance** is the set of canister controllers, and the only caller of
-//! update methods. Node operators and clients send their keys to governance
-//! off-chain. `inspect_message` drops all other ingress before the canister
-//! pays for it.
+//! every update method but `push`. Node operators and clients send their keys
+//! to governance off-chain.
+//!
+//! **Nodes** call `push` with their latest frames, as the anonymous identity.
+//! `inspect_message` lets a push in only when one of its frames is new and
+//! valid, and drops all other ingress, before the canister pays for it.
 //!
 //! # Interchange
 //!
@@ -28,6 +35,7 @@
 //! `effective_from`. A round that fails changes nothing.
 
 mod certify;
+pub mod prices;
 mod publish;
 mod runtime;
 mod signing;
@@ -38,12 +46,18 @@ pub mod testing;
 use candid::CandidType;
 use ic_http_certification::utils::add_v2_certificate_header;
 pub use ic_http_certification::{HttpRequest, HttpResponse};
+use oracle_types::{FeedId, Symbol};
 use oracle_wire::{NodeEntry, Quorum};
 use serde::Deserialize;
+use serde_bytes::ByteBuf;
 
 use crate::certify::{CERTIFIED, certify_documents};
+use crate::prices::{MAX_FRAMES_PER_PUSH, PriceRecord, Prices, StoredPrices, Verdict};
 use crate::publish::{Document, mutate_and_publish};
-use crate::runtime::{STATE, address, governance_only, is_governance, now_secs, read_state};
+use crate::runtime::{
+    PRICES, STATE, address, anonymous_only, governance_only, is_governance, now_ns, now_secs,
+    read_prices, read_state, with_prices,
+};
 use crate::signing::ensure_governance_key;
 use crate::state::{Config, DEFAULT_EPOCH_SECS, State};
 
@@ -58,10 +72,33 @@ pub struct InitArgs {
     pub recommended: u16,
     /// Broadcast-key epoch for the client list. Default 60.
     pub epoch_secs: Option<u64>,
+    /// The feeds the canister prices, as canonical symbols. Default none.
+    pub feeds: Option<Vec<String>>,
+}
+
+/// One listed feed.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FeedInfo {
+    /// The 32-byte feed id: keccak256 of the symbol.
+    pub feed_id: ByteBuf,
+    /// The canonical symbol, such as `CRYPTO.BTC/USD`.
+    pub symbol: String,
+}
+
+fn symbols(texts: &[String]) -> Result<Vec<Symbol>, String> {
+    texts
+        .iter()
+        .map(|text| {
+            text.parse()
+                .map_err(|error| format!("symbol `{text}`: {error}"))
+        })
+        .collect()
 }
 
 #[ic_cdk::init]
 fn init(args: InitArgs) {
+    let feeds =
+        symbols(&args.feeds.unwrap_or_default()).unwrap_or_else(|error| ic_cdk::trap(error));
     let state = State::new(
         Config {
             key_name: args.key_name,
@@ -74,33 +111,78 @@ fn init(args: InitArgs) {
     )
     .unwrap_or_else(|error| ic_cdk::trap(error.to_string()));
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
+    with_prices(|prices| prices.set_feeds(&feeds));
     certify_documents();
 }
 
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
     let bytes = read_state(serde_json::to_vec).expect("state serialises");
-    ic_cdk::storage::stable_save((bytes,)).expect("stable memory is writable");
+    let prices = read_prices(Prices::to_stored);
+    ic_cdk::storage::stable_save((bytes, Some(prices))).expect("stable memory is writable");
 }
 
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
-    let (bytes,): (Vec<u8>,) =
+    // A canister from before the prices saved one value, so the second is `None`.
+    let (bytes, prices): (Vec<u8>, Option<StoredPrices>) =
         ic_cdk::storage::stable_restore().expect("stable memory holds the state");
     let state: State = serde_json::from_slice(&bytes).expect("state deserialises");
+    let registry = state.verified_registry();
     STATE.with(|cell| *cell.borrow_mut() = Some(state));
+    let prices = Prices::restore(&prices.unwrap_or_default(), registry);
+    PRICES.with(|cell| *cell.borrow_mut() = prices);
     certify_documents();
 }
 
-/// Only controllers get past this, so spam costs the canister nothing.
+/// Only controllers and pushes with a new, valid frame get past this, so
+/// spam costs the canister nothing.
 ///
-/// One replica runs this check, so every update method has the
-/// `governance_only` guard too.
+/// One replica runs this check, so every update method has a guard too, and
+/// `push` checks every frame again.
 #[ic_cdk::inspect_message]
 fn inspect_message() {
-    if is_governance() {
+    if is_governance() || accepts_push() {
         ic_cdk::api::accept_message();
     }
+}
+
+/// The IC drops the changes that `inspect_message` makes, so the frame that
+/// `accepts_any` stores here is stored again only under consensus.
+fn accepts_push() -> bool {
+    if ic_cdk::api::msg_method_name() != "push" || anonymous_only().is_err() {
+        return false;
+    }
+    let Ok((frames,)) = candid::decode_args::<(Vec<ByteBuf>,)>(&ic_cdk::api::msg_arg_data()) else {
+        return false;
+    };
+    frames.len() <= MAX_FRAMES_PER_PUSH
+        && with_prices(|prices| prices.accepts_any(&frames, now_ns()))
+}
+
+/// A node pushes its latest frames. Returns one verdict for each, in order.
+#[ic_cdk::update(guard = "anonymous_only")]
+fn push(frames: Vec<ByteBuf>) -> Result<Vec<Verdict>, String> {
+    if frames.len() > MAX_FRAMES_PER_PUSH {
+        return Err(format!(
+            "a push carries at most {MAX_FRAMES_PER_PUSH} frames"
+        ));
+    }
+    let verdicts = with_prices(|prices| prices.push(&frames, now_ns()));
+    if verdicts.contains(&Verdict::Accepted) {
+        certify_documents();
+    }
+    Ok(verdicts)
+}
+
+/// Governance sets the feeds that the canister prices, as canonical symbols.
+/// A feed that stays keeps its frames.
+#[ic_cdk::update(guard = "governance_only")]
+fn set_feeds(feeds: Vec<String>) -> Result<(), String> {
+    let feeds = symbols(&feeds)?;
+    with_prices(|prices| prices.set_feeds(&feeds));
+    certify_documents();
+    Ok(())
 }
 
 /// Governance lists a node. `entry_json` is the operator's `NodeEntry`.
@@ -224,6 +306,58 @@ fn get_governance() -> Option<String> {
     })
 }
 
+/// The listed feeds: the 32-byte id and the symbol of each.
+#[ic_cdk::query]
+fn get_feeds() -> Vec<FeedInfo> {
+    read_prices(|prices| {
+        prices
+            .feeds()
+            .map(|(id, symbol)| FeedInfo {
+                feed_id: ByteBuf::from(id.as_bytes().to_vec()),
+                symbol: symbol.to_string(),
+            })
+            .collect()
+    })
+}
+
+/// One feed's price, resolved now, by its 32-byte feed id.
+#[ic_cdk::query]
+fn get_price(feed_id: ByteBuf) -> Option<PriceRecord> {
+    let id = FeedId::from_bytes(<[u8; 32]>::try_from(feed_id.as_slice()).ok()?);
+    read_prices(|prices| prices.price(&id, now_ns()))
+}
+
+/// Every listed feed's price, resolved now.
+#[ic_cdk::query]
+fn get_prices() -> Vec<PriceRecord> {
+    read_prices(|prices| prices.prices(now_ns()))
+}
+
+/// `/prices.json`: each feed resolved when the last frame was accepted.
+pub(crate) fn prices_document() -> String {
+    let now = now_ns();
+    let prices = read_prices(|prices| prices.resolve_all(now));
+    serde_json::json!({ "resolved_at_ns": now.to_string(), "prices": prices }).to_string()
+}
+
+/// `/frames.json`: each node's latest frame of each feed, for clients that
+/// verify the nodes themselves.
+pub(crate) fn frames_document() -> String {
+    let frames: Vec<serde_json::Value> = read_prices(|prices| {
+        prices
+            .frames()
+            .map(|(symbol, node, bytes)| {
+                serde_json::json!({
+                    "symbol": symbol.to_string(),
+                    "node": node.to_checksummed(),
+                    "bytes": format!("0x{}", hex::encode(bytes)),
+                })
+            })
+            .collect()
+    });
+    serde_json::json!({ "frames": frames }).to_string()
+}
+
 /// When a node address was listed, as JSON, for stored-frame verification.
 #[ic_cdk::query]
 fn get_node_listing(node: String) -> Option<String> {
@@ -234,8 +368,8 @@ fn get_node_listing(node: String) -> Option<String> {
     })
 }
 
-/// Serves `/registry.json`, `/clients.json`, and a 404 for every other path,
-/// as certified query responses.
+/// Serves `/registry.json`, `/clients.json`, `/prices.json`, `/frames.json`,
+/// and a 404 for every other path, as certified query responses.
 #[ic_cdk::query]
 fn http_request(request: HttpRequest<'static>) -> HttpResponse<'static> {
     let path = request.get_path().unwrap_or_else(|_| "/".to_owned());
@@ -273,18 +407,28 @@ mod candid_export {
 
 #[cfg(test)]
 mod tests {
-    /// SPEC §3.6: governance is the only caller of update methods. The guard
-    /// is an attribute, so a new method could ship without it.
+    /// SPEC §3.6: governance is the only caller of update methods but
+    /// `push`. The guard is an attribute, so a new method could ship without it.
     #[test]
-    fn every_update_method_is_governance_only() {
+    fn every_update_method_but_push_is_governance_only() {
         let source = include_str!("lib.rs");
-        let updates: Vec<&str> = source
+        let updates: Vec<(&str, &str)> = source
             .lines()
-            .filter(|line| line.starts_with("#[ic_cdk::update"))
+            .zip(source.lines().skip(1))
+            .filter(|(attribute, _)| attribute.starts_with("#[ic_cdk::update"))
             .collect();
-        assert_eq!(updates.len(), 10);
-        for line in updates {
-            assert_eq!(line, "#[ic_cdk::update(guard = \"governance_only\")]");
+        assert_eq!(updates.len(), 12);
+        for (attribute, signature) in updates {
+            let guard = if signature.starts_with("fn push(") {
+                "anonymous_only"
+            } else {
+                "governance_only"
+            };
+            assert_eq!(
+                attribute,
+                format!("#[ic_cdk::update(guard = \"{guard}\")]"),
+                "{signature}"
+            );
         }
     }
 }

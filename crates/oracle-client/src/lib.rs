@@ -78,11 +78,11 @@ mod client;
 pub mod latency;
 pub mod mainnet;
 pub mod nodes;
-pub mod quorum;
 pub mod source;
 pub mod tap;
 pub mod testing;
-pub mod verify;
+
+pub use oracle_quorum::{quorum, verify};
 
 /// The shared types, at the SDK's own version: `Fixed`, `Symbol`, `InstrumentId`.
 pub use oracle_types as types;

@@ -190,6 +190,8 @@ pub(crate) const fn rejected_node(reason: &RejectReason) -> Option<Address> {
         | RejectReason::FromTheFuture { signer, .. }
         | RejectReason::IncoherentTimestamps { signer } => Some(*signer),
         RejectReason::Untrusted(_) | RejectReason::RetiredKey { .. } => None,
+        // Non-exhaustive outside oracle-quorum.
+        _ => None,
     }
 }
 
@@ -204,6 +206,7 @@ impl NodeFrames {
                 self.incoherent = self.incoherent.saturating_add(1);
             }
             RejectReason::Untrusted(_) | RejectReason::RetiredKey { .. } => {}
+            _ => {}
         }
     }
 }

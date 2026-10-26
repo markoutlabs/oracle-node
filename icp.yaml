@@ -14,7 +14,8 @@ canisters:
         - type: script
           commands:
             - scripts/icp-wasm.sh
-    init_args: '(record { key_name = "dfx_test_key"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null })'
+    # The priced feeds are the 14 of node/all-feeds.toml; `set_feeds` changes them.
+    init_args: '(record { key_name = "dfx_test_key"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null; feeds = opt vec { "CRYPTO.USDT/USD"; "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD"; "CRYPTO.SOL/USD"; "CRYPTO.BTC/USDT"; "CRYPTO.BTC/USD.PERP_MARK"; "CRYPTO.ETH/USD.PERP_MARK"; "CRYPTO.BTC/USD.PERP_INDEX"; "CRYPTO.BTC/USDT.PERP_MARK"; "CRYPTO.ETH/USDT.PERP_MARK"; "CRYPTO.BTC/USDT.PERP_MID"; "CRYPTO.ETH/USDT.PERP_MID"; "CRYPTO.BTC/USD.FUNDING_8H"; "CRYPTO.ETH/USD.FUNDING_8H" } })'
     # post_upgrade takes no arguments.
     upgrade_args: "()"
 
@@ -22,4 +23,4 @@ environments:
   - name: ic
     network: ic
     init_args:
-      oracle_registry: '(record { key_name = "key_1"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null })'
+      oracle_registry: '(record { key_name = "key_1"; min_nodes = 1 : nat16; recommended = 3 : nat16; epoch_secs = null; feeds = opt vec { "CRYPTO.USDT/USD"; "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD"; "CRYPTO.SOL/USD"; "CRYPTO.BTC/USDT"; "CRYPTO.BTC/USD.PERP_MARK"; "CRYPTO.ETH/USD.PERP_MARK"; "CRYPTO.BTC/USD.PERP_INDEX"; "CRYPTO.BTC/USDT.PERP_MARK"; "CRYPTO.ETH/USDT.PERP_MARK"; "CRYPTO.BTC/USDT.PERP_MID"; "CRYPTO.ETH/USDT.PERP_MID"; "CRYPTO.BTC/USD.FUNDING_8H"; "CRYPTO.ETH/USD.FUNDING_8H" } })'

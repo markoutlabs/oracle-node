@@ -20,6 +20,7 @@ use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::routing::get;
 use oracle_client::{ClientStats, HttpRegistrySource, OracleClient};
+use oracle_registry_canister::prices::PriceStatus;
 use oracle_registry_canister::testing::Harness;
 use oracle_server::unix_now;
 use oracle_wire::{Address, NodeEntry, Signer};
@@ -166,6 +167,91 @@ fn a_client_follows_a_rotation_and_loses_access_on_revocation_and_expiry() {
 /// A Binance-shaped venue: one `bookTicker` frame every 100 ms, and a
 /// `markPrice` frame with funding every 500 ms, on every connection. Returns
 /// the URL for the node's `[[endpoints]]`.
+/// The node pushes its frames to the registry canister, which resolves the
+/// median and serves it to other canisters (SPEC §3.7).
+#[test]
+fn a_node_pushes_its_frames_and_the_canister_prices_them() {
+    let mut canister = Harness::new(1, "dfx_test_key", None);
+    let gateway = canister.make_live();
+    let governance = canister.refresh_governance_key();
+    let runtime = Runtime::new().expect("runtime");
+    let venue = start_venue(&runtime);
+    let dir = common::scratch("push");
+    std::fs::create_dir_all(&dir).expect("creates");
+
+    let node_dir = dir.join("node");
+    let passphrase_file = common::passphrase_file(&node_dir);
+    let port = free_port();
+    run(Command::new(BINARY)
+        .arg("init")
+        .arg("--out")
+        .arg(&node_dir)
+        .args(["--passphrase-file", &passphrase_file])
+        .args(["--endpoint", &format!("ws://127.0.0.1:{port}/v2/ws")])
+        .args(["--canister", &canister.canister.to_text()])
+        .args(["--gateway", &gateway])
+        .args(["--root-key", &canister.root_key()])
+        .args(["--governance", &governance.to_checksummed()]));
+    let entry = std::fs::read_to_string(node_dir.join("node-entry.json")).expect("init wrote it");
+    let entry: NodeEntry = serde_json::from_str(&entry).expect("an entry");
+    assert_eq!(canister.add_node(&entry), Ok(1));
+    assert_eq!(canister.set_quorum(1, 1), Ok(2));
+    let client = Signer::generate().expect("a key").address();
+    assert_eq!(canister.add_client(client, unix_now() + 86_400), Ok(1));
+    canister
+        .set_feeds(&[FEED])
+        .expect("governance sets the feeds");
+
+    // `init` wrote a [publish] section for this network; push faster than a
+    // deployed node does.
+    let config = node_dir.join("config.toml");
+    run_locally(&config, port, &venue);
+    let text = std::fs::read_to_string(&config).expect("the config");
+    let mut table: toml::Table = toml::from_str(&text).expect("TOML");
+    let publish = table
+        .get_mut("publish")
+        .and_then(toml::Value::as_table_mut)
+        .expect("init wrote a [publish] section");
+    assert_eq!(
+        publish.get("gateway").and_then(toml::Value::as_str),
+        Some(gateway.as_str())
+    );
+    publish.insert("heartbeat_secs".to_owned(), toml::Value::Integer(2));
+    publish.insert("min_interval_secs".to_owned(), toml::Value::Integer(1));
+    std::fs::write(&config, toml::to_string(&table).expect("serialises")).expect("writes");
+
+    let node = Node::spawn(common::start(&config, "json"), dir.join("node.log"));
+    event(&node, READY, |_| true);
+    event(&node, "pushing frames to the registry canister", |_| true);
+    let deadline = std::time::Instant::now() + WAIT;
+    let record = loop {
+        if let Some(record) = canister.price(FEED)
+            && record.status == PriceStatus::Ok
+        {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the canister got no price from the node:\n{}",
+            node.log()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(record.nodes, 1);
+    assert!(record.price.is_some_and(|price| price > 0), "{record:?}");
+    let first = record.publish_time_ns;
+    // The heartbeat keeps the price fresh while the venue is quiet.
+    let deadline = std::time::Instant::now() + WAIT;
+    while canister
+        .price(FEED)
+        .is_none_or(|record| record.publish_time_ns <= first)
+    {
+        assert!(std::time::Instant::now() < deadline, "no second push");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    node.stop();
+}
+
 fn start_venue(runtime: &Runtime) -> String {
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))

@@ -14,18 +14,21 @@ crate-type = ["cdylib", "rlib"]
 # No `os-rng`: a canister never generates keys and wasm32 has no entropy
 # source `getrandom` knows about.
 oracle-wire = { path = "../oracle-wire", version = "0.1.0", default-features = false, features = ["pure-rust"] }
+oracle-quorum = { workspace = true, features = ["pure-rust"] }
+oracle-types.workspace = true
 
 candid.workspace = true
 ic-cdk.workspace = true
 ic-cdk-management-canister.workspace = true
+hex.workspace = true
 ic-http-certification.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 # For `testing`, which is left out of the wasm32 build.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-hex.workspace = true
 oracle-client = { workspace = true, features = ["pure-rust"] }
 pocket-ic.workspace = true
 

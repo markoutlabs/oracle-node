@@ -1,5 +1,6 @@
-//! HTTP certification of `/registry.json`, `/clients.json` and a 404 for every
-//! other path. The certificate is what proves a fetched document is current.
+//! HTTP certification of `/registry.json`, `/clients.json`, `/prices.json`,
+//! `/frames.json` and a 404 for every other path. The certificate is what
+//! proves a fetched document is current.
 
 use std::cell::RefCell;
 
@@ -9,10 +10,12 @@ use ic_http_certification::{
     HttpResponse, StatusCode,
 };
 
-use crate::{get_clients, get_registry};
+use crate::{frames_document, get_clients, get_registry, prices_document};
 
 const REGISTRY_PATH: &str = "/registry.json";
 const CLIENTS_PATH: &str = "/clients.json";
+const PRICES_PATH: &str = "/prices.json";
+const FRAMES_PATH: &str = "/frames.json";
 
 thread_local! {
     // Not in stable memory: rebuilt from `STATE` in `post_upgrade`.
@@ -41,8 +44,7 @@ impl Certified {
     }
 }
 
-/// Certifies the current `/registry.json` and `/clients.json` responses, and a
-/// 404 for every other path, in one tree.
+/// Certifies the current documents, and a 404 for every other path, in one tree.
 pub(crate) fn certify_documents() {
     // An allow-list, not exclusions: gateways add their own headers, and a
     // client that checks the certificate itself must still match.
@@ -99,6 +101,14 @@ pub(crate) fn certify_documents() {
                 get_clients(),
                 b"no client list version has been published yet",
             ),
+        ),
+        certify(
+            HttpCertificationPath::exact(PRICES_PATH),
+            document(Some(prices_document()), b""),
+        ),
+        certify(
+            HttpCertificationPath::exact(FRAMES_PATH),
+            document(Some(frames_document()), b""),
         ),
     ];
     // A gateway rejects an uncertified response, a 404 included.

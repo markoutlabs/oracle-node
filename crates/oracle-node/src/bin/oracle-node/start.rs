@@ -20,6 +20,7 @@ use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::kucoin_connect::KucoinConnector;
 use oracle_ingest::venues::mexc_connect::MexcConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
+use oracle_node::publish::PushTarget;
 use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
 use oracle_server::{Channel, NodeTransport, ServerState, TransportConfig, router, unix_now};
 use oracle_types::{FeedId, InstrumentId, Symbol};
@@ -103,6 +104,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
+    let push = PushTarget::from_config(&config)?;
     let address = signer.address();
     let registry_version = registry.version;
     let feeds = resolved.symbols.len();
@@ -151,6 +153,10 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         config.clone(),
         shutdown.clone(),
     );
+    if let Some(target) = push {
+        info!(canister = %target.canister, gateway = %target.gateway, "pushing frames to the registry canister");
+        crate::publish::spawn(Arc::clone(&state), target, shutdown.clone());
+    }
 
     // One clock for receipt times and publish times, so a resync moves both.
     let clock = MonotonicClock::new();

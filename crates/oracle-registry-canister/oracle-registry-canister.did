@@ -1,3 +1,10 @@
+// One listed feed.
+type FeedInfo = record {
+  // The 32-byte feed id: keccak256 of the symbol.
+  feed_id : blob;
+  // The canonical symbol, such as `CRYPTO.BTC/USD`.
+  symbol : text;
+};
 // A Candid-encodable representation of an HTTP request. This struct is used by
 // the `http_request` method of the HTTP Gateway Protocol's Candid interface.
 // 
@@ -122,9 +129,72 @@ type InitArgs = record {
   key_name : text;
   // Fewest nodes a consumer should require.
   min_nodes : nat16;
+  // The feeds the canister prices, as canonical symbols. Default none.
+  feeds : opt vec text;
+};
+// One feed's price for another canister: integers at the feed's exponent.
+type PriceRecord = record {
+  // How much to trust the price.
+  status : PriceStatus;
+  // The spread between the nodes, in basis points of the price.
+  spread_bps : opt text;
+  // The confidence half-width, as a mantissa.
+  conf : opt nat64;
+  // The decimal exponent of `price` and `conf`.
+  expo : int32;
+  // The 32-byte feed id: keccak256 of the symbol.
+  feed_id : blob;
+  // Why the price is not `Ok`, such as `insufficient_nodes`.
+  concerns : vec text;
+  // The freshest contributing publish time, unix nanoseconds.
+  publish_time_ns : nat64;
+  // Nodes that contributed.
+  nodes : nat32;
+  // Nodes that reported the feed halted.
+  halted_nodes : nat32;
+  // The median of the nodes, as a mantissa: price × 10^-expo.
+  price : opt int64;
+  // When the canister resolved the price, unix nanoseconds.
+  resolved_at_ns : nat64;
+  // The canonical symbol, such as `CRYPTO.BTC/USD`.
+  symbol : text;
+};
+// How much to trust a price, in Candid.
+type PriceStatus = variant {
+  // Enough nodes agree.
+  Ok;
+  // Usable, but act on `conf`.
+  Degraded;
+  // Not usable.
+  Halted;
 };
 type Result = variant { Ok : nat64; Err : text };
-type Result_1 = variant { Ok : text; Err : text };
+type Result_1 = variant { Ok : vec Verdict; Err : text };
+type Result_2 = variant { Ok : text; Err : text };
+type Result_3 = variant { Ok; Err : text };
+// What `push` did with one frame.
+type Verdict = variant {
+  // Malformed, or a signature that is not valid.
+  Invalid;
+  // The feed is not on the canister's list.
+  UnknownFeed;
+  // More than 10 s ahead of the canister's clock.
+  FromTheFuture;
+  // Stored as the node's latest frame for its feed.
+  Accepted;
+  // Observed after it was published.
+  Incoherent;
+  // No registry is published yet.
+  NoRegistry;
+  // The signer is not a listed node.
+  UnknownSigner;
+  // The signer is a key that the registry retired.
+  RetiredKey;
+  // Published more than 30 s ago.
+  TooOld;
+  // The sequence does not advance: the frame or a newer one is stored.
+  Replayed;
+};
 service : (InitArgs) -> {
   // Governance authorises a client: the address of its secp256k1 API key.
   // Returns the new client-list version.
@@ -134,20 +204,28 @@ service : (InitArgs) -> {
   add_node : (text) -> (Result);
   // The last published client list as JSON, if any.
   get_clients : () -> (opt text) query;
+  // The listed feeds: the 32-byte id and the symbol of each.
+  get_feeds : () -> (vec FeedInfo) query;
   // The governance address, once the threshold key has been fetched.
   get_governance : () -> (opt text) query;
   // When a node address was listed, as JSON, for stored-frame verification.
   get_node_listing : (text) -> (opt text) query;
+  // One feed's price, resolved now, by its 32-byte feed id.
+  get_price : (blob) -> (opt PriceRecord) query;
+  // Every listed feed's price, resolved now.
+  get_prices : () -> (vec PriceRecord) query;
   // The last published registry document as JSON, if any.
   get_registry : () -> (opt text) query;
   // The version of the last published document. Zero before the first.
   get_version : () -> (nat64) query;
-  // Serves `/registry.json`, `/clients.json`, and a 404 for every other path,
-  // as certified query responses.
+  // Serves `/registry.json`, `/clients.json`, `/prices.json`, `/frames.json`,
+  // and a 404 for every other path, as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
+  // A node pushes its latest frames. Returns one verdict for each, in order.
+  push : (vec blob) -> (Result_1);
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.
-  refresh_governance_key : () -> (Result_1);
+  refresh_governance_key : () -> (Result_2);
   // Governance revokes a client. Returns the new client-list version.
   remove_client : (text) -> (Result);
   // Governance de-lists a node. Returns the new version.
@@ -162,6 +240,9 @@ service : (InitArgs) -> {
   republish_clients : () -> (Result);
   // Governance moves a client's expiry. Returns the new client-list version.
   set_client_expiry : (text, nat64) -> (Result);
+  // Governance sets the feeds that the canister prices, as canonical symbols.
+  // A feed that stays keeps its frames.
+  set_feeds : (vec text) -> (Result_3);
   // Governance changes the quorum guidance. Returns the new version.
   set_quorum : (nat16, nat16) -> (Result);
 }

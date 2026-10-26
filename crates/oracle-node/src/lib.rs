@@ -23,6 +23,7 @@ pub mod init;
 pub mod keyfile;
 pub mod logging;
 pub mod pipeline;
+pub mod publish;
 pub mod seed;
 
 pub use adapters::{Adapters, build_adapters};

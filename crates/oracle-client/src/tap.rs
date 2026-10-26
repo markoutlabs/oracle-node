@@ -66,6 +66,8 @@ impl Verdict {
             RejectReason::Replayed { .. } => Some(Self::Replayed),
             RejectReason::IncoherentTimestamps { .. } => Some(Self::Incoherent),
             RejectReason::Untrusted(_) | RejectReason::RetiredKey { .. } => None,
+            // Non-exhaustive outside oracle-quorum.
+            _ => None,
         }
     }
 }
