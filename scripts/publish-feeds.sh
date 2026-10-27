@@ -27,7 +27,10 @@ if [ -n "${PUSH:-}" ]; then
   PACE=(--push-heartbeat-secs "$heartbeat" --push-deviation-bps "$deviation"
     --push-min-interval-secs "$interval")
 fi
-(cd "$ROOT" && cargo run -q --release -p oracle-node --bin oracle-node -- export-feeds \
+# A first build takes minutes, so cargo shows its progress.
+echo "building oracle-node for the export" >&2
+(cd "$ROOT" && cargo build --release -p oracle-node --bin oracle-node)
+(cd "$ROOT" && target/release/oracle-node export-feeds \
   node/all-feeds.toml node/assets.toml --candid "$WORK/args.bin" ${PACE[@]+"${PACE[@]}"}) >"$WORK/content.json"
 
 # The published set, as the nodes read it, for the diff only: the canister signs
@@ -40,7 +43,7 @@ else
     | python3 -c 'import sys,json; print(json.load(sys.stdin)["gateway_url"].rstrip("/"))')
   URL="$GATEWAY/feeds.json?canisterId=$ID"
 fi
-curl -sf "$URL" >"$WORK/current.json" || echo '{}' >"$WORK/current.json"
+curl -sf --max-time 30 "$URL" >"$WORK/current.json" || echo '{}' >"$WORK/current.json"
 
 SUMMARY=$(python3 - "$WORK/content.json" "$WORK/current.json" <<'PY'
 import json, sys
