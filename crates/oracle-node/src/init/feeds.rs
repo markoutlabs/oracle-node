@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use toml_edit::DocumentMut;
 
 use super::InitError;
+use crate::config::max_pending;
 
 /// The hand-written feeds, below the settings of a local test node.
 const CORE: &str = include_str!("../../../../node/all-feeds.toml");
@@ -47,15 +48,6 @@ pub(super) fn network() -> NetworkFeeds {
     NetworkFeeds { text, count }
 }
 
-/// The bound below which `max_pending_feeds` never goes.
-const MIN_PENDING: usize = 512;
-
-/// The `server.max_pending_feeds` that `init` writes for `count` feeds.
-pub(super) fn max_pending(count: usize) -> usize {
-    // A slow subscriber can owe a price and a venue report for each feed.
-    count.saturating_mul(2).next_power_of_two().max(MIN_PENDING)
-}
-
 /// The header above the feeds in a config.
 pub(super) fn header(count: usize) -> String {
     format!(
@@ -78,13 +70,38 @@ pub struct FeedUpdate {
     pub changed: Vec<String>,
     /// Feeds in the new config.
     pub count: usize,
+    /// The config had no `[network_feeds]` section, and now has one.
+    pub network_feeds_added: bool,
 }
 
-/// Replaces the `[[feeds]]` of a node's config with the network's feeds of this
-/// binary, so that a node keeps serving the same feeds as the others.
-///
-/// Every other key and comment stays. `server.max_pending_feeds` rises to what
-/// `init` would write, when it is lower.
+/// The `[network_feeds]` section for a config whose registry comes from a URL:
+/// the same canister's `/feeds.json`. `None` for a registry read from a file.
+fn network_feeds_section(document: &DocumentMut) -> Option<toml_edit::Item> {
+    let registry_url = document
+        .get("registry")
+        .and_then(|registry| registry.get("url"))
+        .and_then(toml_edit::Item::as_str)?;
+    if !registry_url.contains("registry.json") {
+        return None;
+    }
+    let url = oracle_client::document_url_beside(registry_url, "feeds.json")?;
+    let poll_secs = crate::config::NetworkFeedsSettings::POLL_SECS;
+    let mut section = toml_edit::Table::new();
+    section.insert("url", toml_edit::value(url));
+    section.insert(
+        "poll_secs",
+        toml_edit::value(i64::try_from(poll_secs).unwrap_or(i64::MAX)),
+    );
+    section.decor_mut().set_prefix(
+        "\n# The network's feed set from the canister (SPEC §3.8). Once it verifies, it\n\
+         # takes the place of the feeds below, and the node takes each new version\n\
+         # while it runs, in its own slot. Every node must see a new set within\n\
+         # two minutes, so keep poll_secs low.\n",
+    );
+    Some(toml_edit::Item::Table(section))
+}
+
+/// Replaces a config's `[[feeds]]` with this binary's, and adds `[network_feeds]` for a fetched registry.
 ///
 /// # Errors
 ///
@@ -95,6 +112,11 @@ pub fn update_feeds(config: &str) -> Result<FeedUpdate, InitError> {
         .parse()
         .map_err(|e| InitError::Invalid(format!("the config is not TOML: {e}")))?;
     document.remove("feeds");
+    let network_feeds_added = !document.contains_key("network_feeds")
+        && network_feeds_section(&document).is_some_and(|section| {
+            document.insert("network_feeds", section);
+            true
+        });
     let feeds = network();
     let wanted = i64::try_from(max_pending(feeds.count)).unwrap_or(i64::MAX);
     if let Some(server) = document
@@ -116,9 +138,10 @@ pub fn update_feeds(config: &str) -> Result<FeedUpdate, InitError> {
 
     let parsed: crate::NodeConfig = toml::from_str(&text)
         .map_err(|e| InitError::Invalid(format!("the new config does not parse: {e}")))?;
-    parsed
-        .resolve()
-        .map_err(|e| InitError::Invalid(format!("the new config does not resolve: {e}")))?;
+    // The checks of the node's start, so that a bad peg fails here, not in a
+    // restart loop.
+    crate::feed_set::check_feeds(&parsed, &parsed.feeds)
+        .map_err(|e| InitError::Invalid(format!("the new config fails a check: {e}")))?;
 
     let (old, new) = (by_symbol(config)?, by_symbol(&text)?);
     let changed = new
@@ -139,6 +162,7 @@ pub fn update_feeds(config: &str) -> Result<FeedUpdate, InitError> {
             .collect(),
         changed,
         count: feeds.count,
+        network_feeds_added,
         text,
     })
 }
@@ -236,6 +260,32 @@ governance_address = "0x0000000000000000000000000000000000000001"
             max_pending(network().count)
         );
         assert_eq!(config.tick_interval_ms, 25);
+    }
+
+    #[test]
+    fn a_config_that_fetches_its_registry_gets_the_network_feed_set_once() {
+        let fetched = older_config().replace(
+            r#"path = "r.json""#,
+            "url = \"https://xb5gv-diaaa-aaaaf-qg5qa-cai.raw.icp0.io/registry.json\"\ncanister_id = \"xb5gv-diaaa-aaaaf-qg5qa-cai\"",
+        );
+        let first = update_feeds(&fetched).expect("updates");
+        assert!(first.network_feeds_added);
+        let config: crate::NodeConfig = toml::from_str(&first.text).expect("parses");
+        let section = config.network_feeds.expect("the section");
+        assert_eq!(
+            section.url,
+            "https://xb5gv-diaaa-aaaaf-qg5qa-cai.raw.icp0.io/feeds.json"
+        );
+        assert_eq!(section.poll_secs, 30);
+        let second = update_feeds(&first.text).expect("updates");
+        assert!(!second.network_feeds_added);
+        assert_eq!(second.text, first.text);
+        assert!(
+            !update_feeds(&older_config())
+                .expect("updates")
+                .network_feeds_added,
+            "a registry file has no canister to ask"
+        );
     }
 
     #[test]

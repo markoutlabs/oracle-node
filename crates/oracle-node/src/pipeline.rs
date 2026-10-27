@@ -14,9 +14,10 @@
 //! order on one task. Anything that fans events across workers would break the
 //! guarantee silently: a book carried across a gap looks live and is not.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use oracle_agg::{AggError, Aggregator, FeedStats, Trigger};
+use oracle_agg::{AggError, Aggregator, ConfigError, FeedConfig, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
 use oracle_types::{FeedId, InstrumentId, PriceUpdate};
 use oracle_wire::{
@@ -78,6 +79,21 @@ impl Pipeline {
         self.books = BookPublisher::new(floor);
         self.funding = FundingPublisher::new(floor);
         self
+    }
+
+    /// Takes a new feed set (see [`Aggregator::reconfigure`]) and retires the books it no longer reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the aggregator's [`ConfigError`], and then changes nothing.
+    pub fn reconfigure(&mut self, feeds: Vec<FeedConfig>, floor: u64) -> Result<(), ConfigError> {
+        let books: HashSet<InstrumentId> = feeds
+            .iter()
+            .flat_map(|feed| feed.sources.iter().map(|source| source.instrument.clone()))
+            .collect();
+        self.aggregator.reconfigure(feeds, floor)?;
+        self.books.retain(&books);
+        Ok(())
     }
 
     /// Returns the counters.

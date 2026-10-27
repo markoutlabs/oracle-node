@@ -8,27 +8,29 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
 use oracle_agg::{AggError, Cause};
 use oracle_ingest::IngestEvent;
-use oracle_ingest::binance::snapshot::SnapshotConnector;
 use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
-use oracle_ingest::transport::WebSocketConnector;
-use oracle_ingest::venues::kucoin_connect::KucoinConnector;
-use oracle_ingest::venues::mexc_connect::MexcConnector;
 use oracle_ingest::{Recorder, RecordingConnector};
+use oracle_node::feed_set;
 use oracle_node::publish::PushTarget;
-use oracle_node::{LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging};
+use oracle_node::{
+    Adapter, LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging,
+};
 use oracle_server::{Channel, NodeTransport, ServerState, TransportConfig, router, unix_now};
-use oracle_types::{FeedId, InstrumentId, Symbol};
-use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList};
+use oracle_types::{FeedId, Symbol};
+use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList, VerifiedFeedSet};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::ingest::{Ingest, connectors};
+use crate::live_feeds::{FeedSetTask, Pace, Reconfigure, books_of, first_feed_set, names};
 use crate::notify;
 use crate::status::{NodeLatency, NodeStatus, STATUS_EVERY, Summary, log_venue_lag};
 use crate::tail::{log_observation, log_update};
@@ -52,6 +54,12 @@ const CLOCK_SYNC_EVERY: Duration = Duration::from_secs(1);
 const CLOCK_STEP_WARNING: u64 = 100_000_000;
 /// How often a node that the registry does not list fetches it again.
 const LISTING_POLL: Duration = Duration::from_secs(30);
+
+/// The node stops so that systemd starts it again on the cached new feed set.
+/// It exits 75, which the unit restarts.
+#[derive(Debug, thiserror::Error)]
+#[error("restarting on the new network feed set")]
+pub(crate) struct RestartForFeeds;
 
 #[derive(Args)]
 pub(crate) struct StartArgs {
@@ -85,6 +93,8 @@ pub(crate) fn run(args: StartArgs) -> anyhow::Result<()> {
 struct Node {
     config: NodeConfig,
     resolved: ResolvedConfig,
+    /// The network's feed set that `config` holds, if the node serves one.
+    feed_set: Option<VerifiedFeedSet>,
     signer: Arc<Signer>,
     governance: Address,
     registry: Registry,
@@ -96,6 +106,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     let Some(Node {
         config,
         resolved,
+        feed_set,
         signer,
         governance,
         registry,
@@ -108,22 +119,15 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     let address = signer.address();
     let registry_version = registry.version;
     let feeds = resolved.symbols.len();
-    let symbols: HashMap<FeedId, Symbol> = resolved
-        .symbols
-        .iter()
-        .map(|symbol| (oracle_wire::feed_id(symbol), *symbol))
-        .collect();
+    let place = registry.verify(governance, 0)?.authorize(address)?;
+    let nodes = registry.nodes.len();
+    let symbols = names(&resolved.feeds);
 
     // Sequence numbers must never go backwards for this node, including across
     // restarts. Milliseconds since the epoch outrun any publish counter.
-    let books: HashMap<FeedId, Vec<InstrumentId>> = resolved
-        .feeds
-        .iter()
-        .map(|feed| {
-            let sources = feed.sources.iter().map(|source| source.instrument.clone());
-            (feed.feed_id, sources.collect())
-        })
-        .collect();
+    let books = books_of(&resolved.feeds);
+    let feeds_in_force = resolved.feeds.clone();
+    let subscriptions = feed_set::subscriptions(&resolved);
     let seq_floor = wall_clock_unix_nanos() / 1_000_000;
     let aggregator = oracle_agg::Aggregator::new(resolved.feeds)?.with_sequence_floor(seq_floor);
     let pipeline =
@@ -140,51 +144,79 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         TransportConfig::default()
     };
     let push_signer = Arc::clone(&signer);
-    let transport = NodeTransport::new(
-        signer,
-        clients,
-        limits,
-        config.server.max_pending_feeds,
-        unix_now(),
-    );
-    let state = ServerState::with_books(&resolved.symbols, books, registry, transport);
+    // A network feed set can hold more feeds than the config was written for.
+    let max_pending = config.max_pending_for(feeds);
+    let transport = NodeTransport::new(signer, clients, limits, max_pending, unix_now());
+    let version = feed_set.as_ref().map_or(0, VerifiedFeedSet::version);
+    let state = ServerState::with_books(&resolved.symbols, books, version, registry, transport);
     let shutdown = CancellationToken::new();
     spawn_transport_tasks(
         Arc::clone(state.transport()),
         config.clone(),
         shutdown.clone(),
     );
-    if let Some(target) = push {
+    let pace = push.map(|target| {
         info!(canister = %target.canister, gateway = %target.gateway, "pushing frames to the registry canister");
-        crate::publish::spawn(Arc::clone(&state), push_signer, target, shutdown.clone());
-    }
+        let (pace, paced) = Pace::new(target.pace, feed_set.as_ref());
+        crate::publish::spawn(Arc::clone(&state), push_signer, target, paced, shutdown.clone());
+        pace
+    });
 
     // One clock for receipt times and publish times, so a resync moves both.
     let clock = MonotonicClock::new();
     spawn_clock_sync(clock.clone(), shutdown.clone());
-    let (ingest, connections) = spawn_ingest(
+    let (events, ingest) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
+    let mut adapters = Ingest::new(events, clock.clone(), shutdown.clone());
+    adapters.start(first_adapters(
         resolved.binance,
         resolved.venues,
         args.record.as_deref(),
         &clock,
-        &shutdown,
-    )?;
+    )?);
+    let connections = adapters.connections();
+    let (reconfigure, reconfigured) = mpsc::channel::<Reconfigure>(1);
+    let restart = CancellationToken::new();
     let pipeline_task = tokio::spawn(
         PipelineTask {
             pipeline,
             ingest,
+            reconfigure: reconfigured,
             state: Arc::clone(&state),
             tick: resolved.tick_interval,
             tail: args.tail,
-            feeds,
             symbols,
-            connections,
+            connections: Arc::clone(&connections),
             latency: NodeLatency::default(),
             clock,
             shutdown: shutdown.clone(),
         }
         .run(),
     );
+    if let Some(settings) = &config.network_feeds {
+        tokio::spawn(
+            FeedSetTask {
+                config: config.clone(),
+                feeds_in_force,
+                subscriptions,
+                version,
+                governance,
+                index: place,
+                nodes,
+                slots: settings.slots(),
+                poll: Duration::from_secs(settings.poll_secs.max(1)),
+                cache: feed_set::cache_path(&args.config),
+                state: Arc::clone(&state),
+                ingest: adapters,
+                pipeline: reconfigure,
+                pace,
+                recording: args.record.is_some(),
+                restart: restart.clone(),
+                shutdown: shutdown.clone(),
+            }
+            .run(),
+        );
+    }
+    let connections = connections.load(Ordering::Relaxed);
 
     #[cfg(unix)]
     raise_open_files(
@@ -215,16 +247,23 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
 
     let limits = config.server.limits.clone();
     let server = oracle_server::serve(listener, router(state, &limits), limits, shutdown.clone());
+    let mut restarting = false;
     tokio::select! {
         () = server => {},
         signal = signals.recv() => {
             info!(signal = signal?, "shutting down");
+        }
+        () = restart.cancelled() => {
+            restarting = true;
         }
     }
 
     notify::stopping();
     shutdown.cancel();
     let _ = pipeline_task.await;
+    if restarting {
+        return Err(RestartForFeeds.into());
+    }
     Ok(())
 }
 
@@ -261,10 +300,20 @@ fn raise_open_files(needed: usize) {
 async fn load(path: &Path, signals: &mut Signals) -> anyhow::Result<Option<Node>> {
     notify::status("loading the config and the key");
     let config = NodeConfig::load(path)?;
-    let resolved = config.resolve()?;
     // Both fail loudly at startup rather than at the first publish.
     let signer = Arc::new(config.load_signing_key()?);
     let governance = config.governance()?;
+    let (config, resolved, feed_set) = match first_feed_set(&config, path, governance).await {
+        Some(chosen) => (
+            chosen.checked.config,
+            chosen.checked.resolved,
+            Some(chosen.set),
+        ),
+        None => {
+            let resolved = config.resolve()?;
+            (config, resolved, None)
+        }
+    };
 
     info!(
         address = %signer.address(),
@@ -292,6 +341,7 @@ async fn load(path: &Path, signals: &mut Signals) -> anyhow::Result<Option<Node>
     Ok(Some(Node {
         config,
         resolved,
+        feed_set,
         signer,
         governance,
         registry,
@@ -356,8 +406,10 @@ async fn listed_registry(
     }
 }
 
-/// Starts one task per venue. Returns their events and the connection count.
-fn spawn_ingest(
+/// The venue adapters at start. With `--record`, the recorder sits under them,
+/// so a recording holds Binance's REST snapshots and funding intervals, and the
+/// KuCoin and MEXC tokens and contract records: a replay never calls REST.
+fn first_adapters(
     binance: oracle_ingest::binance::BinanceConfig,
     venues: Vec<(
         oracle_types::Venue,
@@ -365,17 +417,9 @@ fn spawn_ingest(
     )>,
     record: Option<&Path>,
     clock: &MonotonicClock,
-    shutdown: &CancellationToken,
-) -> anyhow::Result<(mpsc::Receiver<IngestEvent>, usize)> {
-    // The same adapters either way; `--record` only wraps the transport. The
-    // snapshot connector sits under the recorder, so a recording holds Binance's
-    // REST snapshots and funding intervals, and a replay never calls REST. The
-    // KuCoin and MEXC connectors sit there too, for tokens and contract records.
-    let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?
-        .with_funding_info(binance.funding_info_routes())
-        .with_open_interest(binance.open_interest_routes());
-    let snapshots = MexcConnector::new(KucoinConnector::new(snapshots)?)?;
-    let adapters = match record {
+) -> anyhow::Result<Vec<Adapter>> {
+    let snapshots = connectors(&binance)?;
+    Ok(match record {
         Some(path) => {
             info!(path = %path.display(), "recording raw venue frames");
             let recorder = Recorder::to_file(path)?.with_clock(clock.clone());
@@ -383,24 +427,7 @@ fn spawn_ingest(
             build_adapters(binance, venues, connector, clock.clone())?
         }
         None => build_adapters(binance, venues, snapshots, clock.clone())?,
-    };
-
-    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
-    for adapter in adapters.adapters {
-        let shutdown = shutdown.clone();
-        let ingest_tx = ingest_tx.clone();
-        let label = adapter.label().to_owned();
-        tokio::spawn(async move {
-            let result = adapter.run(ingest_tx, shutdown.clone()).await;
-            // After shutdown the pipeline is gone, so a failed send is expected.
-            if let Err(error) = result
-                && !shutdown.is_cancelled()
-            {
-                error!(venue = %label, %error, "ingest stopped");
-            }
-        });
-    }
-    Ok((ingest_rx, adapters.connections))
+    })
 }
 
 /// One task owns the pipeline. Events are applied in arrival order, which is
@@ -408,13 +435,15 @@ fn spawn_ingest(
 struct PipelineTask {
     pipeline: Pipeline,
     ingest: mpsc::Receiver<IngestEvent>,
+    /// A new network feed set, from the feed set task.
+    reconfigure: mpsc::Receiver<Reconfigure>,
     state: Arc<ServerState>,
     tick: Duration,
     tail: bool,
-    feeds: usize,
     /// Names each feed id in the tail.
     symbols: HashMap<FeedId, Symbol>,
-    connections: usize,
+    /// Shared with the venue adapters, which a feed set change replaces.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
     latency: NodeLatency,
     clock: MonotonicClock,
     shutdown: CancellationToken,
@@ -529,17 +558,33 @@ impl PipelineTask {
                     self.publish(polled, &mut published, None);
                     self.publish_venues(clock.now_ns());
                 }
+                Some(change) = self.reconfigure.recv() => {
+                    // Above the floor of this run, and above every sequence the
+                    // old set used: `Aggregator::reconfigure` takes the larger.
+                    let floor = wall_clock_unix_nanos() / 1_000_000;
+                    let symbols = names(&change.feeds);
+                    let result = self
+                        .pipeline
+                        .reconfigure(change.feeds, floor)
+                        .map_err(|error| error.to_string());
+                    if result.is_ok() {
+                        self.symbols = symbols;
+                        published.clear();
+                    }
+                    let _ = change.reply.send(result);
+                }
                 _ = status_ticker.tick() => {
                     let stats = self.pipeline.stats();
                     let (signed, venues) = self.latency.take();
                     let status = NodeStatus {
                         feeds_published: published.len(),
-                        feeds: self.feeds,
+                        feeds: self.symbols.len(),
                         clients: self.state.transport().session_count(),
                         connections_up: stats.connections_up(),
-                        connections: self.connections,
+                        connections: self.connections.load(Ordering::Relaxed),
                         updates: stats.published.saturating_sub(updates_before),
                         client_list_version: self.state.transport().clients_version(),
+                        feed_set: self.state.feed_set_version(),
                         signed,
                     };
                     status.log();
@@ -602,8 +647,6 @@ impl Signals {
     }
 }
 
-/// Runs the transport's clock: key rotation and deadlines every second, and a
-/// client-list poll when it comes from a URL.
 /// Keeps the node clock on wall time. A consumer compares publish times with its
 /// own clock.
 fn spawn_clock_sync(clock: MonotonicClock, shutdown: CancellationToken) {
@@ -627,6 +670,8 @@ fn spawn_clock_sync(clock: MonotonicClock, shutdown: CancellationToken) {
     });
 }
 
+/// Runs the transport's clock: key rotation and deadlines every second, and a
+/// client-list poll when it comes from a URL.
 fn spawn_transport_tasks(
     transport: Arc<NodeTransport>,
     config: NodeConfig,

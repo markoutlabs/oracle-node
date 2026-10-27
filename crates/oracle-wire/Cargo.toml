@@ -25,6 +25,7 @@ oracle-types.workspace = true
 hex.workspace = true
 getrandom = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
+semver.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tiny-keccak.workspace = true

@@ -32,6 +32,8 @@ pub(super) fn render(
         )));
     }
     let exe = quoted(&service.exe)?;
+    // The node caches the network's feed set beside its config.
+    let dir = quoted(config.parent().unwrap_or_else(|| Path::new("/")))?;
     let config = quoted(config)?;
     Ok(format!(
         r#"# Written by `oracle-node init`. After an edit:
@@ -85,8 +87,9 @@ CapabilityBoundingSet=
 # A listen port below 1024 needs:
 # AmbientCapabilities=CAP_NET_BIND_SERVICE
 # CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# `start --record FILE` writes outside a read-only system:
-# ReadWritePaths=/var/lib/oracle-node
+# The node caches the network's feed set next to its config, and
+# `start --record FILE` writes there too.
+ReadWritePaths={dir}
 
 [Install]
 WantedBy=multi-user.target
@@ -139,6 +142,7 @@ mod tests {
             "MemorySwapMax=0",
             "ProtectSystem=strict",
             "ProtectHome=read-only",
+            r#"ReadWritePaths="/home/oracle/node 1""#,
         ] {
             assert!(unit.lines().any(|l| l == line), "missing `{line}`:\n{unit}");
         }

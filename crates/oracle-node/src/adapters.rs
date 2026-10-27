@@ -12,11 +12,13 @@ use tracing::info;
 
 use crate::config::VenueConnection;
 
-/// The adapters a node runs.
-pub struct Adapters {
-    /// One per venue.
-    pub adapters: Vec<Box<dyn ExchangeAdapter>>,
-    /// The WebSocket connections they hold between them, when all are up.
+/// One venue's adapter, as a node runs it.
+pub struct Adapter {
+    /// The venue.
+    pub venue: Venue,
+    /// The adapter.
+    pub adapter: Box<dyn ExchangeAdapter>,
+    /// The WebSocket connections it holds when it is up.
     pub connections: usize,
 }
 
@@ -35,16 +37,39 @@ pub fn build_adapters<C: Connector + Clone + 'static>(
     venues: Vec<(Venue, Vec<VenueConnection>)>,
     connector: C,
     clock: MonotonicClock,
-) -> Result<Adapters, IngestError> {
-    let mut adapters: Vec<Box<dyn ExchangeAdapter>> = Vec::new();
-    let mut connections = 0_usize;
+) -> Result<Vec<Adapter>, IngestError> {
+    let adapters = build_venue_adapters(binance, venues, connector, clock)?;
+    if adapters.is_empty() {
+        return Err(IngestError::NoInstruments {
+            venue: Venue::Binance,
+        });
+    }
+    Ok(adapters)
+}
+
+/// Builds the adapters of `venues` only, for a live change; no instrument is no error.
+///
+/// # Errors
+///
+/// Returns [`IngestError`] if an adapter rejects its instruments.
+pub fn build_venue_adapters<C: Connector + Clone + 'static>(
+    binance: BinanceConfig,
+    venues: Vec<(Venue, Vec<VenueConnection>)>,
+    connector: C,
+    clock: MonotonicClock,
+) -> Result<Vec<Adapter>, IngestError> {
+    let mut adapters = Vec::new();
     if !binance.spot.is_empty() || !binance.perp.is_empty() {
         let adapter = BinanceAdapter::new(binance, connector.clone())?.with_clock(clock.clone());
-        for (session, market, _) in adapter.plan()? {
+        let plan = adapter.plan()?;
+        for (session, market, _) in &plan {
             info!(venue = "binance", %market, url = %session.url, "ingest endpoint");
-            connections = connections.saturating_add(1);
         }
-        adapters.push(Box::new(adapter));
+        adapters.push(Adapter {
+            venue: Venue::Binance,
+            adapter: Box::new(adapter),
+            connections: plan.len(),
+        });
     }
     for (venue, venue_connections) in venues {
         // Each connection carries its own decoder: a venue can speak different
@@ -58,18 +83,13 @@ pub fn build_adapters<C: Connector + Clone + 'static>(
                 (connection.spec, connection.instruments)
             })
             .collect();
-        connections = connections.saturating_add(specs.len());
-        adapters.push(Box::new(
-            VenueAdapter::new(venue, specs, connector.clone())?.with_clock(clock.clone()),
-        ));
-    }
-    if adapters.is_empty() {
-        return Err(IngestError::NoInstruments {
-            venue: Venue::Binance,
+        adapters.push(Adapter {
+            venue,
+            connections: specs.len(),
+            adapter: Box::new(
+                VenueAdapter::new(venue, specs, connector.clone())?.with_clock(clock.clone()),
+            ),
         });
     }
-    Ok(Adapters {
-        adapters,
-        connections,
-    })
+    Ok(adapters)
 }

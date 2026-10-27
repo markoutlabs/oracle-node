@@ -6,7 +6,10 @@ use std::process::ExitCode;
 use clap::{CommandFactory as _, Parser, Subcommand};
 use oracle_node::{ConfigError, KeyFileError};
 
+mod export_feeds;
+mod ingest;
 mod init;
+mod live_feeds;
 mod notify;
 mod publish;
 mod rotate;
@@ -22,6 +25,10 @@ mod wizard;
 /// `EX_CONFIG` from sysexits.h. The unit file tells systemd not to restart on
 /// it, because only an edit fixes the cause.
 const EXIT_CONFIG: u8 = 78;
+
+/// A planned restart on a new network feed set; the unit restarts it, as for
+/// any exit but 78. 75 is `EX_TEMPFAIL`.
+const EXIT_RESTART: u8 = 75;
 
 /// What a shell reports for Ctrl-C.
 const EXIT_CANCELLED: u8 = 130;
@@ -42,6 +49,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print a feed set for the canister's `set_feed_set`, from feed files,
+    /// after every check that the nodes run on it.
+    ExportFeeds(export_feeds::ExportFeedsArgs),
     /// Generate this node's key and print what to do with it. As root, also
     /// install the node as a systemd service and start it.
     Init(init::InitArgs),
@@ -82,6 +92,7 @@ fn dispatch() -> anyhow::Result<()> {
         );
     }
     match Cli::parse().command {
+        Command::ExportFeeds(args) => export_feeds::run(args),
         Command::Init(args) => init::run(args),
         Command::Rotate(args) => rotate::run(args),
         Command::Start(args) => start::run(args),
@@ -90,11 +101,19 @@ fn dispatch() -> anyhow::Result<()> {
 }
 
 fn exit_code(error: &anyhow::Error) -> ExitCode {
+    if error
+        .chain()
+        .any(|cause| cause.is::<start::RestartForFeeds>())
+    {
+        return ExitCode::from(EXIT_RESTART);
+    }
     let permanent = error.chain().any(|cause| {
         cause
             .downcast_ref::<ConfigError>()
             .is_some_and(ConfigError::is_permanent)
             || cause.is::<KeyFileError>()
+            // A bad peg or a duplicate feed: the aggregator refuses the same set again.
+            || cause.is::<oracle_agg::ConfigError>()
     });
     if permanent {
         ExitCode::from(EXIT_CONFIG)

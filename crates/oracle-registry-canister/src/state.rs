@@ -6,9 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use oracle_types::Symbol;
 use oracle_wire::{
-    Address, ClientEntry, ClientList, CompressedPublicKey, MAX_CLIENTS, MAX_NODES, NodeEntry,
-    NodeListing, Quorum, Registry, Signature, VerifiedRegistry, WireError,
+    Address, ClientEntry, ClientList, CompressedPublicKey, FeedContent, FeedSet, MAX_CLIENTS,
+    MAX_NODES, NodeEntry, NodeListing, Quorum, Registry, Signature, VerifiedRegistry, WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,12 @@ pub enum StateError {
     /// The wire crate rejected an encoding.
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// The feed set failed a check.
+    #[error("invalid feed set: {0}")]
+    InvalidFeedSet(String),
+    /// No feed set has been set, so there is nothing to sign.
+    #[error("no feed set has been set yet; call set_feed_set first")]
+    NoFeedSet,
 }
 
 /// Canister configuration, fixed at install.
@@ -143,6 +150,19 @@ pub struct UnsignedClientList {
     pub signing_bytes: Vec<u8>,
 }
 
+/// A feed set ready to sign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsignedFeedSet {
+    /// `State::feeds_version + 1`.
+    pub version: u64,
+    /// The issue time, unix seconds.
+    pub effective_from: u64,
+    /// The feeds and the settings that go with them.
+    pub content: FeedContent,
+    /// `FeedSet::signing_bytes` over the above.
+    pub signing_bytes: Vec<u8>,
+}
+
 /// The whole canister state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
@@ -168,6 +188,17 @@ pub struct State {
     pub clients_version: u64,
     /// The last signed client list.
     pub clients_published: Option<ClientList>,
+    // The feed set came after the first mainnet install, so an older state
+    // loads with none of these fields.
+    /// The feed set governance last set, in canonical form. `None` before the first.
+    #[serde(default)]
+    pub feed_content: Option<FeedContent>,
+    /// Version of the last published feed set. Zero before the first.
+    #[serde(default)]
+    pub feeds_version: u64,
+    /// The last signed feed set.
+    #[serde(default)]
+    pub feeds_published: Option<FeedSet>,
 }
 
 impl State {
@@ -190,6 +221,9 @@ impl State {
             removed_clients: BTreeSet::new(),
             clients_version: 0,
             clients_published: None,
+            feed_content: None,
+            feeds_version: 0,
+            feeds_published: None,
         })
     }
 
@@ -469,6 +503,82 @@ impl State {
         });
         self.clients_version = list.version;
         Ok(self.clients_version)
+    }
+
+    /// Checks a feed set and keeps its canonical form for the next signing round.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::InvalidFeedSet`] with the first problem.
+    pub fn set_feed_content(&mut self, content: &FeedContent) -> Result<(), StateError> {
+        self.feed_content = Some(content.canonical().map_err(StateError::InvalidFeedSet)?);
+        Ok(())
+    }
+
+    /// Builds the next feed set to sign, from the content governance last set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::NoFeedSet`] before the first `set_feed_set`, and
+    /// [`StateError::Wire`] if a field exceeds its cap.
+    pub fn unsigned_feed_set(&self, now: u64) -> Result<UnsignedFeedSet, StateError> {
+        let content = self.feed_content.as_ref().ok_or(StateError::NoFeedSet)?;
+        let version = self.feeds_version.saturating_add(1);
+        let signing_bytes = FeedSet::signing_bytes(
+            version,
+            now,
+            &content.min_node_version,
+            content.push,
+            &content.feeds,
+        )?;
+        Ok(UnsignedFeedSet {
+            version,
+            effective_from: now,
+            content: content.clone(),
+            signing_bytes,
+        })
+    }
+
+    /// Stores a signed feed set as the published one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::VersionMismatch`] if the set was built for a
+    /// version other than the next one.
+    pub fn publish_feeds(
+        &mut self,
+        set: UnsignedFeedSet,
+        governance_signature: Signature,
+    ) -> Result<u64, StateError> {
+        let expected = self.feeds_version.saturating_add(1);
+        if set.version != expected {
+            return Err(StateError::VersionMismatch {
+                expected,
+                got: set.version,
+            });
+        }
+        self.feeds_published = Some(FeedSet {
+            version: set.version,
+            effective_from: set.effective_from,
+            min_node_version: set.content.min_node_version,
+            push: set.content.push,
+            feeds: set.content.feeds,
+            governance_signature,
+        });
+        self.feeds_version = set.version;
+        Ok(self.feeds_version)
+    }
+
+    /// The first of `feeds` that the feed set does not list; `None` when it lists all, or when there is no set.
+    #[must_use]
+    pub fn first_unlisted(&self, feeds: &[Symbol]) -> Option<Symbol> {
+        let content = self.feed_content.as_ref()?;
+        let listed: BTreeSet<Symbol> = content
+            .feeds
+            .iter()
+            .filter_map(|feed| feed.symbol.parse().ok())
+            .collect();
+        feeds.iter().find(|feed| !listed.contains(feed)).copied()
     }
 
     /// The published document, verified against the governance key. The
@@ -814,6 +924,78 @@ mod tests {
         let bytes = serde_json::to_vec(&state).expect("serialises");
         let loaded: State = serde_json::from_slice(&bytes).expect("loads");
         assert_eq!(loaded, state);
+    }
+
+    fn one_feed() -> FeedContent {
+        FeedContent {
+            min_node_version: String::new(),
+            push: None,
+            feeds: vec![oracle_wire::FeedSettings {
+                symbol: "CRYPTO.ETH/BTC".to_owned(),
+                deviation_bps: Some("0.50".to_owned()),
+                sources: vec![oracle_wire::SourceSettings {
+                    venue: "binance".to_owned(),
+                    market: "spot".to_owned(),
+                    symbol: "ETHBTC".to_owned(),
+                    ..oracle_wire::SourceSettings::default()
+                }],
+                ..oracle_wire::FeedSettings::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn a_feed_set_publishes_in_canonical_form_and_verifies() {
+        let mut state = listed(&[1], 1);
+        assert_eq!(state.unsigned_feed_set(NOW), Err(StateError::NoFeedSet));
+        state.set_feed_content(&one_feed()).expect("passes");
+        let unsigned = state.unsigned_feed_set(NOW).expect("encodes");
+        let signature = governance_signer().sign_payload(&unsigned.signing_bytes);
+        assert_eq!(state.publish_feeds(unsigned.clone(), signature), Ok(1));
+        let published = state.feeds_published.clone().expect("published");
+        let verified = published
+            .verify(governance_signer().address(), 0)
+            .expect("verifies");
+        assert_eq!(
+            verified
+                .feeds()
+                .first()
+                .and_then(|feed| feed.deviation_bps.as_deref()),
+            Some("0.5")
+        );
+        assert_eq!(
+            state.publish_feeds(unsigned, signature),
+            Err(StateError::VersionMismatch {
+                expected: 2,
+                got: 1,
+            })
+        );
+        let eth: Symbol = "CRYPTO.ETH/BTC".parse().expect("a symbol");
+        let sol: Symbol = "CRYPTO.SOL/BTC".parse().expect("a symbol");
+        assert_eq!(state.first_unlisted(&[eth]), None);
+        assert_eq!(state.first_unlisted(&[eth, sol]), Some(sol));
+        let mut bad = one_feed();
+        bad.feeds.clear();
+        assert!(matches!(
+            state.set_feed_content(&bad),
+            Err(StateError::InvalidFeedSet(_))
+        ));
+    }
+
+    /// The mainnet state was saved before the feed set, so it lacks the fields.
+    #[test]
+    fn a_state_from_before_the_feed_set_loads() {
+        let mut state = listed(&[1], 1);
+        state.set_feed_content(&one_feed()).expect("passes");
+        let mut old = serde_json::to_value(&state).expect("serialises");
+        let fields = old.as_object_mut().expect("an object");
+        for field in ["feed_content", "feeds_version", "feeds_published"] {
+            fields.remove(field).expect("the field");
+        }
+        let loaded: State = serde_json::from_value(old).expect("loads");
+        assert_eq!(loaded.feed_content, None);
+        assert_eq!(loaded.feeds_version, 0);
+        assert_eq!(loaded.published, state.published);
     }
 
     /// Nothing was deployed with node ids, so there is no migration. An old

@@ -74,7 +74,8 @@ async fn start_limited(
     let btc: Symbol = BTC.parse().expect("valid");
     let symbols = vec![btc];
     let books = [(feed_id(&btc), vec![btcusdt()])].into_iter().collect();
-    let state = ServerState::with_books(&symbols, books, test_registry(), Arc::clone(&transport));
+    let state =
+        ServerState::with_books(&symbols, books, 0, test_registry(), Arc::clone(&transport));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("bound");
     let app = router(Arc::clone(&state), &limits);

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use candid::{CandidType, Decode, Encode, Principal};
 use oracle_client::Certification;
-use oracle_wire::{Address, NodeEntry, NodeListing, Registry};
+use oracle_wire::{Address, FeedSet, NodeEntry, NodeListing, Registry};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 use serde::de::DeserializeOwned;
 
@@ -301,6 +301,22 @@ impl Harness {
             "set_feeds",
             Encode!(&symbols).expect("encodes"),
         )
+    }
+
+    /// Governance publishes a feed set from its JSON content. Returns the version.
+    pub fn set_feed_set(&self, content_json: &str) -> Result<u64, String> {
+        self.update(
+            self.governance,
+            "set_feed_set",
+            Encode!(&content_json.to_owned()).expect("encodes"),
+        )
+    }
+
+    /// The published feed set, if any.
+    #[must_use]
+    pub fn feed_set(&self) -> Option<FeedSet> {
+        let json: Option<String> = self.query("get_feed_set", Encode!().expect("encodes"));
+        json.map(|json| serde_json::from_str(&json).expect("the feed set parses"))
     }
 
     /// A push as the anonymous identity, as a node makes it. `Err` holds the

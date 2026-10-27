@@ -45,6 +45,9 @@ pub const KIND_NODE_AUTH_OK: u8 = 0x84;
 /// Payload kind for the client allow-list.
 pub const KIND_CLIENT_LIST: u8 = 0x85;
 
+/// Payload kind for the network's feed set.
+pub const KIND_FEED_SET: u8 = 0x86;
+
 /// Size of an encoded price update.
 pub const PRICE_UPDATE_SIZE: usize = 96;
 

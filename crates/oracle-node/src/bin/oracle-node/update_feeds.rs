@@ -40,6 +40,11 @@ pub(crate) fn run(args: UpdateFeedsArgs) -> anyhow::Result<()> {
         update.changed.len(),
         prev.display()
     );
+    if update.network_feeds_added {
+        println!(
+            "  added [network_feeds]: the node follows the network's feed set from the canister"
+        );
+    }
     for (what, symbols) in [
         ("added", &update.added),
         ("removed", &update.removed),

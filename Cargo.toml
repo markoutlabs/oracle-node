@@ -97,6 +97,10 @@ ed25519-dalek = "2"
 # Test-only: the verifier tapray-perps runs.
 ed25519-zebra = "4.0.3"
 serde = { version = "1", features = ["derive"] }
+# The server's feed catalog, which a new feed set swaps while publishes read it.
+arc-swap = "1"
+# The feed set names the oldest node version that can serve it.
+semver = "1"
 serde_json = "1"
 # Candid `blob` arguments: a plain Vec<u8> encodes as `vec nat8`, one byte at a time.
 serde_bytes = "0.11"

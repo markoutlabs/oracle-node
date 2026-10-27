@@ -12,11 +12,21 @@ thread_local! {
     static BUSY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The two signed documents the canister publishes.
+/// The signed documents the canister publishes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Document {
     Registry,
     Clients,
+    Feeds,
+}
+
+/// Refuses a change while a signing round runs: the round's own checks read
+/// the state it replaces, and so do those of `set_feeds` and `set_price_window`.
+pub(crate) fn idle() -> Result<(), String> {
+    if BUSY.get() {
+        return Err("a signing round is in flight; retry shortly".to_owned());
+    }
+    Ok(())
 }
 
 /// Runs a mutation, then one signing round for `document`. Returns its new version.
@@ -27,9 +37,7 @@ pub(crate) async fn mutate_and_publish(
     document: Document,
     mutation: impl FnOnce(&mut State) -> Result<(), StateError>,
 ) -> Result<u64, String> {
-    if BUSY.get() {
-        return Err("a signing round is in flight; retry shortly".to_owned());
-    }
+    idle()?;
     BUSY.set(true);
     let result = round(document, mutation).await;
     BUSY.set(false);
@@ -60,6 +68,14 @@ async fn round(
                 .map_err(|error| error.to_string())?;
             let signature = sign(&unsigned.signing_bytes).await?;
             next.publish_clients(unsigned, signature)
+                .map_err(|error| error.to_string())?
+        }
+        Document::Feeds => {
+            let unsigned = next
+                .unsigned_feed_set(now)
+                .map_err(|error| error.to_string())?;
+            let signature = sign(&unsigned.signing_bytes).await?;
+            next.publish_feeds(unsigned, signature)
                 .map_err(|error| error.to_string())?
         }
     };

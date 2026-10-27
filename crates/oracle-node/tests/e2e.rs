@@ -252,6 +252,145 @@ fn a_node_pushes_its_frames_and_the_canister_prices_them() {
     node.stop();
 }
 
+/// The node takes each new network feed set while it runs (SPEC §3.8): new
+/// feeds start, removed feeds stop, only the changed venue reconnects, and a
+/// set that the node cannot serve is refused.
+#[test]
+fn a_node_takes_each_new_feed_set_while_it_runs() {
+    let mut canister = Harness::new(1, "dfx_test_key", None);
+    let gateway = canister.make_live();
+    let governance = canister.refresh_governance_key();
+    let runtime = Runtime::new().expect("runtime");
+    let venue = start_venue(&runtime);
+    let dir = common::scratch("feed-set");
+    std::fs::create_dir_all(&dir).expect("creates");
+
+    let node_dir = dir.join("node");
+    let passphrase_file = common::passphrase_file(&node_dir);
+    let port = free_port();
+    run(Command::new(BINARY)
+        .arg("init")
+        .arg("--out")
+        .arg(&node_dir)
+        .args(["--passphrase-file", &passphrase_file])
+        .args(["--endpoint", &format!("ws://127.0.0.1:{port}/v2/ws")])
+        .args(["--canister", &canister.canister.to_text()])
+        .args(["--gateway", &gateway])
+        .args(["--root-key", &canister.root_key()])
+        .args(["--governance", &governance.to_checksummed()]));
+    let entry = std::fs::read_to_string(node_dir.join("node-entry.json")).expect("init wrote it");
+    let entry: NodeEntry = serde_json::from_str(&entry).expect("an entry");
+    assert_eq!(canister.add_node(&entry), Ok(1));
+    assert_eq!(canister.set_quorum(1, 1), Ok(2));
+    let client = Signer::generate().expect("a key").address();
+    assert_eq!(canister.add_client(client, unix_now() + 86_400), Ok(1));
+
+    let spot = |symbol: &str, venue_symbol: &str| {
+        serde_json::json!({ "symbol": symbol, "min_sources": 1,
+            "sources": [{ "venue": "binance", "market": "spot", "symbol": venue_symbol }] })
+    };
+    let funding = serde_json::json!({ "symbol": FUNDING, "min_sources": 1,
+        "sources": [{ "venue": "binance", "market": "linear_perp", "symbol": "BTCUSDT" }] });
+    let content = |feeds: Vec<Value>| serde_json::json!({ "feeds": feeds }).to_string();
+    let first = content(vec![spot(FEED, "BTCUSDT"), funding.clone()]);
+    assert_eq!(canister.set_feed_set(&first), Ok(1));
+    canister
+        .set_feeds(&[FEED])
+        .expect("governance prices the feed");
+
+    // `init` wrote [network_feeds] for this canister. A test network changes
+    // at once, and the node pushes fast, so the price shows it keeps working.
+    let config = node_dir.join("config.toml");
+    run_locally(&config, port, &venue);
+    let written = std::fs::read_to_string(&config).expect("the config");
+    let mut table: toml::Table = toml::from_str(&written).expect("TOML");
+    let section = table
+        .get_mut("network_feeds")
+        .and_then(toml::Value::as_table_mut)
+        .expect("init wrote a [network_feeds] section");
+    for (key, value) in [("poll_secs", 1), ("lead_secs", 1), ("slot_secs", 1)] {
+        section.insert(key.to_owned(), toml::Value::Integer(value));
+    }
+    let publish = table
+        .get_mut("publish")
+        .and_then(toml::Value::as_table_mut)
+        .expect("a [publish] section");
+    publish.insert("heartbeat_secs".to_owned(), toml::Value::Integer(2));
+    publish.insert("min_interval_secs".to_owned(), toml::Value::Integer(1));
+    std::fs::write(&config, toml::to_string(&table).expect("serialises")).expect("writes");
+
+    let node = Node::spawn(common::start(&config, "json"), dir.join("node.log"));
+    let started = event(&node, "serving the network feed set", |_| true);
+    assert_eq!(started.get("version").and_then(Value::as_u64), Some(1));
+    event(&node, READY, |_| true);
+    assert!(
+        node_dir.join("network-feeds.json").exists(),
+        "the node cached the set it serves"
+    );
+    let price_after = |at_ns: u64| {
+        let deadline = std::time::Instant::now() + WAIT;
+        while canister.price(FEED).is_none_or(|record| {
+            record.status != PriceStatus::Ok || record.publish_time_ns <= at_ns
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no fresh price after the change:\n{}",
+                node.log()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    price_after(0);
+
+    // A new Binance market: Binance alone reconnects, and the price goes on.
+    let second = content(vec![
+        spot(FEED, "BTCUSDT"),
+        funding.clone(),
+        spot("CRYPTO.ETH/USDT", "ETHUSDT"),
+    ]);
+    assert_eq!(canister.set_feed_set(&second), Ok(2));
+    let applied = event(&node, "network feed set applied", |fields| {
+        fields.get("version").and_then(Value::as_u64) == Some(2)
+    });
+    assert_eq!(applied.get("feeds").and_then(Value::as_u64), Some(3));
+    assert!(text(&applied, "venues").contains("binance"), "{applied}");
+    event(&node, "venue reconnects for the new feed set", |_| true);
+    let changed_at = unix_now() * 1_000_000_000;
+    price_after(changed_at);
+
+    // The new feed leaves again.
+    assert_eq!(canister.set_feed_set(&first), Ok(3));
+    let applied = event(&node, "network feed set applied", |fields| {
+        fields.get("version").and_then(Value::as_u64) == Some(3)
+    });
+    assert_eq!(applied.get("feeds").and_then(Value::as_u64), Some(2));
+
+    // The canister takes a Coinbase perpetual; a node cannot serve one.
+    let perp = serde_json::json!({ "symbol": "CRYPTO.ETH/USD.PERP_MARK", "min_sources": 1,
+        "sources": [{ "venue": "coinbase", "market": "linear_perp", "symbol": "ETH-PERP" }] });
+    assert_eq!(
+        canister.set_feed_set(&content(vec![spot(FEED, "BTCUSDT"), funding, perp])),
+        Ok(4)
+    );
+    let refused = event(
+        &node,
+        "network feed set refused; the node keeps its feeds",
+        |fields| fields.get("version").and_then(Value::as_u64) == Some(4),
+    );
+    assert!(
+        text(&refused, "reason").to_lowercase().contains("coinbase"),
+        "{refused}"
+    );
+    let still = unix_now() * 1_000_000_000;
+    price_after(still);
+    let log = node.stop();
+    assert!(
+        !log.contains("\"version\":4,\"feeds\""),
+        "the refused set was never applied"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn start_venue(runtime: &Runtime) -> String {
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))

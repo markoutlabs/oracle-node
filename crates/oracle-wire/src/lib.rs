@@ -78,6 +78,7 @@ mod clients;
 mod codec;
 pub mod domain;
 mod error;
+mod feeds;
 mod frame;
 mod funding;
 mod keccak;
@@ -104,6 +105,10 @@ pub use books::{
 };
 pub use clients::{ClientEntry, ClientList, MAX_CLIENTS, VerifiedClientList};
 pub use error::{VerifyError, WireError};
+pub use feeds::{
+    FeedContent, FeedSet, FeedSettings, MAX_FEED_FIELD_LEN, MAX_FEEDS, MAX_SOURCE_KINDS,
+    PushPolicy, SLOT_LEAD_SECS, SLOT_SECS, Slots, SourceSettings, VerifiedFeedSet,
+};
 pub use frame::{
     FRAME_SIZE, FRAME_TYPE_PRICE_UPDATE, SignedUpdate, UnverifiedFrame, VerifiedUpdate,
 };
@@ -113,9 +118,9 @@ pub use funding::{
 };
 pub use keccak::{keccak256, keccak256_parts};
 pub use payload::{
-    KIND_BOOK_UPDATE, KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_FUNDING_UPDATE, KIND_NODE_AUTH_OK,
-    KIND_PRICE_BATCH, KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_VENUE_REPORT, PAYLOAD_VERSION,
-    PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
+    KIND_BOOK_UPDATE, KIND_CLIENT_AUTH, KIND_CLIENT_LIST, KIND_FEED_SET, KIND_FUNDING_UPDATE,
+    KIND_NODE_AUTH_OK, KIND_PRICE_BATCH, KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_VENUE_REPORT,
+    PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
 };
 pub use registry::{
     EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, NodeEntry, NodeListing, Quorum,

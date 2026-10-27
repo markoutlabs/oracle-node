@@ -3105,6 +3105,7 @@ dependencies = [
 name = "oracle-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "bytes",
  "futures-util",
@@ -3163,6 +3164,7 @@ dependencies = [
  "k256",
  "oracle-types",
  "secp256k1",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

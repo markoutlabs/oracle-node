@@ -18,6 +18,7 @@
 pub mod adapters;
 pub mod books;
 pub mod config;
+pub mod feed_set;
 pub mod funding;
 pub mod init;
 pub mod keyfile;
@@ -26,7 +27,7 @@ pub mod pipeline;
 pub mod publish;
 pub mod seed;
 
-pub use adapters::{Adapters, build_adapters};
+pub use adapters::{Adapter, build_adapters, build_venue_adapters};
 pub use config::{ConfigError, NodeConfig, ResolvedConfig};
 pub use init::{
     CanisterId, Endpoint, FeedUpdate, Gateway, InitError, NodeKey, NodeSetup, RegistrySource,

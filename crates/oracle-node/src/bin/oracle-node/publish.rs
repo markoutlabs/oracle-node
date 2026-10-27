@@ -12,11 +12,12 @@ use candid::{CandidType, Decode, Deserialize, Encode};
 use ic_agent::Agent;
 use ic_agent::export::Principal;
 use oracle_ingest::clock::wall_clock_unix_nanos;
-use oracle_node::publish::{PushPlanner, PushTarget};
+use oracle_node::publish::{PushPace, PushPlanner, PushTarget};
 use oracle_server::ServerState;
 use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::Signer;
 use serde_bytes::ByteBuf;
+use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -99,15 +100,17 @@ pub(crate) fn spawn(
     state: Arc<ServerState>,
     signer: Arc<Signer>,
     target: PushTarget,
+    pace: watch::Receiver<PushPace>,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(run(state, signer, target, shutdown));
+    tokio::spawn(run(state, signer, target, pace, shutdown));
 }
 
 async fn run(
     state: Arc<ServerState>,
     signer: Arc<Signer>,
     target: PushTarget,
+    mut pace: watch::Receiver<PushPace>,
     shutdown: CancellationToken,
 ) {
     let agent = match agent(&target) {
@@ -118,7 +121,7 @@ async fn run(
         }
     };
     let canister = target.canister;
-    let mut planner = PushPlanner::new(target.policy);
+    let mut planner = PushPlanner::new(*pace.borrow_and_update());
     let mut read_feeds_at = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -128,6 +131,13 @@ async fn run(
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
+            Ok(()) = pace.changed() => {
+                let next = *pace.borrow_and_update();
+                info!(heartbeat_secs = next.heartbeat.as_secs(), deviation_bps = next.deviation_bps,
+                      min_interval_secs = next.min_interval.as_secs(), "push pace changed with the network feed set");
+                planner.set_pace(next);
+                continue;
+            }
             _ = report.tick() => {
                 minute.log(planner.feed_count());
                 minute = Minute::default();
@@ -140,7 +150,8 @@ async fn run(
                 Ok(feeds) => {
                     planner.set_feeds(feeds);
                     read_feeds_at = Instant::now() + FEEDS_EVERY;
-                    check_window(&agent, &canister, target.policy.heartbeat).await;
+                    let heartbeat = pace.borrow().heartbeat;
+                    check_window(&agent, &canister, heartbeat).await;
                 }
                 Err(error) => {
                     minute.failed(format!("get_feeds: {error}"));
@@ -222,7 +233,7 @@ async fn check_window(agent: &Agent, canister: &Principal, heartbeat: Duration) 
     let Some(window) = reply.ok().and_then(|reply| Decode!(&reply, u64).ok()) else {
         return;
     };
-    if heartbeat.as_secs().saturating_mul(2) > window {
+    if oracle_wire::PushPolicy::min_window_secs(heartbeat.as_secs()) > window {
         warn!(
             heartbeat_secs = heartbeat.as_secs(),
             window_secs = window,

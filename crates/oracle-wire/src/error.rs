@@ -220,4 +220,17 @@ pub enum VerifyError {
     /// The client list was structurally invalid.
     #[error("malformed client list: {0}")]
     MalformedClientList(String),
+
+    /// The feed set version was not newer than the version already trusted.
+    #[error("feed set version {found} is not newer than the trusted version {minimum}")]
+    StaleFeedSet {
+        /// Version in the supplied set.
+        found: u64,
+        /// Minimum the caller will accept.
+        minimum: u64,
+    },
+
+    /// The feed set was structurally invalid.
+    #[error("malformed feed set: {0}")]
+    MalformedFeedSet(String),
 }

@@ -17,7 +17,7 @@
 //! durable log, not a live socket.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -296,7 +296,8 @@ pub struct Subscriber {
     lagged: AtomicBool,
     closed: AtomicBool,
     notify: Notify,
-    max_pending: usize,
+    /// The hub's, shared, so a larger feed set raises it for every subscriber.
+    max_pending: Arc<AtomicUsize>,
 }
 
 impl Subscriber {
@@ -528,7 +529,8 @@ impl Subscriber {
             return;
         };
         let key = (frame.channel(), feed_id);
-        if pending.len() >= self.max_pending && !pending.contains_key(&key) {
+        if pending.len() >= self.max_pending.load(Ordering::Relaxed) && !pending.contains_key(&key)
+        {
             // Too many distinct feeds outstanding: this subscriber is not
             // keeping up at all. Say so rather than quietly dropping data.
             self.lagged.store(true, Ordering::Relaxed);
@@ -581,7 +583,7 @@ pub struct Hub {
     /// The latest funding frame of each perpetual, for a new subscriber.
     latest_funding: Mutex<HashMap<InstrumentId, Arc<PreparedFunding>>>,
     next_id: AtomicU64,
-    max_pending: usize,
+    max_pending: Arc<AtomicUsize>,
     sealer: Arc<BroadcastSealer>,
 }
 
@@ -599,7 +601,7 @@ impl Hub {
             book_history: Mutex::new(HashMap::new()),
             latest_funding: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            max_pending: max_pending.max(1),
+            max_pending: Arc::new(AtomicUsize::new(max_pending.max(1))),
             sealer,
         }
     }
@@ -621,7 +623,7 @@ impl Hub {
             lagged: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             notify: Notify::new(),
-            max_pending: self.max_pending,
+            max_pending: Arc::clone(&self.max_pending),
         });
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.insert(subscriber.id, Arc::clone(&subscriber));
@@ -657,6 +659,19 @@ impl Hub {
                 .values()
                 .any(|subscriber| !subscriber.is_closed() && subscriber.wants_book(book))
         })
+    }
+
+    /// Sets every subscriber's bound on outstanding feeds, after the feed set changed size.
+    pub fn set_max_pending(&self, max_pending: usize) {
+        self.max_pending
+            .store(max_pending.max(1), Ordering::Relaxed);
+    }
+
+    /// Drops the latest update of every feed outside `keep`, after a new feed set.
+    pub fn forget_feeds(&self, keep: &HashSet<FeedId>) {
+        if let Ok(mut latest) = self.latest.lock() {
+            latest.retain(|feed, _| keep.contains(feed));
+        }
     }
 
     /// Returns the current subscriber count.

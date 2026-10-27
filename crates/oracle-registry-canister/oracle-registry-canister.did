@@ -204,6 +204,8 @@ service : (InitArgs) -> {
   add_node : (text) -> (Result);
   // The last published client list as JSON, if any.
   get_clients : () -> (opt text) query;
+  // The last published feed set as JSON, if any.
+  get_feed_set : () -> (opt text) query;
   // The listed feeds: the 32-byte id and the symbol of each.
   get_feeds : () -> (vec FeedInfo) query;
   // The governance address, once the threshold key has been fetched.
@@ -220,8 +222,8 @@ service : (InitArgs) -> {
   get_registry : () -> (opt text) query;
   // The version of the last published document. Zero before the first.
   get_version : () -> (nat64) query;
-  // Serves `/registry.json`, `/clients.json`, `/prices.json`, `/frames.json`,
-  // and a 404 for every other path, as certified query responses.
+  // Serves `/registry.json`, `/clients.json`, `/feeds.json`, `/prices.json`,
+  // `/frames.json`, and a 404 for every other path, as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
   // A node pushes its latest updates as one batch, or as single frames.
   // Returns one verdict for each update, in order.
@@ -241,8 +243,14 @@ service : (InitArgs) -> {
   // Governance re-signs the client list with no change, for example to publish
   // an empty list before the first client. Returns the new client-list version.
   republish_clients : () -> (Result);
+  // Governance re-signs the feed set with no change. Returns the new feed set version.
+  republish_feeds : () -> (Result);
   // Governance moves a client's expiry. Returns the new client-list version.
   set_client_expiry : (text, nat64) -> (Result);
+  // Governance publishes the network's feed set: every feed the nodes serve.
+  // `content_json` is `{ "min_node_version", "push", "feeds" }`, with each feed
+  // as in a node config. Returns the new feed set version.
+  set_feed_set : (text) -> (Result);
   // Governance sets the feeds that the canister prices, as canonical symbols.
   // A feed that stays keeps its frames.
   set_feeds : (vec text) -> (Result_3);

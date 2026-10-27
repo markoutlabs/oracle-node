@@ -1,10 +1,10 @@
 //! The node registry as an Internet Computer canister (SPEC §3.6).
 //!
 //! The canister is the trust root for membership. It holds every node and
-//! every client by address, and the addresses it retired. It publishes two
-//! documents signed with a threshold ECDSA key: the registry and the client
-//! list. The governance address consumers pin is the address of that key, so
-//! no consumer needs an Internet Computer agent.
+//! every client by address, and the addresses it retired. It publishes three
+//! documents signed with a threshold ECDSA key: the registry, the client list
+//! and the feed set. The governance address consumers pin is the address of
+//! that key, so no consumer needs an Internet Computer agent.
 //!
 //! It also takes the nodes' signed price frames and resolves each listed feed
 //! to the median of the nodes, with the SDK's own checks. Clients fetch the
@@ -47,19 +47,19 @@ use candid::CandidType;
 use ic_http_certification::utils::add_v2_certificate_header;
 pub use ic_http_certification::{HttpRequest, HttpResponse};
 use oracle_types::{FeedId, Symbol};
-use oracle_wire::{NodeEntry, Quorum};
+use oracle_wire::{FeedContent, NodeEntry, PushPolicy, Quorum};
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
-use crate::certify::{CERTIFIED, certify_documents};
+use crate::certify::{CERTIFIED, certify_documents, certify_prices};
 use crate::prices::{MAX_FRAMES_PER_PUSH, PriceRecord, Prices, StoredPrices, Verdict};
-use crate::publish::{Document, mutate_and_publish};
+use crate::publish::{Document, idle, mutate_and_publish};
 use crate::runtime::{
     PRICES, STATE, address, anonymous_only, governance_only, is_governance, now_ns, now_secs,
     read_prices, read_state, with_prices,
 };
 use crate::signing::ensure_governance_key;
-use crate::state::{Config, DEFAULT_EPOCH_SECS, State};
+use crate::state::{Config, DEFAULT_EPOCH_SECS, State, StateError};
 
 /// Install arguments.
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -171,7 +171,7 @@ fn push(frames: Vec<ByteBuf>) -> Result<Vec<Verdict>, String> {
     }
     let verdicts = with_prices(|prices| prices.push(&frames, now_ns()));
     if verdicts.contains(&Verdict::Accepted) {
-        certify_documents();
+        certify_prices();
     }
     Ok(verdicts)
 }
@@ -180,8 +180,19 @@ fn push(frames: Vec<ByteBuf>) -> Result<Vec<Verdict>, String> {
 /// in seconds. About three push intervals: 25 for pushes every 7 s.
 #[ic_cdk::update(guard = "governance_only")]
 fn set_price_window(secs: u64) -> Result<(), String> {
+    idle()?;
+    let heartbeat = read_state(|s| s.feed_content.as_ref().and_then(|c| c.push))
+        .map(|push| push.heartbeat_secs);
+    if let Some(heartbeat) = heartbeat
+        && PushPolicy::min_window_secs(heartbeat) > secs
+    {
+        return Err(format!(
+            "the feed set pushes every {heartbeat} s at the latest; a window below {} s drops quiet feeds",
+            PushPolicy::min_window_secs(heartbeat)
+        ));
+    }
     with_prices(|prices| prices.set_window(std::time::Duration::from_secs(secs)))?;
-    certify_documents();
+    certify_prices();
     Ok(())
 }
 
@@ -189,10 +200,49 @@ fn set_price_window(secs: u64) -> Result<(), String> {
 /// A feed that stays keeps its frames.
 #[ic_cdk::update(guard = "governance_only")]
 fn set_feeds(feeds: Vec<String>) -> Result<(), String> {
+    idle()?;
     let feeds = symbols(&feeds)?;
+    if let Some(missing) = read_state(|s| s.first_unlisted(&feeds)) {
+        return Err(format!("{missing} is not in the feed set"));
+    }
     with_prices(|prices| prices.set_feeds(&feeds));
-    certify_documents();
+    certify_prices();
     Ok(())
+}
+
+/// Governance publishes the network's feed set, `{ "min_node_version", "push", "feeds" }` as JSON.
+/// Returns the new feed set version.
+#[ic_cdk::update(guard = "governance_only")]
+async fn set_feed_set(content_json: String) -> Result<u64, String> {
+    let content: FeedContent = serde_json::from_str(&content_json)
+        .map_err(|error| format!("the feed set is not valid JSON: {error}"))?;
+    let window = read_prices(|prices| prices.window().as_secs());
+    if let Some(push) = content.push
+        && PushPolicy::min_window_secs(push.heartbeat_secs) > window
+    {
+        return Err(format!(
+            "push.heartbeat_secs {} is more than half the price window of {window} s",
+            push.heartbeat_secs
+        ));
+    }
+    let priced: Vec<Symbol> =
+        read_prices(|prices| prices.feeds().map(|(_, symbol)| symbol).collect());
+    mutate_and_publish(Document::Feeds, |s| {
+        s.set_feed_content(&content)?;
+        match s.first_unlisted(&priced) {
+            Some(missing) => Err(StateError::InvalidFeedSet(format!(
+                "{missing} is priced on-chain; remove it with set_feeds first"
+            ))),
+            None => Ok(()),
+        }
+    })
+    .await
+}
+
+/// Governance re-signs the feed set with no change. Returns the new feed set version.
+#[ic_cdk::update(guard = "governance_only")]
+async fn republish_feeds() -> Result<u64, String> {
+    mutate_and_publish(Document::Feeds, |_| Ok(())).await
 }
 
 /// Governance lists a node. `entry_json` is the operator's `NodeEntry`.
@@ -300,6 +350,16 @@ fn get_clients() -> Option<String> {
     })
 }
 
+/// The last published feed set as JSON, if any.
+#[ic_cdk::query]
+fn get_feed_set() -> Option<String> {
+    read_state(|s| {
+        s.feeds_published
+            .as_ref()
+            .map(|set| serde_json::to_string(set).expect("feed set serialises"))
+    })
+}
+
 /// The version of the last published document. Zero before the first.
 #[ic_cdk::query]
 fn get_version() -> u64 {
@@ -392,8 +452,8 @@ fn get_node_listing(node: String) -> Option<String> {
     })
 }
 
-/// Serves `/registry.json`, `/clients.json`, `/prices.json`, `/frames.json`,
-/// and a 404 for every other path, as certified query responses.
+/// Serves `/registry.json`, `/clients.json`, `/feeds.json`, `/prices.json`,
+/// `/frames.json`, and a 404 for every other path, as certified query responses.
 #[ic_cdk::query]
 fn http_request(request: HttpRequest<'static>) -> HttpResponse<'static> {
     let path = request.get_path().unwrap_or_else(|_| "/".to_owned());
@@ -441,7 +501,7 @@ mod tests {
             .zip(source.lines().skip(1))
             .filter(|(attribute, _)| attribute.starts_with("#[ic_cdk::update"))
             .collect();
-        assert_eq!(updates.len(), 13);
+        assert_eq!(updates.len(), 15);
         for (attribute, signature) in updates {
             let guard = if signature.starts_with("fn push(") {
                 "anonymous_only"

@@ -2,7 +2,7 @@
 """Checks golden.json with a second implementation of the wire format.
 
 Every payload is built again from its JSON fields with `struct`, from the
-tables in SPEC §3.3, §3.3.1, §3.3.2 and §3.3.3, and hashed with foundry's `cast keccak`.
+tables in SPEC §3.3, §3.3.1, §3.3.2, §3.3.3 and §3.8, and hashed with foundry's `cast keccak`.
 Nothing here shares code with the Rust encoder.
 
     python3 check_layout.py golden.json
@@ -165,6 +165,53 @@ def funding_update(u: dict) -> bytes:
     return out
 
 
+def text(value: str) -> bytes:
+    data = value.encode()
+    return struct.pack(">H", len(data)) + data
+
+
+def opt_text(value) -> bytes:
+    return b"\x00" if value is None else b"\x01" + text(value)
+
+
+def opt_u64(value) -> bytes:
+    return b"\x00" if value is None else b"\x01" + struct.pack(">Q", value)
+
+
+def feed_set(s: dict) -> bytes:
+    out = struct.pack(">BBQQ", 1, 0x86, s["version"], s["effective_from"])
+    out += text(s["min_node_version"])
+    push = s["push"]
+    if push is None:
+        out += b"\x00"
+    else:
+        out += b"\x01" + struct.pack(
+            ">QIQ", push["heartbeat_secs"], push["deviation_bps"], push["min_interval_secs"]
+        )
+    out += struct.pack(">I", len(s["feeds"]))
+    for feed in s["feeds"]:
+        out += text(feed["symbol"])
+        out += opt_text(feed.get("peg"))
+        out += opt_text(feed.get("max_peg_conf_bps"))
+        out += opt_u64(feed.get("min_sources"))
+        out += opt_text(feed.get("deviation_bps"))
+        out += opt_u64(feed.get("min_interval_ms"))
+        out += opt_u64(feed.get("max_age_ms"))
+        out += opt_text(feed.get("impact_notional"))
+        out += struct.pack(">H", len(feed["sources"]))
+        for source in feed["sources"]:
+            out += text(source["venue"]) + text(source["market"]) + text(source["symbol"])
+            kinds = source.get("kinds")
+            if kinds is None:
+                out += b"\x00"
+            else:
+                out += b"\x01" + struct.pack(">H", len(kinds)) + b"".join(text(k) for k in kinds)
+            out += opt_text(source.get("weight"))
+            out += bytes([1 if source.get("converted") else 0])
+            out += opt_text(source.get("contract_size"))
+    return out
+
+
 def check(kind: str, vector: dict, payload: bytes, separator: bytes) -> list:
     name = f"{kind} `{vector['name']}`"
     errors = []
@@ -205,6 +252,14 @@ def main() -> int:
     for vector in golden["price_batches"]:
         errors += check("batch", vector, price_batch(vector["updates"]), separator)
         count += 1
+    vector = golden["feed_set"]
+    payload = feed_set(vector["feed_set"])
+    if payload != unhex(vector["signing_bytes"]):
+        errors.append(f"feed set: bytes differ\n  ours   0x{payload.hex()}\n  stored {vector['signing_bytes']}")
+    digest = keccak(b"\x19\x01" + separator + keccak(payload))
+    if digest != unhex(vector["digest"]):
+        errors.append(f"feed set: digest differs: ours 0x{digest.hex()}, stored {vector['digest']}")
+    count += 1
     for error in errors:
         print(error)
     print(f"{count} vectors checked, {len(errors)} differences")

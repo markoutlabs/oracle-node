@@ -708,5 +708,82 @@
       "signature": "0x2298b5822735eb5cb8d1da99ea9f4d21dcf299794d9fb2a69c4a0245e41c751e30278d8fef2d55acce3bd13d414aaa6c2d0ac993d46f872c922be0263496adba1c",
       "frame": "0x0519e7e376e7c213b7e7e7e46cc70a5dd086daff2a01020001010100010523e79c7ed211911a19afaa4def68c896bc72d674bf33c5c64d4d7089e320e2000005d21dba00000000009502f90000fffffff818598766005c9400185987658927000018598765c4c1ca0000000000000e030300000000000000002298b5822735eb5cb8d1da99ea9f4d21dcf299794d9fb2a69c4a0245e41c751e30278d8fef2d55acce3bd13d414aaa6c2d0ac993d46f872c922be0263496adba1c"
     }
-  ]
+  ],
+  "feed_set": {
+    "governance_secret_key": "0x9191919191919191919191919191919191919191919191919191919191919191",
+    "governance_address": "0x751562ab6780c7cad6f2c383b4b807f3a5ec72c1",
+    "feed_set": {
+      "version": 1,
+      "effective_from": 1754582400,
+      "min_node_version": "0.1.0",
+      "push": {
+        "heartbeat_secs": 7,
+        "deviation_bps": 10,
+        "min_interval_secs": 5
+      },
+      "feeds": [
+        {
+          "symbol": "CRYPTO.USDC/USD",
+          "peg": "CRYPTO.USDT/USD",
+          "min_sources": 2,
+          "max_age_ms": 30000,
+          "sources": [
+            {
+              "venue": "kraken",
+              "market": "spot",
+              "symbol": "USDC/USD"
+            },
+            {
+              "venue": "binance",
+              "market": "spot",
+              "symbol": "USDCUSDT",
+              "converted": true
+            }
+          ]
+        },
+        {
+          "symbol": "CRYPTO.USDT/USD",
+          "min_sources": 1,
+          "sources": [
+            {
+              "venue": "kraken",
+              "market": "spot",
+              "symbol": "USDT/USD"
+            }
+          ]
+        },
+        {
+          "symbol": "CRYPTO.ETH/USDT.PERP_MARK",
+          "max_peg_conf_bps": "50",
+          "deviation_bps": "0.5",
+          "min_interval_ms": 250,
+          "impact_notional": "20000",
+          "sources": [
+            {
+              "venue": "binance",
+              "market": "spot",
+              "symbol": "ETHUSDT",
+              "kinds": [
+                "mark_price"
+              ]
+            },
+            {
+              "venue": "okx",
+              "market": "linear_perp",
+              "symbol": "ETH-USDT-SWAP",
+              "kinds": [
+                "mark_price",
+                "book_top"
+              ],
+              "weight": "2",
+              "contract_size": "0.1"
+            }
+          ]
+        }
+      ],
+      "governance_signature": "0x5fcfe951169065d786a437f9122dc82e5835f1db0c16d94a6692249b12b495fb0c58ba280deb537f4270e9d761b1d7898628aeaadb60c6d06838116355f3a4931b"
+    },
+    "signing_bytes": "0x01860000000000000001000000006894cd800005302e312e300100000000000000070000000a000000000000000500000003000f43525950544f2e555344432f55534401000f43525950544f2e555344542f55534400010000000000000002000001000000000000753000000200066b72616b656e000473706f740008555344432f55534400000000000762696e616e6365000473706f740008555344435553445400000100000f43525950544f2e555344542f555344000001000000000000000100000000000100066b72616b656e000473706f740008555344542f55534400000000001943525950544f2e4554482f555344542e504552505f4d41524b00010002353000010003302e350100000000000000fa0001000532303030300002000762696e616e6365000473706f74000745544855534454010001000a6d61726b5f707269636500000000036f6b78000b6c696e6561725f70657270000d4554482d555344542d53574150010002000a6d61726b5f70726963650008626f6f6b5f746f700100013200010003302e31",
+    "digest": "0x8cbc588fc825a42656bea0d0c65bfd02494620ac18d665d592b609fe772ed244"
+  }
 }

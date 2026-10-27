@@ -232,9 +232,7 @@ impl RegistrySource {
     #[must_use]
     pub fn url(&self, document: &str) -> String {
         match self {
-            // The raw domain hands over the canister's response as it is; the
-            // node checks the certificate itself.
-            Self::Mainnet(canister) => format!("https://{canister}.raw.icp0.io/{document}"),
+            Self::Mainnet(canister) => oracle_client::mainnet_document_url(&canister.0, document),
             Self::Network {
                 canister, gateway, ..
             } => format!("{gateway}/{document}?canisterId={canister}"),

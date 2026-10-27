@@ -37,13 +37,18 @@ flags() {
 
 # Runs a governance update call and fails unless the canister answers Ok.
 # Mainnet asks first: each call publishes, and an address is used once, ever.
-governance_call() { # identity, method, Candid arguments, what the call does
-  local reply answer
+# Arguments that start with @ are a file of binary Candid, for a large argument.
+governance_call() { # identity, method, Candid arguments or @file, what the call does
+  local reply answer args
   [ "$1" != anonymous ] || die "the anonymous identity is not governance"
   if [ "$ENV" = ic ]; then
     read -r -p "$4 on mainnet as $1? [y/N] " answer
     [ "$answer" = y ] || die "nothing was sent"
   fi
-  reply=$(cd "$ROOT" && icp canister call oracle_registry "$2" "$3" -e "$ENV" --identity "$1" | tee /dev/stderr)
+  case $3 in
+    @*) args=(--args-file "${3#@}" --args-format bin) ;;
+    *) args=("$3") ;;
+  esac
+  reply=$(cd "$ROOT" && icp canister call oracle_registry "$2" "${args[@]}" -e "$ENV" --identity "$1" | tee /dev/stderr)
   grep -q "Ok = " <<<"$reply" || die "the canister refused $2"
 }

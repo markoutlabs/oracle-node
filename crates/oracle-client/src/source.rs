@@ -30,10 +30,10 @@ pub type RegistryFuture<'a> =
 #[non_exhaustive]
 pub enum FetchError {
     /// The transport failed, or the server answered with an error status.
-    #[error("registry fetch failed: {0}")]
+    #[error("the fetch failed: {0}")]
     Transport(String),
-    /// The body was not a registry document.
-    #[error("registry document is not valid JSON: {0}")]
+    /// The body was not the document asked for.
+    #[error("the document is not valid JSON: {0}")]
     Malformed(String),
     /// The response has no valid, recent certificate from the canister.
     #[error("response is not certified by the canister: {0}")]
@@ -218,6 +218,23 @@ impl HttpDocumentSource {
     }
 }
 
+/// The URL of a mainnet canister's document, such as `registry.json`.
+#[must_use]
+pub fn mainnet_document_url(canister_id: &str, document: &str) -> String {
+    // The raw domain hands over the canister's response as it is; the reader
+    // checks the certificate itself.
+    format!("https://{canister_id}.raw.icp0.io/{document}")
+}
+
+/// The URL of another document of the same canister, such as `feeds.json` beside `registry.json`.
+#[must_use]
+pub fn document_url_beside(url: &str, document: &str) -> Option<String> {
+    // A local network's URL names the canister in its query, which stays.
+    let mut url = reqwest::Url::parse(url).ok()?;
+    url.path_segments_mut().ok()?.pop().push(document);
+    Some(url.into())
+}
+
 /// Fetches the registry document from the canister over HTTP.
 pub struct HttpRegistrySource {
     document: HttpDocumentSource,
@@ -248,7 +265,7 @@ impl HttpRegistrySource {
     /// See [`HttpRegistrySource::new`].
     pub fn canister(canister_id: &str) -> Result<Self, FetchError> {
         Self::new(
-            &format!("https://{canister_id}.raw.icp0.io/registry.json"),
+            &mainnet_document_url(canister_id, "registry.json"),
             Certification::mainnet(canister_id)?,
         )
     }
@@ -269,6 +286,27 @@ impl RegistrySource for HttpRegistrySource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_document_url_beside_another_keeps_the_host_and_the_query() {
+        assert_eq!(
+            document_url_beside("https://x.raw.icp0.io/registry.json", "feeds.json").as_deref(),
+            Some("https://x.raw.icp0.io/feeds.json")
+        );
+        assert_eq!(
+            document_url_beside(
+                "http://127.0.0.1:4943/registry.json?canisterId=uxrrr-q7777-77774-qaaaq-cai",
+                "feeds.json"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:4943/feeds.json?canisterId=uxrrr-q7777-77774-qaaaq-cai")
+        );
+        assert_eq!(document_url_beside("not a url", "feeds.json"), None);
+        assert_eq!(
+            mainnet_document_url("x", "registry.json"),
+            "https://x.raw.icp0.io/registry.json"
+        );
+    }
 
     /// Building the client is where TLS providers get resolved. With `ring`
     /// from tungstenite and no second provider from reqwest, this must work.

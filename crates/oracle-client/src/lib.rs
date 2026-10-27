@@ -102,7 +102,7 @@ pub use nodes::{ConnectionState, DeliveryWindow, NodeFeed, NodeFrames, NodeRepor
 pub use quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 pub use source::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, IC_MAINNET_ROOT_KEY,
-    RegistrySource,
+    RegistrySource, document_url_beside, mainnet_document_url,
 };
 pub use tap::{FrameKind, TappedFrame, Verdict};
 pub use verify::{

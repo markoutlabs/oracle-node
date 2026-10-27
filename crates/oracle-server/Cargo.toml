@@ -12,6 +12,7 @@ oracle-transport.workspace = true
 oracle-types.workspace = true
 oracle-wire.workspace = true
 
+arc-swap.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true

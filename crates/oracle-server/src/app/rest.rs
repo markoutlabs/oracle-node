@@ -54,6 +54,8 @@ pub(super) async fn registry(State(web): State<Arc<Web>>) -> Response {
 struct Health {
     address: Address,
     feeds: usize,
+    /// The network's feed set version; zero for the node's own feeds.
+    feed_set: u64,
     subscribers: usize,
     publishing: usize,
 }
@@ -62,7 +64,8 @@ pub(super) async fn health(State(web): State<Arc<Web>>) -> Response {
     let state = &web.state;
     axum::Json(Health {
         address: state.transport.address(),
-        feeds: state.catalog.len(),
+        feeds: state.feeds().len(),
+        feed_set: state.feed_set_version(),
         subscribers: state.hub.subscriber_count(),
         publishing: state.hub.latest_all().len(),
     })

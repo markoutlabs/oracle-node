@@ -67,6 +67,9 @@ struct BookState {
     /// The connection dropped: the next frame is a snapshot, empty until new
     /// data arrives.
     reset: bool,
+    /// The feed set no longer reads this book. After one empty snapshot it
+    /// sends nothing, and it keeps its `seq` for a set that reads it again.
+    retired: bool,
 }
 
 /// Turns local books into snapshot and delta frames.
@@ -90,6 +93,14 @@ impl BookPublisher {
         if observation.kind != ObsKind::Depth || observation.book.is_none() {
             return;
         }
+        // The old connection still sends while a new feed set swaps its venue.
+        if self
+            .books
+            .get(&observation.instrument)
+            .is_some_and(|state| state.retired)
+        {
+            return;
+        }
         let seq_floor = self.seq_floor;
         let state = self
             .books
@@ -105,6 +116,7 @@ impl BookPublisher {
                 last_snapshot_ns: None,
                 dirty: false,
                 reset: false,
+                retired: false,
             });
         state.current.clone_from(&observation.book);
         state.exchange_time_ns = observation.exchange_time_ns;
@@ -117,13 +129,28 @@ impl BookPublisher {
     /// snapshot, so nobody keeps a book that nothing updates.
     pub fn reset(&mut self, venue: Venue, market: MarketKind) {
         for (instrument, state) in &mut self.books {
-            if instrument.venue == venue && instrument.market == market {
+            if instrument.venue == venue && instrument.market == market && !state.retired {
                 state.current = None;
                 // The empty snapshot shows no venue state.
                 state.venue_seq = None;
                 state.reset = true;
                 state.dirty = true;
             }
+        }
+    }
+
+    /// Retires every book outside `keep`, after a new feed set, and takes back each one inside it.
+    pub fn retain(&mut self, keep: &std::collections::HashSet<InstrumentId>) {
+        for (instrument, state) in &mut self.books {
+            let kept = keep.contains(instrument);
+            if !kept && !state.retired {
+                // As for a dropped connection: subscribers get an empty snapshot.
+                state.current = None;
+                state.venue_seq = None;
+                state.reset = true;
+                state.dirty = true;
+            }
+            state.retired = !kept;
         }
     }
 
@@ -137,6 +164,10 @@ impl BookPublisher {
         let snapshot_every = nanos(SNAPSHOT_EVERY);
         let mut updates = Vec::new();
         for (instrument, state) in &mut self.books {
+            // A retired book's last frame is the empty snapshot.
+            if state.retired && !state.reset {
+                continue;
+            }
             if state
                 .last_sent_ns
                 .is_some_and(|last| now_ns.saturating_sub(last) < min_interval)
@@ -252,6 +283,35 @@ mod tests {
             })),
             funding: None,
         }
+    }
+
+    #[test]
+    fn a_retired_book_ends_with_an_empty_snapshot_and_its_sequence_goes_on() {
+        let mut books = BookPublisher::new(100);
+        books.observe(&depth(&[("100", "1")], &[("101", "1")], START));
+        let first = books.poll(START, |_| true);
+        assert_eq!(first.first().map(|update| update.seq), Some(101));
+        books.retain(&std::collections::HashSet::new());
+        let last = books.poll(START + SECOND, |_| true);
+        let last = last.first().expect("one last frame");
+        assert!(last.snapshot && last.bids.is_empty() && last.asks.is_empty());
+        assert_eq!(last.seq, 102);
+        // The old connection still sends during the venue swap, then drops.
+        books.observe(&depth(&[("100", "2")], &[("101", "1")], START + 2 * SECOND));
+        books.reset(Venue::Binance, MarketKind::Spot);
+        assert!(
+            books.poll(START + 10 * SECOND, |_| true).is_empty(),
+            "a retired book sends nothing more"
+        );
+        let keep = std::collections::HashSet::from([instrument()]);
+        books.retain(&keep);
+        books.observe(&depth(
+            &[("100", "3")],
+            &[("101", "1")],
+            START + 11 * SECOND,
+        ));
+        let back = books.poll(START + 11 * SECOND, |_| true);
+        assert_eq!(back.first().map(|update| update.seq), Some(103));
     }
 
     fn level(price: &str, qty: &str) -> BookLevel {

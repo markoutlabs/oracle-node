@@ -21,19 +21,25 @@ pub const MAX_UPDATES_PER_PUSH: usize = oracle_wire::MAX_BATCH_UPDATES;
 /// means the feed stopped, and a push of it would only be refused.
 pub const MAX_FRAME_AGE: Duration = Duration::from_secs(25);
 
-/// The longest heartbeat. The canister's price window must hold two of them;
-/// the node warns when it does not.
-const MAX_HEARTBEAT_SECS: u64 = 60;
-
 /// When to push a feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PushPolicy {
+pub struct PushPace {
     /// Push each feed at least this often.
     pub heartbeat: Duration,
     /// Push a feed at once when its price moved this much, in basis points.
     pub deviation_bps: u32,
     /// Push at most this often.
     pub min_interval: Duration,
+}
+
+impl From<oracle_wire::PushPolicy> for PushPace {
+    fn from(pace: oracle_wire::PushPolicy) -> Self {
+        Self {
+            heartbeat: Duration::from_secs(pace.heartbeat_secs),
+            deviation_bps: pace.deviation_bps,
+            min_interval: Duration::from_secs(pace.min_interval_secs),
+        }
+    }
 }
 
 /// Where the pushes go, from the `[publish]` and `[registry]` sections.
@@ -46,7 +52,7 @@ pub struct PushTarget {
     /// The root key of the canister's network, DER. `None` on mainnet.
     pub root_key: Option<Vec<u8>>,
     /// When to push.
-    pub policy: PushPolicy,
+    pub pace: PushPace,
 }
 
 impl PushTarget {
@@ -78,28 +84,19 @@ impl PushTarget {
             .map(hex::decode)
             .transpose()
             .map_err(|error| invalid(format!("registry.root_key: {error}")))?;
-        if !(1..=MAX_HEARTBEAT_SECS).contains(&publish.heartbeat_secs) {
-            return Err(invalid(format!(
-                "heartbeat_secs must be 1 to {MAX_HEARTBEAT_SECS}"
-            )));
+        // The same rules as a feed set's pace, which the canister checks.
+        let pace = oracle_wire::PushPolicy {
+            heartbeat_secs: publish.heartbeat_secs,
+            deviation_bps: publish.deviation_bps,
+            min_interval_secs: publish.min_interval_secs,
         }
-        if !(1..=publish.heartbeat_secs).contains(&publish.min_interval_secs) {
-            return Err(invalid(
-                "min_interval_secs must be 1 to heartbeat_secs".to_owned(),
-            ));
-        }
-        if publish.deviation_bps == 0 {
-            return Err(invalid("deviation_bps must be at least 1".to_owned()));
-        }
+        .check()
+        .map_err(invalid)?;
         Ok(Some(Self {
             gateway: publish.gateway.clone(),
             canister,
             root_key,
-            policy: PushPolicy {
-                heartbeat: Duration::from_secs(publish.heartbeat_secs),
-                deviation_bps: publish.deviation_bps,
-                min_interval: Duration::from_secs(publish.min_interval_secs),
-            },
+            pace: pace.into(),
         }))
     }
 }
@@ -115,7 +112,7 @@ struct Pushed {
 /// Decides which of the node's latest updates to push.
 #[derive(Debug)]
 pub struct PushPlanner {
-    policy: PushPolicy,
+    pace: PushPace,
     feeds: HashSet<FeedId>,
     pushed: HashMap<FeedId, Pushed>,
     last_attempt_ns: Option<u64>,
@@ -124,13 +121,18 @@ pub struct PushPlanner {
 impl PushPlanner {
     /// A planner with no feeds yet.
     #[must_use]
-    pub fn new(policy: PushPolicy) -> Self {
+    pub fn new(pace: PushPace) -> Self {
         Self {
-            policy,
+            pace,
             feeds: HashSet::new(),
             pushed: HashMap::new(),
             last_attempt_ns: None,
         }
+    }
+
+    /// Takes a new pace, after the network's feed set changed it.
+    pub const fn set_pace(&mut self, pace: PushPace) {
+        self.pace = pace;
     }
 
     /// Sets the feeds that the canister prices.
@@ -155,7 +157,7 @@ impl PushPlanner {
         let since = |at_ns: u64| Duration::from_nanos(now_ns.saturating_sub(at_ns));
         if self
             .last_attempt_ns
-            .is_some_and(|at| since(at) < self.policy.min_interval)
+            .is_some_and(|at| since(at) < self.pace.min_interval)
         {
             return Vec::new();
         }
@@ -169,7 +171,7 @@ impl PushPlanner {
                     update.seq > last.seq
                         && (update.flags != last.flags
                             || self.moved(last.price, update.price)
-                            || since(last.at_ns) >= self.policy.heartbeat)
+                            || since(last.at_ns) >= self.pace.heartbeat)
                 }
             })
             .take(MAX_UPDATES_PER_PUSH)
@@ -179,7 +181,7 @@ impl PushPlanner {
 
     fn moved(&self, from: i64, to: i64) -> bool {
         let change = (i128::from(to) - i128::from(from)).abs() * 10_000;
-        change >= i128::from(self.policy.deviation_bps) * i128::from(from).abs() && to != from
+        change >= i128::from(self.pace.deviation_bps) * i128::from(from).abs() && to != from
     }
 
     /// Records a push attempt, so the next one waits `min_interval`.
@@ -211,7 +213,7 @@ mod tests {
     const T0: u64 = 1_800_000_000 * SEC;
 
     fn planner() -> PushPlanner {
-        let mut planner = PushPlanner::new(PushPolicy {
+        let mut planner = PushPlanner::new(PushPace {
             heartbeat: Duration::from_secs(30),
             deviation_bps: 10,
             min_interval: Duration::from_secs(5),

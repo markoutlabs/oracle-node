@@ -39,10 +39,11 @@ use oracle_types::{
     VenueEntry, VenueReport,
 };
 use oracle_wire::{
-    NodeEntry, Quorum, Registry, Signer, UnverifiedBookFrame, UnverifiedFrame,
-    UnverifiedFundingFrame, UnverifiedPriceBatch, UnverifiedVenueFrame, decode_book_update,
-    decode_funding_update, decode_price_batch, decode_venue_report, domain, encode_book_update,
-    encode_funding_update, encode_price_batch, encode_price_update, encode_venue_report, feed_id,
+    FeedSet, FeedSettings, NodeEntry, PushPolicy, Quorum, Registry, Signer, SourceSettings,
+    UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame, UnverifiedPriceBatch,
+    UnverifiedVenueFrame, decode_book_update, decode_funding_update, decode_price_batch,
+    decode_venue_report, domain, encode_book_update, encode_funding_update, encode_price_batch,
+    encode_price_update, encode_venue_report, feed_id,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +70,16 @@ struct GoldenFile {
     book_updates: Vec<BookUpdateVector>,
     funding_updates: Vec<FundingUpdateVector>,
     price_batches: Vec<PriceBatchVector>,
+    feed_set: FeedSetVector,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct FeedSetVector {
+    governance_secret_key: String,
+    governance_address: String,
+    feed_set: FeedSet,
+    signing_bytes: String,
+    digest: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -536,6 +547,73 @@ fn sample_funding_updates() -> Vec<(&'static str, FundingUpdate)> {
     ]
 }
 
+fn spot(venue: &str, symbol: &str, converted: bool) -> SourceSettings {
+    SourceSettings {
+        venue: venue.to_owned(),
+        market: "spot".to_owned(),
+        symbol: symbol.to_owned(),
+        converted,
+        ..SourceSettings::default()
+    }
+}
+
+/// A peg-converted spot feed and a perpetual mark with contract sizes, so that
+/// every optional field is set somewhere and absent somewhere else.
+fn sample_feed_set(governance: &Signer) -> FeedSet {
+    let usdc = FeedSettings {
+        symbol: "CRYPTO.USDC/USD".to_owned(),
+        peg: Some("CRYPTO.USDT/USD".to_owned()),
+        min_sources: Some(2),
+        max_age_ms: Some(30_000),
+        sources: vec![
+            spot("kraken", "USDC/USD", false),
+            spot("binance", "USDCUSDT", true),
+        ],
+        ..FeedSettings::default()
+    };
+    // The peg of `usdc`, which must be in the set.
+    let usdt = FeedSettings {
+        symbol: "CRYPTO.USDT/USD".to_owned(),
+        min_sources: Some(1),
+        sources: vec![spot("kraken", "USDT/USD", false)],
+        ..FeedSettings::default()
+    };
+    let mark = FeedSettings {
+        symbol: "CRYPTO.ETH/USDT.PERP_MARK".to_owned(),
+        max_peg_conf_bps: Some("50".to_owned()),
+        deviation_bps: Some("0.5".to_owned()),
+        min_interval_ms: Some(250),
+        impact_notional: Some("20000".to_owned()),
+        sources: vec![
+            SourceSettings {
+                kinds: Some(vec!["mark_price".to_owned()]),
+                ..spot("binance", "ETHUSDT", false)
+            },
+            SourceSettings {
+                market: "linear_perp".to_owned(),
+                kinds: Some(vec!["mark_price".to_owned(), "book_top".to_owned()]),
+                weight: Some("2".to_owned()),
+                contract_size: Some("0.1".to_owned()),
+                ..spot("okx", "ETH-USDT-SWAP", false)
+            },
+        ],
+        ..FeedSettings::default()
+    };
+    FeedSet::sign(
+        governance,
+        1,
+        BASE_TIME_NS / NANOS_PER_SEC,
+        "0.1.0".to_owned(),
+        Some(PushPolicy {
+            heartbeat_secs: 7,
+            deviation_bps: 10,
+            min_interval_secs: 5,
+        }),
+        vec![usdc, usdt, mark],
+    )
+    .expect("signs")
+}
+
 fn build() -> GoldenFile {
     let feed_ids = [
         "CRYPTO.BTC/USD",
@@ -596,6 +674,8 @@ fn build() -> GoldenFile {
     )
     .expect("signs");
     let registry_bytes = registry.to_signing_bytes().expect("encodes");
+    let feed_set = sample_feed_set(&governance);
+    let feed_set_bytes = feed_set.to_signing_bytes().expect("encodes");
 
     // The registry's node signs these too, so stored frames verify against it.
     let (node_secret, node) = signer_from(0x11);
@@ -702,6 +782,13 @@ fn build() -> GoldenFile {
         book_updates,
         funding_updates,
         price_batches,
+        feed_set: FeedSetVector {
+            governance_secret_key: hex0x(&governance_secret),
+            governance_address: governance.address().to_string(),
+            signing_bytes: hex0x(&feed_set_bytes),
+            digest: hex0x(&domain::digest(&feed_set_bytes)),
+            feed_set,
+        },
     }
 }
 
@@ -808,6 +895,19 @@ fn golden_vectors_are_unchanged() {
         generated.price_batches, expected.price_batches,
         "price batch encoding changed"
     );
+    assert_eq!(
+        generated.feed_set, expected.feed_set,
+        "feed set encoding changed"
+    );
+}
+
+/// The stored feed set must verify against its own governance address.
+#[test]
+fn the_stored_feed_set_verifies() {
+    let stored = load().feed_set;
+    let governance: oracle_wire::Address = stored.governance_address.parse().expect("an address");
+    let verified = stored.feed_set.verify(governance, 0).expect("verifies");
+    assert_eq!(verified.feeds().len(), 3);
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.

@@ -38,6 +38,12 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
          poll_secs = 30",
         quoted(&source.url("clients.json"))
     );
+    let network_feeds_source = format!(
+        "url = {}\n# Seconds between fetches. Every node must see a new set within two minutes.\n\
+         poll_secs = {}",
+        quoted(&source.url("feeds.json")),
+        crate::config::NetworkFeedsSettings::POLL_SECS
+    );
     let publish_gateway = source.gateway().map_or_else(String::new, |gateway| {
         format!("gateway = {}\n", quoted(&gateway.to_string()))
     });
@@ -46,7 +52,7 @@ pub(super) fn render(setup: &NodeSetup, key_file: &Path) -> String {
         quoted(&setup.governance.to_checksummed())
     );
     let feeds = feeds::network();
-    let max_pending = feeds::max_pending(feeds.count);
+    let max_pending = crate::config::max_pending(feeds.count);
 
     format!(
         r#"# Heartbeats and stale venues are checked on this timer. A price move publishes
@@ -75,6 +81,12 @@ key_file = {key_file}
 # these clients, encrypted, over /v2/ws, and refuses to start without the list.
 [clients]
 {clients_source}
+
+# The network's feed set, which governance signs and the canister serves
+# (SPEC §3.8). Once it verifies, it takes the place of the feeds below, and the
+# node takes each new version while it runs, in its own slot.
+[network_feeds]
+{network_feeds_source}
 
 # Pushes this node's frames to the registry canister, which serves each listed
 # feed's median to other canisters and as the certified /prices.json. Each push

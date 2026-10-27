@@ -60,13 +60,20 @@ pub enum ConfigError {
     /// The registry could not be loaded or verified.
     #[error("cannot load the registry: {0}")]
     Registry(String),
+
+    /// The network's feed set could not be fetched.
+    #[error("cannot load the network feed set: {0}")]
+    FeedSet(String),
 }
 
 impl ConfigError {
     /// Returns `true` if only an edit fixes this. A failed fetch may pass on a retry.
     #[must_use]
     pub const fn is_permanent(&self) -> bool {
-        !matches!(self, Self::Registry(_) | Self::Clients(_))
+        !matches!(
+            self,
+            Self::Registry(_) | Self::Clients(_) | Self::FeedSet(_)
+        )
     }
 }
 
@@ -98,6 +105,52 @@ pub struct NodeConfig {
     /// No section, no pushes.
     #[serde(default)]
     pub publish: Option<PublishSettings>,
+    /// The network's feed set, which replaces `feeds` once it verifies.
+    #[serde(default)]
+    pub network_feeds: Option<NetworkFeedsSettings>,
+}
+
+/// The canister's certified `/feeds.json`, checked against `registry.governance_address`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkFeedsSettings {
+    /// URL of the canister's `/feeds.json`.
+    pub url: String,
+    /// Seconds between polls; keep it well below `lead_secs`, so every node sees a set before the first slot.
+    #[serde(default = "default_network_feeds_poll_secs")]
+    pub poll_secs: u64,
+    /// Seconds from a publish to the first node's change; the same on every node of a network.
+    #[serde(default = "default_network_feeds_lead_secs")]
+    pub lead_secs: u64,
+    /// Seconds between two nodes' changes. The same on every node, as `lead_secs`.
+    #[serde(default = "default_network_feeds_slot_secs")]
+    pub slot_secs: u64,
+}
+
+impl NetworkFeedsSettings {
+    /// The default `poll_secs`, which `init` writes too.
+    pub const POLL_SECS: u64 = 30;
+
+    /// The nodes' change slots.
+    #[must_use]
+    pub const fn slots(&self) -> oracle_wire::Slots {
+        oracle_wire::Slots {
+            lead_secs: self.lead_secs,
+            slot_secs: self.slot_secs,
+        }
+    }
+}
+
+const fn default_network_feeds_poll_secs() -> u64 {
+    NetworkFeedsSettings::POLL_SECS
+}
+
+const fn default_network_feeds_lead_secs() -> u64 {
+    oracle_wire::SLOT_LEAD_SECS
+}
+
+const fn default_network_feeds_slot_secs() -> u64 {
+    oracle_wire::SLOT_SECS
 }
 
 /// When the node pushes its frames to the registry canister.
@@ -226,70 +279,8 @@ pub struct RegistrySettings {
     pub governance_address: String,
 }
 
-/// One feed.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeedSettings {
-    /// Canonical symbol.
-    pub symbol: String,
-    /// The peg feed converted sources are priced through, such as `CRYPTO.USDT/USD`.
-    #[serde(default)]
-    pub peg: Option<String>,
-    /// Peg confidence above which this feed degrades, in basis points.
-    #[serde(default)]
-    pub max_peg_conf_bps: Option<String>,
-    /// Surviving venues required before the feed publishes a usable price.
-    #[serde(default)]
-    pub min_sources: Option<u32>,
-    /// Publish on a move of at least this many basis points, as a decimal string.
-    #[serde(default)]
-    pub deviation_bps: Option<String>,
-    /// Never publish more often than this, in milliseconds.
-    #[serde(default)]
-    pub min_interval_ms: Option<u64>,
-    /// Drop a venue whose newest data is older than this, in milliseconds. A
-    /// quiet book, such as a stablecoin pair, can stay unchanged far longer
-    /// than the default.
-    #[serde(default)]
-    pub max_age_ms: Option<u64>,
-    /// Price each venue at the average fill for this notional, in quote units,
-    /// from depth snapshots, as a decimal string. Subscribes to depth where the
-    /// venue offers it.
-    #[serde(default)]
-    pub impact_notional: Option<String>,
-    /// Contributing venues.
-    pub sources: Vec<SourceSettings>,
-}
-
-/// One venue's contribution to a feed.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceSettings {
-    /// Venue name, as in `oracle_types::Venue`.
-    pub venue: String,
-    /// `spot` or `linear_perp`.
-    pub market: String,
-    /// The venue's own symbol.
-    pub symbol: String,
-    /// Observation kinds in preference order; `["book_top", "trade"]` by default.
-    #[serde(default)]
-    pub kinds: Option<Vec<String>>,
-    /// Static trust weight as a decimal string; `1` by default.
-    #[serde(default)]
-    pub weight: Option<String>,
-
-    /// This source is quoted in the feed's peg asset and must be converted.
-    ///
-    /// Set on every USDT-quoted source of a `/USD` feed. Publishing those
-    /// unconverted is a lie that costs money the day the peg breaks — and a
-    /// silent one, because on an ordinary day the two agree to a basis point.
-    #[serde(default)]
-    pub converted: bool,
-    /// Base units per contract, as a decimal string, for a venue that sizes in
-    /// contracts: OKX swaps (`ctVal` on OKX's instruments endpoint).
-    #[serde(default)]
-    pub contract_size: Option<String>,
-}
+// The feed set is a signed document too, so its types live with the encoding.
+pub use oracle_wire::{FeedSettings, SourceSettings};
 
 /// One venue market's WebSocket endpoint in place of the built-in one: a
 /// regional host, a proxy, or a local feed for tests.
@@ -306,11 +297,21 @@ pub struct EndpointSettings {
 }
 
 const fn default_tick_ms() -> u64 {
-    25
+    DEFAULT_TICK_MS
 }
 
 const fn default_max_pending() -> usize {
     512
+}
+
+/// The bound below which [`max_pending`] never goes.
+const MIN_PENDING: usize = 512;
+
+/// The `server.max_pending_feeds` that `init` writes for `count` feeds.
+#[must_use]
+pub fn max_pending(count: usize) -> usize {
+    // A slow subscriber can owe a price and a venue report for each feed.
+    count.saturating_mul(2).next_power_of_two().max(MIN_PENDING)
 }
 
 /// Peg confidence above which dependent feeds degrade, from SPEC.md §5.3.
@@ -478,6 +479,27 @@ impl NodeConfig {
             .map_err(ConfigError::Clients)
     }
 
+    /// The config's `max_pending_feeds`, raised for a larger set of `feeds` feeds.
+    #[must_use]
+    pub fn max_pending_for(&self, feeds: usize) -> usize {
+        max_pending(feeds).max(self.server.max_pending_feeds)
+    }
+
+    /// Fetches the network's feed set with its certificate checked, but not its signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::FeedSet`] when the fetch or the certificate fails.
+    pub async fn fetch_feed_set(&self) -> Result<Option<oracle_wire::FeedSet>, ConfigError> {
+        let Some(settings) = &self.network_feeds else {
+            return Ok(None);
+        };
+        self.load_document("network_feeds", None, Some(settings.url.as_str()))
+            .await
+            .map(Some)
+            .map_err(ConfigError::FeedSet)
+    }
+
     /// Reads a signed document from a file, or fetches it from the canister
     /// with its certificate checked. The governance signature is unchecked.
     async fn load_document<T: serde::de::DeserializeOwned>(
@@ -520,204 +542,213 @@ impl NodeConfig {
     /// Returns [`ConfigError::Invalid`] for an unparseable symbol, venue, market,
     /// or observation kind, or for a feed that could never publish.
     pub fn resolve(&self) -> Result<ResolvedConfig, ConfigError> {
-        if self.feeds.is_empty() {
-            return Err(ConfigError::Invalid("no feeds configured".to_owned()));
-        }
+        resolve_feeds(&self.feeds, &self.endpoints, self.tick_interval_ms)
+    }
+}
 
-        let mut feeds = Vec::with_capacity(self.feeds.len());
-        let mut symbols = Vec::with_capacity(self.feeds.len());
-        // Deduplicated because several feeds may read the same instrument, and
-        // subscribing twice would double the message rate for no benefit.
-        let mut instruments: BTreeMap<(Venue, MarketKind, String), InstrumentSpec> =
-            BTreeMap::new();
+/// The default of `tick_interval_ms`.
+pub const DEFAULT_TICK_MS: u64 = 25;
 
-        for feed in &self.feeds {
-            let symbol: Symbol = feed
-                .symbol
+/// Resolves feeds, endpoint overrides and the tick, so a feed list alone resolves as a config does.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Invalid`] as [`NodeConfig::resolve`] does.
+pub fn resolve_feeds(
+    settings: &[FeedSettings],
+    endpoints: &[EndpointSettings],
+    tick_interval_ms: u64,
+) -> Result<ResolvedConfig, ConfigError> {
+    if settings.is_empty() {
+        return Err(ConfigError::Invalid("no feeds configured".to_owned()));
+    }
+
+    let mut feeds = Vec::with_capacity(settings.len());
+    let mut symbols = Vec::with_capacity(settings.len());
+    // Deduplicated because several feeds may read the same instrument, and
+    // subscribing twice would double the message rate for no benefit.
+    let mut instruments: BTreeMap<(Venue, MarketKind, String), InstrumentSpec> = BTreeMap::new();
+
+    for feed in settings {
+        let symbol: Symbol = feed
+            .symbol
+            .parse()
+            .map_err(|e| ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol)))?;
+        symbols.push(symbol);
+
+        let mut sources = Vec::with_capacity(feed.sources.len());
+        for source in &feed.sources {
+            let venue: Venue = source
+                .venue
                 .parse()
                 .map_err(|e| ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol)))?;
-            symbols.push(symbol);
-
-            let mut sources = Vec::with_capacity(feed.sources.len());
-            for source in &feed.sources {
-                let venue: Venue = source
-                    .venue
-                    .parse()
-                    .map_err(|e| ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol)))?;
-                let market: MarketKind = source
-                    .market
-                    .parse()
-                    .map_err(|e| ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol)))?;
-                let kinds = match &source.kinds {
-                    Some(names) => names
-                        .iter()
-                        .map(|name| {
-                            name.parse::<ObsKind>().map_err(|e| {
-                                ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol))
-                            })
+            let market: MarketKind = source
+                .market
+                .parse()
+                .map_err(|e| ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol)))?;
+            let kinds = match &source.kinds {
+                Some(names) => names
+                    .iter()
+                    .map(|name| {
+                        name.parse::<ObsKind>().map_err(|e| {
+                            ConfigError::Invalid(format!("feed `{}`: {e}", feed.symbol))
                         })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    None => vec![ObsKind::BookTop, ObsKind::Trade],
-                };
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => vec![ObsKind::BookTop, ObsKind::Trade],
+            };
 
-                let instrument = InstrumentId::new(venue, market, source.symbol.as_str());
-                // Depth replaces a top-of-book price, so only a book source needs it.
-                let depth = feed.impact_notional.is_some() && kinds.contains(&ObsKind::BookTop);
-                let contract_size = match &source.contract_size {
-                    Some(text) => Some(text.parse::<Fixed>().map_err(|e| {
-                        ConfigError::Invalid(format!(
-                            "feed `{}`: bad contract_size: {e}",
-                            feed.symbol
-                        ))
-                    })?),
-                    None => None,
-                };
-                if contract_size.is_some_and(|size| !size.is_positive()) {
-                    return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: contract_size must be above zero",
-                        feed.symbol
-                    )));
-                }
-                // These perpetuals count in contracts, and venue reports count in coins.
-                // Without the size, a book would also read a hundred times too deep or too thin.
-                if let Some(field) = contract_size_field(venue)
-                    && market.is_perp()
-                    && contract_size.is_none()
-                {
-                    return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: the {venue} perpetual {} needs contract_size ({field}); \
-                         `oracle-node update-feeds` writes the network's feeds with it",
-                        feed.symbol, source.symbol
-                    )));
-                }
-                let mut config = SourceConfig::new(instrument, kinds);
-                if source.converted {
-                    config = config.converted();
-                }
-                if let Some(weight) = &source.weight {
-                    let weight: Fixed = weight.parse().map_err(|e| {
-                        ConfigError::Invalid(format!("feed `{}`: bad weight: {e}", feed.symbol))
-                    })?;
-                    config = config.with_weight(weight);
-                }
-                sources.push(config);
-
-                let spec = instruments
-                    .entry((venue, market, source.symbol.clone()))
-                    .or_insert_with(|| InstrumentSpec {
-                        venue_symbol: source.symbol.clone(),
-                        market,
-                        canonical: symbol,
-                        depth,
-                        contract_size,
-                    });
-                // One subscription serves every feed of the instrument, so its sizes
-                // convert one way.
-                if spec.contract_size != contract_size {
-                    return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: {} has another contract_size in an earlier feed",
-                        feed.symbol, source.symbol
-                    )));
-                }
-                spec.depth |= depth;
+            let instrument = InstrumentId::new(venue, market, source.symbol.as_str());
+            // Depth replaces a top-of-book price, so only a book source needs it.
+            let depth = feed.impact_notional.is_some() && kinds.contains(&ObsKind::BookTop);
+            let contract_size = match &source.contract_size {
+                Some(text) => Some(text.parse::<Fixed>().map_err(|e| {
+                    ConfigError::Invalid(format!("feed `{}`: bad contract_size: {e}", feed.symbol))
+                })?),
+                None => None,
+            };
+            if contract_size.is_some_and(|size| !size.is_positive()) {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: contract_size must be above zero",
+                    feed.symbol
+                )));
             }
-
-            let id = feed_id(&symbol);
-            // The symbol's kind fixes the class and its heartbeat, the same in
-            // every node, because consumers rely on that heartbeat.
-            let mut config = FeedConfig::for_symbol(symbol, id, sources);
-            if let Some(min_sources) = feed.min_sources {
-                config.min_sources = min_sources;
+            // These perpetuals count in contracts, and venue reports count in coins.
+            // Without the size, a book would also read a hundred times too deep or too thin.
+            if let Some(field) = contract_size_field(venue)
+                && market.is_perp()
+                && contract_size.is_none()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: the {venue} perpetual {} needs contract_size ({field}); \
+                     `oracle-node update-feeds` writes the network's feeds with it",
+                    feed.symbol, source.symbol
+                )));
             }
-            if let Some(text) = &feed.deviation_bps {
-                config.deviation_bps = text.parse().map_err(|e| {
-                    ConfigError::Invalid(format!("feed `{}`: bad deviation_bps: {e}", feed.symbol))
+            let mut config = SourceConfig::new(instrument, kinds);
+            if source.converted {
+                config = config.converted();
+            }
+            if let Some(weight) = &source.weight {
+                let weight: Fixed = weight.parse().map_err(|e| {
+                    ConfigError::Invalid(format!("feed `{}`: bad weight: {e}", feed.symbol))
                 })?;
+                config = config.with_weight(weight);
             }
-            if let Some(ms) = feed.min_interval_ms {
-                config.min_interval = Duration::from_millis(ms);
+            sources.push(config);
+
+            let spec = instruments
+                .entry((venue, market, source.symbol.clone()))
+                .or_insert_with(|| InstrumentSpec {
+                    venue_symbol: source.symbol.clone(),
+                    market,
+                    canonical: symbol,
+                    depth,
+                    contract_size,
+                });
+            // One subscription serves every feed of the instrument, so its sizes
+            // convert one way.
+            if spec.contract_size != contract_size {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: {} has another contract_size in an earlier feed",
+                    feed.symbol, source.symbol
+                )));
             }
-            if let Some(ms) = feed.max_age_ms {
-                if ms == 0 {
-                    return Err(ConfigError::Invalid(format!(
-                        "feed `{}`: max_age_ms must be above zero",
-                        feed.symbol
-                    )));
-                }
-                config.max_age = Duration::from_millis(ms);
+            spec.depth |= depth;
+        }
+
+        let id = feed_id(&symbol);
+        // The symbol's kind fixes the class and its heartbeat, the same in
+        // every node, because consumers rely on that heartbeat.
+        let mut config = FeedConfig::for_symbol(symbol, id, sources);
+        if let Some(min_sources) = feed.min_sources {
+            config.min_sources = min_sources;
+        }
+        if let Some(text) = &feed.deviation_bps {
+            config.deviation_bps = text.parse().map_err(|e| {
+                ConfigError::Invalid(format!("feed `{}`: bad deviation_bps: {e}", feed.symbol))
+            })?;
+        }
+        if let Some(ms) = feed.min_interval_ms {
+            config.min_interval = Duration::from_millis(ms);
+        }
+        if let Some(ms) = feed.max_age_ms {
+            if ms == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: max_age_ms must be above zero",
+                    feed.symbol
+                )));
             }
-            if let Some(text) = &feed.impact_notional {
-                config.impact_notional = Some(text.parse().map_err(|e| {
+            config.max_age = Duration::from_millis(ms);
+        }
+        if let Some(text) = &feed.impact_notional {
+            config.impact_notional = Some(text.parse().map_err(|e| {
+                ConfigError::Invalid(format!("feed `{}`: bad impact_notional: {e}", feed.symbol))
+            })?);
+        }
+        if let Some(peg) = &feed.peg {
+            let peg_symbol: Symbol = peg.parse().map_err(|e| {
+                ConfigError::Invalid(format!("feed `{}`: bad peg symbol: {e}", feed.symbol))
+            })?;
+            let max_peg_conf_bps = match &feed.max_peg_conf_bps {
+                Some(text) => text.parse::<Fixed>().map_err(|e| {
                     ConfigError::Invalid(format!(
-                        "feed `{}`: bad impact_notional: {e}",
+                        "feed `{}`: bad max_peg_conf_bps: {e}",
                         feed.symbol
                     ))
-                })?);
-            }
-            if let Some(peg) = &feed.peg {
-                let peg_symbol: Symbol = peg.parse().map_err(|e| {
-                    ConfigError::Invalid(format!("feed `{}`: bad peg symbol: {e}", feed.symbol))
-                })?;
-                let max_peg_conf_bps = match &feed.max_peg_conf_bps {
-                    Some(text) => text.parse::<Fixed>().map_err(|e| {
-                        ConfigError::Invalid(format!(
-                            "feed `{}`: bad max_peg_conf_bps: {e}",
-                            feed.symbol
-                        ))
-                    })?,
-                    None => DEFAULT_MAX_PEG_CONF_BPS,
-                };
-                config = config.with_conversion(QuoteConversion {
-                    peg_feed: feed_id(&peg_symbol),
-                    max_peg_conf_bps,
-                });
-            }
-            config
-                .validate()
-                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-            feeds.push(config);
+                })?,
+                None => DEFAULT_MAX_PEG_CONF_BPS,
+            };
+            config = config.with_conversion(QuoteConversion {
+                peg_feed: feed_id(&peg_symbol),
+                max_peg_conf_bps,
+            });
         }
-
-        let mut binance = BinanceConfig::default();
-        let mut by_venue: BTreeMap<(Venue, MarketKind), Vec<InstrumentSpec>> = BTreeMap::new();
-        for ((venue, market, _), spec) in instruments {
-            match venue {
-                Venue::Binance => match market {
-                    MarketKind::Spot => binance.spot.push(spec),
-                    MarketKind::LinearPerp => binance.perp.push(spec),
-                    MarketKind::InversePerp => {
-                        return Err(ConfigError::Invalid(
-                            "binance coin-margined futures are not served by this build; \
-                             they live on a different host with their own contract catalogue"
-                                .to_owned(),
-                        ));
-                    }
-                },
-                other => by_venue.entry((other, market)).or_default().push(spec),
-            }
-        }
-
-        let mut venues: BTreeMap<Venue, Vec<VenueConnection>> = BTreeMap::new();
-        for ((venue, market), instruments) in by_venue {
-            for chunk in instruments.chunks(markets_per_connection(venue, market)) {
-                let connection = venue_connection(venue, market, chunk)?;
-                venues.entry(venue).or_default().push(connection);
-            }
-            venues
-                .entry(venue)
-                .or_default()
-                .extend(book_connections(venue, market, &instruments));
-        }
-        apply_endpoints(&self.endpoints, &mut binance, &mut venues)?;
-
-        Ok(ResolvedConfig {
-            feeds,
-            symbols,
-            binance,
-            venues: venues.into_iter().collect(),
-            tick_interval: Duration::from_millis(self.tick_interval_ms.max(1)),
-        })
+        config
+            .validate()
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        feeds.push(config);
     }
+
+    let mut binance = BinanceConfig::default();
+    let mut by_venue: BTreeMap<(Venue, MarketKind), Vec<InstrumentSpec>> = BTreeMap::new();
+    for ((venue, market, _), spec) in instruments {
+        match venue {
+            Venue::Binance => match market {
+                MarketKind::Spot => binance.spot.push(spec),
+                MarketKind::LinearPerp => binance.perp.push(spec),
+                MarketKind::InversePerp => {
+                    return Err(ConfigError::Invalid(
+                        "binance coin-margined futures are not served by this build; \
+                         they live on a different host with their own contract catalogue"
+                            .to_owned(),
+                    ));
+                }
+            },
+            other => by_venue.entry((other, market)).or_default().push(spec),
+        }
+    }
+
+    let mut venues: BTreeMap<Venue, Vec<VenueConnection>> = BTreeMap::new();
+    for ((venue, market), instruments) in by_venue {
+        for chunk in instruments.chunks(markets_per_connection(venue, market)) {
+            let connection = venue_connection(venue, market, chunk)?;
+            venues.entry(venue).or_default().push(connection);
+        }
+        venues
+            .entry(venue)
+            .or_default()
+            .extend(book_connections(venue, market, &instruments));
+    }
+    apply_endpoints(endpoints, &mut binance, &mut venues)?;
+
+    Ok(ResolvedConfig {
+        feeds,
+        symbols,
+        binance,
+        venues: venues.into_iter().collect(),
+        tick_interval: Duration::from_millis(tick_interval_ms.max(1)),
+    })
 }
 
 /// Puts each configured endpoint in place of the built-in URL.

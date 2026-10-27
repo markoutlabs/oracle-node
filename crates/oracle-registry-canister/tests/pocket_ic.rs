@@ -16,10 +16,11 @@ use oracle_client::{
 };
 use oracle_registry_canister::testing::{Harness, WASM};
 use oracle_registry_canister::{HttpRequest, HttpResponse};
-use oracle_wire::{ClientList, NodeEntry, Registry, Signer, VerifyError};
+use oracle_wire::{ClientList, FeedSet, NodeEntry, Registry, Signer, VerifyError};
 
 const REGISTRY: &str = "/registry.json";
 const CLIENTS: &str = "/clients.json";
+const FEEDS: &str = "/feeds.json";
 const MAX_CERT_AGE_NS: u128 = 300 * 1_000_000_000;
 
 /// The HTTP side: what a gateway, the SDK and the nodes check on a response.
@@ -357,6 +358,176 @@ fn the_canister_publishes_a_certified_client_list() {
     }
     let after: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
     assert_eq!(after, beat);
+}
+
+/// Two feeds: the peg, and a feed priced through it, with a decimal in a
+/// non-canonical spelling.
+fn feed_content(push_heartbeat: u64, with_usdc: bool) -> String {
+    let mut feeds = vec![serde_json::json!({
+        "symbol": "CRYPTO.USDT/USD",
+        "min_sources": 1,
+        "sources": [
+            { "venue": "coinbase", "market": "spot", "symbol": "USDT-USD" },
+            { "venue": "kraken", "market": "spot", "symbol": "USDT/USD" }
+        ]
+    })];
+    if with_usdc {
+        feeds.push(serde_json::json!({
+            "symbol": "CRYPTO.USDC/USD",
+            "peg": "CRYPTO.USDT/USD",
+            "deviation_bps": "0.10",
+            "sources": [
+                { "venue": "kraken", "market": "spot", "symbol": "USDC/USD" },
+                { "venue": "binance", "market": "spot", "symbol": "USDCUSDT", "converted": true }
+            ]
+        }));
+    }
+    serde_json::json!({
+        "min_node_version": "0.1.0",
+        "push": { "heartbeat_secs": push_heartbeat, "deviation_bps": 10, "min_interval_secs": 5 },
+        "feeds": feeds,
+    })
+    .to_string()
+}
+
+#[test]
+fn the_canister_publishes_a_certified_feed_set() {
+    let h = Harness::new(1, "dfx_test_key", None);
+    let empty = h.get_json(FEEDS);
+    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    h.verify_http(FEEDS, empty)
+        .expect("the empty state is certified at init");
+
+    let content = feed_content(30, true);
+    let stranger = Principal::self_authenticating(b"stranger");
+    assert!(
+        h.pic
+            .update_call(
+                h.canister,
+                stranger,
+                "set_feed_set",
+                Encode!(&content).expect("encodes")
+            )
+            .is_err(),
+        "only governance may set the feed set"
+    );
+    assert!(
+        h.set_feed_set("{")
+            .expect_err("not JSON")
+            .contains("not valid JSON")
+    );
+    let unpegged = content.replace("\"peg\":\"CRYPTO.USDT/USD\",", "");
+    assert_ne!(unpegged, content, "the peg is gone");
+    assert!(
+        h.set_feed_set(&unpegged)
+            .expect_err("a converted source without a peg")
+            .contains("invalid feed set")
+    );
+    assert_eq!(h.set_feed_set(&content), Ok(1));
+
+    let governance = h.governance_address();
+    let response = h.get_json(FEEDS);
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let served: FeedSet = serde_json::from_slice(response.body()).expect("parses");
+    h.verify_http(FEEDS, response).expect("certified");
+    let verified = served.verify(governance, 0).expect("governance signed it");
+    assert_eq!(verified.feeds().len(), 2);
+    assert_eq!(
+        verified
+            .feeds()
+            .get(1)
+            .and_then(|feed| feed.deviation_bps.as_deref()),
+        Some("0.1"),
+        "stored and signed in canonical form"
+    );
+    assert_eq!(h.feed_set(), Some(served.clone()));
+    for path in [REGISTRY, CLIENTS] {
+        h.verify_http(path, h.get_json(path))
+            .expect("the other documents stay certified in the same tree");
+    }
+
+    // The priced subset and the price window must fit the set.
+    assert!(
+        h.set_feeds(&["CRYPTO.BTC/USD"])
+            .expect_err("not in the set")
+            .contains("not in the feed set")
+    );
+    h.set_feeds(&["CRYPTO.USDC/USD"]).expect("in the set");
+    assert!(
+        h.set_feed_set(&feed_content(30, false))
+            .expect_err("drops a priced feed")
+            .contains("priced on-chain")
+    );
+    assert!(
+        h.set_price_window(40)
+            .expect_err("below twice the heartbeat")
+            .contains("drops quiet feeds")
+    );
+    assert!(
+        h.set_feed_set(&feed_content(60, true))
+            .expect_err("more than half the window")
+            .contains("half the price window")
+    );
+
+    let version: Result<u64, String> =
+        h.update(h.governance, "republish_feeds", Encode!().expect("encodes"));
+    assert_eq!(version, Ok(2));
+    let again: FeedSet = serde_json::from_slice(h.get_json(FEEDS).body()).expect("parses");
+    assert_eq!(again.feeds, served.feeds);
+    again
+        .verify(governance, 1)
+        .expect("the next version verifies");
+
+    h.pic
+        .upgrade_canister(
+            h.canister,
+            WASM.clone(),
+            Encode!().expect("encodes"),
+            Some(h.governance),
+        )
+        .expect("upgrades");
+    let response = h.get_json(FEEDS);
+    let after: FeedSet = serde_json::from_slice(response.body()).expect("parses");
+    h.verify_http(FEEDS, response)
+        .expect("certified after an upgrade");
+    assert_eq!(after, again);
+}
+
+/// While a feed set is being signed, `set_feeds` and `set_price_window` would
+/// check against the set that the round replaces, so they wait for it.
+#[test]
+fn the_priced_feeds_and_the_window_wait_for_a_signing_round() {
+    let h = Harness::new(1, "dfx_test_key", None);
+    let content = feed_content(30, true);
+    let round = h
+        .pic
+        .submit_call(
+            h.canister,
+            h.governance,
+            "set_feed_set",
+            Encode!(&content).expect("encodes"),
+        )
+        .expect("submits");
+    // One round starts it; the threshold signature takes several more.
+    h.pic.tick();
+    let during = h.set_feeds(&["CRYPTO.USDC/USD"]);
+    assert!(
+        during
+            .as_ref()
+            .is_err_and(|error| error.contains("in flight")),
+        "{during:?}"
+    );
+    let window = h.set_price_window(20);
+    assert!(
+        window
+            .as_ref()
+            .is_err_and(|error| error.contains("in flight")),
+        "{window:?}"
+    );
+    let reply = h.pic.await_call(round).expect("the round ends");
+    let version: Result<u64, String> = candid::decode_one(&reply).expect("decodes");
+    assert_eq!(version, Ok(1));
+    h.set_feeds(&["CRYPTO.USDC/USD"]).expect("after the round");
 }
 
 /// A round works on a copy, so a signature that fails leaves no trace and

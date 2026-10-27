@@ -10,9 +10,10 @@ mod peer;
 mod rest;
 mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use axum::middleware;
 use axum::routing::get;
@@ -39,13 +40,39 @@ pub struct FeedEntry {
     pub expo: i32,
 }
 
+/// The feeds a node serves, the books of each one's sources, and the version
+/// of the network's feed set that holds them.
+struct Catalog {
+    symbols: HashMap<FeedId, Symbol>,
+    by_symbol: HashMap<String, FeedId>,
+    books: HashMap<FeedId, Vec<InstrumentId>>,
+    version: u64,
+}
+
+impl Catalog {
+    fn new(feeds: &[Symbol], books: HashMap<FeedId, Vec<InstrumentId>>, version: u64) -> Self {
+        let mut symbols = HashMap::with_capacity(feeds.len());
+        let mut by_symbol = HashMap::with_capacity(feeds.len());
+        for symbol in feeds {
+            let id = feed_id(symbol);
+            symbols.insert(id, *symbol);
+            by_symbol.insert(symbol.to_string(), id);
+        }
+        Self {
+            symbols,
+            by_symbol,
+            books,
+            version,
+        }
+    }
+}
+
 /// Shared server state.
 pub struct ServerState {
     hub: Arc<Hub>,
-    catalog: HashMap<FeedId, Symbol>,
-    by_symbol: HashMap<String, FeedId>,
-    /// The books of each feed's sources.
-    books: HashMap<FeedId, Vec<InstrumentId>>,
+    /// Swapped whole when the network's feed set changes. A publish takes the
+    /// current one, so it never sees half of a change.
+    catalog: ArcSwap<Catalog>,
     registry: Registry,
     transport: Arc<NodeTransport>,
 }
@@ -55,33 +82,46 @@ impl ServerState {
     /// transport's, so every update is sealed once before fan-out.
     #[must_use]
     pub fn new(feeds: &[Symbol], registry: Registry, transport: Arc<NodeTransport>) -> Arc<Self> {
-        Self::with_books(feeds, HashMap::new(), registry, transport)
+        Self::with_books(feeds, HashMap::new(), 0, registry, transport)
     }
 
-    /// Builds server state that also serves the books of each feed's sources.
+    /// Builds server state that also serves the books of each feed's sources, from feed set `version`.
     #[must_use]
     pub fn with_books(
         feeds: &[Symbol],
         books: HashMap<FeedId, Vec<InstrumentId>>,
+        version: u64,
         registry: Registry,
         transport: Arc<NodeTransport>,
     ) -> Arc<Self> {
         let hub = Arc::clone(transport.hub());
-        let mut catalog = HashMap::with_capacity(feeds.len());
-        let mut by_symbol = HashMap::with_capacity(feeds.len());
-        for symbol in feeds {
-            let id = feed_id(symbol);
-            catalog.insert(id, *symbol);
-            by_symbol.insert(symbol.to_string(), id);
-        }
         Arc::new(Self {
             hub,
-            catalog,
-            by_symbol,
-            books,
+            catalog: ArcSwap::from_pointee(Catalog::new(feeds, books, version)),
             registry,
             transport,
         })
+    }
+
+    /// Serves feed set `version` with `max_pending` per subscriber, and drops the latest update of each feed that left.
+    pub fn set_feeds(
+        &self,
+        feeds: &[Symbol],
+        books: HashMap<FeedId, Vec<InstrumentId>>,
+        version: u64,
+        max_pending: usize,
+    ) {
+        let next = Catalog::new(feeds, books, version);
+        let kept: HashSet<FeedId> = next.symbols.keys().copied().collect();
+        self.hub.set_max_pending(max_pending);
+        self.catalog.store(Arc::new(next));
+        self.hub.forget_feeds(&kept);
+    }
+
+    /// The version of the network's feed set this node serves; zero for its config's feeds.
+    #[must_use]
+    pub fn feed_set_version(&self) -> u64 {
+        self.catalog.load().version
     }
 
     /// Returns the transport: admission, key rotation, revocation.
@@ -102,7 +142,7 @@ impl ServerState {
     /// under an unknown symbol.
     #[must_use]
     pub fn publish(&self, signed: SignedUpdate) -> Option<Arc<PreparedUpdate>> {
-        let symbol = *self.catalog.get(&signed.update().feed_id)?;
+        let symbol = *self.catalog.load().symbols.get(&signed.update().feed_id)?;
         Some(self.hub.publish(symbol, signed))
     }
 
@@ -121,17 +161,18 @@ impl ServerState {
     /// Publishes a signed venue report to the subscribers that asked for it.
     #[must_use]
     pub fn publish_venues(&self, signed: SignedVenueReport) -> Option<Arc<PreparedVenues>> {
-        let symbol = *self.catalog.get(&signed.report().feed_id)?;
+        let symbol = *self.catalog.load().symbols.get(&signed.report().feed_id)?;
         Some(self.hub.publish_venues(symbol, signed))
     }
 
     /// The books of these feeds' sources, each once.
     #[must_use]
     pub fn books_of(&self, feeds: &[FeedId]) -> Vec<InstrumentId> {
+        let catalog = self.catalog.load();
         let mut books: Vec<InstrumentId> = Vec::new();
         for book in feeds
             .iter()
-            .filter_map(|feed| self.books.get(feed))
+            .filter_map(|feed| catalog.books.get(feed))
             .flatten()
         {
             if !books.contains(book) {
@@ -152,7 +193,7 @@ impl ServerState {
     /// Resolves a symbol to a feed id.
     #[must_use]
     pub fn lookup(&self, symbol: &str) -> Option<FeedId> {
-        self.by_symbol.get(symbol).copied()
+        self.catalog.load().by_symbol.get(symbol).copied()
     }
 
     /// Returns the feed catalogue.
@@ -160,6 +201,8 @@ impl ServerState {
     pub fn feeds(&self) -> Vec<FeedEntry> {
         let mut feeds: Vec<FeedEntry> = self
             .catalog
+            .load()
+            .symbols
             .iter()
             .map(|(id, symbol)| FeedEntry {
                 symbol: symbol.to_string(),
@@ -233,6 +276,27 @@ mod tests {
         let expected = feed_id(&"CRYPTO.BTC/USD".parse::<Symbol>().expect("valid"));
         assert_eq!(btc.feed_id, expected.to_string());
         assert_eq!(btc.expo, -8);
+    }
+
+    #[test]
+    fn a_new_feed_set_serves_its_feeds_and_drops_the_others() {
+        let state = state();
+        let signer = oracle_wire::Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let btc = feed_id(&"CRYPTO.BTC/USD".parse::<Symbol>().expect("valid"));
+        let sol: Symbol = "CRYPTO.SOL/USD".parse().expect("valid");
+        let update = |id| signer.sign_update(&crate::testing::sample_update(id));
+        assert!(state.publish(update(btc)).is_some());
+        state.set_feeds(&[sol], HashMap::new(), 4, 512);
+        assert!(state.publish(update(btc)).is_none(), "BTC left the set");
+        assert!(state.publish(update(feed_id(&sol))).is_some());
+        assert_eq!(state.lookup("CRYPTO.BTC/USD"), None);
+        assert_eq!(state.feeds().len(), 1);
+        assert_eq!(
+            state.hub().latest_all().len(),
+            1,
+            "BTC's latest update left"
+        );
+        assert_eq!(state.feed_set_version(), 4);
     }
 
     #[test]

@@ -206,15 +206,21 @@ oracle-node start config.toml --tail
 
 ### Update the feeds
 
-`init` writes the feeds of its own version into the config. After you install a
-new version, write its feeds into the config, and restart the node:
+The network's feeds come from the registry canister as a signed feed set
+(SPEC §3.8). A node with a `[network_feeds]` section, which `init` writes, takes
+each new set while it runs, in its own slot: no release and no restart.
+
+The feeds in the config are the fallback before the first fetch. After you
+install a new version, write its feeds into the config, and restart the node.
+`update-feeds` also adds `[network_feeds]` to a config from before it:
 
 ```bash
 sudo oracle-node update-feeds /var/lib/oracle-node/config.toml
 sudo systemctl restart oracle-node
 ```
 
-The old config stays as `config.toml.prev`.
+The old config stays as `config.toml.prev`. `scripts/deploy-nodes.sh` does both
+on each host, and lets the node write its directory, where it caches the set.
 
 ### Rotate the key
 
@@ -343,7 +349,7 @@ Other folders:
 
 | Folder | Contents |
 |---|---|
-| `node/` | `all-feeds.toml`, the feed set, and `assets.toml`, the generated asset feeds. |
+| `node/` | `all-feeds.toml`, the curated feeds, and `assets.toml`, the generated asset feeds: together the network's feed set, which `scripts/publish-feeds.sh` publishes. |
 | `scripts/` | The local stack, registry calls, the asset list. |
 | `release/` | The release build and the install script. |
 
@@ -435,6 +441,15 @@ priced feeds. The 14 defaults are in the install arguments in `icp.yaml`:
 
 ```bash
 icp canister call oracle_registry set_feeds '(vec { "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD" })' -e ic
+```
+
+Governance publishes the network's feed set from `node/all-feeds.toml` and
+`node/assets.toml`. The script runs every check a node runs, shows what the
+publish adds, removes and changes, and asks before the call. `PUSH` sets every
+node's push pace:
+
+```bash
+PUSH=7,10,5 scripts/publish-feeds.sh --identity tapray
 ```
 
 ## License

@@ -89,6 +89,8 @@ pub(crate) struct NodeStatus {
     pub(crate) connections: usize,
     pub(crate) updates: u64,
     pub(crate) client_list_version: u64,
+    /// The network feed set version; zero for the config's own feeds.
+    pub(crate) feed_set: u64,
     /// From the venue data that moved a price to the signed update.
     pub(crate) signed: Percentiles,
 }
@@ -101,6 +103,7 @@ impl NodeStatus {
             connections = %format_args!("{}/{}", self.connections_up, self.connections),
             updates = self.updates,
             client_list = self.client_list_version,
+            feed_set = self.feed_set,
             signed_p50_ms = %format_args!("{:.2}", millis(self.signed.p50)),
             signed_p99_ms = %format_args!("{:.2}", millis(self.signed.p99)),
             "status"
@@ -265,6 +268,7 @@ mod tests {
             connections: 8,
             updates: 2_400,
             client_list_version: 4,
+            feed_set: 0,
             signed: Percentiles::default(),
         };
         let text = status.to_string();

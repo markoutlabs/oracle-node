@@ -211,7 +211,7 @@ pub async fn run(
 
     let aggregator = Aggregator::new(resolved.feeds)?;
     let mut pipeline = Pipeline::new(aggregator, std::sync::Arc::new(signer));
-    let adapters = build_adapters(resolved.binance, resolved.venues, connector, clock)?.adapters;
+    let adapters = build_adapters(resolved.binance, resolved.venues, connector, clock)?;
 
     let shutdown = CancellationToken::new();
     let (tx, mut rx) = mpsc::channel::<IngestEvent>(1_024);
@@ -220,7 +220,7 @@ pub async fn run(
         let tx = tx.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {
-            if let Err(error) = adapter.run(tx, shutdown).await {
+            if let Err(error) = adapter.adapter.run(tx, shutdown).await {
                 warn!(%error, "adapter stopped");
             }
         }));

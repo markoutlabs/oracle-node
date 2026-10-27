@@ -196,6 +196,35 @@ impl Aggregator {
         self
     }
 
+    /// Replaces the feeds; an unchanged feed keeps its state, and no feed's sequence goes below `floor` or back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] as [`Self::new`] does, and then changes nothing.
+    pub fn reconfigure(&mut self, configs: Vec<FeedConfig>, floor: u64) -> Result<(), ConfigError> {
+        let mut next = Self::new(configs)?;
+        let mut old: HashMap<FeedId, FeedRuntime> = self
+            .feeds
+            .drain(..)
+            .map(|feed| (feed.config.feed_id, feed))
+            .collect();
+        for feed in &mut next.feeds {
+            match old.remove(&feed.config.feed_id) {
+                Some(kept) if kept.config == feed.config => *feed = kept,
+                replaced => {
+                    let (seq, venue_seq) =
+                        replaced.map_or((0, 0), |replaced| (replaced.seq, replaced.venue_seq));
+                    feed.seq = seq.max(floor);
+                    feed.venue_seq = venue_seq.max(floor);
+                    feed.dirty = true;
+                    feed.venue_dirty = true;
+                }
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Builds an aggregator.
     ///
     /// # Errors
@@ -906,6 +935,105 @@ mod tests {
         for (venue, bid, ask) in prices {
             aggregator.observe(&book(*venue, bid, ask, at_ns));
         }
+    }
+
+    fn eth(venues: &[Venue]) -> FeedConfig {
+        let symbol: Symbol = "CRYPTO.ETH/USDT".parse().expect("valid");
+        let sources = venues
+            .iter()
+            .map(|venue| {
+                SourceConfig::new(
+                    InstrumentId::new(*venue, MarketKind::Spot, "ETHUSDT"),
+                    vec![ObsKind::BookTop],
+                )
+            })
+            .collect();
+        FeedConfig::spot(symbol, FeedId::from_bytes([2; 32]), sources)
+    }
+
+    fn published(aggregator: &mut Aggregator, at_ns: u64) -> PriceUpdate {
+        feed(
+            aggregator,
+            at_ns,
+            &[
+                (Venue::Binance, "100", "100.02"),
+                (Venue::Bybit, "100.01", "100.03"),
+                (Venue::Okx, "99.99", "100.01"),
+            ],
+        );
+        aggregator
+            .poll(feed_id(), at_ns)
+            .expect("no error")
+            .expect("publishes")
+    }
+
+    #[test]
+    fn an_unchanged_feed_keeps_its_state_across_a_new_feed_set() {
+        let mut aggregator = aggregator();
+        let first = published(&mut aggregator, SECOND);
+        aggregator
+            .reconfigure(vec![config(&THREE), eth(&THREE)], 1_000)
+            .expect("valid set");
+        let second = published(&mut aggregator, 2 * SECOND);
+        assert_eq!(second.seq, first.seq + 1, "the sequence went on");
+        assert_eq!(second.prev_publish_time_ns, first.publish_time_ns);
+        assert_eq!(aggregator.len(), 2);
+    }
+
+    #[test]
+    fn a_changed_or_new_feed_never_reuses_a_sequence() {
+        let mut aggregator = aggregator();
+        let first = published(&mut aggregator, SECOND);
+        // A floor below the old sequence: the old one wins.
+        aggregator
+            .reconfigure(
+                vec![
+                    config(&[Venue::Binance, Venue::Bybit, Venue::Okx, Venue::Kraken]),
+                    eth(&THREE),
+                ],
+                0,
+            )
+            .expect("valid set");
+        let second = published(&mut aggregator, 2 * SECOND);
+        assert_eq!(second.seq, first.seq + 1);
+        assert_eq!(
+            second.prev_publish_time_ns, 0,
+            "a changed feed starts fresh"
+        );
+        for venue in THREE {
+            aggregator.observe(&Observation {
+                instrument: InstrumentId::new(venue, MarketKind::Spot, "ETHUSDT"),
+                ..book(venue, "2000", "2000.2", 2 * SECOND)
+            });
+        }
+        let new = aggregator
+            .poll(FeedId::from_bytes([2; 32]), 2 * SECOND)
+            .expect("no error")
+            .expect("publishes");
+        assert_eq!(new.seq, 1, "a new feed starts at the floor");
+    }
+
+    #[test]
+    fn a_removed_feed_leaves_and_a_bad_set_changes_nothing() {
+        let mut aggregator = Aggregator::new(vec![config(&THREE), eth(&THREE)]).expect("valid");
+        aggregator
+            .reconfigure(vec![eth(&THREE)], 0)
+            .expect("valid set");
+        assert!(aggregator.feed_ids().all(|id| id != feed_id()));
+        // Converted through a peg that is not in the set.
+        let mut converted = config(&THREE).with_conversion(crate::config::QuoteConversion {
+            peg_feed: FeedId::from_bytes([9; 32]),
+            max_peg_conf_bps: Fixed::ONE,
+        });
+        if let Some(source) = converted.sources.first_mut() {
+            source.convert_quote = true;
+        }
+        assert!(
+            aggregator
+                .reconfigure(vec![converted, eth(&THREE)], 0)
+                .is_err()
+        );
+        assert_eq!(aggregator.len(), 1, "the old set stays");
     }
 
     #[test]
