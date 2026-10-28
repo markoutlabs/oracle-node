@@ -378,13 +378,27 @@ fn ssh_ports() -> Vec<u16> {
     if ports.is_empty() { vec![22] } else { ports }
 }
 
-/// The `port N` lines of `sshd -T`.
+/// The ports of the `port N` and `listenaddress ADDR:PORT` lines of `sshd -T`.
 fn ports_in(config: &str) -> Vec<u16> {
-    config
+    // A ListenAddress with a port replaces the Port lines for that address, so
+    // a firewall that allowed only those would lock the operator out.
+    let mut ports: Vec<u16> = config
         .lines()
-        .filter_map(|line| line.strip_prefix("port "))
-        .filter_map(|port| port.trim().parse().ok())
-        .collect()
+        .filter_map(|line| {
+            if let Some(port) = line.strip_prefix("port ") {
+                return port.trim().parse().ok();
+            }
+            let address = line.strip_prefix("listenaddress ")?;
+            address
+                .trim()
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .map(|address| address.port())
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// `true` when the program can run, whatever it answers to `--version`.
@@ -459,10 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn sshd_ports_come_from_its_port_lines() {
+    fn sshd_ports_come_from_its_port_and_listen_lines() {
         assert_eq!(
             ports_in("port 22\nport 2222\nlistenaddress [::]:22\n"),
             [22, 2222]
+        );
+        assert_eq!(
+            ports_in("port 22\nlistenaddress 0.0.0.0:2200\n"),
+            [22, 2200]
         );
         assert!(ports_in("addressfamily any\n").is_empty());
     }

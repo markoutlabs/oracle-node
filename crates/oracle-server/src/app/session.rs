@@ -190,7 +190,9 @@ async fn handshake(
     let auth: HandshakeMessage = match serde_json::from_str(&auth) {
         Ok(auth) => auth,
         Err(error) => {
-            refuse(sink, &error.to_string()).await;
+            debug!(%error, "client sent no valid auth");
+            // The parse error quotes the input, so a stranger would size the reply.
+            refuse(sink, "the auth message does not parse").await;
             return None;
         }
     };
@@ -216,7 +218,8 @@ async fn refuse(sink: &mut Sink, reason: &str) {
     let message = HandshakeMessage::Refused {
         reason: reason.to_owned(),
     };
-    let _ = sink.send(json_message(&message)).await;
+    // A peer that does not read must not hold its handshake place.
+    let _ = tokio::time::timeout(STALL, sink.send(json_message(&message))).await;
 }
 
 async fn send(sink: &mut Sink, message: Message) -> Result<(), ()> {
@@ -240,5 +243,8 @@ fn json_message(message: &HandshakeMessage) -> Message {
 }
 
 fn instant_at(deadline: u64) -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(deadline.saturating_sub(unix_now()))
+    // A client that never expires must not overflow the clock. Thirty years is
+    // as far as tokio's own timers reach.
+    let wait = Duration::from_secs(deadline.saturating_sub(unix_now()));
+    tokio::time::Instant::now() + wait.min(Duration::from_secs(30 * 365 * 86_400))
 }

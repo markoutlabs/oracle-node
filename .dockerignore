@@ -2,6 +2,10 @@
 target/
 .git/
 .icp/cache/
-node/*.key
 node/registry.json
+# What .gitignore keeps out: keys anywhere, a node that `init` wrote in the
+# repo root, with its passphrase, and the local design spec.
+**/*.key
+/oracle-node
+SPEC.md
 **/.DS_Store

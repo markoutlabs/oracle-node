@@ -17,7 +17,7 @@
 //! to governance off-chain.
 //!
 //! **Nodes** call `push` with their latest frames, as the anonymous identity.
-//! `inspect_message` lets a push in only when one of its frames is new and
+//! `inspect_message` lets a push in only when each of its frames is new and
 //! valid, and drops all other ingress, before the canister pays for it.
 //!
 //! # Interchange
@@ -52,7 +52,9 @@ use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
 use crate::certify::{CERTIFIED, certify_documents, certify_prices};
-use crate::prices::{MAX_FRAMES_PER_PUSH, PriceRecord, Prices, StoredPrices, Verdict};
+use crate::prices::{
+    MAX_FRAMES_PER_PUSH, MAX_PUSH_BYTES, PriceRecord, Prices, StoredPrices, Verdict,
+};
 use crate::publish::{Document, idle, mutate_and_publish};
 use crate::runtime::{
     PRICES, STATE, address, anonymous_only, governance_only, is_governance, now_ns, now_secs,
@@ -135,8 +137,8 @@ fn post_upgrade() {
     certify_documents();
 }
 
-/// Only controllers and pushes with a new, valid frame get past this, so
-/// spam costs the canister nothing.
+/// Only controllers and pushes whose every frame is new and valid get past
+/// this, so spam costs the canister nothing.
 ///
 /// One replica runs this check, so every update method has a guard too, and
 /// `push` checks every frame again.
@@ -147,17 +149,22 @@ fn inspect_message() {
     }
 }
 
-/// The IC drops the changes that `inspect_message` makes, so the frame that
-/// `accepts_any` stores here is stored again only under consensus.
+/// The IC drops the changes that `inspect_message` makes, so the frames that
+/// `accepts_all` stores here are stored again only under consensus.
 fn accepts_push() -> bool {
     if ic_cdk::api::msg_method_name() != "push" || anonymous_only().is_err() {
         return false;
     }
-    let Ok((frames,)) = candid::decode_args::<(Vec<ByteBuf>,)>(&ic_cdk::api::msg_arg_data()) else {
+    // The canister pays for each ingress byte, and Candid skips extra arguments.
+    let arg = ic_cdk::api::msg_arg_data();
+    if arg.len() > MAX_PUSH_BYTES {
+        return false;
+    }
+    let Ok((frames,)) = candid::decode_args::<(Vec<ByteBuf>,)>(&arg) else {
         return false;
     };
     frames.len() <= MAX_FRAMES_PER_PUSH
-        && with_prices(|prices| prices.accepts_any(&frames, now_ns()))
+        && with_prices(|prices| prices.accepts_all(&frames, now_ns()))
 }
 
 /// A node pushes its latest updates as one batch, or as single frames.

@@ -404,7 +404,8 @@ fn a_disconnect_invalidates_faster_than_the_staleness_filter() {
     }
     // Binance drops. Its book is milliseconds old and would sail through the
     // two-second staleness filter, but it must not survive the gap.
-    aggregator.invalidate(Venue::Binance, MarketKind::Spot);
+    let binance = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+    aggregator.invalidate(&[(binance, ObsKind::BookTop)]);
 
     let update = aggregator
         .poll(feed_id(), at + 10_000_000)

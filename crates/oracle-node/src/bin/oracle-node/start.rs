@@ -537,22 +537,8 @@ impl PipelineTask {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => break,
-                event = self.ingest.recv() => {
-                    let Some(event) = event else { break };
-                    self.apply(&event);
-                    for _ in 1..BATCH_MAX {
-                        let Ok(event) = self.ingest.try_recv() else { break };
-                        self.apply(&event);
-                    }
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published, Some(&clock));
-                    self.publish_venues(clock.now_ns());
-                }
-                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published, Some(&clock));
-                    self.publish_venues(clock.now_ns());
-                }
+                // The timers first: an ingest queue that is never empty would
+                // otherwise starve the heartbeats, the feed-set change and the status.
                 _ = ticker.tick() => {
                     let polled = self.pipeline.tick(clock.now_ns());
                     self.publish(polled, &mut published, None);
@@ -592,6 +578,22 @@ impl PipelineTask {
                     notify::status(&status.to_string());
                     published.clear();
                     updates_before = stats.published;
+                }
+                event = self.ingest.recv() => {
+                    let Some(event) = event else { break };
+                    self.apply(&event);
+                    for _ in 1..BATCH_MAX {
+                        let Ok(event) = self.ingest.try_recv() else { break };
+                        self.apply(&event);
+                    }
+                    let polled = self.pipeline.flush(clock.now_ns());
+                    self.publish(polled, &mut published, Some(&clock));
+                    self.publish_venues(clock.now_ns());
+                }
+                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
+                    let polled = self.pipeline.flush(clock.now_ns());
+                    self.publish(polled, &mut published, Some(&clock));
+                    self.publish_venues(clock.now_ns());
                 }
             }
         }

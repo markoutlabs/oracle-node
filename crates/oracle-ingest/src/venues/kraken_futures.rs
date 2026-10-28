@@ -150,11 +150,10 @@ pub fn decode_payload(
     let Some(entry) = map.lookup(ticker.product_id) else {
         return Err(DecodeError::Control);
     };
-    // A suspended contract still publishes a stale-looking book. Dropping it
-    // here means the staleness filter sheds it rather than the aggregator
-    // pricing off a market nobody can trade.
+    // A suspended contract still publishes a stale-looking book. The session
+    // stops confirming its last values, so the staleness filter sheds them.
     if ticker.suspended == Some(true) {
-        return Err(DecodeError::Control);
+        return Err(DecodeError::Halted(entry.instrument.clone()));
     }
     let exchange_time_ns = ticker.time.map(millis_to_nanos);
 
@@ -350,7 +349,7 @@ mod tests {
         let mut out = Vec::new();
         let error =
             decode_payload(suspended.as_bytes(), &map(), RECV, &mut out).expect_err("suspended");
-        assert!(error.is_benign(), "got {error:?}");
+        assert!(matches!(error, DecodeError::Halted(_)), "got {error:?}");
         assert!(
             out.is_empty(),
             "a market nobody can trade must not reach the aggregator"

@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
 use serde_json::value::RawValue;
-use tokio::time::Instant;
 use tracing::warn;
 
 use crate::transport::{Frame, Transport, TransportError};
@@ -20,11 +19,6 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One contract's record is a few kilobytes.
 const MAX_BODY: usize = 256 * 1024;
-
-/// The records arrive every second or two, so they would keep a dead socket
-/// alive in the session's eyes. The socket itself must send within this time;
-/// both venues answer a keepalive every 15 s.
-const SOCKET_SILENCE: Duration = Duration::from_secs(45);
 
 /// Takes the `data` of a venue's reply, or says why the reply failed.
 pub(crate) type DataOf = fn(&[u8]) -> Result<Box<RawValue>, String>;
@@ -125,15 +119,13 @@ pub(crate) fn frame(
             serde_json::json!({ "type": "rest", "subject": subject, "topic": topic, "error": error })
         }
     };
-    Frame::Text(text.to_string())
+    Frame::Rest(text.to_string())
 }
 
 /// A connection whose REST records arrive among its frames.
 pub struct RestTransport<T> {
     inner: T,
     pending: SelectAll<BoxStream<'static, Frame>>,
-    /// When the socket itself last sent a frame.
-    socket_seen: Instant,
 }
 
 impl<T> RestTransport<T> {
@@ -142,7 +134,6 @@ impl<T> RestTransport<T> {
         Self {
             inner,
             pending: SelectAll::new(),
-            socket_seen: Instant::now(),
         }
     }
 
@@ -150,11 +141,7 @@ impl<T> RestTransport<T> {
     pub(crate) fn with(inner: T, records: BoxStream<'static, Frame>) -> Self {
         let mut pending = SelectAll::new();
         pending.push(records);
-        Self {
-            inner,
-            pending,
-            socket_seen: Instant::now(),
-        }
+        Self { inner, pending }
     }
 }
 
@@ -163,19 +150,13 @@ impl<T: Transport> Transport for RestTransport<T> {
         if self.pending.is_empty() {
             return self.inner.recv().await;
         }
-        // Every arm is cancel-safe: the socket's `recv` is, a pending read stays
-        // in the set until it completes, and the sleep is recreated each call.
-        let result = tokio::select! {
-            Some(frame) = self.pending.next() => return Ok(Some(frame)),
+        // Both arms are cancel-safe: the socket's `recv` is, and a pending read
+        // stays in the set until it completes. The session times out a silent
+        // socket, because a REST record does not count as its frame.
+        tokio::select! {
+            Some(frame) = self.pending.next() => Ok(Some(frame)),
             result = self.inner.recv() => result,
-            () = tokio::time::sleep_until(self.socket_seen + SOCKET_SILENCE) => {
-                return Err(TransportError::Io(format!(
-                    "the socket sent nothing for {SOCKET_SILENCE:?}"
-                )));
-            }
-        };
-        self.socket_seen = Instant::now();
-        result
+        }
     }
 
     async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
@@ -203,8 +184,8 @@ mod tests {
     #[test]
     fn a_record_frame_holds_its_data_or_its_error() {
         let data = RawValue::from_string(r#"{"value":0.0001}"#.to_owned()).expect("json");
-        let Frame::Text(text) = frame("funding.current", "XBTUSDTM", Ok(data)) else {
-            panic!("a text frame");
+        let Frame::Rest(text) = frame("funding.current", "XBTUSDTM", Ok(data)) else {
+            panic!("a REST frame");
         };
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
         let field = |name: &str| parsed.get(name).and_then(serde_json::Value::as_str);
@@ -212,8 +193,8 @@ mod tests {
         assert_eq!(field("subject"), Some("funding.current"));
         assert_eq!(field("topic"), Some("/rest:XBTUSDTM"));
         assert!(text.contains(r#""data":{"value":0.0001}"#), "{text}");
-        let Frame::Text(text) = frame("contract", "XBTUSDTM", Err("timeout".to_owned())) else {
-            panic!("a text frame");
+        let Frame::Rest(text) = frame("contract", "XBTUSDTM", Err("timeout".to_owned())) else {
+            panic!("a REST frame");
         };
         assert!(text.contains(r#""error":"timeout""#), "{text}");
     }

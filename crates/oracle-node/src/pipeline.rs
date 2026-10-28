@@ -128,14 +128,14 @@ impl Pipeline {
             IngestEvent::Connected { .. } => {
                 self.stats.connects = self.stats.connects.saturating_add(1);
             }
-            IngestEvent::Disconnected { stream, .. } => {
+            IngestEvent::Disconnected { sources, .. } => {
                 self.stats.disconnects = self.stats.disconnects.saturating_add(1);
                 // Discard everything from this connection immediately. The venue
                 // may have moved while we were blind, and the staleness filter
                 // cannot help if the gap was shorter than its threshold.
-                self.aggregator.invalidate(stream.venue, stream.market);
-                self.books.reset(stream.venue, stream.market);
-                self.funding.reset(stream.venue, stream.market);
+                self.aggregator.invalidate(sources);
+                self.books.reset(sources);
+                self.funding.reset(sources);
             }
             // `IngestEvent` is non-exhaustive; a new event kind is additive here.
             _ => {}
@@ -383,6 +383,7 @@ mod tests {
         pipeline.observe(&IngestEvent::Disconnected {
             stream: StreamId::new(Venue::Binance, MarketKind::Spot),
             reason: "connection reset".to_owned(),
+            sources: Arc::from([(instrument(Venue::Binance), ObsKind::BookTop)]),
         });
 
         let at = START + SECOND;
@@ -398,6 +399,28 @@ mod tests {
     }
 
     #[test]
+    fn a_disconnect_keeps_what_the_other_connections_delivered() {
+        let mut pipeline = pipeline(&[Venue::Binance, Venue::Bybit]);
+        pipeline.observe(&book(Venue::Binance, "64000", START));
+        pipeline.observe(&book(Venue::Bybit, "64000", START));
+        let _ = pipeline.tick(START);
+
+        // Another Binance spot connection, which carried another instrument, drops.
+        let other = InstrumentId::new(Venue::Binance, MarketKind::Spot, "ETHUSDT");
+        pipeline.observe(&IngestEvent::Disconnected {
+            stream: StreamId::new(Venue::Binance, MarketKind::Spot),
+            reason: "reset".to_owned(),
+            sources: Arc::from([(other, ObsKind::BookTop)]),
+        });
+        let at = START + SECOND;
+        pipeline.observe(&book(Venue::Bybit, "64000", at));
+        let (signed, _) = pipeline.tick(at);
+        let update = signed.first().expect("the heartbeat publishes").update();
+        assert!(!update.flags.is_halted());
+        assert_eq!(update.num_sources, 2);
+    }
+
+    #[test]
     fn a_reconnect_does_not_resurrect_pre_gap_quotes() {
         let mut pipeline = pipeline(&[Venue::Binance, Venue::Bybit]);
         pipeline.observe(&book(Venue::Binance, "64000", START));
@@ -407,6 +430,7 @@ mod tests {
         pipeline.observe(&IngestEvent::Disconnected {
             stream: StreamId::new(Venue::Binance, MarketKind::Spot),
             reason: "reset".to_owned(),
+            sources: Arc::from([(instrument(Venue::Binance), ObsKind::BookTop)]),
         });
         pipeline.observe(&IngestEvent::Connected {
             stream: StreamId::new(Venue::Binance, MarketKind::Spot),

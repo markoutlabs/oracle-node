@@ -48,6 +48,15 @@ pub enum Record {
         /// The frame, verbatim.
         bytes: Vec<u8>,
     },
+    /// A REST record that a connector handed in among the frames.
+    Rest {
+        /// Receipt time, unix nanoseconds.
+        t: u64,
+        /// The endpoint.
+        url: String,
+        /// The record, verbatim.
+        text: String,
+    },
     /// A ping or a pong arrived. It carries no data, but it confirms the
     /// connection.
     Control {
@@ -74,6 +83,7 @@ impl Record {
         match self {
             Self::Connect { url, .. }
             | Self::Text { url, .. }
+            | Self::Rest { url, .. }
             | Self::Binary { url, .. }
             | Self::Control { url, .. }
             | Self::Close { url, .. } => url,
@@ -86,6 +96,7 @@ impl Record {
         match self {
             Self::Connect { t, .. }
             | Self::Text { t, .. }
+            | Self::Rest { t, .. }
             | Self::Binary { t, .. }
             | Self::Control { t, .. }
             | Self::Close { t, .. } => *t,
@@ -226,6 +237,11 @@ impl<T: Transport> Transport for RecordingConn<T> {
         let url = self.url.clone();
         match &received {
             Ok(Some(Frame::Text(text))) => self.recorder.write(&Record::Text {
+                t,
+                url,
+                text: text.clone(),
+            }),
+            Ok(Some(Frame::Rest(text))) => self.recorder.write(&Record::Rest {
                 t,
                 url,
                 text: text.clone(),

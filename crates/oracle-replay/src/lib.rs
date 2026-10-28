@@ -158,6 +158,7 @@ impl Transport for ReplayConn {
             .await;
         Ok(match record {
             Some(Record::Text { text, .. }) => Some(Frame::Text(text)),
+            Some(Record::Rest { text, .. }) => Some(Frame::Rest(text)),
             Some(Record::Binary { bytes, .. }) => Some(Frame::Binary(bytes)),
             Some(Record::Control { .. }) => Some(Frame::Pong),
             Some(Record::Close { .. } | Record::Connect { .. }) | None => None,

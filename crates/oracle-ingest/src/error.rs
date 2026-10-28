@@ -1,6 +1,6 @@
 //! Ingest error types.
 
-use oracle_types::Venue;
+use oracle_types::{InstrumentId, Venue};
 
 /// A failure that retrying will not fix.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +77,11 @@ pub enum DecodeError {
     /// fresh snapshot.
     #[error("book out of sync: {0}")]
     Resync(String),
+
+    /// The venue halted trading in this instrument, and the session stops
+    /// confirming its last values, so they go stale.
+    #[error("trading halted in {0}")]
+    Halted(InstrumentId),
 }
 
 impl From<serde_json::Error> for DecodeError {
@@ -101,7 +106,7 @@ impl DecodeError {
     pub const fn is_benign(&self) -> bool {
         matches!(
             self,
-            Self::Control | Self::UnhandledStream(_) | Self::UnknownInstrument(_)
+            Self::Control | Self::UnhandledStream(_) | Self::UnknownInstrument(_) | Self::Halted(_)
         )
     }
 }

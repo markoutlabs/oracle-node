@@ -10,8 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use oracle_types::{
-    BOOK_EXPO, BookDepth, BookLevel, BookUpdate, InstrumentId, MarketKind, ObsKind, Observation,
-    Venue, side_changes,
+    BOOK_EXPO, BookDepth, BookLevel, BookUpdate, InstrumentId, ObsKind, Observation, side_changes,
 };
 
 /// How often each book sends a full snapshot. A client that missed a frame
@@ -127,9 +126,11 @@ impl BookPublisher {
 
     /// Empties every book of a connection that dropped. Subscribers get an empty
     /// snapshot, so nobody keeps a book that nothing updates.
-    pub fn reset(&mut self, venue: Venue, market: MarketKind) {
-        for (instrument, state) in &mut self.books {
-            if instrument.venue == venue && instrument.market == market && !state.retired {
+    pub fn reset(&mut self, sources: &[(InstrumentId, ObsKind)]) {
+        for (instrument, _) in sources.iter().filter(|(_, kind)| *kind == ObsKind::Depth) {
+            if let Some(state) = self.books.get_mut(instrument)
+                && !state.retired
+            {
                 state.current = None;
                 // The empty snapshot shows no venue state.
                 state.venue_seq = None;
@@ -242,7 +243,7 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oracle_types::{Fixed, Level};
+    use oracle_types::{Fixed, Level, MarketKind, Venue};
 
     const SECOND: u64 = 1_000_000_000;
     const START: u64 = 1_754_582_400 * SECOND;
@@ -298,7 +299,7 @@ mod tests {
         assert_eq!(last.seq, 102);
         // The old connection still sends during the venue swap, then drops.
         books.observe(&depth(&[("100", "2")], &[("101", "1")], START + 2 * SECOND));
-        books.reset(Venue::Binance, MarketKind::Spot);
+        books.reset(&[(instrument(), ObsKind::Depth)]);
         assert!(
             books.poll(START + 10 * SECOND, |_| true).is_empty(),
             "a retired book sends nothing more"
@@ -464,7 +465,7 @@ mod tests {
         );
 
         // An empty snapshot after a drop shows no venue state.
-        publisher.reset(Venue::Binance, MarketKind::Spot);
+        publisher.reset(&[(instrument(), ObsKind::Depth)]);
         let after = later + 100_000_000;
         let empty = publisher.poll(after, |_| true);
         assert_eq!(empty.first().map(|update| update.venue_seq), Some(None));
@@ -475,7 +476,7 @@ mod tests {
         let mut publisher = BookPublisher::new(0);
         publisher.observe(&depth(&[("100", "1")], &[("101", "1")], START));
         let _ = publisher.poll(START, |_| true);
-        publisher.reset(Venue::Binance, MarketKind::Spot);
+        publisher.reset(&[(instrument(), ObsKind::Depth)]);
         let after = START + 100_000_000;
         let frames = publisher.poll(after, |_| true);
         let [empty] = frames.as_slice() else {

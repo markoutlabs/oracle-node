@@ -299,8 +299,8 @@ impl NodeTransport {
     /// returns the number of sessions it revoked.
     ///
     /// Adoption closes sessions whose client was removed, rekeyed or cut
-    /// short; if any were, the keys rotate off the grid so what those clients
-    /// hold stops working. Extensions are pushed.
+    /// short. When a client was removed or cut short, the keys rotate off the
+    /// grid, so what it holds stops working. Extensions are pushed.
     ///
     /// # Errors
     ///
@@ -336,6 +336,14 @@ impl NodeTransport {
         let epoch_secs = verified.epoch_secs();
         let mut keys = self.lock_keys();
         let mut revoked = 0_usize;
+        // A client removed or cut short may hold keys from a session that ended
+        // before this list came, so its keys go too.
+        let cut = clients.clients().iter().any(|old| {
+            verified.get(old.address).is_none_or(|new| {
+                session_deadline(new.expires_at, epoch_secs)
+                    < session_deadline(old.expires_at, clients.epoch_secs())
+            })
+        });
         let pending: Vec<Arc<EpochKey>> = std::iter::once(keys.schedule.current())
             .chain(keys.schedule.next())
             .cloned()
@@ -366,7 +374,7 @@ impl NodeTransport {
                 }
             }
         });
-        if revoked > 0 {
+        if revoked > 0 || cut {
             let fresh = keys.schedule.force_rotate(now, &mut os_rng());
             for key in &fresh {
                 deliver(&mut keys.sessions, key);

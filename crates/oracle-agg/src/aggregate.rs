@@ -169,6 +169,9 @@ pub enum Outcome {
         reasons: Reasons,
         /// How many sources survived filtering.
         live: u32,
+        /// The price that the sources agreed on, when only the sanity band
+        /// halted it. The reference follows it, so a real move ends the halt.
+        out_of_band: Option<Fixed>,
     },
 }
 
@@ -260,6 +263,7 @@ pub fn aggregate(
             return Outcome::Halted {
                 reasons: reasons | Reasons::PEG_UNAVAILABLE,
                 live: 0,
+                out_of_band: None,
             };
         };
         match peg {
@@ -288,6 +292,7 @@ pub fn aggregate(
         return Outcome::Halted {
             reasons: reasons | Reasons::INSUFFICIENT_SOURCES,
             live,
+            out_of_band: None,
         };
     }
 
@@ -330,6 +335,7 @@ pub fn aggregate(
         return Outcome::Halted {
             reasons: reasons | Reasons::INSUFFICIENT_SOURCES,
             live,
+            out_of_band: None,
         };
     };
 
@@ -344,6 +350,7 @@ pub fn aggregate(
         return Outcome::Halted {
             reasons: reasons | Reasons::SANITY_BAND,
             live,
+            out_of_band: Some(price),
         };
     }
 
@@ -607,7 +614,7 @@ mod tests {
     fn priced(outcome: Outcome) -> Aggregation {
         match outcome {
             Outcome::Priced(aggregation) => *aggregation,
-            Outcome::Halted { reasons, live } => {
+            Outcome::Halted { reasons, live, .. } => {
                 panic!("expected a price, halted with {reasons:?} and {live} live sources")
             }
         }
@@ -835,7 +842,7 @@ mod tests {
             None,
         );
         match outcome {
-            Outcome::Halted { reasons, live } => {
+            Outcome::Halted { reasons, live, .. } => {
                 assert!(reasons.contains(Reasons::INSUFFICIENT_SOURCES));
                 assert_eq!(live, 1);
             }

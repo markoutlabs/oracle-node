@@ -51,6 +51,19 @@ fn decimal(feed: &str, field: &str, text: &str, positive: bool) -> Result<String
     Ok(value.to_string())
 }
 
+fn band(feed: &str, low: &str, high: &str) -> Result<[String; 2], String> {
+    let low = decimal(feed, "sanity_band", low, true)?;
+    let high = decimal(feed, "sanity_band", high, true)?;
+    let below_one = Fixed::from_str(&low).is_ok_and(|value| value < Fixed::ONE);
+    let above_one = Fixed::from_str(&high).is_ok_and(|value| value > Fixed::ONE);
+    if !(below_one && above_one) {
+        return Err(format!(
+            "{feed}: sanity_band must be [low, high] with low below 1 and high above 1"
+        ));
+    }
+    Ok([low, high])
+}
+
 fn optional(
     feed: &str,
     field: &str,
@@ -68,9 +81,10 @@ fn source(feed: &str, has_peg: bool, source: &SourceSettings) -> Result<SourceSe
     );
     let venue = Venue::from_str(&source.venue).map_err(|error| format!("{at}: {error}"))?;
     let market = MarketKind::from_str(&source.market).map_err(|error| format!("{at}: {error}"))?;
-    if source.symbol.is_empty() {
-        return Err(format!("{at}: the venue symbol is empty"));
-    }
+    // The rule of the frames that carry it, so a signed set never names a
+    // symbol whose venue reports, books and funding cannot encode.
+    crate::books::check_symbol(source.symbol.as_bytes(), "venue symbol")
+        .map_err(|error| format!("{at}: {error}"))?;
     let kinds = match &source.kinds {
         None => None,
         Some(kinds) => {
@@ -106,9 +120,12 @@ fn source(feed: &str, has_peg: bool, source: &SourceSettings) -> Result<SourceSe
 }
 
 fn feed(settings: &FeedSettings) -> Result<FeedSettings, String> {
-    let symbol = Symbol::from_str(&settings.symbol)
-        .map_err(|error| format!("symbol `{}`: {error}", settings.symbol))?
-        .to_string();
+    let parsed = Symbol::from_str(&settings.symbol)
+        .map_err(|error| format!("symbol `{}`: {error}", settings.symbol))?;
+    let symbol = parsed.to_string();
+    if settings.sanity_band.is_some() && parsed.kind().is_slow() {
+        return Err(format!("{symbol}: a slow feed has no sanity_band"));
+    }
     let peg = settings
         .peg
         .as_ref()
@@ -180,6 +197,11 @@ fn feed(settings: &FeedSettings) -> Result<FeedSettings, String> {
             settings.impact_notional.as_ref(),
             true,
         )?,
+        sanity_band: settings
+            .sanity_band
+            .as_ref()
+            .map(|[low, high]| band(&symbol, low, high))
+            .transpose()?,
         sources,
         symbol,
         peg,
@@ -322,6 +344,14 @@ mod tests {
         let mut zero = feed_of("CRYPTO.ETH/BTC", vec![spot("binance", "ETHBTC")]);
         zero.max_age_ms = Some(0);
         refused(vec![zero]);
+        let mut band = feed_of("CRYPTO.ETH/BTC", vec![spot("binance", "ETHBTC")]);
+        band.sanity_band = Some(["1.1".to_owned(), "2".to_owned()]);
+        assert!(refused(vec![band]).contains("sanity_band"));
+        let error = refused(vec![feed_of(
+            "CRYPTO.ETH/BTC",
+            vec![spot("binance", "ETHBTC ")],
+        )]);
+        assert!(error.contains("printable ASCII"), "{error}");
     }
 
     #[test]

@@ -338,7 +338,7 @@ fn frame(stream: &str, fetched: Result<Box<RawValue>, String>) -> Frame {
         Ok(data) => serde_json::json!({ "stream": stream, "data": data }),
         Err(error) => serde_json::json!({ "stream": stream, "error": error }),
     };
-    Frame::Text(text.to_string())
+    Frame::Rest(text.to_string())
 }
 
 #[cfg(test)]

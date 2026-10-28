@@ -686,6 +686,27 @@ pub fn resolve_feeds(
                 ConfigError::Invalid(format!("feed `{}`: bad impact_notional: {e}", feed.symbol))
             })?);
         }
+        if let Some([low, high]) = &feed.sanity_band {
+            if !config.sanity_band_enabled() {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: a slow feed has no sanity_band",
+                    feed.symbol
+                )));
+            }
+            let bound = |text: &String| {
+                text.parse::<Fixed>().map_err(|e| {
+                    ConfigError::Invalid(format!("feed `{}`: bad sanity_band: {e}", feed.symbol))
+                })
+            };
+            let (low, high) = (bound(low)?, bound(high)?);
+            if !(low.is_positive() && low < Fixed::ONE && high > Fixed::ONE) {
+                return Err(ConfigError::Invalid(format!(
+                    "feed `{}`: sanity_band must be [low, high] with 0 < low < 1 < high",
+                    feed.symbol
+                )));
+            }
+            config.sanity_band = (low, high);
+        }
         if let Some(peg) = &feed.peg {
             let peg_symbol: Symbol = peg.parse().map_err(|e| {
                 ConfigError::Invalid(format!("feed `{}`: bad peg symbol: {e}", feed.symbol))
@@ -1207,6 +1228,42 @@ sources = [
             "the default elsewhere"
         );
         assert!(parse(&with("max_age_ms = 0")).resolve().is_err());
+    }
+
+    #[test]
+    fn a_feed_sets_its_own_sanity_band() {
+        let with = |setting: &str| {
+            SAMPLE.replacen(
+                "min_sources = 1\n",
+                &format!("min_sources = 1\n{setting}\n"),
+                1,
+            )
+        };
+        let resolved = parse(&with(r#"sanity_band = ["0.8", "1.25"]"#))
+            .resolve()
+            .expect("resolves");
+        let feed = resolved.feeds.first().expect("a feed");
+        assert_eq!(
+            feed.sanity_band,
+            (
+                "0.8".parse().expect("fixed"),
+                "1.25".parse().expect("fixed")
+            )
+        );
+        let other = resolved.feeds.get(1).expect("a second feed");
+        assert_eq!(
+            other.sanity_band,
+            ("0.5".parse().expect("fixed"), "2".parse().expect("fixed")),
+            "the default elsewhere"
+        );
+        for bad in [r#"["1.1", "2"]"#, r#"["0.5", "0.9"]"#, r#"["0", "2"]"#] {
+            assert!(
+                parse(&with(&format!("sanity_band = {bad}")))
+                    .resolve()
+                    .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

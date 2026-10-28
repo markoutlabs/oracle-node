@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use oracle_types::{
-    FeedId, Fixed, FixedError, Flags, InstrumentId, MarketKind, ObsKind, Observation, PriceUpdate,
-    QTY_EXPO, RATE_EXPO, SourceStatus, Venue, VenueEntry, VenueReport,
+    FeedId, Fixed, FixedError, Flags, InstrumentId, ObsKind, Observation, PriceUpdate, QTY_EXPO,
+    RATE_EXPO, SourceStatus, VenueEntry, VenueReport,
 };
 
 use crate::aggregate::{self, Outcome, Peg, Reasons};
@@ -64,9 +64,13 @@ impl SourceSlots {
         }
     }
 
-    fn clear(&mut self) {
-        self.latest = Default::default();
-        self.alive = Default::default();
+    fn clear(&mut self, kind: ObsKind) {
+        if let Some(slot) = self.latest.get_mut(kind.index()) {
+            *slot = None;
+        }
+        if let Some(alive) = self.alive.get_mut(kind.index()) {
+            *alive = 0;
+        }
     }
 }
 
@@ -407,21 +411,24 @@ impl Aggregator {
         }
     }
 
-    /// Discards everything known about a venue connection.
+    /// Discards each instrument and kind that a dropped connection delivered.
     ///
     /// Must be called the moment a connection drops. A book carried across a gap
     /// looks live and is not: the venue may have moved while we were blind, and
     /// the staleness filter cannot help if the gap was shorter than its threshold.
-    pub fn invalidate(&mut self, venue: Venue, market: MarketKind) {
+    pub fn invalidate(&mut self, sources: &[(InstrumentId, ObsKind)]) {
         let mut touched = Vec::new();
-        for (feed_index, feed) in self.feeds.iter_mut().enumerate() {
-            for (index, source) in feed.config.sources.iter().enumerate() {
-                if source.instrument.venue == venue && source.instrument.market == market {
-                    if let Some(slots) = feed.sources.get_mut(index) {
-                        slots.clear();
+        for (instrument, kind) in sources {
+            let Some(targets) = self.routes.get(instrument) else {
+                continue;
+            };
+            for (feed_index, source_index) in targets {
+                if let Some(feed) = self.feeds.get_mut(*feed_index) {
+                    if let Some(slots) = feed.sources.get_mut(*source_index) {
+                        slots.clear(*kind);
                     }
                     feed.stats.invalidations = feed.stats.invalidations.saturating_add(1);
-                    touched.push(feed_index);
+                    touched.push(*feed_index);
                 }
             }
         }
@@ -482,7 +489,7 @@ impl Aggregator {
     ///
     /// Call it after the price poll, so that each report carries the statuses of
     /// that evaluation. A feed that `wanted` refuses is skipped and keeps its
-    /// state, so its report goes out as soon as someone wants it.
+    /// change, so its report goes out as soon as someone wants it.
     pub fn poll_venues(
         &mut self,
         now_ns: u64,
@@ -490,8 +497,14 @@ impl Aggregator {
     ) -> Vec<VenueReport> {
         self.feeds
             .iter_mut()
-            .filter(|feed| wanted(feed.config.feed_id))
-            .filter_map(|feed| feed.poll_venues(now_ns))
+            .filter_map(|feed| {
+                if wanted(feed.config.feed_id) {
+                    return feed.poll_venues(now_ns);
+                }
+                // A retry for a report that nobody wants would be due at once, for ever.
+                feed.venue_retry_at_ns = None;
+                None
+            })
             .collect()
     }
 
@@ -565,8 +578,17 @@ impl FeedRuntime {
                     aggregation.observation_time_ns,
                 )
             }
-            Outcome::Halted { reasons, .. } => {
+            Outcome::Halted {
+                reasons,
+                out_of_band,
+                ..
+            } => {
                 self.stats.halted = self.stats.halted.saturating_add(1);
+                // Every source agrees on a price outside the band: follow it, so a
+                // real move ends the halt instead of latching it until a restart.
+                if let Some(agreed) = out_of_band {
+                    self.advance_reference(agreed, now_ns);
+                }
                 // A halted feed has no *current* reading, so it must stop being
                 // usable as a peg. Leaving the last one in place would let a
                 // dead peg silently convert dependent feeds forever, drifting by
@@ -763,9 +785,12 @@ impl FeedRuntime {
     /// Halted prices are excluded — feeding a carried-forward value back into the
     /// reference would let a stuck feed slowly drag its own sanity band with it.
     fn update_reference(&mut self, price: Fixed, now_ns: u64, flags: Flags) {
-        if flags.is_halted() {
-            return;
+        if !flags.is_halted() {
+            self.advance_reference(price, now_ns);
         }
+    }
+
+    fn advance_reference(&mut self, price: Fixed, now_ns: u64) {
         let Some(reference) = self.reference else {
             self.reference = Some(price);
             self.reference_at_ns = now_ns;
@@ -880,7 +905,7 @@ fn venue_entry(
 mod tests {
     use super::*;
     use crate::config::SourceConfig;
-    use oracle_types::{Symbol, VenueSet};
+    use oracle_types::{MarketKind, Symbol, Venue, VenueSet};
 
     const SECOND: u64 = 1_000_000_000;
 
@@ -1488,7 +1513,8 @@ mod tests {
 
         // Binance drops. Its book must not survive the gap, even though it is
         // only milliseconds old and would sail through the staleness filter.
-        aggregator.invalidate(Venue::Binance, MarketKind::Spot);
+        let binance = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        aggregator.invalidate(&[(binance, ObsKind::BookTop)]);
         let later = SECOND + SECOND;
         feed(&mut aggregator, later, &[(Venue::Bybit, "100", "100.02")]);
         feed(&mut aggregator, later, &[(Venue::Okx, "100", "100.02")]);
@@ -1671,5 +1697,45 @@ mod tests {
         }
         let feed_state = aggregator.feeds.first().expect("one feed");
         assert_eq!(feed_state.reference, Some(fixed("100.01")));
+    }
+
+    #[test]
+    fn a_real_move_past_the_band_ends_its_halt() {
+        let mut aggregator = aggregator();
+        let quote = |aggregator: &mut Aggregator, at: u64, bid: &str, ask: &str| {
+            feed(
+                aggregator,
+                at,
+                &[(Venue::Binance, bid, ask), (Venue::Bybit, bid, ask)],
+            );
+        };
+        quote(&mut aggregator, SECOND, "100", "100.02");
+        assert!(
+            aggregator
+                .poll(feed_id(), SECOND)
+                .expect("no error")
+                .is_some()
+        );
+
+        // Every venue moves to 40, below half of the reference, and stays there.
+        let mut halted = false;
+        let mut resumed = None;
+        for second in 2..900_u64 {
+            let at = second * SECOND;
+            quote(&mut aggregator, at, "40", "40.02");
+            let Some(update) = aggregator.poll(feed_id(), at).expect("no error") else {
+                continue;
+            };
+            if update.flags.is_halted() {
+                halted = true;
+            } else if halted {
+                resumed = Some((second, update));
+                break;
+            }
+        }
+        assert!(halted, "the move halts first");
+        let (second, update) = resumed.expect("the halt ends without a restart");
+        assert!(second < 300, "resumed after {second} s");
+        assert_eq!(update.price, 4_001_000_000);
     }
 }

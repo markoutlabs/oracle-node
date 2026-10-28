@@ -59,6 +59,9 @@ pub struct FeedSettings {
     /// venue offers it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact_notional: Option<String>,
+    /// Halts outside `[low, high]` times the slow reference price, as decimal strings; 0.5 to 2 by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanity_band: Option<[String; 2]>,
     /// Contributing venues.
     pub sources: Vec<SourceSettings>,
 }
@@ -220,6 +223,14 @@ fn put_feed(out: &mut Vec<u8>, feed: &FeedSettings) -> Result<(), WireError> {
     put_opt_u64(out, feed.min_interval_ms);
     put_opt_u64(out, feed.max_age_ms);
     put_opt_str(out, "impact_notional", feed.impact_notional.as_deref())?;
+    match &feed.sanity_band {
+        None => out.put_u8(0),
+        Some([low, high]) => {
+            out.put_u8(1);
+            out.try_put_str("sanity_band", low, MAX_FEED_FIELD_LEN)?;
+            out.try_put_str("sanity_band", high, MAX_FEED_FIELD_LEN)?;
+        }
+    }
     out.put_u16(count("sources", &feed.sources, MAX_VENUE_ENTRIES)?);
     for source in &feed.sources {
         put_source(out, source)?;

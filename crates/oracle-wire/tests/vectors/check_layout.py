@@ -198,6 +198,8 @@ def feed_set(s: dict) -> bytes:
         out += opt_u64(feed.get("min_interval_ms"))
         out += opt_u64(feed.get("max_age_ms"))
         out += opt_text(feed.get("impact_notional"))
+        band = feed.get("sanity_band")
+        out += b"\x00" if band is None else b"\x01" + text(band[0]) + text(band[1])
         out += struct.pack(">H", len(feed["sources"]))
         for source in feed["sources"]:
             out += text(source["venue"]) + text(source["market"]) + text(source["symbol"])

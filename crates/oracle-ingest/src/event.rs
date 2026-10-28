@@ -65,15 +65,18 @@ pub enum IngestEvent {
 
     /// A connection went away.
     ///
-    /// **Consumers must immediately invalidate all state for this stream.** A
-    /// book carried across a gap looks live and is not; the venue may have moved
-    /// while we were blind, and the staleness filter cannot save us if the gap
-    /// was shorter than its threshold.
+    /// **Consumers must immediately invalidate what this connection delivered.**
+    /// A book carried across a gap looks live and is not; the venue may have
+    /// moved while we were blind, and the staleness filter cannot save us if
+    /// the gap was shorter than its threshold.
     Disconnected {
         /// Which connection.
         stream: StreamId,
         /// Why, for logs and metrics.
         reason: String,
+        /// Each instrument and kind that this connection delivered. A venue
+        /// market runs on several connections, and the others keep their data.
+        sources: Arc<[(InstrumentId, ObsKind)]>,
     },
 }
 

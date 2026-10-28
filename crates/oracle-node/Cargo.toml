@@ -18,7 +18,7 @@ oracle-wire = { workspace = true, features = ["libsecp"] }
 age.workspace = true
 anyhow.workspace = true
 axum.workspace = true
-candid.workspace = true
+candid = { workspace = true, features = ["value"] }
 ic-agent.workspace = true
 serde_bytes.workspace = true
 getrandom.workspace = true
@@ -42,6 +42,8 @@ toml_edit.workspace = true
 tracing.workspace = true
 rpassword.workspace = true
 shellexpand.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "json", "time", "local-time"] }
 zeroize.workspace = true
 

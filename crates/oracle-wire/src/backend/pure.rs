@@ -72,7 +72,13 @@ pub(crate) fn normalize_s(compact: &[u8; 64]) -> Result<[u8; 64], WireError> {
 
 /// Decompresses a 33-byte public key.
 pub(crate) fn decompress(compressed: &[u8; 33]) -> Result<[u8; 65], WireError> {
-    VerifyingKey::from_sec1_bytes(compressed)
+    // SEC1 also reads tag 0x05 (compact) at this length, and libsecp256k1
+    // refuses it: both backends must take the same keys.
+    let point = k256::EncodedPoint::from_bytes(compressed)
+        .ok()
+        .filter(k256::EncodedPoint::is_compressed)
+        .ok_or(WireError::InvalidPublicKey)?;
+    VerifyingKey::from_encoded_point(&point)
         .map(|key| uncompressed(&key))
         .map_err(|_| WireError::InvalidPublicKey)
 }

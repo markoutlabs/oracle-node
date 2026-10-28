@@ -111,7 +111,15 @@ fn a_push_with_nothing_new_never_reaches_the_canister() {
         ("a stranger's frame", vec![stranger]),
         ("an unlisted feed", vec![unlisted]),
         ("junk", vec![vec![0; 182]]),
-        ("too many frames", vec![accepted.clone(); 33]),
+        ("too many frames", vec![accepted.clone(); 5]),
+        (
+            "a fresh frame with junk",
+            vec![frame(&h, &nodes[0], BTC, 2, 1), vec![0; 182]],
+        ),
+        (
+            "a fresh frame with a replay",
+            vec![frame(&h, &nodes[0], BTC, 3, 1), accepted.clone()],
+        ),
     ] {
         assert!(
             h.push(&frames).is_err(),
@@ -128,22 +136,16 @@ fn a_push_with_nothing_new_never_reaches_the_canister() {
 }
 
 #[test]
-fn a_mixed_push_gets_a_verdict_for_each_frame() {
+fn a_push_of_several_frames_needs_each_one_new() {
     let (h, nodes) = three_nodes();
     let first = frame(&h, &nodes[0], BTC, 1, 1);
     h.push(std::slice::from_ref(&first)).expect("accepted");
-    let verdicts = h.push(&[
-        first,
-        frame(&h, &nodes[0], ETH, 1, 1),
-        frame(&h, &nodes[1], "CRYPTO.SOL/USD", 1, 1),
-    ]);
+    let fresh = frame(&h, &nodes[0], ETH, 1, 1);
+    let unlisted = frame(&h, &nodes[1], "CRYPTO.SOL/USD", 1, 1);
+    assert!(h.push(&[first, fresh.clone(), unlisted]).is_err());
     assert_eq!(
-        verdicts,
-        Ok(vec![
-            Verdict::Replayed,
-            Verdict::Accepted,
-            Verdict::UnknownFeed
-        ])
+        h.push(&[fresh, frame(&h, &nodes[1], ETH, 1, 1)]),
+        Ok(vec![Verdict::Accepted; 2])
     );
 }
 
@@ -170,23 +172,25 @@ fn a_batch_costs_one_signature_for_all_its_updates() {
         assert_eq!(verdicts, vec![Verdict::Accepted; updates]);
         before - h.cycles()
     };
+    let four_feeds = refs.get(..4).expect("14 feeds");
     let one = cost(vec![batch(&h, &node, first, 1)], 1);
     let ten = cost(vec![batch(&h, &node, ten_feeds, 2)], 10);
     let fourteen = cost(vec![batch(&h, &node, &refs, 3)], 14);
-    let singles: Vec<Vec<u8>> = ten_feeds
+    let four = cost(vec![batch(&h, &node, four_feeds, 4)], 4);
+    let singles: Vec<Vec<u8>> = four_feeds
         .iter()
-        .map(|symbol| frame(&h, &node, symbol, 4, 1))
+        .map(|symbol| frame(&h, &node, symbol, 5, 1))
         .collect();
-    let ten_frames = cost(singles, 10);
+    let four_frames = cost(singles, 4);
     eprintln!(
-        "one batch of 1 update: {one} cycles; of 10: {ten}; of 14: {fourteen}; \
-         10 single frames: {ten_frames}"
+        "one batch of 1 update: {one} cycles; of 4: {four}; of 10: {ten}; of 14: {fourteen}; \
+         4 single frames: {four_frames}"
     );
     // One recovery for the batch: its updates add bytes and bookkeeping only.
     assert!(ten < 40_000_000, "a batch of 10 cost {ten} cycles");
     assert!(
-        ten * 3 < ten_frames,
-        "a batch of 10 must cost far less than 10 frames"
+        four * 2 < four_frames,
+        "a batch of 4 must cost far less than 4 frames"
     );
 }
 

@@ -42,6 +42,9 @@ pub enum Frame {
     Ping,
     /// A pong, usually answering our own probe.
     Pong,
+    /// A record that a connector read over REST and hands in among the socket's
+    /// frames. It is data, but it proves nothing about the socket.
+    Rest(String),
 }
 
 impl Frame {
@@ -49,7 +52,7 @@ impl Frame {
     #[must_use]
     pub fn payload(&self) -> Option<&[u8]> {
         match self {
-            Self::Text(text) => Some(text.as_bytes()),
+            Self::Text(text) | Self::Rest(text) => Some(text.as_bytes()),
             Self::Binary(bytes) => Some(bytes),
             Self::Ping | Self::Pong => None,
         }

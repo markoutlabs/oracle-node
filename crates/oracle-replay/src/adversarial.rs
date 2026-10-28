@@ -92,7 +92,10 @@ pub fn silence(records: &[Record], host: &str, from_ns: u64) -> Vec<Record> {
         .filter(|record| {
             !(record.url().contains(host)
                 && record.time_ns() >= from_ns
-                && matches!(record, Record::Text { .. } | Record::Binary { .. }))
+                && matches!(
+                    record,
+                    Record::Text { .. } | Record::Rest { .. } | Record::Binary { .. }
+                ))
         })
         .cloned()
         .collect()

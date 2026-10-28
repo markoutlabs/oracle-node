@@ -206,36 +206,27 @@ impl Rotation {
     }
 }
 
-/// Renders an `icp canister call` with Candid text arguments, on `network`
-/// (`ic` or `local`).
-///
-/// The arguments are JSON documents the canister parses, so they are full of
-/// quotes. Candid text literals escape `\\` and `\"` the same way JSON does,
-/// plus `\n`, `\r` and `\t`; everything else passes through.
+/// Renders an `icp canister call` with Candid text arguments, on `network` (`ic` or `local`).
 #[must_use]
 pub fn candid_call(network: &str, canister: &str, method: &str, args: &[&str]) -> String {
-    let quoted: Vec<String> = args
+    let texts: Vec<String> = args
         .iter()
-        .map(|arg| {
-            let mut out = String::with_capacity(arg.len() + 2);
-            out.push('"');
-            for ch in arg.chars() {
-                match ch {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    other => out.push(other),
-                }
-            }
-            out.push('"');
-            out
-        })
+        .map(|arg| candid::IDLValue::Text((*arg).to_owned()).to_string())
         .collect();
+    let candid = format!("({})", texts.join(", "));
+    // An operator chose the endpoint text, and governance pastes this line into
+    // a shell. Candid text escapes every control byte, so quoting cannot fail.
+    let quote = |word: &str| shlex::try_quote(word).map_or_else(|_| "''".to_owned(), String::from);
+    // Single quotes keep a JSON argument readable, and only a quote can end them;
+    // shlex double-quotes any text with a backslash in it.
+    let argument = if candid.contains('\'') {
+        quote(&candid)
+    } else {
+        format!("'{candid}'")
+    };
     format!(
-        "icp canister call {canister} {method} '({})' -n {network}",
-        quoted.join(", ")
+        "icp canister call {} {method} {argument} -n {network}",
+        quote(canister)
     )
 }
 
@@ -353,6 +344,19 @@ mod tests {
         assert_eq!(
             call,
             r#"icp canister call c m '("plain", "{\"a\":\"b\\\\c\"}", "line\nbreak")' -n local"#
+        );
+    }
+
+    #[test]
+    fn a_quote_in_an_argument_stays_inside_one_shell_word() {
+        let call = candid_call("ic", "c", "add_node", &["wss://n/v2/ws'$(touch x)'"]);
+        let words = shlex::split(&call).expect("the line parses as a shell command");
+        assert_eq!(words.len(), 8, "{call}");
+        assert!(
+            words.get(5).is_some_and(
+                |word| word.starts_with("(\"wss://n/v2/ws") && word.contains("$(touch x)")
+            ),
+            "{words:?}"
         );
     }
 

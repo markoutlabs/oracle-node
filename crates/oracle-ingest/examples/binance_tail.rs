@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(event) = event else { break };
                 match event {
                     IngestEvent::Connected { stream } => println!("[up]   {stream}"),
-                    IngestEvent::Disconnected { stream, reason } => {
+                    IngestEvent::Disconnected { stream, reason, .. } => {
                         println!("[down] {stream}: {reason}");
                     }
                     IngestEvent::Observation(obs) => {

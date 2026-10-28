@@ -149,13 +149,14 @@ impl NodeFeedState {
     /// [`QuorumConfig::max_age_for`].
     #[must_use]
     pub fn of(update: &PriceUpdate, max_age: Duration, now_ns: u64) -> Self {
-        if update.flags.is_halted() {
-            return Self::Halted;
-        }
-        // A node that stopped talking must stop counting toward the quorum.
+        // A node that stopped talking must stop counting toward the quorum, and a
+        // halt it reported before it went silent must stop counting too.
         let max_age = u64::try_from(max_age.as_nanos()).unwrap_or(u64::MAX);
         if now_ns.saturating_sub(update.publish_time_ns) > max_age {
             return Self::Stale;
+        }
+        if update.flags.is_halted() {
+            return Self::Halted;
         }
         if update.flags.is_degraded() {
             Self::Degraded
@@ -197,7 +198,7 @@ pub struct Resolved {
     /// The freshest contributing publish time.
     #[serde(with = "oracle_types::num_str")]
     pub publish_time_ns: u64,
-    /// Inter-node spread as basis points of the median, when there is a price.
+    /// Inter-node spread as basis points of the median's size, when there is a price.
     ///
     /// The number [`Concern::NodeDivergence`] is judged on, reported whether or
     /// not it crossed the line. A monitor watches it move; an alert fires on it.
@@ -300,18 +301,24 @@ impl FeedView {
         let mut halted_nodes = 0;
         let max_age = config.max_age_for(self.kind);
 
-        let mut live: Vec<&PriceUpdate> = Vec::with_capacity(self.per_node.len());
+        let mut live: Vec<(&PriceUpdate, Fixed, Fixed)> = Vec::with_capacity(self.per_node.len());
         for update in self.per_node.values() {
             match NodeFeedState::of(update, max_age, now_ns) {
                 NodeFeedState::Halted => halted_nodes += 1,
                 NodeFeedState::Stale => {}
-                NodeFeedState::Live | NodeFeedState::Degraded => live.push(update),
+                NodeFeedState::Live | NodeFeedState::Degraded => {
+                    // A price that does not convert cannot enter the median, so it
+                    // must not count toward the quorum either.
+                    if let (Ok(price), Ok(conf)) = (update.price_fixed(), update.conf_fixed()) {
+                        live.push((update, price, conf));
+                    }
+                }
             }
         }
         if halted_nodes > 0 {
             concerns.push(Concern::NodeReportedHalted);
         }
-        if live.iter().any(|update| update.flags.is_degraded()) {
+        if live.iter().any(|(update, ..)| update.flags.is_degraded()) {
             concerns.push(Concern::NodeReportedDegraded);
         }
 
@@ -331,31 +338,29 @@ impl FeedView {
             };
         }
 
-        let mut prices: Vec<Fixed> = live.iter().filter_map(|u| u.price_fixed().ok()).collect();
-        let mut confs: Vec<Fixed> = live.iter().filter_map(|u| u.conf_fixed().ok()).collect();
+        let mut prices: Vec<Fixed> = live.iter().map(|(_, price, _)| *price).collect();
+        let mut confs: Vec<Fixed> = live.iter().map(|(_, _, conf)| *conf).collect();
 
         let price = stats::median(&mut prices);
         let conf = stats::median(&mut confs).unwrap_or(Fixed::ZERO);
 
-        // Half the inter-node spread is a floor on the published confidence.
-        // This is what makes a disagreeing node visible to a consumer that only
-        // ever looks at `conf`.
-        let spread_half = match (prices.first(), prices.last()) {
-            (Some(low), Some(high)) => high
-                .checked_sub(*low)
-                .and_then(|spread| spread.checked_div(Fixed::from_int(2).ok()?))
-                .unwrap_or(Fixed::ZERO),
+        // A spread too wide to compute is the widest disagreement there is.
+        let spread = match (prices.first(), prices.last()) {
+            (Some(low), Some(high)) => high.checked_sub(*low).unwrap_or(Fixed::MAX),
             _ => Fixed::ZERO,
         };
-        let conf = conf.max(spread_half);
+        // Half the inter-node spread is a floor on the published confidence, so a
+        // consumer that reads only `conf` sees a disagreeing node. Halving the raw
+        // value, rounded up, cannot overflow.
+        let conf = conf.max(Fixed::from_raw(spread.raw() / 2 + spread.raw() % 2));
 
-        let spread_bps = match (price, prices.first(), prices.last()) {
-            (Some(price), Some(low), Some(high)) if price.is_positive() => high
-                .checked_sub(*low)
-                .and_then(|spread| spread.to_bps_of(price)),
-            _ => None,
-        };
-        if spread_bps.is_some_and(|bps| bps > config.max_divergence_bps) {
+        // Against the size of the median, so that a funding rate at or below zero
+        // is checked too. A spread with no size in basis points fails the check.
+        let spread_bps = price
+            .and_then(Fixed::checked_abs)
+            .filter(|median| !median.is_zero())
+            .and_then(|median| spread.to_bps_of(median));
+        if spread_bps.map_or(!spread.is_zero(), |bps| bps > config.max_divergence_bps) {
             concerns.push(Concern::NodeDivergence);
         }
 
@@ -364,7 +369,11 @@ impl FeedView {
         } else {
             Status::Degraded
         };
-        let publish_time_ns = live.iter().map(|u| u.publish_time_ns).max().unwrap_or(0);
+        let publish_time_ns = live
+            .iter()
+            .map(|(update, ..)| update.publish_time_ns)
+            .max()
+            .unwrap_or(0);
 
         Resolved {
             feed_id: self.feed_id,
@@ -631,5 +640,63 @@ mod tests {
         ]);
         let resolved = view.resolve(&QuorumConfig::default(), NOW);
         assert_eq!(resolved.price, Some(fixed("64015")));
+    }
+
+    fn two_of(view: &FeedView) -> Resolved {
+        let config = QuorumConfig {
+            quorum: 2,
+            ..QuorumConfig::default()
+        };
+        view.resolve(&config, NOW)
+    }
+
+    #[test]
+    fn a_node_too_far_off_to_measure_still_degrades_the_feed() {
+        let mut view = view(&[(1, "64000", "0.5", Flags::NONE)]);
+        let mut huge = update("1", "0", 1, Flags::NONE);
+        huge.price = 200_000_000_000_000;
+        huge.expo = 0;
+        view.record(node(2), huge);
+        let resolved = two_of(&view);
+        assert!(resolved.concerns.contains(&Concern::NodeDivergence));
+        assert_eq!(resolved.status, Status::Degraded);
+        assert!(resolved.conf > Some(fixed("1000000000000")), "{resolved:?}");
+    }
+
+    #[test]
+    fn a_median_at_or_below_zero_is_still_checked_for_divergence() {
+        let split = view(&[
+            (1, "-64000", "0.5", Flags::NONE),
+            (2, "64000", "0.5", Flags::NONE),
+        ]);
+        assert!(two_of(&split).concerns.contains(&Concern::NodeDivergence));
+        let agreeing = view(&[
+            (1, "-0.0001", "0", Flags::NONE),
+            (2, "-0.0001", "0", Flags::NONE),
+        ]);
+        assert_eq!(two_of(&agreeing).status, Status::Ok);
+    }
+
+    #[test]
+    fn a_price_that_does_not_convert_does_not_count_toward_the_quorum() {
+        let mut view = view(&[(1, "64000", "0.5", Flags::NONE)]);
+        let mut broken = update("1", "0.5", 1, Flags::NONE);
+        broken.expo = 30;
+        view.record(node(2), broken);
+        let resolved = two_of(&view);
+        assert_eq!((resolved.status, resolved.nodes), (Status::Halted, 1));
+    }
+
+    #[test]
+    fn a_halt_from_a_node_that_went_silent_ages_out() {
+        let mut view = view(&[
+            (1, "64000", "0.5", Flags::NONE),
+            (2, "64000", "0.5", Flags::NONE),
+        ]);
+        let mut halted = update("64000", "0.5", 1, Flags::HALTED);
+        halted.publish_time_ns = NOW - 10 * NANOS_PER_SEC;
+        view.record(node(3), halted);
+        let resolved = two_of(&view);
+        assert_eq!((resolved.status, resolved.halted_nodes), (Status::Ok, 0));
     }
 }

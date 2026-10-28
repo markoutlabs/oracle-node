@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/markoutlabs/oracle-node"
 
@@ -74,6 +74,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rpassword = "7"
 # A leading `~` in a path typed at the init wizard.
 shellexpand = "3"
+# The `icp canister call` lines that `init` prints for governance to paste.
+shlex = "2"
+# New files that root writes in a directory that the service user can write.
+tempfile = "3"
 # The example address blocks that `init` refuses in an endpoint.
 ipnet = "2"
 sd-notify = "0.5"

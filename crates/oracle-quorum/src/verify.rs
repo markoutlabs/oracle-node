@@ -277,6 +277,11 @@ impl Verifier {
         self.registry = registry;
     }
 
+    /// Drops the price sequence marks of every feed that `keep` refuses.
+    pub fn retain_feeds(&mut self, keep: impl Fn(&FeedId) -> bool) {
+        self.high_water.retain(|(_, feed), _| keep(feed));
+    }
+
     /// Returns `true` if a registry this verifier once trusted listed `signer`
     /// and the current one does not.
     #[must_use]

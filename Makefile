@@ -33,7 +33,7 @@ canister: ## The registry canister wasm, with its .did extracted and baked in
 	$(MAKE) --no-print-directory extract_did bake_candid_metadata
 
 extract_did: ## Regenerate the .did from the built wasm
-	candid-extractor $(WASM) > $(DID)
+	candid-extractor $(WASM) > $(DID).tmp && mv $(DID).tmp $(DID) || { rm -f $(DID).tmp; exit 1; }
 
 # Public, so tools such as `icp canister call` read the interface from the canister.
 bake_candid_metadata: ## Embed the .did in the wasm as candid:service
@@ -42,12 +42,16 @@ bake_candid_metadata: ## Embed the .did in the wasm as candid:service
 node: ## The oracle-node binary for this machine
 	cargo build --release --locked -p oracle-node --bin oracle-node
 
-test: ## Every test, PocketIC included
+# The workspace build turns on `pure-rust` everywhere, so oracle-wire alone
+# runs its vectors on `libsecp`, the backend the node ships with.
+test: ## Every test, PocketIC included, and the wire vectors on both backends
 	cargo test --workspace --locked
+	cargo test -p oracle-wire --locked
 
 lint: ## Formatting, then clippy for the workspace and the canister's wasm32 build
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy -p oracle-wire --all-targets --locked -- -D warnings
 	cargo clippy --target wasm32-unknown-unknown -p $(PACKAGE) --locked -- -D warnings
 
 e2e: ## The whole system on PocketIC: canister, node binary, SDK client

@@ -146,12 +146,20 @@ async fn run(
             _ = ticker.tick() => {}
         }
         if Instant::now() >= read_feeds_at {
-            match feeds(&agent, &canister).await {
+            // The agent's own HTTP limit is minutes, and a stalled query here
+            // would stop every push behind it.
+            let read = tokio::time::timeout(PUSH_TIMEOUT, feeds(&agent, &canister)).await;
+            match read.unwrap_or_else(|_| Err(format!("no reply in {} s", PUSH_TIMEOUT.as_secs())))
+            {
                 Ok(feeds) => {
                     planner.set_feeds(feeds);
                     read_feeds_at = Instant::now() + FEEDS_EVERY;
                     let heartbeat = pace.borrow().heartbeat;
-                    check_window(&agent, &canister, heartbeat).await;
+                    let _ = tokio::time::timeout(
+                        PUSH_TIMEOUT,
+                        check_window(&agent, &canister, heartbeat),
+                    )
+                    .await;
                 }
                 Err(error) => {
                     minute.failed(format!("get_feeds: {error}"));
@@ -267,4 +275,30 @@ async fn push(agent: &Agent, canister: &Principal, batch: Vec<u8>) -> Result<Vec
         .await
         .map_err(|error| error.to_string())?;
     Decode!(&reply, Result<Vec<Verdict>, String>).map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use candid::{CandidType, Decode, Encode};
+    use serde_bytes::ByteBuf;
+
+    // The node decodes the canister's replies with its own copies of these
+    // types, so a change on either side must fail here, not on mainnet.
+    #[test]
+    fn the_push_types_match_the_canister() {
+        assert_eq!(
+            super::Verdict::ty(),
+            oracle_registry_canister::prices::Verdict::ty()
+        );
+        let listed = vec![oracle_registry_canister::FeedInfo {
+            feed_id: ByteBuf::from(vec![7; 32]),
+            symbol: "CRYPTO.BTC/USD".to_owned(),
+        }];
+        let bytes = Encode!(&listed).expect("encodes");
+        let feeds = Decode!(&bytes, Vec<super::FeedInfo>).expect("the node reads the feed list");
+        assert_eq!(
+            feeds.first().map(|feed| feed.feed_id.to_vec()),
+            Some(vec![7; 32])
+        );
+    }
 }

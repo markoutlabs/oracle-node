@@ -15,8 +15,8 @@ os-rng = ["dep:getrandom"]
 # The C `libsecp256k1` backend, the reference and the fastest. Native only.
 libsecp = ["dep:secp256k1"]
 # The pure-Rust `k256` backend, which needs no C compiler. It wins when both
-# are on, and wasm32 always uses it. CI runs the golden vectors under it to
-# prove the backends agree.
+# are on, and wasm32 always uses it. `make test` runs the golden vectors under
+# each backend to prove that they agree.
 pure-rust = ["dep:k256"]
 
 [dependencies]

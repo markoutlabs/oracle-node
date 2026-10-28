@@ -32,6 +32,9 @@ use held::Held;
 const MAX_HEAD: usize = 16 * 1024;
 /// After an accept error such as too many open files, so the loop does not spin.
 const ACCEPT_PAUSE: Duration = Duration::from_secs(1);
+/// The life of a plain HTTP socket. Without it, a peer that keeps sending slow
+/// requests holds its socket place for ever; a WebSocket leaves at its upgrade.
+const SOCKET_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Serves `router` on `listener` within the socket limits, until `shutdown`.
 /// Then it stops accepting and lets each plain request finish. Each request
@@ -80,13 +83,16 @@ pub async fn serve(
             .serve_connection(TokioIo::new(Held { socket, place }), service)
             .with_upgrades();
         let shutdown = shutdown.clone();
+        let drain = limits.header_timeout();
         tracker.spawn(async move {
             let mut connection = pin!(connection);
             tokio::select! {
                 _ = connection.as_mut() => return,
                 () = shutdown.cancelled() => connection.as_mut().graceful_shutdown(),
+                () = tokio::time::sleep(SOCKET_LIFETIME) => connection.as_mut().graceful_shutdown(),
             }
-            let _ = connection.await;
+            // A peer that never reads its last response must not stall the close.
+            let _ = tokio::time::timeout(drain, connection).await;
         });
     }
     tracker.close();

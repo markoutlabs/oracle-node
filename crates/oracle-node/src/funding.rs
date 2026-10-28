@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use oracle_types::{
     FUNDING_EXPO, FUNDING_HEARTBEAT, Fixed, FundingBasis, FundingInfo, FundingUpdate, InstrumentId,
-    MarketKind, OPEN_INTEREST_EXPO, ObsKind, Observation, OpenInterest, SettledFunding, Venue,
+    OPEN_INTEREST_EXPO, ObsKind, Observation, OpenInterest, SettledFunding,
 };
 
 /// The rate cap for each perpetual. Open interest moves with every trade, so
@@ -112,9 +112,9 @@ impl FundingPublisher {
 
     /// Forgets the data of a connection that dropped. Nothing is signed for
     /// its perpetuals until new data arrives.
-    pub fn reset(&mut self, venue: Venue, market: MarketKind) {
-        for (instrument, state) in &mut self.instruments {
-            if instrument.venue == venue && instrument.market == market {
+    pub fn reset(&mut self, sources: &[(InstrumentId, ObsKind)]) {
+        for (instrument, _) in sources.iter().filter(|(_, kind)| *kind == ObsKind::Funding) {
+            if let Some(state) = self.instruments.get_mut(instrument) {
                 state.current = None;
             }
         }
@@ -171,7 +171,7 @@ fn nanos(duration: Duration) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use oracle_types::OpenInterestUnit;
+    use oracle_types::{MarketKind, OpenInterestUnit, Venue};
 
     use super::*;
 
@@ -251,7 +251,7 @@ mod tests {
         let mut publisher = FundingPublisher::new(0);
         publisher.observe(&funding("0.0001", "1", START));
         assert_eq!(publisher.poll(START).len(), 1);
-        publisher.reset(Venue::Bybit, MarketKind::LinearPerp);
+        publisher.reset(&[(instrument(), ObsKind::Funding)]);
         assert!(publisher.poll(START + 120 * S).is_empty());
         publisher.observe(&funding("0.0001", "1", START + 121 * S));
         let frames = publisher.poll(START + 121 * S);

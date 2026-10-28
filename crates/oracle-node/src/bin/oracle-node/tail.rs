@@ -44,7 +44,7 @@ pub(crate) fn log_observation(event: &IngestEvent) {
         IngestEvent::Connected { stream } => {
             info!(target: "tail", %stream, "stream up");
         }
-        IngestEvent::Disconnected { stream, reason } => {
+        IngestEvent::Disconnected { stream, reason, .. } => {
             warn!(target: "tail", %stream, %reason, "stream down — venue state invalidated");
         }
         // Five a second for each connection, and no new value in any of them.

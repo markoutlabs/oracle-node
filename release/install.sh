@@ -17,7 +17,7 @@ REPO="${ORACLE_REPO:-markoutlabs/oracle-node}"
 VERSION="${ORACLE_VERSION:-main}"
 INSTALL_DIR="${ORACLE_INSTALL_DIR:-}"
 # The workspace's rust-version.
-MIN_RUST=1.85
+MIN_RUST=1.88
 # Below this much memory (kB), the build runs one job at a time.
 LOW_MEMORY_KB=3500000
 STEPS=4

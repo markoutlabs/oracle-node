@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::backoff::{Backoff, BackoffConfig};
 use crate::clock::MonotonicClock;
 use crate::{
-    Connector, DecodeError, IngestError, IngestEvent, StreamId, Transport, TransportError,
+    Connector, DecodeError, Frame, IngestError, IngestEvent, StreamId, Transport, TransportError,
 };
 
 /// How a session decodes the payloads it receives.
@@ -78,6 +78,15 @@ impl Carried {
         let key = (observation.instrument.clone(), observation.kind);
         self.last_seen.insert(key.clone(), Instant::now());
         if self.seen.insert(key) {
+            self.list = self.seen.iter().cloned().collect();
+        }
+    }
+
+    fn forget(&mut self, instrument: &InstrumentId) {
+        let before = self.seen.len();
+        self.seen.retain(|(seen, _)| seen != instrument);
+        self.last_seen.retain(|(seen, _), _| seen != instrument);
+        if self.seen.len() != before {
             self.list = self.seen.iter().cloned().collect();
         }
     }
@@ -275,8 +284,9 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             send(&out, IngestEvent::Connected { stream }).await?;
 
             let started = Instant::now();
+            let mut carried = Carried::new();
             let reason = match self.subscribe(&mut conn).await {
-                Ok(()) => self.pump(&mut conn, &out, &shutdown).await?,
+                Ok(()) => self.pump(&mut conn, &mut carried, &out, &shutdown).await?,
                 Err(err) => format!("subscribe failed: {err}"),
             };
             let uptime = started.elapsed();
@@ -285,7 +295,16 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             info!(%stream, ?uptime, %reason, "disconnected");
             // Downstream must invalidate this venue's state before anything new
             // arrives, so the notice is in-band and ordered with the data.
-            send(&out, IngestEvent::Disconnected { stream, reason }).await?;
+            let sources = Arc::clone(&carried.list);
+            send(
+                &out,
+                IngestEvent::Disconnected {
+                    stream,
+                    reason,
+                    sources,
+                },
+            )
+            .await?;
 
             if shutdown.is_cancelled() {
                 break;
@@ -316,6 +335,7 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
     async fn pump(
         &mut self,
         conn: &mut C::Conn,
+        carried: &mut Carried,
         out: &mpsc::Sender<IngestEvent>,
         shutdown: &CancellationToken,
     ) -> Result<String, IngestError> {
@@ -327,7 +347,6 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
             .as_ref()
             .map(|(period, _)| interval_at(Instant::now() + *period, *period));
         let mut observations: Vec<Observation> = Vec::with_capacity(8);
-        let mut carried = Carried::new();
         let mut last_frame = Instant::now();
         let mut probe_at = last_frame + self.config.probe_after;
         let connected_at = last_frame;
@@ -386,8 +405,13 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                 Ok(None) => return Ok("closed by peer".to_owned()),
                 Ok(Some(frame)) => frame,
             };
-            last_frame = Instant::now();
-            probe_at = last_frame + self.config.probe_after;
+            // REST records arrive whether or not the socket lives, so only the
+            // socket's own frames hold off the idle timeout and confirm values.
+            let from_socket = !matches!(frame, Frame::Rest(_));
+            if from_socket {
+                last_frame = Instant::now();
+                probe_at = last_frame + self.config.probe_after;
+            }
 
             let local_recv_ns = self.clock.now_ns();
             // A ping carries no payload; the transport answers it.
@@ -402,6 +426,11 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                             self.stats.messages_decoded =
                                 self.stats.messages_decoded.saturating_add(1);
                             true
+                        }
+                        Err(DecodeError::Halted(instrument)) => {
+                            carried.forget(&instrument);
+                            self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
+                            false
                         }
                         Err(err) if err.is_benign() => {
                             self.stats.decode_skipped = self.stats.decode_skipped.saturating_add(1);
@@ -429,8 +458,8 @@ impl<C: Connector, H: MessageHandler> Session<C, H> {
                     }
                 }
             }
-            // Any frame proves the connection alive, a ping and an ack included.
-            if let Some(alive) = carried.alive(stream, local_recv_ns) {
+            // Any socket frame proves the connection alive, a ping and an ack included.
+            if from_socket && let Some(alive) = carried.alive(stream, local_recv_ns) {
                 send(out, alive).await?;
             }
         }
@@ -727,6 +756,144 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, IngestEvent::Alive { .. }))
         );
+    }
+
+    struct HaltConnector;
+
+    struct HaltConn {
+        sent_price: bool,
+        next_at: Instant,
+    }
+
+    impl Connector for HaltConnector {
+        type Conn = HaltConn;
+
+        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
+            Ok(HaltConn {
+                sent_price: false,
+                next_at: Instant::now(),
+            })
+        }
+    }
+
+    impl Transport for HaltConn {
+        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
+            if !self.sent_price {
+                self.sent_price = true;
+                return Ok(Some(Frame::Text("100".to_owned())));
+            }
+            sleep_until(self.next_at).await;
+            self.next_at += Duration::from_millis(100);
+            Ok(Some(Frame::Text("halt".to_owned())))
+        }
+
+        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct HaltingHandler;
+
+    impl MessageHandler for HaltingHandler {
+        fn on_payload(
+            &mut self,
+            payload: &[u8],
+            local_recv_ns: u64,
+            out: &mut Vec<Observation>,
+        ) -> Result<(), DecodeError> {
+            if payload == b"halt" {
+                let btc = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+                return Err(DecodeError::Halted(btc));
+            }
+            CountingHandler.on_payload(payload, local_recv_ns, out)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_halted_instrument_is_no_longer_confirmed() {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let shutdown = CancellationToken::new();
+        let mut config = config();
+        config.idle_timeout = Duration::from_secs(10);
+        let session = Session::new(
+            config,
+            HaltConnector,
+            HaltingHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+        sleep(Duration::from_secs(1)).await;
+        shutdown.cancel();
+        handle.await.expect("joins").expect("runs");
+        let mut alive = 0;
+        while let Ok(event) = rx.try_recv() {
+            alive += usize::from(matches!(event, IngestEvent::Alive { .. }));
+        }
+        assert_eq!(
+            alive, 1,
+            "only the frame before the halt confirms the price"
+        );
+    }
+
+    struct RestOnlyConnector;
+
+    struct RestOnlyConn {
+        next_at: Instant,
+    }
+
+    impl Connector for RestOnlyConnector {
+        type Conn = RestOnlyConn;
+
+        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
+            Ok(RestOnlyConn {
+                next_at: Instant::now(),
+            })
+        }
+    }
+
+    impl Transport for RestOnlyConn {
+        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
+            sleep_until(self.next_at).await;
+            self.next_at += Duration::from_millis(100);
+            Ok(Some(Frame::Rest("100".to_owned())))
+        }
+
+        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send_ping(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rest_records_do_not_keep_a_silent_socket_alive() {
+        let (tx, mut rx) = mpsc::channel(1_024);
+        let shutdown = CancellationToken::new();
+        let mut config = config();
+        config.probe_after = Duration::from_millis(100);
+        config.idle_timeout = Duration::from_millis(500);
+        let session = Session::new(
+            config,
+            RestOnlyConnector,
+            CountingHandler,
+            MonotonicClock::anchored_at(1_000),
+        );
+        let handle = tokio::spawn(session.run(tx, shutdown.clone()));
+        sleep(Duration::from_millis(1_200)).await;
+        shutdown.cancel();
+        let stats = handle.await.expect("joins").expect("runs");
+        assert!(stats.idle_timeouts >= 1, "{stats:?}");
+        let mut alive = false;
+        while let Ok(event) = rx.try_recv() {
+            alive |= matches!(event, IngestEvent::Alive { .. });
+        }
+        assert!(!alive, "a REST record confirms nothing about the socket");
     }
 
     #[tokio::test(start_paused = true)]

@@ -20,8 +20,11 @@ use oracle_wire::{
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-/// The most frames or batches that one push can carry.
-pub const MAX_FRAMES_PER_PUSH: usize = 32;
+/// The most frames or batches that one push can carry: `inspect_message` recovers the signer of each.
+pub const MAX_FRAMES_PER_PUSH: usize = 4;
+
+/// The largest push argument that `inspect_message` decodes: a batch of 32 updates is 3,162 bytes.
+pub const MAX_PUSH_BYTES: usize = MAX_FRAMES_PER_PUSH * 4 * 1024;
 
 /// How old a pushed frame can be. A node pushes its latest frame, which is
 /// at most one node heartbeat old, and ingress takes some seconds.
@@ -215,6 +218,10 @@ impl Prices {
         let mut feeds = BTreeMap::new();
         for symbol in symbols {
             let id = feed_id(symbol);
+            // A symbol given twice would replace the feed it kept with an empty one.
+            if feeds.contains_key(&id) {
+                continue;
+            }
             let feed = self
                 .feeds
                 .remove(&id)
@@ -273,14 +280,15 @@ impl Prices {
             .collect()
     }
 
-    /// Returns `true` at the first frame or batch that `push` accepts, so an
-    /// honest push costs one signature recovery. It stores what it accepts,
-    /// like `push`.
-    pub fn accepts_any(&mut self, blobs: &[impl AsRef<[u8]>], now_ns: u64) -> bool {
-        blobs.iter().any(|blob| {
-            self.apply(blob.as_ref(), now_ns)
-                .contains(&Verdict::Accepted)
-        })
+    /// `true` when every frame or batch holds an update that `push` accepts; it stores them, like `push`.
+    pub fn accepts_all(&mut self, blobs: &[impl AsRef<[u8]>], now_ns: u64) -> bool {
+        // One fresh frame must not carry replays or junk in with it: each of
+        // those costs a signature recovery under consensus.
+        !blobs.is_empty()
+            && blobs.iter().all(|blob| {
+                self.apply(blob.as_ref(), now_ns)
+                    .contains(&Verdict::Accepted)
+            })
     }
 
     fn apply(&mut self, bytes: &[u8], now_ns: u64) -> Vec<Verdict> {
@@ -354,6 +362,12 @@ impl Prices {
             Ok(accepted) => accepted,
             Err(reason) => return vec![Verdict::of(&reason); updates.len()],
         };
+        if prechecks.contains(&Some(Verdict::UnknownFeed)) {
+            // The verifier marks every update of a batch, and a node must not
+            // fill the heap with marks of feeds that the canister does not price.
+            let feeds = &self.feeds;
+            verifier.retain_feeds(|feed| feeds.contains_key(feed));
+        }
         let source: Rc<[u8]> = Rc::from(bytes);
         prechecks
             .into_iter()
@@ -594,7 +608,63 @@ mod tests {
             prices.push(&[&newer, &older], NOW),
             [Verdict::Replayed, Verdict::Replayed]
         );
-        assert!(!prices.accepts_any(&[&newer, &older], NOW));
+        assert!(!prices.accepts_all(&[&newer, &older], NOW));
+    }
+
+    #[test]
+    fn a_fresh_frame_cannot_carry_junk_or_a_replay_past_inspection() {
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        let first = frame(&node, NOW, 1, 1);
+        assert_eq!(prices.push(&[&first], NOW), [Verdict::Accepted]);
+        let mut forged = frame(&node, NOW, 9, 1);
+        let at = forged.len().saturating_sub(60);
+        if let Some(byte) = forged.get_mut(at) {
+            *byte ^= 1;
+        }
+        assert!(
+            !prices.accepts_all(&[frame(&node, NOW, 2, 1), forged], NOW),
+            "junk after a fresh frame"
+        );
+        assert!(
+            !prices.accepts_all(&[frame(&node, NOW, 3, 1), first], NOW),
+            "a replay after a fresh frame"
+        );
+        assert!(prices.accepts_all(&[frame(&node, NOW, 4, 1)], NOW));
+        assert!(
+            !prices.accepts_all(&Vec::<Vec<u8>>::new(), NOW),
+            "an empty push"
+        );
+    }
+
+    #[test]
+    fn a_batch_leaves_no_marks_for_feeds_the_canister_does_not_price() {
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        let batch = node.sign_batch(&[
+            update("CRYPTO.BTC/USD", NOW, 5, 1),
+            update("CRYPTO.SOL/USD", NOW, 5, 1),
+        ]);
+        assert_eq!(
+            prices.push(&[&batch], NOW),
+            [Verdict::Accepted, Verdict::UnknownFeed]
+        );
+        let sol: Symbol = "CRYPTO.SOL/USD".parse().expect("a valid symbol");
+        prices.set_feeds(&[btc(), sol]);
+        let later = node.sign_batch(&[update("CRYPTO.SOL/USD", NOW, 1, 1)]);
+        assert_eq!(prices.push(&[&later], NOW), [Verdict::Accepted]);
+    }
+
+    #[test]
+    fn a_symbol_given_twice_keeps_its_feed() {
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        assert_eq!(
+            prices.push(&[frame(&node, NOW, 1, 7)], NOW),
+            [Verdict::Accepted]
+        );
+        prices.set_feeds(&[btc(), btc()]);
+        assert_eq!(btc_price(&prices, NOW).nodes, 1);
     }
 
     #[test]
@@ -752,7 +822,7 @@ mod tests {
         let batch = node.sign_batch(&[update("CRYPTO.BTC/USD", NOW, 2, 1)]);
         assert_eq!(prices.push(&[&batch], NOW), [Verdict::Accepted]);
         assert_eq!(prices.push(&[&batch], NOW), [Verdict::Replayed]);
-        assert!(!prices.accepts_any(&[&batch], NOW));
+        assert!(!prices.accepts_all(&[&batch], NOW));
         let single = frame(&node, NOW, 2, 1);
         assert_eq!(
             prices.push(&[&single], NOW),

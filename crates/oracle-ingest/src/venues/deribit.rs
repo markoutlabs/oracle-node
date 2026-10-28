@@ -263,10 +263,10 @@ pub fn decode_payload(
     let Some(entry) = map.lookup(ticker.instrument_name) else {
         return Err(DecodeError::Control);
     };
-    // Deribit keeps publishing a ticker for a closed instrument. Pricing off one
-    // would be pricing off a market that has stopped moving.
+    // Deribit keeps publishing a ticker for a closed instrument. The session
+    // stops confirming its last values, so the staleness filter sheds them.
     if ticker.state.is_some_and(|state| state != "open") {
-        return Err(DecodeError::Control);
+        return Err(DecodeError::Halted(entry.instrument.clone()));
     }
     let exchange_time_ns = ticker.timestamp.map(millis_to_nanos);
     let inverse = entry.instrument.market == MarketKind::InversePerp;
@@ -513,7 +513,7 @@ mod tests {
             &mut out,
         )
         .expect_err("closed");
-        assert!(error.is_benign(), "got {error:?}");
+        assert!(matches!(error, DecodeError::Halted(_)), "got {error:?}");
         assert!(out.is_empty());
     }
 

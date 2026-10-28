@@ -550,6 +550,10 @@ impl Subscriber {
     /// the caller can check [`Subscriber::is_lagged`] and report it.
     pub async fn drain(&self) -> Vec<Outgoing> {
         loop {
+            // Registered before the checks: `notify_waiters` keeps no permit, so a
+            // close or an offer between a check and the wait would be lost.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
             if self.is_closed() || self.is_lagged() {
                 return Vec::new();
             }
@@ -568,7 +572,7 @@ impl Subscriber {
             if !frames.is_empty() {
                 return frames;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }

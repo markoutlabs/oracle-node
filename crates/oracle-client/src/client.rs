@@ -16,8 +16,9 @@ use oracle_transport::{
 };
 use oracle_types::{FeedId, InstrumentId, NANOS_PER_SEC, Symbol};
 use oracle_wire::{
-    Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_FUNDING_UPDATE, FRAME_TYPE_VENUE_REPORT, Registry,
-    Signer, VerifiedRegistry, VerifyError, feed_id,
+    Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_FUNDING_UPDATE, FRAME_TYPE_PRICE_UPDATE,
+    FRAME_TYPE_VENUE_REPORT, Registry, Signer, UnverifiedFrame, UnverifiedVenueFrame,
+    VerifiedRegistry, VerifyError, feed_id,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -687,37 +688,41 @@ impl OracleClient {
     ///
     /// After `subscribe`, the connections follow the new node list.
     ///
+    /// A registry that lists fewer nodes than the quorum is adopted too, with a
+    /// warning: its feeds halt, which is safer than trusting a removed key.
+    ///
     /// Returns the newly adopted version.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Registry`] if the replacement is not strictly newer
-    /// or is not signed by the pinned governance key, or
-    /// [`ClientError::UnreachableQuorum`] if adopting it would leave fewer nodes
-    /// than the configured quorum. The client keeps its existing registry in
-    /// every failure case.
+    /// or is not signed by the pinned governance key. The client then keeps its
+    /// existing registry.
     pub fn refresh_registry(
         &mut self,
         registry: &oracle_wire::Registry,
     ) -> Result<u64, ClientError> {
         let verified = self.registry.accept_successor(registry)?;
 
-        // Checked before anything is swapped in: a registry that shrinks below
-        // the quorum would leave the client permanently halted, and silently
-        // adopting it would turn a governance mistake into an outage with no
-        // obvious cause.
+        // Governance may remove a stolen key below the quorum. Halting is the safe
+        // result, so the client adopts the list and says loudly why its feeds stop.
         let available = verified.nodes().len();
         if self.quorum_config.quorum > available {
-            return Err(ClientError::UnreachableQuorum {
-                requested: self.quorum_config.quorum,
+            tracing::warn!(
+                version = verified.version(),
+                requested = self.quorum_config.quorum,
                 available,
-            });
+                "the new registry lists fewer nodes than the quorum, so every feed halts"
+            );
         }
 
         let listed: HashSet<Address> = verified.nodes().iter().map(|node| node.address).collect();
         for view in self.views.values_mut() {
             view.retain_nodes(&|node| listed.contains(node));
         }
+        self.books.retain(|(node, _), _| listed.contains(node));
+        self.book_nodes.retain(|_, node| listed.contains(node));
+        self.funding.retain(|(node, _), _| listed.contains(node));
 
         let version = verified.version();
         self.verifier.set_registry(verified.clone());
@@ -1299,6 +1304,12 @@ impl OracleClient {
                     continue;
                 }
             };
+            // A node sends only the feeds a client asked for, so another feed is
+            // a faulty or hostile node, and it must not reach the maps.
+            if !self.subscribed(&frame) {
+                debug!("dropped a frame of a feed this client did not ask for");
+                continue;
+            }
             let now_ns = now_unix_nanos();
             match self.ingest_now(&frame, received_ns, now_ns, Self::try_ingest) {
                 Ok(event) => {
@@ -1311,6 +1322,21 @@ impl OracleClient {
                     debug!(%reason, "rejected an update");
                 }
             }
+        }
+    }
+
+    fn subscribed(&self, frame: &[u8]) -> bool {
+        // A frame that does not parse goes on, so the verifier refuses and counts it.
+        match frame.first().copied() {
+            Some(FRAME_TYPE_PRICE_UPDATE) => UnverifiedFrame::parse(frame)
+                .and_then(|frame| frame.decode_unverified())
+                .map_or(true, |update| self.symbols.contains_key(&update.feed_id)),
+            Some(FRAME_TYPE_VENUE_REPORT) => UnverifiedVenueFrame::parse(frame)
+                .and_then(|frame| frame.decode_unverified())
+                .map_or(true, |report| {
+                    self.venue_symbols.contains_key(&report.feed_id)
+                }),
+            _ => true,
         }
     }
 
@@ -1377,10 +1403,15 @@ fn parse_symbols(symbols: &[&str]) -> Result<Vec<Symbol>, ClientError> {
         .collect()
 }
 
-/// Ceiling on the reconnect delay.
+/// Ceiling on the reconnect delay, before jitter.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// A fresh reconnect ladder: 100ms to 30s, doubling, jittered.
+/// A connection that lived this long was not a node that flaps, so the next
+/// failure starts the ladder from the bottom again.
+const RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// A fresh reconnect ladder: 100 ms to 30 s, doubling, and the jitter adds up
+/// to as much again.
 ///
 /// Jittered so every subscriber of a node that just restarted does not come
 /// back at the same instant.
@@ -1456,14 +1487,20 @@ async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: Canc
         target.links.update(target.node, |link| {
             link.state = ConnectionState::Connecting;
         });
+        let started = tokio::time::Instant::now();
         // Also drops a de-listed node in the middle of a handshake.
         let outcome = tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
             outcome = connect_and_pump(&target, &tx) => outcome,
         };
+        // How long the connection lived decides, not how it ended: a node ends a
+        // session with a sealed close, which arrives as an error.
+        if started.elapsed() >= RESET_AFTER {
+            backoff = reconnect_ladder();
+        }
         match outcome {
-            Ok(()) => backoff = reconnect_ladder(),
+            Ok(()) => {}
             Err(reason) => {
                 warn!(endpoint = %target.endpoint, %reason, "node connection failed");
                 target.links.update(target.node, |link| {
@@ -1490,6 +1527,9 @@ async fn node_loop(target: NodeTarget, tx: mpsc::Sender<Inbound>, shutdown: Canc
 }
 
 async fn connect_and_pump(target: &NodeTarget, tx: &mpsc::Sender<Inbound>) -> Result<(), String> {
+    // rustls panics at a wss:// handshake when the process has no provider, as
+    // a client built from a pinned registry may not; an installed one wins.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let connecting = tokio_tungstenite::connect_async(&target.endpoint);
     let (mut socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await

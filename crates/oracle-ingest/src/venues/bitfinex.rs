@@ -168,8 +168,9 @@ pub fn decode(
                     .insert(id, (channel.to_owned(), symbol.to_owned()));
                 Err(DecodeError::Control)
             }
-            // 20051 restarts the server; 20061 ends maintenance and asks for fresh subscriptions.
-            "info" if matches!(event.code, Some(20_051 | 20_061)) => {
+            // 20051 restarts the server; 20060 starts maintenance, which leaves the
+            // last book standing; 20061 ends it and asks for fresh subscriptions.
+            "info" if matches!(event.code, Some(20_051 | 20_060 | 20_061)) => {
                 Err(DecodeError::Resync(format!(
                     "the server asks for a reconnect: {}",
                     event.code.unwrap_or(0)

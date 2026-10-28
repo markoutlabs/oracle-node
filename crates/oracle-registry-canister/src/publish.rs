@@ -39,9 +39,18 @@ pub(crate) async fn mutate_and_publish(
 ) -> Result<u64, String> {
     idle()?;
     BUSY.set(true);
-    let result = round(document, mutation).await;
-    BUSY.set(false);
-    result
+    let _busy = Busy;
+    round(document, mutation).await
+}
+
+/// Ends the round on drop: if a callback traps, the executor drops the task in
+/// its cleanup, so no trap after an await leaves the canister busy.
+struct Busy;
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.set(false);
+    }
 }
 
 async fn round(

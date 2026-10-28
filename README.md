@@ -101,7 +101,7 @@ serves when governance adds it to the registry.
 
 1. If there is no C compiler, it installs one with the system's package
    manager: apt, dnf, yum, apk, zypper or pacman.
-2. If there is no Rust 1.85 or newer, it installs Rust with `rustup`. It does
+2. If there is no Rust 1.88 or newer, it installs Rust with `rustup`. It does
    not change your shell profile.
 3. It builds `oracle-node` with `cargo install --locked`. This takes about 5 to
    10 minutes. With less than 3.5 GB of memory, it builds one job at a time.

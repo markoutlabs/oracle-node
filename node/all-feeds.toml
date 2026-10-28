@@ -43,6 +43,7 @@ path = "node/clients.json"
 
 [[feeds]]
 symbol = "CRYPTO.USDT/USD"
+sanity_band = ["0.9", "1.1"]
 min_sources = 1
 # A stablecoin book can stay unchanged for up to 39 s. The connections confirm
 # the quiet value, so the 2 s default holds (SPEC §5.2).
@@ -62,6 +63,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD"
+sanity_band = ["0.7", "1.4"]
 impact_notional = "20000"
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
@@ -79,6 +81,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USD"
+sanity_band = ["0.7", "1.4"]
 impact_notional = "20000"
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
@@ -116,6 +119,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT"
+sanity_band = ["0.7", "1.4"]
 impact_notional = "20000"
 min_sources = 2
 sources = [
@@ -134,6 +138,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.USDC/USDT"
+sanity_band = ["0.9", "1.1"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "USDCUSDT" },
@@ -150,6 +155,7 @@ sources = [
 # through the peg, as for BTC/USD.
 [[feeds]]
 symbol = "CRYPTO.USDC/USD"
+sanity_band = ["0.9", "1.1"]
 peg = "CRYPTO.USDT/USD"
 min_sources = 2
 sources = [
@@ -170,6 +176,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDC"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "BTCUSDC" },
@@ -183,6 +190,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USDC"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "ETHUSDC" },
@@ -269,6 +277,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/BTC"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "ETHBTC" },
@@ -333,6 +342,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD.PERP_MARK"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["mark_price"] },
@@ -341,6 +351,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USD.PERP_MARK"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "ETH-PERPETUAL", kinds = ["mark_price"] },
@@ -353,6 +364,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD.PERP_INDEX"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["index_price"] },
@@ -369,6 +381,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
@@ -382,6 +395,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USDT.PERP_MARK"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 sources = [
   { venue = "binance", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
@@ -401,6 +415,7 @@ sources = [
 # endpoint (0.01 BTC, 0.1 ETH).
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT.PERP_MID"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 impact_notional = "20000"
 sources = [
@@ -415,6 +430,7 @@ sources = [
 
 [[feeds]]
 symbol = "CRYPTO.ETH/USDT.PERP_MID"
+sanity_band = ["0.7", "1.4"]
 min_sources = 2
 impact_notional = "20000"
 sources = [

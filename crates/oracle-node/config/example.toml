@@ -55,6 +55,9 @@ min_sources = 2
 # Optional. Price each venue at the average fill for this notional, in quote
 # units, from depth snapshots where the venue sends them.
 impact_notional = "20000"
+# Optional. Halt outside [low, high] times the slow reference price; a narrow band
+# suits a stablecoin, a wide one a small token. Default ["0.5", "2"].
+# sanity_band = ["0.5", "2"]
 sources = [
   { venue = "binance", market = "spot", symbol = "BTCUSDT" },
   # Further venues land here as M4 adds their adapters.

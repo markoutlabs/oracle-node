@@ -584,6 +584,7 @@ fn sample_feed_set(governance: &Signer) -> FeedSet {
         deviation_bps: Some("0.5".to_owned()),
         min_interval_ms: Some(250),
         impact_notional: Some("20000".to_owned()),
+        sanity_band: Some(["0.8".to_owned(), "1.25".to_owned()]),
         sources: vec![
             SourceSettings {
                 kinds: Some(vec!["mark_price".to_owned()]),

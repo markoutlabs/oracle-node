@@ -15,6 +15,12 @@ if [ "${ICP_CLI_ENVIRONMENT:-local}" = ic ] && [ "${REPRODUCIBLE:-1}" != 0 ]; th
     echo "no release build at $RELEASE_WASM: run \`make release\` first" >&2
     exit 1
   fi
+  # The check of release/publish.sh: a build from another commit, or from a
+  # dirty tree, is not the code that mainnet would run.
+  if [ "$(cat target/release-artifacts/.commit 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+    echo "the release build is not from HEAD on a clean tree: run \`make release\`" >&2
+    exit 1
+  fi
   cp "$RELEASE_WASM" "$ICP_WASM_OUTPUT_PATH"
 else
   make --no-print-directory canister >&2

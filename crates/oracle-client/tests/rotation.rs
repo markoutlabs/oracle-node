@@ -198,30 +198,29 @@ fn a_de_listed_node_stops_counting_immediately() {
     ));
 }
 
+/// A removed key must stop counting even when the removal leaves fewer nodes
+/// than the quorum: the feeds halt instead of trusting it.
 #[test]
-fn a_refresh_that_would_break_the_quorum_is_refused() {
+fn a_refresh_below_the_quorum_is_adopted_and_halts() {
     let nodes = fleet();
     let mut client = client(&nodes);
 
     let too_few: Vec<NodeEntry> = entries(&nodes).into_iter().take(2).collect();
-    let error = client
+    let version = client
         .refresh_registry(&signed_registry(2, too_few))
-        .expect_err("must refuse");
-    assert!(
-        matches!(
-            error,
-            ClientError::UnreachableQuorum {
-                requested: 3,
-                available: 2
-            }
-        ),
-        "got {error:?}"
-    );
-    assert_eq!(
-        client.registry_version(),
-        1,
-        "a refused refresh must leave the client on its existing registry"
-    );
+        .expect("adopted");
+    assert_eq!((version, client.registry_version()), (2, 2));
+
+    let survivor = nodes.first().expect("a node");
+    let resolved = client
+        .ingest(&survivor.sign(&update_at(NOW, 2)), NOW)
+        .expect("accepted");
+    assert_eq!(resolved.status, Status::Halted);
+    let removed = nodes.last().expect("a node");
+    assert!(matches!(
+        client.ingest(&removed.sign(&update_at(NOW, 3)), NOW),
+        Err(RejectReason::RetiredKey { .. })
+    ));
 }
 
 #[test]
