@@ -57,7 +57,7 @@ lint: ## Formatting, then clippy for the workspace and the canister's wasm32 bui
 e2e: ## The whole system on PocketIC: canister, node binary, SDK client
 	cargo test -p oracle-node --locked --test e2e
 
-latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SECS (default 60)
+latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SECS (default 60), LATENCY_FEED
 	cargo test --release -p oracle-node --locked --test latency -- --ignored --nocapture
 
 smoke: ## The icp-cli path on a local network: deploy, and the calls init and rotate print

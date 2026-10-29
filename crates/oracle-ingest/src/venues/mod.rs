@@ -11,14 +11,19 @@
 
 pub mod adapter;
 pub mod bitfinex;
+pub mod bitget;
+pub mod bitstamp;
 pub mod bybit;
 pub mod coinbase;
 pub mod deribit;
+pub mod dydx;
+pub mod gate;
 pub mod hyperliquid;
 pub mod kraken;
 pub mod kraken_futures;
 pub mod kucoin;
 pub mod kucoin_connect;
+pub mod lighter;
 pub mod mexc;
 pub mod mexc_connect;
 pub mod okx;
@@ -78,6 +83,22 @@ pub(crate) fn base_units(size: Fixed, contract_size: Option<Fixed>) -> Fixed {
     contract_size
         .and_then(|contract| size.checked_mul(contract))
         .unwrap_or(size)
+}
+
+/// Converts an order size to base units.
+///
+/// On an inverse contract the amount is quote-currency notional, so dividing by
+/// the price recovers base units and puts an inverse perpetual on the same
+/// footing as every other market. Returns `None` rather than a wrong number if the division cannot
+/// be represented.
+pub(crate) fn to_base_units(amount: Fixed, price: Fixed, inverse: bool) -> Option<Fixed> {
+    if !inverse {
+        return Some(amount);
+    }
+    if !price.is_positive() {
+        return None;
+    }
+    amount.checked_div(price)
 }
 
 /// A best bid and ask as a book top, priced at the mid. A side at zero or

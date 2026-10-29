@@ -37,7 +37,7 @@ use crate::book::{Books, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal_literal;
+use super::{decimal_literal, to_base_units};
 
 /// The production endpoint.
 pub const URL: &str = "wss://www.deribit.com/ws/api/v2";
@@ -355,22 +355,6 @@ pub fn decode_payload(
     } else {
         Err(DecodeError::Control)
     }
-}
-
-/// Converts an order size to base units.
-///
-/// On an inverse contract the amount is quote-currency notional, so dividing by
-/// the price recovers base units and puts Deribit on the same footing as every
-/// other venue. Returns `None` rather than a wrong number if the division cannot
-/// be represented.
-fn to_base_units(amount: Fixed, price: Fixed, inverse: bool) -> Option<Fixed> {
-    if !inverse {
-        return Some(amount);
-    }
-    if !price.is_positive() {
-        return None;
-    }
-    amount.checked_div(price)
 }
 
 #[cfg(test)]

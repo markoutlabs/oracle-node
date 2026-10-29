@@ -14,8 +14,8 @@ use oracle_agg::config::{QuoteConversion, SourceConfig};
 use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
-    DecodeFn, VenueSpec, bitfinex, bybit, coinbase, deribit, hyperliquid, kraken, kraken_futures,
-    kucoin, mexc, okx,
+    DecodeFn, VenueSpec, bitfinex, bitget, bitstamp, bybit, coinbase, deribit, dydx, gate,
+    hyperliquid, kraken, kraken_futures, kucoin, lighter, mexc, okx,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -883,6 +883,12 @@ fn book_connections(
 const fn markets_per_connection(venue: Venue, market: MarketKind) -> usize {
     match (venue, market) {
         (Venue::Bitfinex, _) => bitfinex::MARKETS_PER_CONNECTION,
+        (Venue::Bitstamp, _) => bitstamp::MARKETS_PER_CONNECTION,
+        (Venue::Bitget, MarketKind::Spot) => bitget::SPOT_MARKETS_PER_CONNECTION,
+        (Venue::Bitget, _) => bitget::FUTURES_MARKETS_PER_CONNECTION,
+        (Venue::Gate, _) => gate::MARKETS_PER_CONNECTION,
+        (Venue::Lighter, _) => lighter::MARKETS_PER_CONNECTION,
+        (Venue::Dydx, _) => dydx::MARKETS_PER_CONNECTION,
         (Venue::Kucoin, _) => kucoin::MARKETS_PER_CONNECTION,
         (Venue::Mexc, MarketKind::Spot) => mexc::SPOT_MARKETS_PER_CONNECTION,
         (Venue::Mexc, _) => mexc::FUTURES_MARKETS_PER_CONNECTION,
@@ -896,6 +902,7 @@ const fn contract_size_field(venue: Venue) -> Option<&'static str> {
         Venue::Okx => Some("`ctVal` on OKX's instruments endpoint"),
         Venue::Kucoin => Some("`multiplier` on KuCoin's contracts endpoint"),
         Venue::Mexc => Some("`contractSize` on MEXC's contract detail endpoint"),
+        Venue::Gate => Some("`quanto_multiplier` on Gate's contracts endpoint"),
         _ => None,
     }
 }
@@ -987,7 +994,7 @@ fn venue_connection(
             hyperliquid::decode,
         ),
 
-        Venue::Kucoin | Venue::Mexc if market == MarketKind::InversePerp => {
+        Venue::Kucoin | Venue::Mexc | Venue::Gate if market == MarketKind::InversePerp => {
             return Err(ConfigError::Invalid(format!(
                 "{venue} inverse perpetuals are not supported; use the USDT-margined ones"
             )));
@@ -1021,6 +1028,62 @@ fn venue_connection(
             bitfinex::subscribe_frames(with_depth(), market.is_perp()),
             Some((bitfinex::KEEPALIVE_EVERY, bitfinex::KEEPALIVE.to_owned())),
             bitfinex::decode,
+        ),
+        // Bitstamp's perpetuals serve EU investors only, and their mark is not on the socket.
+        Venue::Bitstamp if market.is_perp() => {
+            return Err(ConfigError::Invalid(
+                "bitstamp serves spot only in this build; use market = \"spot\"".to_owned(),
+            ));
+        }
+        Venue::Bitstamp => (
+            bitstamp::URL.to_owned(),
+            bitstamp::frames(symbols()),
+            Some((bitstamp::KEEPALIVE_EVERY, bitstamp::KEEPALIVE.to_owned())),
+            bitstamp::decode,
+        ),
+        Venue::Gate if market.is_perp() => (
+            gate::FUTURES_URL.to_owned(),
+            gate::futures_frames(with_depth()),
+            Some((gate::KEEPALIVE_EVERY, gate::FUTURES_KEEPALIVE.to_owned())),
+            gate::decode,
+        ),
+        Venue::Gate => (
+            gate::SPOT_URL.to_owned(),
+            gate::spot_frames(with_depth()),
+            Some((gate::KEEPALIVE_EVERY, gate::SPOT_KEEPALIVE.to_owned())),
+            gate::decode,
+        ),
+        // Lighter's spot books are thin, and it has no inverse perpetuals.
+        Venue::Lighter if market != MarketKind::LinearPerp => {
+            return Err(ConfigError::Invalid(
+                "lighter serves its USDC perpetuals only in this build; use market = \"linear_perp\""
+                    .to_owned(),
+            ));
+        }
+        Venue::Lighter => (
+            lighter::URL.to_owned(),
+            lighter::frames(with_depth()),
+            Some((lighter::KEEPALIVE_EVERY, lighter::KEEPALIVE.to_owned())),
+            lighter::decode,
+        ),
+        Venue::Dydx if market != MarketKind::LinearPerp => {
+            return Err(ConfigError::Invalid(
+                "dydx serves its USDC perpetuals only; use market = \"linear_perp\"".to_owned(),
+            ));
+        }
+        // The venue pings and the transport answers, so no keepalive is sent.
+        Venue::Dydx => (
+            dydx::URL.to_owned(),
+            dydx::frames(symbols()),
+            None,
+            dydx::decode,
+        ),
+        // One socket serves every market; the frames name each market's kind.
+        Venue::Bitget => (
+            bitget::URL.to_owned(),
+            bitget::frames(with_depth(), market),
+            Some((bitget::KEEPALIVE_EVERY, bitget::KEEPALIVE.to_owned())),
+            bitget::decode,
         ),
         Venue::Binance => {
             return Err(ConfigError::Invalid(
@@ -1865,6 +1928,306 @@ sources = [
     /// Coinbase's public feed is spot only; its perps need credentials this
     /// build has no way to supply. Better to say so at startup than to open a
     /// socket that is disconnected three seconds later.
+    #[test]
+    fn bitstamp_splits_its_markets_and_refuses_perps() {
+        let sources: String = (0..25)
+            .map(|i| {
+                format!("  {{ venue = \"bitstamp\", market = \"spot\", symbol = \"c{i}usd\" }},\n")
+            })
+            .collect();
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USD"
+min_sources = 1
+sources = [
+{sources}]
+"#
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Bitstamp)
+            .expect("bitstamp")
+            .1;
+        let sizes: Vec<usize> = connections.iter().map(|c| c.instruments.len()).collect();
+        assert_eq!(sizes, [20, 5]);
+        for connection in connections {
+            assert_eq!(connection.spec.url, bitstamp::URL);
+            assert_eq!(
+                connection.spec.subscribe.len(),
+                connection.instruments.len() * 2
+            );
+            assert!(connection.spec.keepalive.is_some());
+        }
+
+        let error = one_source("bitstamp", "linear_perp", "btcusd-perp")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("spot only")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn bitget_splits_spot_and_perpetuals_and_takes_coin_margined_ones() {
+        let spot: String = (0..30)
+            .map(|i| {
+                format!("  {{ venue = \"bitget\", market = \"spot\", symbol = \"C{i}USDT\" }},\n")
+            })
+            .collect();
+        let perps: String = (0..13)
+            .map(|i| {
+                format!(
+                    "  {{ venue = \"bitget\", market = \"linear_perp\", symbol = \"C{i}USDT\", kinds = [\"mark_price\"] }},\n"
+                )
+            })
+            .collect();
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 1
+sources = [
+{spot}]
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [
+{perps}]
+[[feeds]]
+symbol = "CRYPTO.BTC/USD.PERP_MARK"
+min_sources = 1
+sources = [
+  {{ venue = "bitget", market = "inverse_perp", symbol = "BTCUSD_CM", kinds = ["mark_price"] }},
+]
+"#
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Bitget)
+            .expect("bitget")
+            .1;
+        let mut sizes: Vec<(MarketKind, usize)> = connections
+            .iter()
+            .map(|c| (c.spec.market, c.instruments.len()))
+            .collect();
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            [
+                (MarketKind::Spot, 6),
+                (MarketKind::Spot, 24),
+                (MarketKind::LinearPerp, 1),
+                (MarketKind::LinearPerp, 12),
+                (MarketKind::InversePerp, 1),
+            ]
+        );
+        for connection in connections {
+            assert_eq!(connection.spec.url, bitget::URL);
+            assert_eq!(connection.spec.subscribe.len(), 1);
+        }
+    }
+
+    #[test]
+    fn gate_splits_its_markets_and_a_perp_needs_its_contract_size() {
+        let config = |size: &str| {
+            // A feed takes at most 32 sources, so the 45 markets go in two feeds.
+            let spot = |range: std::ops::Range<u32>| -> String {
+                range
+                    .map(|i| {
+                        format!(
+                            "{{ venue = \"gate\", market = \"spot\", symbol = \"C{i}_USDT\" }},"
+                        )
+                    })
+                    .collect()
+            };
+            let (first, second) = (spot(0..25), spot(25..45));
+            format!(
+                r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT"
+min_sources = 1
+sources = [{first}]
+[[feeds]]
+symbol = "CRYPTO.ETH/USDT"
+min_sources = 1
+sources = [{second}]
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [{{ venue = "gate", market = "linear_perp", symbol = "BTC_USDT", kinds = ["mark_price"]{size} }}]
+"#
+            )
+        };
+        let Err(error) = parse(&config("")).resolve() else {
+            panic!("a Gate perpetual without its contract size resolves");
+        };
+        assert!(error.to_string().contains("quanto_multiplier"), "{error}");
+        let resolved = parse(&config(r#", contract_size = "0.0001""#))
+            .resolve()
+            .expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Gate)
+            .expect("gate")
+            .1;
+        let mut sizes: Vec<(&str, usize)> = connections
+            .iter()
+            .map(|c| (c.spec.url.as_str(), c.instruments.len()))
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [
+                (gate::SPOT_URL, 5),
+                (gate::SPOT_URL, 40),
+                (gate::FUTURES_URL, 1)
+            ]
+        );
+        // An inverse perpetual is refused: this build reads the USDT-settled ones only.
+        let error = one_source("gate", "inverse_perp", "BTC_USD")
+            .err()
+            .expect("must refuse");
+        assert!(matches!(&error, ConfigError::Invalid(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn lighter_splits_its_perpetuals_and_refuses_spot() {
+        // A feed takes at most 32 sources, so the 61 markets go in two feeds.
+        let perps = |range: std::ops::Range<u32>| -> String {
+            range
+                .map(|id| {
+                    format!(
+                        "{{ venue = \"lighter\", market = \"linear_perp\", symbol = \"{id}\", kinds = [\"mark_price\"] }},"
+                    )
+                })
+                .collect()
+        };
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [{}]
+[[feeds]]
+symbol = "CRYPTO.ETH/USDT.PERP_MARK"
+min_sources = 1
+sources = [{}]
+"#,
+            perps(0..30),
+            perps(30..61)
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Lighter)
+            .expect("lighter")
+            .1;
+        let mut sizes: Vec<usize> = connections.iter().map(|c| c.instruments.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [1, 60]);
+        for connection in connections {
+            assert_eq!(connection.spec.url, lighter::URL);
+            assert_eq!(
+                connection.spec.subscribe.len(),
+                connection.instruments.len() * 3
+            );
+        }
+        let error = one_source("lighter", "spot", "2048")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("perpetuals only")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn dydx_splits_its_perpetuals_and_refuses_spot() {
+        let perps: String = (0..12)
+            .map(|i| {
+                format!(
+                    "{{ venue = \"dydx\", market = \"linear_perp\", symbol = \"C{i}-USD\", kinds = [\"mark_price\"] }},"
+                )
+            })
+            .collect();
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:1"
+[signing]
+key_env = "K"
+[registry]
+path = "r.json"
+governance_address = "0x0000000000000000000000000000000000000000"
+[[feeds]]
+symbol = "CRYPTO.BTC/USDT.PERP_MARK"
+min_sources = 1
+sources = [{perps}]
+"#
+        );
+        let resolved = parse(&text).resolve().expect("resolves");
+        let connections = &resolved
+            .venues
+            .iter()
+            .find(|(venue, _)| *venue == Venue::Dydx)
+            .expect("dydx")
+            .1;
+        let mut sizes: Vec<usize> = connections.iter().map(|c| c.instruments.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [2, 10]);
+        for connection in connections {
+            assert_eq!(connection.spec.url, dydx::URL);
+            // A book and the trades of each market, and the markets channel once.
+            assert_eq!(
+                connection.spec.subscribe.len(),
+                connection.instruments.len() * 2 + 1
+            );
+        }
+        let error = one_source("dydx", "spot", "BTC-USD")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&error, ConfigError::Invalid(m) if m.contains("perpetuals only")),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn coinbase_perps_are_refused_with_the_reason() {
         let error = one_source("coinbase", "linear_perp", "BTC-PERP")

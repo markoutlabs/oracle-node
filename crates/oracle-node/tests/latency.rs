@@ -3,7 +3,8 @@
 //! venues, and the SDK as a listed client.
 //!
 //! Ignored by default because it needs the internet. `make latency` runs it in
-//! release mode; `LATENCY_SECS` sets the measured span (default 60).
+//! release mode; `LATENCY_SECS` sets the measured span (default 60), and
+//! `LATENCY_FEED` the feed whose venue report it prints (default [`SHOWN`]).
 #![cfg(unix)]
 
 mod common;
@@ -25,7 +26,7 @@ use tokio::runtime::Runtime;
 
 use common::{BINARY, Node, READY, fields_of, free_port};
 
-/// The feed whose last venue report the run prints.
+/// The feed whose last venue report and books the run prints.
 const SHOWN: &str = "CRYPTO.BTC/USDT";
 /// Venue connections and local books settle in this time; it is not measured.
 const WARM_UP: Duration = Duration::from_secs(15);
@@ -39,6 +40,8 @@ fn live_latency_from_the_venues_to_the_sdk() {
         .ok()
         .and_then(|secs| secs.parse().ok())
         .map_or(Duration::from_secs(60), Duration::from_secs);
+    // A new venue's first check is often a feed with no books, such as the peg.
+    let reported = std::env::var("LATENCY_FEED").unwrap_or_else(|_| SHOWN.to_owned());
     let mut canister = Harness::new(1, "dfx_test_key", None);
     let gateway = canister.make_live();
     let governance = canister.refresh_governance_key();
@@ -89,7 +92,10 @@ fn live_latency_from_the_venues_to_the_sdk() {
             .expect("builds");
         let names: Vec<&str> = symbols.iter().map(String::as_str).collect();
         client.subscribe(&names).await.expect("subscribes");
-        client.subscribe_venues(&[SHOWN]).await.expect("subscribes");
+        client
+            .subscribe_venues(&[reported.as_str()])
+            .await
+            .expect("subscribes");
         client.subscribe_books(&[SHOWN]).await.expect("subscribes");
         drain(&mut client, WARM_UP).await;
         client.reset_latency();
@@ -113,7 +119,7 @@ fn live_latency_from_the_venues_to_the_sdk() {
     report(span, symbols.len(), &stats, &latency, &status, &lag);
     let venues = venues.expect("a venue report arrived");
     println!(
-        "\nlast venue report for {SHOWN}, signed by {}:\n{}",
+        "\nlast venue report for {reported}, signed by {}:\n{}",
         venues.signer,
         serde_json::to_string_pretty(&venues.report).expect("serialises")
     );
