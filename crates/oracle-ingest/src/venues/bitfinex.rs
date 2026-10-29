@@ -19,6 +19,10 @@
 //! - Bare JSON numbers, like Deribit: each one goes through `RawValue`, so the
 //!   venue's own digits reach the aggregator. Checked against the live socket
 //!   and the docs on 2026-10-25.
+//! - **Book checksums.** The [`CONF`] frame asks for `[id, "cs", CHECKSUM]`
+//!   on each book every few seconds: a CRC32 of the top 25 levels, the whole
+//!   book at [`BOOK_LEN`]. A mismatch is a missed or misapplied update, so the
+//!   book resyncs. On 2026-10-29, 168 of 168 live checksums matched.
 
 use std::time::Duration;
 
@@ -26,7 +30,7 @@ use oracle_types::{Fixed, NANOS_PER_SEC, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{Books, LocalBook, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
@@ -45,8 +49,15 @@ pub const KEEPALIVE_EVERY: Duration = Duration::from_secs(30);
 pub const MARKETS_PER_CONNECTION: usize = 6;
 const _: () = assert!(MARKETS_PER_CONNECTION * 3 <= 30);
 
+/// Turns on the book checksums (`OB_CHECKSUM`). The venue applies it only to
+/// subscriptions after it.
+pub const CONF: &str = r#"{"event":"conf","flags":131072}"#;
+
 /// Book levels per side.
 const BOOK_LEN: &str = "25";
+
+/// The levels per side that a checksum covers.
+const CHECKSUM_LEVELS: usize = 25;
 
 const EIGHT_HOURS_NS: u64 = 8 * 3_600 * NANOS_PER_SEC;
 
@@ -55,15 +66,15 @@ fn status_key(symbol: &str) -> String {
     format!("deriv:{symbol}")
 }
 
-/// Builds the subscribe frames for a set of Bitfinex symbols: the book and the
-/// trades of each, and the status channel of a perpetual. Whether a market
-/// wants depth only changes what the decoder emits from its book.
+/// Builds the frames of one connection: [`CONF`] first, then the book and the
+/// trades of each symbol, and the status channel of a perpetual. Whether a
+/// market wants depth only changes what the decoder emits from its book.
 #[must_use]
 pub fn subscribe_frames<'a>(
     instruments: impl Iterator<Item = (&'a str, bool)>,
     perp: bool,
 ) -> Vec<String> {
-    let mut frames = Vec::new();
+    let mut frames = vec![CONF.to_owned()];
     for (symbol, _) in instruments {
         frames.push(
             serde_json::json!({
@@ -199,6 +210,20 @@ pub fn decode(
     if body.get() == r#""hb""# || body.get() == r#""tu""# {
         return Err(DecodeError::Control);
     }
+    if body.get() == r#""cs""# && channel == "book" {
+        let sent: i32 = serde_json::from_str(
+            message
+                .get(2)
+                .ok_or(DecodeError::MissingField("CHECKSUM"))?
+                .get(),
+        )
+        .map_err(malformed)?;
+        return if checksum(books.book(&symbol)) == Some(sent) {
+            Err(DecodeError::Control)
+        } else {
+            Err(DecodeError::Resync(format!("{symbol}: checksum mismatch")))
+        };
+    }
     match channel.as_str() {
         "trades" => {
             // `[id, "te", [ID, MTS, AMOUNT, PRICE]]`; the snapshot of past trades is skipped.
@@ -232,10 +257,13 @@ pub fn decode(
             };
             let book = books.book(&symbol);
             for level in levels {
+                let (Some(price_text), Some(amount_text)) = (level.first(), level.get(2)) else {
+                    return Err(DecodeError::MissingField("PRICE or AMOUNT"));
+                };
                 let price =
-                    number("PRICE", level.first())?.ok_or(DecodeError::MissingField("PRICE"))?;
+                    number("PRICE", Some(price_text))?.ok_or(DecodeError::MissingField("PRICE"))?;
                 let count = number("COUNT", level.get(1))?.unwrap_or(Fixed::ZERO);
-                let amount = number("AMOUNT", level.get(2))?.unwrap_or(Fixed::ZERO);
+                let amount = number("AMOUNT", Some(amount_text))?.unwrap_or(Fixed::ZERO);
                 // A positive amount is a bid, a negative one an ask; a count of 0 removes the level.
                 let side = if amount.is_positive() {
                     Side::Bid
@@ -247,7 +275,12 @@ pub fn decode(
                 } else {
                     Fixed::ZERO
                 };
-                book.set(side, price, qty);
+                book.set_with_text(
+                    side,
+                    price,
+                    qty,
+                    Some((price_text.get(), amount_text.get())),
+                );
             }
             let emit = if entry.depth {
                 Books::emit
@@ -305,6 +338,24 @@ pub fn decode(
         }
         other => Err(DecodeError::UnhandledStream(other.to_owned())),
     }
+}
+
+/// Bitfinex's CRC32, as a signed integer: the best bid, then the best ask, then
+/// the next of each, each price and amount as sent (an ask's amount is
+/// negative), joined by colons. A shorter side adds nothing past its end.
+fn checksum(book: &LocalBook) -> Option<i32> {
+    let bids = book.top_text(Side::Bid, CHECKSUM_LEVELS)?;
+    let asks = book.top_text(Side::Ask, CHECKSUM_LEVELS)?;
+    let mut parts = Vec::with_capacity(CHECKSUM_LEVELS * 4);
+    for index in 0..CHECKSUM_LEVELS {
+        for side in [&bids, &asks] {
+            if let Some((price, amount)) = side.get(index) {
+                parts.extend([*price, *amount]);
+            }
+        }
+    }
+    let crc = crc32fast::hash(parts.join(":").as_bytes());
+    Some(i32::from_ne_bytes(crc.to_ne_bytes()))
 }
 
 #[cfg(test)]
@@ -494,10 +545,88 @@ mod tests {
         ));
     }
 
+    /// Recorded from Bitfinex on 2026-10-29 with [`CONF`]: one perpetual's book
+    /// from its snapshot through 57 updates and two checksums.
+    const CHECKSUMS: &str = include_str!("../../tests/fixtures/bitfinex-checksum.jsonl");
+
+    fn perp_book_map() -> InstrumentMap {
+        let spec = InstrumentSpec::new(
+            "tETHF0:USTF0",
+            MarketKind::LinearPerp,
+            "CRYPTO.ETH/USDT.PERP_MARK",
+        )
+        .expect("valid")
+        .with_depth();
+        InstrumentMap::new(Venue::Bitfinex, MarketKind::LinearPerp, &[spec]).expect("valid")
+    }
+
+    /// Decodes each line and returns how many checksums matched, or the first resync.
+    fn checksums_through(lines: &[&str]) -> Result<usize, DecodeError> {
+        let map = perp_book_map();
+        let mut books = Books::default();
+        let mut matched = 0;
+        for line in lines {
+            let mut out = Vec::new();
+            match decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
+                Err(DecodeError::Control) if line.contains(r#","cs","#) => matched += 1,
+                Err(error @ DecodeError::Resync(_)) => return Err(error),
+                Ok(()) => {}
+                Err(error) if error.is_benign() => {}
+                Err(error) => panic!("{error}: {line}"),
+            }
+        }
+        Ok(matched)
+    }
+
+    #[test]
+    fn the_recorded_checksums_match_the_book() {
+        let lines: Vec<&str> = CHECKSUMS.lines().collect();
+        assert_eq!(checksums_through(&lines).expect("no resync"), 2);
+    }
+
+    #[test]
+    fn a_missed_update_fails_the_next_checksum() {
+        let mut lines: Vec<&str> = CHECKSUMS.lines().collect();
+        // Line 0 is the conf reply, 1 the subscribe reply, 2 the snapshot.
+        lines.remove(10);
+        assert!(matches!(
+            checksums_through(&lines),
+            Err(DecodeError::Resync(_))
+        ));
+    }
+
+    /// The checksum takes the amount as sent, in exponent form too, and a
+    /// shorter side adds nothing past its end. The value is Python's
+    /// `zlib.crc32(b"100:2:101:-1e-8:99:3:102:-4")` as a signed integer.
+    #[test]
+    fn the_checksum_takes_the_text_as_sent() {
+        let (spot, _) = maps();
+        let mut books = Books::default();
+        let mut out = Vec::new();
+        let subscribed =
+            r#"{"event":"subscribed","channel":"book","chanId":5,"symbol":"tBTCUSD","prec":"P0"}"#;
+        let snapshot = "[5,[[100,1,2],[99,1,3],[101,1,-1e-8],[102,1,-4]]]";
+        for line in [subscribed, snapshot] {
+            let _ = decode(line.as_bytes(), &spot, &mut books, RECV, &mut out);
+        }
+        assert!(matches!(
+            decode(br#"[5,"cs",524973713]"#, &spot, &mut books, RECV, &mut out),
+            Err(DecodeError::Control)
+        ));
+        assert!(matches!(
+            decode(br#"[5,"cs",524973714]"#, &spot, &mut books, RECV, &mut out),
+            Err(DecodeError::Resync(_))
+        ));
+    }
+
     #[test]
     fn subscribe_frames_name_each_channel_and_the_status_key() {
         let frames = subscribe_frames([("tBTCF0:USTF0", true)].into_iter(), true);
-        assert_eq!(frames.len(), 3, "{frames:?}");
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(
+            frames[0], CONF,
+            "the checksums come before the subscriptions"
+        );
         assert!(frames.iter().all(|f| !f.contains("ticker")));
         assert!(
             frames
@@ -510,7 +639,7 @@ mod tests {
                 .any(|f| f.contains(r#""channel":"book""#) && f.contains(r#""prec":"P0""#))
         );
         let spot = subscribe_frames([("tBTCUSD", false)].into_iter(), false);
-        assert_eq!(spot.len(), 2);
-        assert!(spot[0].contains(r#""channel":"book""#));
+        assert_eq!(spot.len(), 3);
+        assert!(spot[1].contains(r#""channel":"book""#));
     }
 }
