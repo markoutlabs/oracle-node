@@ -52,11 +52,21 @@ pub enum Venue {
     Mexc = 8,
     /// KuCoin (spot, and USDT-margined perpetuals in contracts; sockets open with a token).
     Kucoin = 9,
+    /// Bitstamp (spot, natively USD-quoted).
+    Bitstamp = 10,
+    /// Bitget (spot, USDT-margined and coin-margined perpetuals).
+    Bitget = 11,
+    /// Gate (spot, and USDT-settled perpetuals in contracts).
+    Gate = 12,
+    /// Lighter (USDC-margined perpetuals on numeric market ids).
+    Lighter = 13,
+    /// dYdX v4 (USDC-margined perpetuals, read from the indexer).
+    Dydx = 14,
 }
 
 impl Venue {
     /// Every venue, in discriminant order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 15] = [
         Self::Binance,
         Self::Bybit,
         Self::Okx,
@@ -67,6 +77,11 @@ impl Venue {
         Self::Bitfinex,
         Self::Mexc,
         Self::Kucoin,
+        Self::Bitstamp,
+        Self::Bitget,
+        Self::Gate,
+        Self::Lighter,
+        Self::Dydx,
     ];
 
     /// Returns the wire-stable index.
@@ -88,6 +103,11 @@ impl Venue {
             Self::Bitfinex => 7,
             Self::Mexc => 8,
             Self::Kucoin => 9,
+            Self::Bitstamp => 10,
+            Self::Bitget => 11,
+            Self::Gate => 12,
+            Self::Lighter => 13,
+            Self::Dydx => 14,
         }
     }
 
@@ -112,6 +132,11 @@ impl Venue {
             7 => Some(Self::Bitfinex),
             8 => Some(Self::Mexc),
             9 => Some(Self::Kucoin),
+            10 => Some(Self::Bitstamp),
+            11 => Some(Self::Bitget),
+            12 => Some(Self::Gate),
+            13 => Some(Self::Lighter),
+            14 => Some(Self::Dydx),
             _ => None,
         }
     }
@@ -130,6 +155,11 @@ impl Venue {
             Self::Bitfinex => "bitfinex",
             Self::Mexc => "mexc",
             Self::Kucoin => "kucoin",
+            Self::Bitstamp => "bitstamp",
+            Self::Bitget => "bitget",
+            Self::Gate => "gate",
+            Self::Lighter => "lighter",
+            Self::Dydx => "dydx",
         }
     }
 
@@ -142,7 +172,7 @@ impl Venue {
     /// trades about 15 bp apart from a dollar on Coinbase or Kraken.
     #[must_use]
     pub const fn quotes_native_usd(self) -> bool {
-        matches!(self, Self::Coinbase | Self::Kraken)
+        matches!(self, Self::Coinbase | Self::Kraken | Self::Bitstamp)
     }
 }
 
@@ -493,6 +523,11 @@ mod tests {
         assert_eq!(Venue::Bitfinex.index(), 7);
         assert_eq!(Venue::Mexc.index(), 8);
         assert_eq!(Venue::Kucoin.index(), 9);
+        assert_eq!(Venue::Bitstamp.index(), 10);
+        assert_eq!(Venue::Bitget.index(), 11);
+        assert_eq!(Venue::Gate.index(), 12);
+        assert_eq!(Venue::Lighter.index(), 13);
+        assert_eq!(Venue::Dydx.index(), 14);
         for venue in Venue::ALL {
             assert_eq!(Venue::from_index(venue.index()), Some(venue));
         }
@@ -527,14 +562,15 @@ mod tests {
     fn venue_set_rejects_unassigned_bits() {
         assert!(VenueSet::from_bits(1 << 31).is_err());
         // Every assigned bit, and the first one past them.
-        assert!(VenueSet::from_bits(0b11_1111_1111).is_ok());
-        assert!(VenueSet::from_bits(0b100_0000_0000).is_err());
+        assert!(VenueSet::from_bits(0b111_1111_1111_1111).is_ok());
+        assert!(VenueSet::from_bits(0b1000_0000_0000_0000).is_err());
     }
 
     #[test]
     fn native_usd_venues_are_identified() {
         assert!(Venue::Coinbase.quotes_native_usd());
         assert!(Venue::Kraken.quotes_native_usd());
+        assert!(Venue::Bitstamp.quotes_native_usd());
         assert!(!Venue::Binance.quotes_native_usd());
         assert!(!Venue::Bitfinex.quotes_native_usd());
 

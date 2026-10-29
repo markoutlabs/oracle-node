@@ -300,6 +300,11 @@ fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
         Venue::Bitfinex => "tBTCUSD",
         Venue::Mexc => "BTCUSDT",
         Venue::Kucoin => "BTC-USDT",
+        Venue::Bitstamp => "btcusd",
+        Venue::Bitget => "BTCUSDT",
+        Venue::Gate => "BTC_USDT",
+        Venue::Lighter => "1",
+        Venue::Dydx => "BTC-USD",
         // A venue added later; these vectors never use it.
         _ => "OTHER",
     };
