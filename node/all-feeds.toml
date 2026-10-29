@@ -1,4 +1,4 @@
-# Every feed kind this build can actually serve, across all fifteen venues.
+# Every feed kind this build can actually serve, across all ten venues.
 #
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
@@ -36,7 +36,7 @@ path = "node/clients.json"
 # USDT-quoted venue would be circular: it would report 1.0 by construction on
 # exactly the day it stopped being true. §12.4.
 #
-# Coinbase, Kraken and Bitstamp are the native-USD venues in scope. A Bitfinex dollar is
+# Coinbase and Kraken are the native-USD venues in scope. A Bitfinex dollar is
 # a balance at Bitfinex: on 2026-10-25 it bought 12 to 16 bp less BTC and ETH
 # than a dollar on Coinbase or Kraken, and its USDT book sat at par while theirs
 # sat at 0.9987. Bitfinex and Tether are one group, so the peg takes no Bitfinex book.
@@ -50,7 +50,6 @@ min_sources = 1
 sources = [
   { venue = "coinbase", market = "spot", symbol = "USDT-USD" },
   { venue = "kraken", market = "spot", symbol = "USDT/USD" },
-  { venue = "bitstamp", market = "spot", symbol = "usdtusd" },
 ]
 
 # ------------------------------------------------------------ spot, USD
@@ -71,7 +70,6 @@ min_sources = 2
 sources = [
   { venue = "coinbase", market = "spot", symbol = "BTC-USD" },
   { venue = "kraken", market = "spot", symbol = "BTC/USD" },
-  { venue = "bitstamp", market = "spot", symbol = "btcusd" },
   { venue = "binance", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "BTC-USDT", converted = true },
@@ -79,8 +77,6 @@ sources = [
   { venue = "kucoin", market = "spot", symbol = "BTC-USDT", converted = true },
   { venue = "mexc", market = "spot", symbol = "BTCUSDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
-  { venue = "bitget", market = "spot", symbol = "BTCUSDT", converted = true },
-  { venue = "gate", market = "spot", symbol = "BTC_USDT", converted = true },
 ]
 
 [[feeds]]
@@ -92,7 +88,6 @@ min_sources = 2
 sources = [
   { venue = "coinbase", market = "spot", symbol = "ETH-USD" },
   { venue = "kraken", market = "spot", symbol = "ETH/USD" },
-  { venue = "bitstamp", market = "spot", symbol = "ethusd" },
   { venue = "binance", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "ETH-USDT", converted = true },
@@ -100,8 +95,6 @@ sources = [
   { venue = "kucoin", market = "spot", symbol = "ETH-USDT", converted = true },
   { venue = "mexc", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
-  { venue = "bitget", market = "spot", symbol = "ETHUSDT", converted = true },
-  { venue = "gate", market = "spot", symbol = "ETH_USDT", converted = true },
 ]
 
 [[feeds]]
@@ -112,15 +105,12 @@ min_sources = 2
 sources = [
   { venue = "coinbase", market = "spot", symbol = "SOL-USD" },
   { venue = "kraken", market = "spot", symbol = "SOL/USD" },
-  { venue = "bitstamp", market = "spot", symbol = "solusd" },
   { venue = "binance", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "SOL-USDT", converted = true },
   { venue = "kucoin", market = "spot", symbol = "SOL-USDT", converted = true },
   { venue = "mexc", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
-  { venue = "bitget", market = "spot", symbol = "SOLUSDT", converted = true },
-  { venue = "gate", market = "spot", symbol = "SOL_USDT", converted = true },
 ]
 
 # ----------------------------------------------------------- spot, USDT
@@ -139,8 +129,6 @@ sources = [
   { venue = "bitfinex", market = "spot", symbol = "tBTCUST" },
   { venue = "kucoin", market = "spot", symbol = "BTC-USDT" },
   { venue = "mexc", market = "spot", symbol = "BTCUSDT" },
-  { venue = "bitget", market = "spot", symbol = "BTCUSDT" },
-  { venue = "gate", market = "spot", symbol = "BTC_USDT" },
 ]
 
 # ------------------------------------------------- spot, stablecoin pairs
@@ -160,11 +148,9 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "USDCUSDT" },
   { venue = "kraken", market = "spot", symbol = "USDC/USDT" },
   { venue = "bitfinex", market = "spot", symbol = "tUDCUST" },
-  { venue = "bitget", market = "spot", symbol = "USDCUSDT" },
-  { venue = "gate", market = "spot", symbol = "USDC_USDT" },
 ]
 
-# Kraken and Bitstamp have the native-USD books: Coinbase keeps no USDC book. The Bitfinex
+# Kraken has the one native-USD book: Coinbase keeps no USDC book. The Bitfinex
 # and Binance USD books are left out, as for the peg. The Tether books count
 # through the peg, as for BTC/USD.
 [[feeds]]
@@ -174,15 +160,12 @@ peg = "CRYPTO.USDT/USD"
 min_sources = 2
 sources = [
   { venue = "kraken", market = "spot", symbol = "USDC/USD" },
-  { venue = "bitstamp", market = "spot", symbol = "usdcusd" },
   { venue = "binance", market = "spot", symbol = "USDCUSDT", converted = true },
   { venue = "bybit", market = "spot", symbol = "USDCUSDT", converted = true },
   { venue = "okx", market = "spot", symbol = "USDC-USDT", converted = true },
   { venue = "kucoin", market = "spot", symbol = "USDC-USDT", converted = true },
   { venue = "mexc", market = "spot", symbol = "USDCUSDT", converted = true },
   { venue = "kraken", market = "spot", symbol = "USDC/USDT", converted = true },
-  { venue = "bitget", market = "spot", symbol = "USDCUSDT", converted = true },
-  { venue = "gate", market = "spot", symbol = "USDC_USDT", converted = true },
 ]
 
 # ----------------------------------------------------------- spot, USDC
@@ -203,8 +186,6 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "BTCUSDC" },
   { venue = "kraken", market = "spot", symbol = "BTC/USDC" },
   { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
-  { venue = "bitget", market = "spot", symbol = "BTCUSDC" },
-  { venue = "gate", market = "spot", symbol = "BTC_USDC" },
 ]
 
 [[feeds]]
@@ -219,8 +200,6 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "ETHUSDC" },
   { venue = "kraken", market = "spot", symbol = "ETH/USDC" },
   { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
-  { venue = "bitget", market = "spot", symbol = "ETHUSDC" },
-  { venue = "gate", market = "spot", symbol = "ETH_USDC" },
 ]
 
 [[feeds]]
@@ -234,8 +213,6 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "SOLUSDC" },
   { venue = "kraken", market = "spot", symbol = "SOL/USDC" },
   { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
-  { venue = "bitget", market = "spot", symbol = "SOLUSDC" },
-  { venue = "gate", market = "spot", symbol = "SOL_USDC" },
 ]
 
 [[feeds]]
@@ -361,8 +338,7 @@ sources = [
 # --------------------------------------------------- perpetual mark, USD
 #
 # Deribit's BTC-PERPETUAL is inverse (coin-margined) but USD-quoted; Kraken
-# Futures' PF_ contracts are linear. Bitget's `_CM` contracts are coin-margined
-# and USD-quoted, sized in USD. All price in USD, so none needs the peg.
+# Futures' PF_ contracts are linear. Both price in USD, so neither needs the peg.
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USD.PERP_MARK"
@@ -371,7 +347,6 @@ min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["mark_price"] },
   { venue = "kraken", market = "linear_perp", symbol = "PF_XBTUSD", kinds = ["mark_price"] },
-  { venue = "bitget", market = "inverse_perp", symbol = "BTCUSD_CM", kinds = ["mark_price"] },
 ]
 
 [[feeds]]
@@ -381,7 +356,6 @@ min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "ETH-PERPETUAL", kinds = ["mark_price"] },
   { venue = "kraken", market = "linear_perp", symbol = "PF_ETHUSD", kinds = ["mark_price"] },
-  { venue = "bitget", market = "inverse_perp", symbol = "ETHUSD_CM", kinds = ["mark_price"] },
 ]
 
 # The venue-computed index, which is what the mark is tethered to. Worth
@@ -395,19 +369,15 @@ min_sources = 2
 sources = [
   { venue = "deribit", market = "inverse_perp", symbol = "BTC-PERPETUAL", kinds = ["index_price"] },
   { venue = "kraken", market = "linear_perp", symbol = "PF_XBTUSD", kinds = ["index_price"] },
-  { venue = "bitget", market = "inverse_perp", symbol = "BTCUSD_CM", kinds = ["index_price"] },
 ]
 
 # -------------------------------------------------- perpetual mark, USDT
 #
-# Binance, Bybit, OKX, Bitfinex, KuCoin, Bitget and Gate perps are USDT-margined, so they
+# Binance, Bybit, OKX, Bitfinex and KuCoin perps are USDT-margined, so they
 # belong under a /USDT symbol rather than being converted into the /USD one.
-# Hyperliquid's, Lighter's and dYdX's are USDC-margined, taken at par. Lighter
-# names a market by its number: 1 is BTC, 0 is ETH. dYdX's mark is its oracle
-# price, and its books are thin, so it gives marks only. A KuCoin contract is
+# Hyperliquid's are USDC-margined, taken at par. A KuCoin contract is
 # `multiplier` coins on KuCoin's contracts endpoint (0.001 BTC, 0.01 ETH), and a
-# MEXC one `contractSize` on its contract detail endpoint (0.0001 BTC, 0.01 ETH),
-# and a Gate one `quanto_multiplier` on its contracts endpoint (0.0001 BTC, 0.01 ETH).
+# MEXC one `contractSize` on its contract detail endpoint (0.0001 BTC, 0.01 ETH).
 
 [[feeds]]
 symbol = "CRYPTO.BTC/USDT.PERP_MARK"
@@ -421,10 +391,6 @@ sources = [
   { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0", kinds = ["mark_price"] },
   { venue = "kucoin", market = "linear_perp", symbol = "XBTUSDTM", kinds = ["mark_price"], contract_size = "0.001" },
   { venue = "mexc", market = "linear_perp", symbol = "BTC_USDT", kinds = ["mark_price"], contract_size = "0.0001" },
-  { venue = "bitget", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
-  { venue = "gate", market = "linear_perp", symbol = "BTC_USDT", kinds = ["mark_price"], contract_size = "0.0001" },
-  { venue = "lighter", market = "linear_perp", symbol = "1", kinds = ["mark_price"] },  # BTC
-  { venue = "dydx", market = "linear_perp", symbol = "BTC-USD", kinds = ["mark_price"] },
 ]
 
 [[feeds]]
@@ -439,10 +405,6 @@ sources = [
   { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0", kinds = ["mark_price"] },
   { venue = "kucoin", market = "linear_perp", symbol = "ETHUSDTM", kinds = ["mark_price"], contract_size = "0.01" },
   { venue = "mexc", market = "linear_perp", symbol = "ETH_USDT", kinds = ["mark_price"], contract_size = "0.01" },
-  { venue = "bitget", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
-  { venue = "gate", market = "linear_perp", symbol = "ETH_USDT", kinds = ["mark_price"], contract_size = "0.01" },
-  { venue = "lighter", market = "linear_perp", symbol = "0", kinds = ["mark_price"] },  # ETH
-  { venue = "dydx", market = "linear_perp", symbol = "ETH-USD", kinds = ["mark_price"] },
 ]
 
 # -------------------------------------------------- perpetual mid, USDT
@@ -464,9 +426,6 @@ sources = [
   { venue = "bitfinex", market = "linear_perp", symbol = "tBTCF0:USTF0" },
   { venue = "kucoin", market = "linear_perp", symbol = "XBTUSDTM", contract_size = "0.001" },
   { venue = "mexc", market = "linear_perp", symbol = "BTC_USDT", contract_size = "0.0001" },
-  { venue = "bitget", market = "linear_perp", symbol = "BTCUSDT" },
-  { venue = "gate", market = "linear_perp", symbol = "BTC_USDT", contract_size = "0.0001" },
-  { venue = "lighter", market = "linear_perp", symbol = "1" },  # BTC
 ]
 
 [[feeds]]
@@ -482,9 +441,6 @@ sources = [
   { venue = "bitfinex", market = "linear_perp", symbol = "tETHF0:USTF0" },
   { venue = "kucoin", market = "linear_perp", symbol = "ETHUSDTM", contract_size = "0.01" },
   { venue = "mexc", market = "linear_perp", symbol = "ETH_USDT", contract_size = "0.01" },
-  { venue = "bitget", market = "linear_perp", symbol = "ETHUSDT" },
-  { venue = "gate", market = "linear_perp", symbol = "ETH_USDT", contract_size = "0.01" },
-  { venue = "lighter", market = "linear_perp", symbol = "0" },  # ETH
 ]
 
 # --------------------------------------------------------------- funding
