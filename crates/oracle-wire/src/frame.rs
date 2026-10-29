@@ -22,6 +22,7 @@
 
 use oracle_types::PriceUpdate;
 
+use crate::Recovered;
 use crate::payload::{PRICE_UPDATE_SIZE, decode_price_update, encode_price_update};
 use crate::registry::VerifiedRegistry;
 use crate::signature::SIGNATURE_LEN;
@@ -251,12 +252,32 @@ impl UnverifiedFrame {
     ///
     /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedUpdate, VerifyError> {
+        self.recover()?.authorize(registry)
+    }
+
+    /// Decodes the payload and recovers the signer: the costly half of [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed payload or a failed recovery.
+    pub fn recover(&self) -> Result<Recovered<PriceUpdate>, VerifyError> {
         let update = decode_price_update(&self.payload)?;
-        let signer = self.recover_signer()?;
-        let node_index = registry.authorize(signer)?;
+        Ok(Recovered::new(update, self.recover_signer()?))
+    }
+}
+
+impl Recovered<PriceUpdate> {
+    /// Finds the signer in a trusted registry: the second half of
+    /// [`UnverifiedFrame::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::UnknownSigner`] if no node has the signer's address.
+    pub fn authorize(self, registry: &VerifiedRegistry) -> Result<VerifiedUpdate, VerifyError> {
+        let node_index = registry.authorize(self.signer)?;
         Ok(VerifiedUpdate {
-            update,
-            signer,
+            update: self.value,
+            signer: self.signer,
             node_index,
         })
     }
@@ -372,6 +393,34 @@ mod tests {
         assert_eq!(verified.update(), &update());
         assert_eq!(verified.signer(), hot().address());
         assert_eq!(verified.node_index(), 0);
+    }
+
+    #[test]
+    fn recover_then_authorize_is_verify() {
+        let frame = hot().sign_update(&update()).encode_frame();
+        let parsed = UnverifiedFrame::parse(&frame).expect("parses");
+        let recovered = parsed.recover().expect("recovers");
+        assert_eq!(recovered.signer(), hot().address());
+        assert_eq!(recovered.unverified(), &update());
+        assert_eq!(
+            recovered.authorize(&verified_registry()),
+            parsed.verify(&verified_registry())
+        );
+    }
+
+    #[test]
+    fn a_forged_update_recovers_but_is_not_authorized() {
+        let impostor = Signer::from_secret_bytes([0xDD; 32]).expect("valid key");
+        let frame = impostor.sign_update(&update()).encode_frame();
+        let recovered = UnverifiedFrame::parse(&frame)
+            .expect("parses")
+            .recover()
+            .expect("recovers");
+        assert_eq!(recovered.signer(), impostor.address());
+        assert!(matches!(
+            recovered.authorize(&verified_registry()),
+            Err(VerifyError::UnknownSigner { .. })
+        ));
     }
 
     #[test]

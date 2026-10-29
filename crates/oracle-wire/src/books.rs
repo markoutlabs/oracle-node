@@ -26,6 +26,7 @@ use oracle_types::{
     BOOK_EXPO, BookLevel, BookUpdate, MAX_BOOK_LEVELS, MAX_VENUE_SYMBOL, MarketKind, Venue,
 };
 
+use crate::Recovered;
 use crate::codec::{Reader, Sink as _};
 use crate::payload::{KIND_BOOK_UPDATE, PAYLOAD_VERSION};
 use crate::registry::VerifiedRegistry;
@@ -343,12 +344,32 @@ impl UnverifiedBookFrame {
     ///
     /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedBookUpdate, VerifyError> {
+        self.recover()?.authorize(registry)
+    }
+
+    /// Decodes the payload and recovers the signer: the costly half of [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed payload or a failed recovery.
+    pub fn recover(&self) -> Result<Recovered<BookUpdate>, VerifyError> {
         let update = decode_book_update(&self.raw.payload)?;
-        let signer = self.raw.recover_signer()?;
-        let node_index = registry.authorize(signer)?;
+        Ok(Recovered::new(update, self.raw.recover_signer()?))
+    }
+}
+
+impl Recovered<BookUpdate> {
+    /// Finds the signer in a trusted registry: the second half of
+    /// [`UnverifiedBookFrame::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::UnknownSigner`] if no node has the signer's address.
+    pub fn authorize(self, registry: &VerifiedRegistry) -> Result<VerifiedBookUpdate, VerifyError> {
+        let node_index = registry.authorize(self.signer)?;
         Ok(VerifiedBookUpdate {
-            update,
-            signer,
+            update: self.value,
+            signer: self.signer,
             node_index,
         })
     }

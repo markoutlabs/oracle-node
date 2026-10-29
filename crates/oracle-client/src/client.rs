@@ -14,11 +14,14 @@ use oracle_transport::{
     ClientHandshake, ClientSession, Control, HandshakeMessage, KEY_GRACE_SECS, TYPE_CONTROL,
     TYPE_FRAME, TransportError, os_rng,
 };
-use oracle_types::{FeedId, InstrumentId, NANOS_PER_SEC, Symbol};
+use oracle_types::{
+    BookUpdate, FeedId, FundingUpdate, InstrumentId, NANOS_PER_SEC, PriceUpdate, Symbol,
+    VenueReport,
+};
 use oracle_wire::{
     Address, FRAME_TYPE_BOOK_UPDATE, FRAME_TYPE_FUNDING_UPDATE, FRAME_TYPE_PRICE_UPDATE,
-    FRAME_TYPE_VENUE_REPORT, Registry, Signer, UnverifiedFrame, UnverifiedVenueFrame,
-    VerifiedRegistry, VerifyError, feed_id,
+    FRAME_TYPE_VENUE_REPORT, Recovered, Registry, Signer, UnverifiedBookFrame, UnverifiedFrame,
+    UnverifiedFundingFrame, UnverifiedVenueFrame, VerifiedRegistry, VerifyError, feed_id,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -375,6 +378,8 @@ enum Inbound {
         frame: Vec<u8>,
         /// Stamped as the message arrives, before decryption.
         received_ns: u64,
+        /// Not trusted until the verifier finds the signer in its registry.
+        recovered: Result<RecoveredFrame, VerifyError>,
     },
     Polled(Result<Registry, FetchError>),
     /// The result of a fetch that an unknown signer or a moved node started.
@@ -385,6 +390,37 @@ enum Inbound {
         /// The address in the node's challenge.
         got: Address,
     },
+}
+
+/// A frame's payload and signer, recovered in its node's task. Recovery is most
+/// of the cost of a frame, so the nodes' frames recover on several cores at once.
+enum RecoveredFrame {
+    Price(Recovered<PriceUpdate>),
+    Venues(Recovered<VenueReport>),
+    Book(Recovered<BookUpdate>),
+    Funding(Recovered<FundingUpdate>),
+}
+
+impl RecoveredFrame {
+    /// Any other frame type goes to the price path, whose parse refuses it.
+    fn of(frame: &[u8]) -> Result<Self, VerifyError> {
+        Ok(match frame.first().copied() {
+            Some(FRAME_TYPE_VENUE_REPORT) => {
+                Self::Venues(UnverifiedVenueFrame::parse(frame)?.recover()?)
+            }
+            Some(FRAME_TYPE_BOOK_UPDATE) => {
+                Self::Book(UnverifiedBookFrame::parse(frame)?.recover()?)
+            }
+            Some(FRAME_TYPE_FUNDING_UPDATE) => {
+                Self::Funding(UnverifiedFundingFrame::parse(frame)?.recover()?)
+            }
+            _ => Self::Price(recover_price(frame)?),
+        })
+    }
+}
+
+fn recover_price(frame: &[u8]) -> Result<Recovered<PriceUpdate>, VerifyError> {
+    UnverifiedFrame::parse(frame)?.recover()
 }
 
 struct NodeConnection {
@@ -1019,7 +1055,7 @@ impl OracleClient {
     ///
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest(&mut self, frame: &[u8], now_ns: u64) -> Result<Resolved, RejectReason> {
-        let outcome = self.try_ingest_price(frame, now_ns, now_ns);
+        let outcome = self.try_ingest_price(frame, recover_price(frame), now_ns, now_ns);
         self.record(frame, now_ns, &outcome);
         outcome
     }
@@ -1031,7 +1067,7 @@ impl OracleClient {
     ///
     /// Returns [`RejectReason`] if the frame fails verification.
     pub fn ingest_event(&mut self, frame: &[u8], now_ns: u64) -> Result<Event, RejectReason> {
-        let outcome = self.try_ingest(frame, now_ns, now_ns);
+        let outcome = self.try_ingest(frame, RecoveredFrame::of(frame), now_ns, now_ns);
         self.record(frame, now_ns, &outcome);
         outcome
     }
@@ -1052,18 +1088,8 @@ impl OracleClient {
         frame: &[u8],
         now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
-        self.ingest_received(frame, now_ns, now_ns, Self::try_ingest_price)
-            .await
-    }
-
-    async fn ingest_received<T>(
-        &mut self,
-        frame: &[u8],
-        received_ns: u64,
-        now_ns: u64,
-        accept: fn(&mut Self, &[u8], u64, u64) -> Result<T, RejectReason>,
-    ) -> Result<T, RejectReason> {
-        let mut outcome = accept(self, frame, received_ns, now_ns);
+        let recovered = recover_price(frame);
+        let mut outcome = self.try_ingest_price(frame, recovered.clone(), now_ns, now_ns);
         if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { signer })) = &outcome
             && self.refresh_due(now_ns)
         {
@@ -1073,22 +1099,22 @@ impl OracleClient {
                 Ok(None) => debug!(%signer, "registry unchanged; signer stays unknown"),
                 Err(error) => warn!(%signer, %error, "registry refresh failed"),
             }
-            outcome = accept(self, frame, received_ns, now_ns);
+            outcome = self.try_ingest_price(frame, recovered, now_ns, now_ns);
         }
-        self.record(frame, received_ns, &outcome);
+        self.record(frame, now_ns, &outcome);
         outcome
     }
 
     /// Accepts a frame now. An unknown signer starts a registry fetch on its
     /// own task, and this frame stays refused.
-    fn ingest_now<T>(
+    fn ingest_now(
         &mut self,
         frame: &[u8],
+        recovered: Result<RecoveredFrame, VerifyError>,
         received_ns: u64,
         now_ns: u64,
-        accept: fn(&mut Self, &[u8], u64, u64) -> Result<T, RejectReason>,
-    ) -> Result<T, RejectReason> {
-        let outcome = accept(self, frame, received_ns, now_ns);
+    ) -> Result<Event, RejectReason> {
+        let outcome = self.try_ingest(frame, recovered, received_ns, now_ns);
         if let Err(RejectReason::Untrusted(VerifyError::UnknownSigner { .. })) = &outcome {
             self.refresh_in_background(now_ns);
         }
@@ -1140,21 +1166,22 @@ impl OracleClient {
     fn try_ingest(
         &mut self,
         frame: &[u8],
+        recovered: Result<RecoveredFrame, VerifyError>,
         received_ns: u64,
         now_ns: u64,
     ) -> Result<Event, RejectReason> {
-        match frame.first().copied() {
-            Some(FRAME_TYPE_VENUE_REPORT) => {
-                let accepted = self.verifier.accept_venues(frame, now_ns)?;
+        match recovered? {
+            RecoveredFrame::Venues(recovered) => {
+                let accepted = self.verifier.accept_venues_recovered(recovered, now_ns)?;
                 self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
                 self.stats.venue_reports = self.stats.venue_reports.saturating_add(1);
                 let tally = self.tallies.entry(accepted.signer).or_default();
                 tally.frames.venue_reports = tally.frames.venue_reports.saturating_add(1);
                 tally.seen(received_ns);
-                return Ok(Event::Venues(accepted));
+                Ok(Event::Venues(accepted))
             }
-            Some(FRAME_TYPE_BOOK_UPDATE) => {
-                let accepted = self.verifier.accept_book(frame, now_ns)?;
+            RecoveredFrame::Book(recovered) => {
+                let accepted = self.verifier.accept_book_recovered(recovered, now_ns)?;
                 self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
                 self.stats.book_updates = self.stats.book_updates.saturating_add(1);
                 let tally = self.tallies.entry(accepted.signer).or_default();
@@ -1167,10 +1194,10 @@ impl OracleClient {
                     .entry((accepted.signer, instrument.clone()))
                     .or_insert_with(|| Book::new(accepted.signer, instrument))
                     .apply(update);
-                return Ok(Event::Book(accepted));
+                Ok(Event::Book(accepted))
             }
-            Some(FRAME_TYPE_FUNDING_UPDATE) => {
-                let accepted = self.verifier.accept_funding(frame, now_ns)?;
+            RecoveredFrame::Funding(recovered) => {
+                let accepted = self.verifier.accept_funding_recovered(recovered, now_ns)?;
                 self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
                 self.stats.funding_updates = self.stats.funding_updates.saturating_add(1);
                 let tally = self.tallies.entry(accepted.signer).or_default();
@@ -1181,21 +1208,22 @@ impl OracleClient {
                     InstrumentId::new(update.venue, update.market, update.symbol.as_str());
                 self.funding
                     .insert((accepted.signer, perpetual), accepted.clone());
-                return Ok(Event::Funding(accepted));
+                Ok(Event::Funding(accepted))
             }
-            _ => {}
+            RecoveredFrame::Price(recovered) => self
+                .try_ingest_price(frame, Ok(recovered), received_ns, now_ns)
+                .map(Event::Price),
         }
-        self.try_ingest_price(frame, received_ns, now_ns)
-            .map(Event::Price)
     }
 
     fn try_ingest_price(
         &mut self,
         frame: &[u8],
+        recovered: Result<Recovered<PriceUpdate>, VerifyError>,
         received_ns: u64,
         now_ns: u64,
     ) -> Result<Resolved, RejectReason> {
-        let accepted = self.verifier.accept(frame, now_ns)?;
+        let accepted = self.verifier.accept_recovered(recovered?, now_ns)?;
         self.copy(frame, accepted.signer, received_ns, Verdict::Accepted);
         self.stats.accepted = self.stats.accepted.saturating_add(1);
         self.latency.arrived(&accepted.update, received_ns);
@@ -1276,8 +1304,12 @@ impl OracleClient {
                 () = self.shutdown.cancelled() => return None,
                 inbound = self.inbound_rx.recv() => inbound?,
             };
-            let (frame, received_ns) = match inbound {
-                Inbound::Frame { frame, received_ns } => (frame, received_ns),
+            let (frame, received_ns, recovered) = match inbound {
+                Inbound::Frame {
+                    frame,
+                    received_ns,
+                    recovered,
+                } => (frame, received_ns, recovered),
                 Inbound::Polled(fetched) => {
                     self.stats.polls = self.stats.polls.saturating_add(1);
                     match self.adopt_fetched(fetched) {
@@ -1306,12 +1338,12 @@ impl OracleClient {
             };
             // A node sends only the feeds a client asked for, so another feed is
             // a faulty or hostile node, and it must not reach the maps.
-            if !self.subscribed(&frame) {
+            if !self.subscribed(&frame, &recovered) {
                 debug!("dropped a frame of a feed this client did not ask for");
                 continue;
             }
             let now_ns = now_unix_nanos();
-            match self.ingest_now(&frame, received_ns, now_ns, Self::try_ingest) {
+            match self.ingest_now(&frame, recovered, received_ns, now_ns) {
                 Ok(event) => {
                     if let Event::Price(_) = event {
                         self.latency.resolved(received_ns, now_unix_nanos());
@@ -1325,7 +1357,20 @@ impl OracleClient {
         }
     }
 
-    fn subscribed(&self, frame: &[u8]) -> bool {
+    fn subscribed(&self, frame: &[u8], recovered: &Result<RecoveredFrame, VerifyError>) -> bool {
+        match recovered {
+            Ok(RecoveredFrame::Price(update)) => {
+                self.symbols.contains_key(&update.unverified().feed_id)
+            }
+            Ok(RecoveredFrame::Venues(report)) => self
+                .venue_symbols
+                .contains_key(&report.unverified().feed_id),
+            Ok(RecoveredFrame::Book(_) | RecoveredFrame::Funding(_)) => true,
+            Err(_) => self.subscribed_unrecovered(frame),
+        }
+    }
+
+    fn subscribed_unrecovered(&self, frame: &[u8]) -> bool {
         // A frame that does not parse goes on, so the verifier refuses and counts it.
         match frame.first().copied() {
             Some(FRAME_TYPE_PRICE_UPDATE) => UnverifiedFrame::parse(frame)
@@ -1608,8 +1653,13 @@ async fn pump(
                 match session.keys.open(&bytes) {
                     Ok(frame) => {
                         missing_since = None;
+                        let recovered = RecoveredFrame::of(&frame);
                         if tx
-                            .send(Inbound::Frame { frame, received_ns })
+                            .send(Inbound::Frame {
+                                frame,
+                                received_ns,
+                                recovered,
+                            })
                             .await
                             .is_err()
                         {

@@ -15,6 +15,7 @@
 //! Skip these and the signatures buy you nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::time::Duration;
 
 use oracle_types::{
@@ -22,7 +23,7 @@ use oracle_types::{
     SLOW_HEARTBEAT, VenueReport,
 };
 use oracle_wire::{
-    Address, NodeListing, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
+    Address, NodeListing, Recovered, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
     UnverifiedPriceBatch, UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
 };
 
@@ -296,14 +297,23 @@ impl Verifier {
     /// Returns [`RejectReason`]. Signature and registry failures come first, so a
     /// forged frame is never measured against the clock.
     pub fn accept(&mut self, frame: &[u8], now_ns: u64) -> Result<Accepted, RejectReason> {
-        let parsed = UnverifiedFrame::parse(frame).map_err(VerifyError::from)?;
-        let verified = match parsed.verify(&self.registry) {
-            Ok(verified) => verified,
-            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
-                return Err(RejectReason::RetiredKey { signer });
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let recovered = UnverifiedFrame::parse(frame)
+            .map_err(VerifyError::from)?
+            .recover()?;
+        self.accept_recovered(recovered, now_ns)
+    }
+
+    /// [`Self::accept`] for a frame recovered elsewhere, such as in a node's own task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_recovered(
+        &mut self,
+        recovered: Recovered<PriceUpdate>,
+        now_ns: u64,
+    ) -> Result<Accepted, RejectReason> {
+        let verified = self.trusted(recovered.authorize(&self.registry))?;
         let update = *verified.update();
         let signer = verified.signer();
         let node_index = verified.node_index();
@@ -329,13 +339,7 @@ impl Verifier {
         now_ns: u64,
     ) -> Result<AcceptedBatch, RejectReason> {
         let parsed = UnverifiedPriceBatch::parse(frame).map_err(VerifyError::from)?;
-        let verified = match parsed.verify(&self.registry) {
-            Ok(verified) => verified,
-            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
-                return Err(RejectReason::RetiredKey { signer });
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let verified = self.trusted(parsed.verify(&self.registry))?;
         let signer = verified.signer();
         let node_index = verified.node_index();
         let updates = verified
@@ -386,14 +390,24 @@ impl Verifier {
         frame: &[u8],
         now_ns: u64,
     ) -> Result<AcceptedVenues, RejectReason> {
-        let parsed = UnverifiedVenueFrame::parse(frame).map_err(VerifyError::from)?;
-        let verified = match parsed.verify(&self.registry) {
-            Ok(verified) => verified,
-            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
-                return Err(RejectReason::RetiredKey { signer });
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let recovered = UnverifiedVenueFrame::parse(frame)
+            .map_err(VerifyError::from)?
+            .recover()?;
+        self.accept_venues_recovered(recovered, now_ns)
+    }
+
+    /// [`Self::accept_venues`] for a frame whose signer is already recovered, like
+    /// [`Self::accept_recovered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_venues_recovered(
+        &mut self,
+        recovered: Recovered<VenueReport>,
+        now_ns: u64,
+    ) -> Result<AcceptedVenues, RejectReason> {
+        let verified = self.trusted(recovered.authorize(&self.registry))?;
         let (signer, node_index) = (verified.signer(), verified.node_index());
         let report = verified.into_report();
         if !report.timestamps_coherent() {
@@ -426,14 +440,24 @@ impl Verifier {
     ///
     /// Returns [`RejectReason`], in the same order as [`Self::accept`].
     pub fn accept_book(&mut self, frame: &[u8], now_ns: u64) -> Result<AcceptedBook, RejectReason> {
-        let parsed = UnverifiedBookFrame::parse(frame).map_err(VerifyError::from)?;
-        let verified = match parsed.verify(&self.registry) {
-            Ok(verified) => verified,
-            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
-                return Err(RejectReason::RetiredKey { signer });
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let recovered = UnverifiedBookFrame::parse(frame)
+            .map_err(VerifyError::from)?
+            .recover()?;
+        self.accept_book_recovered(recovered, now_ns)
+    }
+
+    /// [`Self::accept_book`] for a frame whose signer is already recovered, like
+    /// [`Self::accept_recovered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_book_recovered(
+        &mut self,
+        recovered: Recovered<BookUpdate>,
+        now_ns: u64,
+    ) -> Result<AcceptedBook, RejectReason> {
+        let verified = self.trusted(recovered.authorize(&self.registry))?;
         let (signer, node_index) = (verified.signer(), verified.node_index());
         let update = verified.into_update();
         if !update.timestamps_coherent() {
@@ -441,17 +465,12 @@ impl Verifier {
         }
         self.check_clock(signer, update.publish_time_ns, now_ns, self.config.max_age)?;
         let book = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
-        let key = (signer, book);
-        if let Some(last_seq) = self.book_high_water.get(&key).copied()
-            && update.seq <= last_seq
-        {
-            return Err(RejectReason::Replayed {
-                signer,
-                seq: update.seq,
-                last_seq,
-            });
-        }
-        self.book_high_water.insert(key, update.seq);
+        advance(
+            &mut self.book_high_water,
+            (signer, book),
+            update.seq,
+            signer,
+        )?;
         Ok(AcceptedBook {
             update,
             signer,
@@ -470,14 +489,24 @@ impl Verifier {
         frame: &[u8],
         now_ns: u64,
     ) -> Result<AcceptedFunding, RejectReason> {
-        let parsed = UnverifiedFundingFrame::parse(frame).map_err(VerifyError::from)?;
-        let verified = match parsed.verify(&self.registry) {
-            Ok(verified) => verified,
-            Err(VerifyError::UnknownSigner { signer }) if self.retired.contains(&signer) => {
-                return Err(RejectReason::RetiredKey { signer });
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let recovered = UnverifiedFundingFrame::parse(frame)
+            .map_err(VerifyError::from)?
+            .recover()?;
+        self.accept_funding_recovered(recovered, now_ns)
+    }
+
+    /// [`Self::accept_funding`] for a frame whose signer is already recovered, like
+    /// [`Self::accept_recovered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RejectReason`], in the same order as [`Self::accept`].
+    pub fn accept_funding_recovered(
+        &mut self,
+        recovered: Recovered<FundingUpdate>,
+        now_ns: u64,
+    ) -> Result<AcceptedFunding, RejectReason> {
+        let verified = self.trusted(recovered.authorize(&self.registry))?;
         let (signer, node_index) = (verified.signer(), verified.node_index());
         let update = verified.into_update();
         if !update.timestamps_coherent() {
@@ -485,21 +514,27 @@ impl Verifier {
         }
         self.check_clock(signer, update.publish_time_ns, now_ns, FUNDING_MAX_AGE)?;
         let perpetual = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
-        let key = (signer, perpetual);
-        if let Some(last_seq) = self.funding_high_water.get(&key).copied()
-            && update.seq <= last_seq
-        {
-            return Err(RejectReason::Replayed {
-                signer,
-                seq: update.seq,
-                last_seq,
-            });
-        }
-        self.funding_high_water.insert(key, update.seq);
+        advance(
+            &mut self.funding_high_water,
+            (signer, perpetual),
+            update.seq,
+            signer,
+        )?;
         Ok(AcceptedFunding {
             update,
             signer,
             node_index,
+        })
+    }
+
+    /// Reports a key that a past registry listed as retired, not unknown, so
+    /// the client does not fetch a registry that it already has.
+    fn trusted<T>(&self, verified: Result<T, VerifyError>) -> Result<T, RejectReason> {
+        verified.map_err(|error| match error {
+            VerifyError::UnknownSigner { signer } if self.retired.contains(&signer) => {
+                RejectReason::RetiredKey { signer }
+            }
+            error => error.into(),
         })
     }
 
@@ -537,9 +572,9 @@ impl Verifier {
 
 /// Raises the high-water mark for `key`, or refuses a sequence that does not
 /// advance.
-fn advance(
-    marks: &mut HashMap<(Address, FeedId), u64>,
-    key: (Address, FeedId),
+fn advance<K: Eq + Hash>(
+    marks: &mut HashMap<K, u64>,
+    key: K,
     seq: u64,
     signer: Address,
 ) -> Result<(), RejectReason> {
@@ -936,6 +971,44 @@ mod tests {
             .accept(&node.sign(&update_at(NOW, 2)), NOW)
             .expect("the live key verifies");
         assert_eq!(accepted.signer, node.signing_address());
+    }
+
+    /// Recovery may run long before the verifier sees the frame. The registry
+    /// check runs at acceptance, so a key removed in between is refused.
+    #[test]
+    fn a_key_removed_after_recovery_is_refused() {
+        let mut node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let old_address = node.signing_address();
+        let recovered = UnverifiedFrame::parse(&node.sign(&update_at(NOW, 1)))
+            .expect("parses")
+            .recover()
+            .expect("recovers");
+
+        node.rotate();
+        verifier.set_registry(registry_with(&[&node]));
+
+        assert!(matches!(
+            verifier.accept_recovered(recovered, NOW),
+            Err(RejectReason::RetiredKey { signer }) if signer == old_address
+        ));
+    }
+
+    /// Both paths share the sequence marks, so a frame is accepted once.
+    #[test]
+    fn a_recovered_frame_is_a_replay_after_the_same_frame() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let frame = node.sign_venues(&venues_at(NOW, 1));
+        assert!(verifier.accept_venues(&frame, NOW).is_ok());
+        let recovered = UnverifiedVenueFrame::parse(&frame)
+            .expect("parses")
+            .recover()
+            .expect("recovers");
+        assert!(matches!(
+            verifier.accept_venues_recovered(recovered, NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
     }
 
     /// Stored frames verify while their signer was listed, and not after.

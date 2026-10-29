@@ -32,6 +32,7 @@ use oracle_types::{
     VenueReport,
 };
 
+use crate::Recovered;
 use crate::books::check_symbol;
 use crate::codec::{Reader, Sink as _};
 use crate::payload::{KIND_VENUE_REPORT, PAYLOAD_VERSION};
@@ -368,12 +369,35 @@ impl UnverifiedVenueFrame {
     ///
     /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedVenueReport, VerifyError> {
+        self.recover()?.authorize(registry)
+    }
+
+    /// Decodes the payload and recovers the signer: the costly half of [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed payload or a failed recovery.
+    pub fn recover(&self) -> Result<Recovered<VenueReport>, VerifyError> {
         let report = decode_venue_report(&self.raw.payload)?;
-        let signer = self.raw.recover_signer()?;
-        let node_index = registry.authorize(signer)?;
+        Ok(Recovered::new(report, self.raw.recover_signer()?))
+    }
+}
+
+impl Recovered<VenueReport> {
+    /// Finds the signer in a trusted registry: the second half of
+    /// [`UnverifiedVenueFrame::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::UnknownSigner`] if no node has the signer's address.
+    pub fn authorize(
+        self,
+        registry: &VerifiedRegistry,
+    ) -> Result<VerifiedVenueReport, VerifyError> {
+        let node_index = registry.authorize(self.signer)?;
         Ok(VerifiedVenueReport {
-            report,
-            signer,
+            report: self.value,
+            signer: self.signer,
             node_index,
         })
     }
@@ -515,6 +539,16 @@ mod tests {
         let verified = frame.verify(&registry()).expect("a listed node signed it");
         assert_eq!(verified.report(), &report());
         assert_eq!(verified.signer(), node().address());
+    }
+
+    #[test]
+    fn recover_then_authorize_is_verify() {
+        let signed = node().sign_venue_report(&report()).expect("signs");
+        let frame = UnverifiedVenueFrame::parse(&signed.encode_frame()).expect("parses");
+        let recovered = frame.recover().expect("recovers");
+        assert_eq!(recovered.signer(), node().address());
+        assert_eq!(recovered.unverified(), &report());
+        assert_eq!(recovered.authorize(&registry()), frame.verify(&registry()));
     }
 
     #[test]

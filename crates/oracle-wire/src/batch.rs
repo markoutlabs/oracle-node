@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use oracle_types::PriceUpdate;
 
+use crate::Recovered;
 use crate::codec::{Reader, Sink as _};
 use crate::payload::{
     KIND_PRICE_BATCH, PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update,
@@ -223,12 +224,32 @@ impl UnverifiedPriceBatch {
     ///
     /// Returns [`VerifyError`] for malformed payloads and unknown signers.
     pub fn verify(&self, registry: &VerifiedRegistry) -> Result<VerifiedPriceBatch, VerifyError> {
+        self.recover()?.authorize(registry)
+    }
+
+    /// Decodes the payload and recovers the signer: the costly half of [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed payload or a failed recovery.
+    pub fn recover(&self) -> Result<Recovered<Vec<PriceUpdate>>, VerifyError> {
         let updates = decode_price_batch(&self.raw.payload)?;
-        let signer = self.raw.recover_signer()?;
-        let node_index = registry.authorize(signer)?;
+        Ok(Recovered::new(updates, self.raw.recover_signer()?))
+    }
+}
+
+impl Recovered<Vec<PriceUpdate>> {
+    /// Finds the signer in a trusted registry: the second half of
+    /// [`UnverifiedPriceBatch::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::UnknownSigner`] if no node has the signer's address.
+    pub fn authorize(self, registry: &VerifiedRegistry) -> Result<VerifiedPriceBatch, VerifyError> {
+        let node_index = registry.authorize(self.signer)?;
         Ok(VerifiedPriceBatch {
-            updates,
-            signer,
+            updates: self.value,
+            signer: self.signer,
             node_index,
         })
     }

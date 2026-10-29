@@ -24,10 +24,16 @@
 //!
 //! ```text
 //!   bytes ──parse──▶ UnverifiedFrame ──verify(&VerifiedRegistry)──▶ VerifiedUpdate
+//!                          │                                            ▲
+//!                          ├─ recover() ──▶ Recovered ──authorize(&VerifiedRegistry)
 //!                          │
 //!                          └─ recover_signer() yields an address for ANY
 //!                             well-formed signature, including a forged one
 //! ```
+//!
+//! `verify` is `recover` and then `authorize`. Recovery is the costly step and
+//! needs no registry, so a consumer can recover frames on several threads and
+//! keep the registry check in one place.
 //!
 //! [`VerifiedRegistry`] is itself only obtainable by checking a [`Registry`]
 //! against a governance address the caller pins, and against a version floor, so
@@ -83,6 +89,7 @@ mod frame;
 mod funding;
 mod keccak;
 mod payload;
+mod recovered;
 mod registry;
 mod signature;
 mod signer;
@@ -122,6 +129,7 @@ pub use payload::{
     KIND_NODE_AUTH_OK, KIND_PRICE_BATCH, KIND_PRICE_UPDATE, KIND_REGISTRY, KIND_VENUE_REPORT,
     PAYLOAD_VERSION, PRICE_UPDATE_SIZE, decode_price_update, encode_price_update, feed_id,
 };
+pub use recovered::Recovered;
 pub use registry::{
     EntryError, MAX_ENDPOINT_LEN, MAX_ENDPOINTS, MAX_NODES, NodeEntry, NodeListing, Quorum,
     Registry, VerifiedRegistry, check_endpoint,

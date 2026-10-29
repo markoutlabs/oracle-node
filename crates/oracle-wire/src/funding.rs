@@ -36,6 +36,7 @@ use oracle_types::{
     OpenInterest, OpenInterestUnit, SettledFunding, Venue,
 };
 
+use crate::Recovered;
 use crate::books::check_symbol;
 use crate::codec::{Reader, Sink as _};
 use crate::payload::{KIND_FUNDING_UPDATE, PAYLOAD_VERSION};
@@ -325,12 +326,35 @@ impl UnverifiedFundingFrame {
         &self,
         registry: &VerifiedRegistry,
     ) -> Result<VerifiedFundingUpdate, VerifyError> {
+        self.recover()?.authorize(registry)
+    }
+
+    /// Decodes the payload and recovers the signer: the costly half of [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError`] for a malformed payload or a failed recovery.
+    pub fn recover(&self) -> Result<Recovered<FundingUpdate>, VerifyError> {
         let update = decode_funding_update(&self.raw.payload)?;
-        let signer = self.raw.recover_signer()?;
-        let node_index = registry.authorize(signer)?;
+        Ok(Recovered::new(update, self.raw.recover_signer()?))
+    }
+}
+
+impl Recovered<FundingUpdate> {
+    /// Finds the signer in a trusted registry: the second half of
+    /// [`UnverifiedFundingFrame::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::UnknownSigner`] if no node has the signer's address.
+    pub fn authorize(
+        self,
+        registry: &VerifiedRegistry,
+    ) -> Result<VerifiedFundingUpdate, VerifyError> {
+        let node_index = registry.authorize(self.signer)?;
         Ok(VerifiedFundingUpdate {
-            update,
-            signer,
+            update: self.value,
+            signer: self.signer,
             node_index,
         })
     }
