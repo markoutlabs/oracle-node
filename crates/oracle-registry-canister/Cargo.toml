@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # No `os-rng`: a canister never generates keys and wasm32 has no entropy
 # source `getrandom` knows about.
-oracle-wire = { path = "../oracle-wire", version = "0.1.0", default-features = false, features = ["pure-rust"] }
+oracle-wire = { path = "../oracle-wire", version = "0.2.0", default-features = false, features = ["pure-rust"] }
 oracle-quorum = { workspace = true, features = ["pure-rust"] }
 oracle-types.workspace = true
 
