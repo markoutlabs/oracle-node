@@ -9,11 +9,12 @@ keeps an asset when at least three venues trade it with $1M or more a day.
 Stablecoins, fiat, wrapped and staked copies, leveraged tokens, and stock or
 commodity perpetuals are left out. The top assets by 24 h volume get:
 
-  CRYPTO.<ASSET>/USD             spot: Coinbase and Kraken in USD, Binance,
-                                 Bybit, OKX, Bitfinex, KuCoin and MEXC in USDT
+  CRYPTO.<ASSET>/USD             spot: Coinbase, Kraken and Bitstamp in USD, Binance,
+                                 Bybit, OKX, Bitfinex, KuCoin, MEXC, Bitget and Gate in USDT
                                  through the peg, and Hyperliquid in USDC at par
   CRYPTO.<ASSET>/USDT.PERP_MARK  the mark of Binance, Bybit, OKX, Hyperliquid,
-                                 Bitfinex, KuCoin and MEXC perpetuals
+                                 Bitfinex, KuCoin, MEXC, Bitget, Gate, Lighter and
+                                 dYdX perpetuals
 
 Each feed takes only venue markets with $1M or more a day. A spot feed needs
 three, so that one venue that stops cannot halt it. A perpetual's mark moves
@@ -194,6 +195,43 @@ def markets():
         base, _, quote = t["symbol"].partition("_")
         if quote == "USDT" and t["symbol"] in sizes:
             add("mexc", "perp", t["symbol"], base, quote, number(t.get("amount24")), contract=sizes[t["symbol"]])
+    # Bitget: spot and USDT perpetuals as `BTCUSDT`; a perpetual counts in coins.
+    for category, kind in (("SPOT", "spot"), ("USDT-FUTURES", "perp")):
+        live = {i["symbol"] for i in get(f"https://api.bitget.com/api/v3/market/instruments?category={category}")["data"]
+                if i.get("status") == "online" and i.get("quoteCoin") == "USDT"
+                and (kind == "spot" or i.get("type") == "perpetual")}
+        for t in get(f"https://api.bitget.com/api/v3/market/tickers?category={category}")["data"]:
+            base, quote = split_suffix(t["symbol"])
+            if quote == "USDT" and t["symbol"] in live:
+                add("bitget", kind, t["symbol"], base, quote, number(t.get("turnover24h")))
+    # Gate: spot `BTC_USDT`; USDT-settled perpetuals `BTC_USDT`, which count in
+    # contracts of `quanto_multiplier` coins.
+    for t in get("https://api.gateio.ws/api/v4/spot/tickers"):
+        base, _, quote = t["currency_pair"].partition("_")
+        if quote == "USDT":
+            add("gate", "spot", t["currency_pair"], base, quote, number(t.get("quote_volume")))
+    sizes = {c["name"]: Decimal(c["quanto_multiplier"]) for c in get("https://api.gateio.ws/api/v4/futures/usdt/contracts")
+             if c.get("status") == "trading" and not c.get("in_delisting") and c.get("type") == "direct"}
+    for t in get("https://api.gateio.ws/api/v4/futures/usdt/tickers"):
+        base, _, quote = t["contract"].partition("_")
+        if quote == "USDT" and t["contract"] in sizes:
+            add("gate", "perp", t["contract"], base, quote, number(t.get("volume_24h_quote")), contract=sizes[t["contract"]])
+    # Lighter: USDC perpetuals taken at par, named by their market number; the
+    # socket takes only the number.
+    for m in get("https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails")["order_book_details"]:
+        if m.get("market_type") == "perp" and m.get("status") == "active":
+            add("lighter", "perp", str(m["market_id"]), m["symbol"], "USDC", number(m.get("daily_quote_token_volume")))
+    # dYdX: USDC perpetuals `BTC-USD`, taken at par, from the indexer.
+    for ticker, m in get("https://indexer.dydx.trade/v4/perpetualMarkets")["markets"].items():
+        if m.get("status") == "ACTIVE" and ticker.endswith("-USD"):
+            add("dydx", "perp", ticker, ticker[:-4], "USDC", number(m.get("volume24H")))
+    # Bitstamp: natively in USD; the socket names a market by its lowercase `market_symbol`.
+    symbols = {m["name"]: m["market_symbol"] for m in get("https://www.bitstamp.net/api/v2/markets/")
+               if m.get("market_type") == "SPOT" and m.get("trading") == "Enabled"}
+    for t in get("https://www.bitstamp.net/api/v2/ticker/"):
+        base, _, quote = t.get("pair", "").partition("/")
+        if quote == "USD" and t.get("pair") in symbols:
+            add("bitstamp", "spot", symbols[t["pair"]], base, quote, number(t["volume"]) * number(t["last"]))
     spot_meta, spot_ctxs = get("https://api.hyperliquid.xyz/info", {"type": "spotMetaAndAssetCtxs"})
     tokens = {t["index"]: t for t in spot_meta["tokens"]}
     volumes = {c["coin"]: number(c.get("dayNtlVlm")) for c in spot_ctxs}
@@ -234,6 +272,9 @@ def source_line(m, perpetual):
         extra += f', contract_size = "{m["contract"].normalize():f}"'
     # A Hyperliquid spot pair's index says nothing to a reader; name the coin.
     note = f'  # {m["raw"]}/USDC' if m["venue"] == "hyperliquid" and m["symbol"].startswith("@") else ""
+    # A Lighter market number says nothing to a reader either.
+    if m["venue"] == "lighter":
+        note = f'  # {m["raw"]}'
     return f'  {{ venue = "{m["venue"]}", market = "{market}", symbol = "{m["symbol"]}"{extra} }},{note}'
 
 

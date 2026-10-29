@@ -31,8 +31,9 @@ exchanges ──▶ node 1 ──┐
                 └── registry canister: lists the node keys, signed by governance
 ```
 
-1. **Ingest.** Each node keeps WebSocket connections to six venues: Binance,
-   Bybit, OKX, Coinbase, Kraken and Deribit.
+1. **Ingest.** Each node keeps WebSocket connections to fifteen venues: Binance,
+   Bybit, OKX, Coinbase, Kraken, Deribit, Hyperliquid, Bitfinex, MEXC, KuCoin,
+   Bitstamp, Bitget, Gate, Lighter and dYdX.
 2. **Aggregate.** For each feed, the node removes stale and outlier sources, and
    takes a weighted median of the rest. Deeper and tighter order books weigh
    more.
