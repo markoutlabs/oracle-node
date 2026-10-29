@@ -15,7 +15,7 @@ sources = [
   { venue = "bitget", market = "linear_perp", symbol = "SOLUSDT", kinds = ["mark_price"] },
   { venue = "gate", market = "linear_perp", symbol = "SOL_USDT", kinds = ["mark_price"], contract_size = "1" },
   { venue = "lighter", market = "linear_perp", symbol = "2", kinds = ["mark_price"] },  # SOL
-  { venue = "dydx", market = "linear_perp", symbol = "SOL-USD", kinds = ["mark_price"] },
+  # { venue = "dydx", market = "linear_perp", symbol = "SOL-USD", kinds = ["mark_price"] },  # off until its books have a gap check (2026-10-29)
 ]
 
 # ZEC: rank 4, $2,157M a day

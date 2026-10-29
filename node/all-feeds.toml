@@ -424,7 +424,7 @@ sources = [
   { venue = "bitget", market = "linear_perp", symbol = "BTCUSDT", kinds = ["mark_price"] },
   { venue = "gate", market = "linear_perp", symbol = "BTC_USDT", kinds = ["mark_price"], contract_size = "0.0001" },
   { venue = "lighter", market = "linear_perp", symbol = "1", kinds = ["mark_price"] },  # BTC
-  { venue = "dydx", market = "linear_perp", symbol = "BTC-USD", kinds = ["mark_price"] },
+  # { venue = "dydx", market = "linear_perp", symbol = "BTC-USD", kinds = ["mark_price"] },  # off until its books have a gap check (2026-10-29)
 ]
 
 [[feeds]]
@@ -442,7 +442,7 @@ sources = [
   { venue = "bitget", market = "linear_perp", symbol = "ETHUSDT", kinds = ["mark_price"] },
   { venue = "gate", market = "linear_perp", symbol = "ETH_USDT", kinds = ["mark_price"], contract_size = "0.01" },
   { venue = "lighter", market = "linear_perp", symbol = "0", kinds = ["mark_price"] },  # ETH
-  { venue = "dydx", market = "linear_perp", symbol = "ETH-USD", kinds = ["mark_price"] },
+  # { venue = "dydx", market = "linear_perp", symbol = "ETH-USD", kinds = ["mark_price"] },  # off until its books have a gap check (2026-10-29)
 ]
 
 # -------------------------------------------------- perpetual mid, USDT
