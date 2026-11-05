@@ -293,6 +293,132 @@ sources = [
   { venue = "kraken", market = "spot", symbol = "LINK/USDC" },
 ]
 
+# ------------------------------------------------------ spot, routes through USDC
+#
+# Binance's USDC book and MEXC's USDT book of the coins whose route paid in the
+# sampler of 2026-11-05, apart from PEPE and BONK: one step of 8 decimals is 20
+# and 33 bp there. These books are too thin for the /USD prices, so they have
+# their own feeds.
+
+[[feeds]]
+symbol = "CRYPTO.RUNE/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "RUNEUSDC" },
+  { venue = "mexc", market = "spot", symbol = "RUNEUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.NEAR/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "NEARUSDC" },
+  { venue = "mexc", market = "spot", symbol = "NEARUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.STX/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "STXUSDC" },
+  { venue = "mexc", market = "spot", symbol = "STXUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.NIGHT/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "NIGHTUSDC" },
+  { venue = "mexc", market = "spot", symbol = "NIGHTUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.AERO/USDC"
+min_sources = 1  # No other venue has this USDC book.
+sources = [
+  { venue = "binance", market = "spot", symbol = "AEROUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.WLD/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "WLDUSDC" },
+  { venue = "mexc", market = "spot", symbol = "WLDUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.TRUMP/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "TRUMPUSDC" },
+  { venue = "mexc", market = "spot", symbol = "TRUMPUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.RENDER/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "RENDERUSDC" },
+  { venue = "mexc", market = "spot", symbol = "RENDERUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.HBAR/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "HBARUSDC" },
+  { venue = "mexc", market = "spot", symbol = "HBARUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.RUNE/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "RUNEUSDT" },
+  { venue = "mexc", market = "spot", symbol = "RUNEUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.STX/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "STXUSDT" },
+  { venue = "mexc", market = "spot", symbol = "STXUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.NIGHT/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "NIGHTUSDT" },
+  { venue = "mexc", market = "spot", symbol = "NIGHTUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.WLD/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "WLDUSDT" },
+  { venue = "mexc", market = "spot", symbol = "WLDUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.RENDER/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "RENDERUSDT" },
+  { venue = "mexc", market = "spot", symbol = "RENDERUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.HBAR/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "HBARUSDT" },
+  { venue = "mexc", market = "spot", symbol = "HBARUSDT" },
+]
+
 # ------------------------------------------------------ spot, BTC and ETH
 #
 # Books quoted in a coin, for cycles of trades between coins. Prices have 8
