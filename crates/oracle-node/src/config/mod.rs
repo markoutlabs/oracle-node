@@ -11,16 +11,18 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "serve")]
 mod load;
 mod resolve;
 mod settings;
 
 pub use resolve::{ResolvedConfig, VenueConnection, resolve_feeds};
+#[cfg(feature = "serve")]
 pub use settings::{
-    ClientsSettings, DEFAULT_TICK_MS, EndpointSettings, FeedSettings, NetworkFeedsSettings,
-    NodeConfig, PublishSettings, RegistrySettings, ServerSettings, SigningSettings, SourceSettings,
-    max_pending,
+    ClientsSettings, NetworkFeedsSettings, NodeConfig, PublishSettings, RegistrySettings,
+    ServerSettings, SigningSettings,
 };
+pub use settings::{DEFAULT_TICK_MS, EndpointSettings, FeedSettings, SourceSettings, max_pending};
 
 /// Anything that stops the node starting.
 #[derive(Debug, thiserror::Error)]
@@ -78,5 +80,5 @@ impl ConfigError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serve"))]
 mod fixture;

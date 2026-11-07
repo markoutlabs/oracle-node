@@ -7,7 +7,6 @@ use clap::{CommandFactory as _, Parser, Subcommand};
 use oracle_node::{ConfigError, KeyFileError};
 
 mod export_feeds;
-mod ingest;
 mod init;
 mod live_feeds;
 mod notify;

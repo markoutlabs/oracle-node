@@ -412,6 +412,49 @@ fn a_slow_feed_ingested_before_the_feed_set_takes_the_slow_limit_from_it() {
 }
 
 #[test]
+fn a_local_subscription_names_each_feed_and_sets_its_age_limit_with_no_connection() {
+    const FUNDING: &str = "CRYPTO.BTC/USD.FUNDING_8H";
+    let node = TestNode::new(1);
+    let mut client = OracleClient::builder(registry_with(&[&node]))
+        .quorum(1)
+        .i_understand_this_provides_no_protection_against_a_bad_node()
+        .build()
+        .expect("one node, acknowledged");
+    let bad = Subscription {
+        prices: &["CRYPTO.BTC/USDT", "not a symbol"],
+        ..Subscription::default()
+    };
+    assert!(client.subscribe_local(bad).is_err());
+    assert!(client.symbols.is_empty(), "a bad symbol changes nothing");
+
+    // No client key: `subscribe_all` would refuse, and this dials nothing.
+    let prices = ["CRYPTO.BTC/USDT", FUNDING];
+    let local = Subscription {
+        prices: &prices,
+        ..Subscription::default()
+    };
+    client.subscribe_local(local).expect("valid symbols");
+    assert!(client.connections.is_empty() && client.subscription.is_none());
+    for text in prices {
+        let symbol: Symbol = text.parse().expect("a symbol");
+        let update = PriceUpdate {
+            feed_id: feed_id(&symbol),
+            ..update_at(NOW, 1)
+        };
+        let resolved = client.ingest(&node.sign(&update), NOW).expect("accepted");
+        assert_eq!(resolved.symbol, Some(symbol));
+    }
+    let funding: Symbol = FUNDING.parse().expect("a symbol");
+    let between_heartbeats = client
+        .resolve(&funding, NOW + 9 * NANOS_PER_SEC)
+        .expect("a view");
+    assert_eq!(
+        between_heartbeats.nodes, 1,
+        "the slow limit, not the fast one"
+    );
+}
+
+#[test]
 fn a_new_feed_set_drops_the_books_and_funding_that_it_does_not_list() {
     let nodes = nodes();
     let registry = registry_with(&nodes.iter().collect::<Vec<_>>());

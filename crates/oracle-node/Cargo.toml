@@ -8,56 +8,115 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["cli"]
+# The commands at the terminal: the binary, the init wizard, systemd and the log output.
+cli = [
+    "serve",
+    "dep:axum",
+    "dep:candid",
+    "dep:clap",
+    "dep:cliclack",
+    "dep:console",
+    "dep:ctrlc",
+    "dep:ipnet",
+    "dep:nix",
+    "dep:sd-notify",
+    "dep:shellexpand",
+    "dep:shlex",
+    "dep:tempfile",
+    "dep:time",
+    "dep:toml_edit",
+    "dep:tracing-subscriber",
+]
+# The node on the network: its config file and key file, the server, and the
+# pushes to the registry canister. `embed` needs neither feature.
+serve = [
+    "dep:age",
+    "dep:ic-agent",
+    "dep:oracle-registry-api",
+    "dep:oracle-server",
+    "dep:rpassword",
+    "dep:serde_bytes",
+]
 # Reads `signing.key_env`, for local playgrounds only: the environment keeps the key.
 dev-key-env = []
+
+[[bin]]
+name = "oracle-node"
+path = "src/bin/oracle-node/main.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "gen_local_registry"
+required-features = ["cli"]
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[[test]]
+name = "e2e"
+required-features = ["cli"]
+
+[[test]]
+name = "latency"
+required-features = ["cli"]
+
+[[test]]
+name = "start"
+required-features = ["cli"]
 
 [dependencies]
 oracle-agg.workspace = true
 oracle-client = { workspace = true, features = ["libsecp"] }
 oracle-ingest.workspace = true
-oracle-registry-api.workspace = true
-oracle-server.workspace = true
+oracle-registry-api = { workspace = true, optional = true }
+oracle-server = { workspace = true, optional = true }
 oracle-types.workspace = true
 oracle-wire = { workspace = true, features = ["libsecp"] }
 
-age.workspace = true
+age = { workspace = true, optional = true }
 anyhow.workspace = true
-axum.workspace = true
-candid = { workspace = true, features = ["value"] }
-ic-agent.workspace = true
-serde_bytes.workspace = true
+axum = { workspace = true, optional = true }
+candid = { workspace = true, features = ["value"], optional = true }
+ic-agent = { workspace = true, optional = true }
+serde_bytes = { workspace = true, optional = true }
 getrandom.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 hkdf.workspace = true
-ipnet.workspace = true
+ipnet = { workspace = true, optional = true }
 sha2.workspace = true
-clap.workspace = true
-cliclack.workspace = true
-console.workspace = true
-ctrlc.workspace = true
+clap = { workspace = true, optional = true }
+cliclack = { workspace = true, optional = true }
+console = { workspace = true, optional = true }
+ctrlc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tokio-util.workspace = true
-time = { workspace = true, features = ["formatting", "local-offset", "macros"] }
+time = { workspace = true, features = ["formatting", "local-offset", "macros"], optional = true }
 toml.workspace = true
-toml_edit.workspace = true
+toml_edit = { workspace = true, optional = true }
 tracing.workspace = true
-rpassword.workspace = true
-shellexpand.workspace = true
-shlex.workspace = true
-tempfile.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter", "json", "time", "local-time"] }
+rpassword = { workspace = true, optional = true }
+shellexpand = { workspace = true, optional = true }
+shlex = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json", "time", "local-time"], optional = true }
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
-sd-notify.workspace = true
+nix = { workspace = true, optional = true }
+sd-notify = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The config tests serve a registry over HTTP.
+axum.workspace = true
 ed25519-zebra.workspace = true
+# The scripted venue connections of the embed test.
+oracle-ingest = { workspace = true, features = ["testing"] }
 oracle-registry-canister = { path = "../oracle-registry-canister" }
 tokio = { workspace = true, features = ["sync"] }
 

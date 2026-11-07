@@ -59,6 +59,24 @@ impl OracleClient {
         if self.client_key.is_none() {
             return Err(ClientError::NoClientKey);
         }
+        self.register(subscription)?;
+        self.resubscribe()
+    }
+
+    /// Takes the feeds of `subscription` as [`OracleClient::subscribe_all`] does, but dials no node.
+    ///
+    /// For a consumer that feeds each frame to [`OracleClient::ingest_event`]: each
+    /// resolved price then carries its symbol, and each feed gets the age limit of its kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidSymbol`] for an unparseable symbol.
+    pub fn subscribe_local(&mut self, subscription: Subscription<'_>) -> Result<(), ClientError> {
+        self.register(subscription)
+    }
+
+    /// Parses every list first, so a bad symbol changes nothing.
+    fn register(&mut self, subscription: Subscription<'_>) -> Result<(), ClientError> {
         let prices = parse_symbols(subscription.prices)?;
         let venues = parse_symbols(subscription.venues)?;
         let books = parse_symbols(subscription.books)?;
@@ -88,7 +106,7 @@ impl OracleClient {
         for symbol in funding {
             self.funding_symbols.insert(feed_id(&symbol), symbol);
         }
-        self.resubscribe()
+        Ok(())
     }
 
     /// Adds feeds whose venue reports to receive, and reconnects every node with

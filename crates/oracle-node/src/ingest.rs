@@ -13,13 +13,14 @@ use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::kucoin_connect::KucoinConnector;
 use oracle_ingest::venues::mexc_connect::MexcConnector;
 use oracle_ingest::{IngestEvent, VenueHealth};
-use oracle_node::config::VenueConnection;
-use oracle_node::{Adapter, build_venue_adapters};
 use oracle_types::Venue;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use crate::config::VenueConnection;
+use crate::{Adapter, build_venue_adapters};
 
 /// How long a venue adapter gets to close its sockets.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,10 +29,14 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const VENUE_PAUSE: Duration = Duration::from_secs(5);
 
 /// The connectors under the venue adapters.
-pub(crate) type Connectors = MexcConnector<KucoinConnector<SnapshotConnector<WebSocketConnector>>>;
+pub type Connectors = MexcConnector<KucoinConnector<SnapshotConnector<WebSocketConnector>>>;
 
 /// Builds the connectors for the Binance instruments of `binance`.
-pub(crate) fn connectors(binance: &BinanceConfig) -> anyhow::Result<Connectors> {
+///
+/// # Errors
+///
+/// Returns the error of a connector that cannot build its REST client.
+pub fn connectors(binance: &BinanceConfig) -> anyhow::Result<Connectors> {
     let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?
         .with_funding_info(binance.funding_info_routes())
         .with_open_interest(binance.open_interest_routes());
@@ -47,10 +52,10 @@ struct Running {
 
 /// The counters of every running connection, for the status line. A feed set
 /// change replaces the handles of the venues that it swaps.
-pub(crate) type Health = Arc<Mutex<Vec<VenueHealth>>>;
+pub type Health = Arc<Mutex<Vec<VenueHealth>>>;
 
 /// The venue adapters, one task each.
-pub(crate) struct Ingest {
+pub struct Ingest {
     events: mpsc::Sender<IngestEvent>,
     running: BTreeMap<Venue, Running>,
     /// The connections of every adapter, for the status line.
@@ -61,7 +66,9 @@ pub(crate) struct Ingest {
 }
 
 impl Ingest {
-    pub(crate) fn new(
+    /// Runs no adapter until [`Self::start`].
+    #[must_use]
+    pub fn new(
         events: mpsc::Sender<IngestEvent>,
         clock: MonotonicClock,
         shutdown: CancellationToken,
@@ -77,12 +84,14 @@ impl Ingest {
     }
 
     /// The connection counters, shared with the status line.
-    pub(crate) fn health(&self) -> Health {
+    #[must_use]
+    pub fn health(&self) -> Health {
         Arc::clone(&self.health)
     }
 
     /// The connection count, shared with the status line.
-    pub(crate) fn connections(&self) -> Arc<AtomicUsize> {
+    #[must_use]
+    pub fn connections(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.connections)
     }
 
@@ -102,7 +111,7 @@ impl Ingest {
     }
 
     /// Starts each adapter as its own task.
-    pub(crate) fn start(&mut self, adapters: Vec<Adapter>) {
+    pub fn start(&mut self, adapters: Vec<Adapter>) {
         for Adapter {
             venue,
             adapter,
@@ -155,8 +164,20 @@ impl Ingest {
         self.count();
     }
 
+    /// Stops every venue adapter and waits for its sockets, one venue at a time.
+    pub async fn stop_all(&mut self) {
+        let venues: Vec<Venue> = self.running.keys().copied().collect();
+        for venue in venues {
+            self.stop(venue).await;
+        }
+    }
+
     /// Replaces the `changed` venues one at a time, so the other venues keep each quorum.
-    pub(crate) async fn swap(
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a connector or an adapter that cannot be built.
+    pub async fn swap(
         &mut self,
         changed: &[Venue],
         mut binance: BinanceConfig,

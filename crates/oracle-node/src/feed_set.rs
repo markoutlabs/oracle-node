@@ -9,16 +9,21 @@ use oracle_ingest::InstrumentSpec;
 use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_types::Venue;
-use oracle_wire::{Address, FeedSet, FeedSettings, NodeEntry, VerifiedFeedSet};
+#[cfg(feature = "serve")]
+use oracle_wire::VerifiedFeedSet;
+use oracle_wire::{Address, FeedSet, FeedSettings, NodeEntry};
 
+#[cfg(feature = "serve")]
+use crate::config::NodeConfig;
 use crate::config::{
-    ConfigError, DEFAULT_TICK_MS, EndpointSettings, NodeConfig, ResolvedConfig, resolve_feeds,
+    ConfigError, DEFAULT_TICK_MS, EndpointSettings, ResolvedConfig, resolve_feeds,
 };
 
 /// This node's version, which a feed set may require.
 pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A feed set that passed every check, with the config it resolves to.
+#[cfg(feature = "serve")]
 pub struct CheckedFeeds {
     /// The node's config with the set's feeds, and every `[[endpoints]]` override kept for a later set.
     pub config: NodeConfig,
@@ -33,6 +38,7 @@ pub struct CheckedFeeds {
 /// # Errors
 ///
 /// Returns [`ConfigError::Invalid`] with the first problem.
+#[cfg(feature = "serve")]
 pub fn check_feeds(base: &NodeConfig, feeds: &[FeedSettings]) -> Result<CheckedFeeds, ConfigError> {
     let mut config = base.clone();
     config.feeds = feeds.to_vec();
@@ -177,6 +183,7 @@ pub fn write_cache(path: &Path, set: &FeedSet) -> std::io::Result<()> {
 }
 
 /// A feed set that verified and passed every check.
+#[cfg(feature = "serve")]
 pub struct Chosen {
     /// The set.
     pub set: VerifiedFeedSet,
@@ -189,6 +196,7 @@ pub struct Chosen {
 /// # Errors
 ///
 /// Returns why the set cannot be used.
+#[cfg(feature = "serve")]
 pub fn accept(
     base: &NodeConfig,
     set: &FeedSet,
@@ -212,6 +220,7 @@ pub fn accept(
 }
 
 /// Picks the newest set that [`accept`] takes, with the reason each newer one failed.
+#[cfg(feature = "serve")]
 #[must_use]
 pub fn choose(
     base: &NodeConfig,
@@ -232,7 +241,7 @@ pub fn choose(
     (None, refused)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serve"))]
 mod tests {
     use super::*;
 

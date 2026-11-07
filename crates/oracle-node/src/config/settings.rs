@@ -1,10 +1,12 @@
 //! The serde types of the config file, and their defaults.
 
+#[cfg(feature = "serve")]
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
 /// The whole node configuration.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -38,6 +40,7 @@ pub struct NodeConfig {
 }
 
 /// The canister's certified `/feeds.json`, checked against `registry.governance_address`.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFeedsSettings {
@@ -54,6 +57,7 @@ pub struct NetworkFeedsSettings {
     pub slot_secs: u64,
 }
 
+#[cfg(feature = "serve")]
 impl NetworkFeedsSettings {
     /// The default `poll_secs`, which `init` writes too.
     pub const POLL_SECS: u64 = 30;
@@ -68,19 +72,23 @@ impl NetworkFeedsSettings {
     }
 }
 
+#[cfg(feature = "serve")]
 const fn default_network_feeds_poll_secs() -> u64 {
     NetworkFeedsSettings::POLL_SECS
 }
 
+#[cfg(feature = "serve")]
 const fn default_network_feeds_lead_secs() -> u64 {
     oracle_wire::SLOT_LEAD_SECS
 }
 
+#[cfg(feature = "serve")]
 const fn default_network_feeds_slot_secs() -> u64 {
     oracle_wire::SLOT_SECS
 }
 
 /// When the node pushes its frames to the registry canister.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishSettings {
@@ -101,23 +109,28 @@ pub struct PublishSettings {
     pub min_interval_secs: u64,
 }
 
+#[cfg(feature = "serve")]
 fn default_publish_gateway() -> String {
     "https://icp-api.io".to_owned()
 }
 
+#[cfg(feature = "serve")]
 const fn default_publish_heartbeat_secs() -> u64 {
     30
 }
 
+#[cfg(feature = "serve")]
 const fn default_publish_deviation_bps() -> u32 {
     10
 }
 
+#[cfg(feature = "serve")]
 const fn default_publish_min_interval_secs() -> u64 {
     5
 }
 
 /// Subscriber-facing server settings.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSettings {
@@ -135,6 +148,7 @@ pub struct ServerSettings {
 ///
 /// A file, never a command-line argument: arguments are visible in `ps` to
 /// every user on the box.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigningSettings {
@@ -159,6 +173,7 @@ pub struct SigningSettings {
 /// Where the client list comes from. Exactly one of `path` and `url`. It is
 /// verified against `registry.governance_address`, and a `url` response
 /// against the certificate of `registry.canister_id`.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientsSettings {
@@ -173,11 +188,13 @@ pub struct ClientsSettings {
     pub poll_secs: u64,
 }
 
+#[cfg(feature = "serve")]
 const fn default_clients_poll_secs() -> u64 {
     30
 }
 
 /// Where the registry comes from. Exactly one of `path` and `url`.
+#[cfg(feature = "serve")]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrySettings {
@@ -224,10 +241,12 @@ pub struct EndpointSettings {
     pub url: String,
 }
 
+#[cfg(feature = "serve")]
 const fn default_tick_ms() -> u64 {
     DEFAULT_TICK_MS
 }
 
+#[cfg(feature = "serve")]
 const fn default_max_pending() -> usize {
     512
 }
@@ -245,6 +264,7 @@ pub fn max_pending(count: usize) -> usize {
 /// The default of `tick_interval_ms`.
 pub const DEFAULT_TICK_MS: u64 = 25;
 
+#[cfg(feature = "serve")]
 impl NodeConfig {
     /// The config's `max_pending_feeds`, raised for a larger set of `feeds` feeds.
     #[must_use]
@@ -253,7 +273,7 @@ impl NodeConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serve"))]
 mod tests {
     use crate::config::fixture::{btc, config};
 

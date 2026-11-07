@@ -15,7 +15,9 @@ use oracle_ingest::venues::{
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
 
-use super::{ConfigError, EndpointSettings, FeedSettings, NodeConfig};
+#[cfg(feature = "serve")]
+use super::NodeConfig;
+use super::{ConfigError, EndpointSettings, FeedSettings};
 
 /// Peg confidence above which dependent feeds degrade, from SPEC.md §5.3.
 const DEFAULT_MAX_PEG_CONF_BPS: Fixed = Fixed::from_raw(50 * 1_000_000_000_000);
@@ -53,6 +55,7 @@ pub struct ResolvedConfig {
     pub tick_interval: Duration,
 }
 
+#[cfg(feature = "serve")]
 impl NodeConfig {
     /// Resolves the config into everything the node needs to run.
     ///
@@ -633,5 +636,5 @@ fn venue_connection(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serve"))]
 mod tests;

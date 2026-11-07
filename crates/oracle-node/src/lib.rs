@@ -18,23 +18,35 @@
 pub mod adapters;
 pub mod books;
 pub mod config;
+pub mod embed;
 pub mod feed_set;
 pub mod funding;
+pub mod ingest;
+#[cfg(feature = "cli")]
 pub mod init;
+#[cfg(feature = "serve")]
 pub mod keyfile;
+#[cfg(feature = "cli")]
 pub mod logging;
 pub mod pipeline;
+#[cfg(feature = "serve")]
 pub mod publish;
+pub mod run;
 pub mod seed;
 
 pub use adapters::{Adapter, build_adapters, build_venue_adapters};
-pub use config::{ConfigError, NodeConfig, ResolvedConfig};
+#[cfg(feature = "serve")]
+pub use config::NodeConfig;
+pub use config::{ConfigError, ResolvedConfig};
+#[cfg(feature = "cli")]
 pub use init::{
     CanisterId, Endpoint, FeedUpdate, Gateway, InitError, NodeKey, NodeSetup, RegistrySource,
     RootKey, Rotation, ServiceUnit, Unlock, Written, candid_call, generate_passphrase,
     resolve_path, update_feeds,
 };
+#[cfg(feature = "serve")]
 pub use keyfile::{KeyFileError, PassphraseSource};
+#[cfg(feature = "cli")]
 pub use logging::LogFormat;
 pub use pipeline::{Pipeline, PipelineStats};
 pub use seed::{NodeKeys, Seed, SeedError};

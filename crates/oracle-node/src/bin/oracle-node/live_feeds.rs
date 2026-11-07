@@ -9,6 +9,7 @@ use std::time::Duration;
 use oracle_agg::FeedConfig;
 use oracle_node::NodeConfig;
 use oracle_node::feed_set::{self, Chosen, Subscriptions};
+use oracle_node::ingest::Ingest;
 use oracle_node::publish::PushPace;
 use oracle_server::{ServerState, unix_now};
 use oracle_types::{FeedId, InstrumentId, Symbol};
@@ -17,7 +18,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::ingest::Ingest;
 use crate::notify;
 
 /// The newest good copy of the network's feed set, cached or fetched; `None` for the config's own feeds.

@@ -13,10 +13,12 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::Args;
 use oracle_ingest::IngestEvent;
-use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
+use oracle_ingest::clock::{MonotonicClock, wall_clock_unix_nanos};
 use oracle_ingest::{Recorder, RecordingConnector};
 use oracle_node::feed_set;
+use oracle_node::ingest::{Ingest, connectors};
 use oracle_node::publish::PushTarget;
+use oracle_node::run::{INGEST_CAPACITY, sync_clock};
 use oracle_node::{
     Adapter, LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging,
 };
@@ -26,7 +28,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::ingest::{Ingest, connectors};
 use crate::live_feeds::{FeedSetTask, Pace, Reconfigure, books_of, first_feed_set, names};
 use crate::notify;
 use crate::pipeline_task::PipelineTask;
@@ -35,20 +36,9 @@ use crate::process::Signals;
 use crate::process::raise_open_files;
 use crate::status::{NodeLatency, Summary};
 
-/// Bound on the ingest queue.
-///
-/// Bounded so a stalled pipeline applies backpressure to ingest rather than
-/// growing without limit. Dropping the socket is recoverable; running out of
-/// memory is not.
-const INGEST_CAPACITY: usize = 8_192;
 /// Open files beyond the client sockets and the venue connections: logs,
 /// recordings, the runtime.
 const SPARE_FILES: usize = 256;
-/// How often the node clock re-anchors to wall time.
-const CLOCK_SYNC_EVERY: Duration = Duration::from_secs(1);
-/// Normal drift is microseconds a second. A correction this large means the host
-/// clock stepped.
-const CLOCK_STEP_WARNING: u64 = 100_000_000;
 /// How often a node that the registry does not list fetches it again.
 const LISTING_POLL: Duration = Duration::from_secs(30);
 
@@ -160,7 +150,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
 
     // One clock for receipt times and publish times, so a resync moves both.
     let clock = MonotonicClock::new();
-    spawn_clock_sync(clock.clone(), shutdown.clone());
+    tokio::spawn(sync_clock(clock.clone(), shutdown.clone()));
     let (events, ingest) = mpsc::channel::<IngestEvent>(INGEST_CAPACITY);
     let mut adapters = Ingest::new(events, clock.clone(), shutdown.clone());
     adapters.start(first_adapters(
@@ -399,29 +389,6 @@ fn first_adapters(
         }
         None => build_adapters(binance, venues, snapshots, clock.clone())?,
     })
-}
-
-/// Keeps the node clock on wall time. A consumer compares publish times with its
-/// own clock.
-fn spawn_clock_sync(clock: MonotonicClock, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(CLOCK_SYNC_EVERY);
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                _ = ticker.tick() => match clock.resync() {
-                    Resync::Stepped(step) if step > CLOCK_STEP_WARNING => {
-                        warn!(step_ms = step / 1_000_000, "the wall clock stepped forward; the node clock followed");
-                    }
-                    Resync::Slewing(lead) if lead > CLOCK_STEP_WARNING => {
-                        warn!(lead_ms = lead / 1_000_000, "the wall clock stepped back; the node clock runs slow until it matches");
-                    }
-                    Resync::Stepped(_) | Resync::Slewing(_) => {}
-                },
-            }
-        }
-    });
 }
 
 /// Runs the transport's clock: key rotation and deadlines every second, and a
