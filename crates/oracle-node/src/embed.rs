@@ -71,11 +71,12 @@ use oracle_wire::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub use oracle_ingest::VenueHealth;
 pub use oracle_ingest::clock::MonotonicClock;
+/// The token that [`LocalNode::start`] takes, so a caller needs no `tokio-util` of its own.
+pub use tokio_util::sync::CancellationToken;
 
 use crate::config::{ConfigError, EndpointSettings, FeedSettings, ResolvedConfig, resolve_feeds};
 use crate::ingest::{Health, Ingest, connectors};

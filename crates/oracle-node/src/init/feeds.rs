@@ -9,9 +9,9 @@ use super::InitError;
 use crate::config::max_pending;
 
 /// The hand-written feeds, below the settings of a local test node.
-const CORE: &str = include_str!("../../../../node/all-feeds.toml");
+const CORE: &str = crate::catalog::ALL_FEEDS_TOML;
 /// The most traded assets, from `scripts/asset-feeds.py`.
-const ASSETS: &str = include_str!("../../../../node/assets.toml");
+const ASSETS: &str = crate::catalog::ASSETS_TOML;
 
 /// The `[[feeds]]` tables of the built-in files.
 pub(super) struct NetworkFeeds {

@@ -17,6 +17,7 @@
 
 pub mod adapters;
 pub mod books;
+pub mod catalog;
 pub mod config;
 pub mod embed;
 pub mod feed_set;
