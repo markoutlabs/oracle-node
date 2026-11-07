@@ -12,7 +12,7 @@
 //! use oracle_client::{OracleClient, Subscription, now_unix_nanos};
 //! use oracle_node::Seed;
 //! use oracle_node::config::{DEFAULT_TICK_MS, FeedSettings};
-//! use oracle_node::embed::{EmbedConfig, LocalNode, MonotonicClock, local_registry};
+//! use oracle_node::embed::{BookFrames, EmbedConfig, LocalNode, MonotonicClock, local_registry};
 //! use tokio_util::sync::CancellationToken;
 //!
 //! # async fn run(feeds: Vec<FeedSettings>) -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@
 //!         signer: Arc::clone(&signer),
 //!         clock: MonotonicClock::new(),
 //!         venue_reports: false,
-//!         books: true,
+//!         books: BookFrames::All,
 //!         funding: true,
 //!     },
 //!     CancellationToken::new(),
@@ -57,14 +57,16 @@
 //! # }
 //! ```
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use oracle_agg::AggError;
+use oracle_agg::{AggError, FeedConfig};
 use oracle_ingest::clock::wall_clock_unix_nanos;
 use oracle_ingest::{Connector, IngestError, IngestEvent};
+use oracle_types::{InstrumentId, Symbol};
 use oracle_wire::{
     Address, NodeEntry, Quorum, Registry, SignedBookUpdate, SignedFundingUpdate, SignedUpdate,
     SignedVenueReport, Signer, VerifiedRegistry, VerifyError, WireError,
@@ -100,10 +102,22 @@ pub struct EmbedConfig {
     pub clock: MonotonicClock,
     /// Sign a venue report for every feed.
     pub venue_reports: bool,
-    /// Sign the book frames of every source that a feed with `impact_notional` reads.
-    pub books: bool,
+    /// The books to sign frames for.
+    pub books: BookFrames,
     /// Sign the funding frames of every perpetual source.
     pub funding: bool,
+}
+
+/// The books whose frames the local node signs. Only a source that a feed with `impact_notional`
+/// reads has a book.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BookFrames {
+    /// No book frames.
+    None,
+    /// The book of every source.
+    All,
+    /// The books of these feeds' sources, as the node's server serves a book subscription.
+    Only(Vec<Symbol>),
 }
 
 /// One signed frame of the local node.
@@ -157,6 +171,9 @@ pub enum EmbedError {
     /// The local registry did not verify.
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    /// [`BookFrames::Only`] names a feed that the node does not run.
+    #[error("the book frames name {0}, which is not a feed of the node")]
+    UnknownBookFeed(Symbol),
 }
 
 /// Signs and verifies a registry that lists `node` alone, at quorum 1. `version` starts at 1.
@@ -233,10 +250,14 @@ impl LocalNode {
         // Sequence numbers must never go backwards for this node, including across
         // restarts. Milliseconds since the epoch outrun any publish counter.
         let seq_floor = wall_clock_unix_nanos() / 1_000_000;
+        let books = books_only(&config.books, &resolved.feeds)?;
         let aggregator =
             oracle_agg::Aggregator::new(resolved.feeds)?.with_sequence_floor(seq_floor);
-        let pipeline =
+        let mut pipeline =
             Pipeline::new(aggregator, config.signer).with_stream_sequence_floor(seq_floor);
+        if let Some(books) = books {
+            pipeline = pipeline.with_books_only(books);
+        }
         let adapters = build_adapters(
             resolved.binance,
             resolved.venues,
@@ -257,7 +278,6 @@ impl LocalNode {
             frames: sender,
             dropped: Arc::clone(&dropped),
             venue_reports: config.venue_reports,
-            books: config.books,
             funding: config.funding,
         };
         let pipeline = tokio::spawn(
@@ -321,12 +341,32 @@ fn resolve(config: &EmbedConfig) -> Result<ResolvedConfig, ConfigError> {
     resolve_feeds(&config.feeds, &config.endpoints, config.tick_interval_ms)
 }
 
+/// The books that get frames, or `None` for every book.
+fn books_only(
+    books: &BookFrames,
+    feeds: &[FeedConfig],
+) -> Result<Option<HashSet<InstrumentId>>, EmbedError> {
+    let names = match books {
+        BookFrames::All => return Ok(None),
+        BookFrames::None => return Ok(Some(HashSet::new())),
+        BookFrames::Only(names) => names,
+    };
+    let mut only = HashSet::new();
+    for name in names {
+        let feed = feeds
+            .iter()
+            .find(|feed| feed.symbol == *name)
+            .ok_or(EmbedError::UnknownBookFeed(*name))?;
+        only.extend(feed.sources.iter().map(|source| source.instrument.clone()));
+    }
+    Ok(Some(only))
+}
+
 /// Signs the kinds that the config asks for, on the cadence of the node binary.
 struct ChannelOutlet {
     frames: mpsc::Sender<SignedFrame>,
     dropped: Arc<AtomicU64>,
     venue_reports: bool,
-    books: bool,
     funding: bool,
 }
 
@@ -376,14 +416,13 @@ impl Outlet for ChannelOutlet {
                 self.send(SignedFrame::Venues(report));
             }
         }
-        if self.books {
-            let (books, errors) = pipeline.book_updates(now_ns, |_| true);
-            for error in errors {
-                warn!(%error, "book update could not be encoded");
-            }
-            for update in books {
-                self.send(SignedFrame::Book(update));
-            }
+        // The pipeline holds only the books of `EmbedConfig::books`, so each one is wanted.
+        let (books, errors) = pipeline.book_updates(now_ns, |_| true);
+        for error in errors {
+            warn!(%error, "book update could not be encoded");
+        }
+        for update in books {
+            self.send(SignedFrame::Book(update));
         }
         if self.funding {
             let (funding, errors) = pipeline.funding_updates(now_ns);

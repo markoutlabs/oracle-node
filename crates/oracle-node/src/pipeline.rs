@@ -54,6 +54,8 @@ impl PipelineStats {
 pub struct Pipeline {
     aggregator: Aggregator,
     books: BookPublisher,
+    /// The books that get frames. `None` is every book.
+    books_only: Option<HashSet<InstrumentId>>,
     funding: FundingPublisher,
     signer: Arc<Signer>,
     stats: PipelineStats,
@@ -66,6 +68,7 @@ impl Pipeline {
         Self {
             aggregator,
             books: BookPublisher::new(0),
+            books_only: None,
             funding: FundingPublisher::new(0),
             signer,
             stats: PipelineStats::default(),
@@ -78,6 +81,14 @@ impl Pipeline {
     pub fn with_stream_sequence_floor(mut self, floor: u64) -> Self {
         self.books = BookPublisher::new(floor);
         self.funding = FundingPublisher::new(floor);
+        self
+    }
+
+    /// Makes book frames only for the books in `books`. A book outside the set gets no snapshot
+    /// and no signature, but it still feeds the aggregator.
+    #[must_use]
+    pub fn with_books_only(mut self, books: HashSet<InstrumentId>) -> Self {
+        self.books_only = Some(books);
         self
     }
 
@@ -117,7 +128,13 @@ impl Pipeline {
             IngestEvent::Observation(observation) => {
                 self.stats.observations = self.stats.observations.saturating_add(1);
                 self.aggregator.observe(observation);
-                self.books.observe(observation);
+                if self
+                    .books_only
+                    .as_ref()
+                    .is_none_or(|books| books.contains(&observation.instrument))
+                {
+                    self.books.observe(observation);
+                }
                 self.funding.observe(observation);
             }
             IngestEvent::Alive {
@@ -466,6 +483,49 @@ mod tests {
                 .is_none(),
             "fresh quotes from both venues must clear the halt"
         );
+    }
+
+    fn depth(venue: Venue, at: u64) -> IngestEvent {
+        let level = |price: &str| oracle_types::Level {
+            price: price.parse().expect("valid decimal"),
+            qty: Fixed::ONE,
+        };
+        IngestEvent::observation(Observation {
+            instrument: instrument(venue),
+            kind: ObsKind::Depth,
+            price: "64000".parse().expect("valid decimal"),
+            bid: None,
+            ask: None,
+            bid_qty: None,
+            ask_qty: None,
+            depth_notional_1bp: None,
+            exchange_time_ns: None,
+            local_recv_ns: at,
+            seq: None,
+            book: Some(Arc::new(oracle_types::BookDepth {
+                bids: vec![level("63999")],
+                asks: vec![level("64001")],
+            })),
+            funding: None,
+        })
+    }
+
+    #[test]
+    fn only_the_kept_books_get_frames() {
+        let mut kept = pipeline(&[Venue::Binance, Venue::Bybit])
+            .with_books_only(HashSet::from([instrument(Venue::Binance)]));
+        kept.observe(&depth(Venue::Binance, START));
+        kept.observe(&depth(Venue::Bybit, START));
+        let (books, errors) = kept.book_updates(START, |_| true);
+        assert!(errors.is_empty(), "{errors:?}");
+        let venues: Vec<Venue> = books.iter().map(|book| book.update().venue).collect();
+        assert_eq!(venues, [Venue::Binance]);
+        assert_eq!(kept.stats().observations, 2, "the aggregator sees both");
+
+        let mut every = pipeline(&[Venue::Binance, Venue::Bybit]);
+        every.observe(&depth(Venue::Binance, START));
+        every.observe(&depth(Venue::Bybit, START));
+        assert_eq!(every.book_updates(START, |_| true).0.len(), 2);
     }
 
     #[test]

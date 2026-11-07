@@ -7,7 +7,9 @@ use std::time::Duration;
 use oracle_client::{Event, OracleClient, Status, Subscription, now_unix_nanos};
 use oracle_ingest::testing::{Script, ScriptedConnector};
 use oracle_node::config::{DEFAULT_TICK_MS, FeedSettings};
-use oracle_node::embed::{EmbedConfig, LocalNode, MonotonicClock, local_registry};
+use oracle_node::embed::{
+    BookFrames, EmbedConfig, EmbedError, LocalNode, MonotonicClock, local_registry,
+};
 use oracle_types::{Fixed, Symbol};
 use oracle_wire::Signer;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +45,7 @@ async fn a_local_node_signs_frames_that_the_sdk_accepts_with_no_socket() {
         signer: Arc::clone(&signer),
         clock: MonotonicClock::new(),
         venue_reports: true,
-        books: false,
+        books: BookFrames::None,
         funding: false,
     };
     let mut node = LocalNode::start_with_connector(config, connector, CancellationToken::new())
@@ -95,4 +97,27 @@ async fn a_local_node_signs_frames_that_the_sdk_accepts_with_no_socket() {
     assert_eq!(node.dropped_frames(), 0);
     // On another task, so the stop is proved `Send` as an app needs.
     tokio::spawn(node.stop()).await.expect("stops");
+}
+
+#[tokio::test]
+async fn book_frames_for_a_feed_that_the_node_does_not_run_stop_the_start() {
+    let signer = Arc::new(Signer::from_secret(&[0x51; 32].into()).expect("a key"));
+    let other: Symbol = "CRYPTO.ETH/USDT".parse().expect("a symbol");
+    let config = EmbedConfig {
+        feeds: vec![btc()],
+        endpoints: Vec::new(),
+        tick_interval_ms: DEFAULT_TICK_MS,
+        signer,
+        clock: MonotonicClock::new(),
+        venue_reports: false,
+        books: BookFrames::Only(vec![other]),
+        funding: false,
+    };
+    let connector = ScriptedConnector::repeating(Script::new().pong_on_ping());
+    let started = LocalNode::start_with_connector(config, connector, CancellationToken::new());
+    assert!(
+        matches!(started, Err(EmbedError::UnknownBookFeed(symbol)) if symbol == other),
+        "{:?}",
+        started.err()
+    );
 }
