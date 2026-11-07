@@ -15,14 +15,14 @@ use hpke::rand_core::CryptoRng;
 use hpke::{Deserializable as _, HpkeError, Kem as _, OpModeR, OpModeS, Serializable as _};
 use oracle_wire::{
     Address, CompressedPublicKey, Signature, Signer, TRANSPORT_PROTOCOL, VerifiedClientList,
-    auth_ok_payload, auth_ok_transcript, client_auth_payload, client_auth_transcript, keccak256,
-    recover_payload_signer,
+    auth_ok_payload, auth_ok_transcript, client_auth_payload, client_auth_transcript,
+    initial_keys_digest, recover_payload_signer,
 };
 use zeroize::Zeroizing;
 
 use crate::TransportError;
 use crate::broadcast::KeyRing;
-use crate::schedule::{EpochKey, eligible, put_prefixed, session_deadline};
+use crate::schedule::{EpochKey, eligible, session_deadline};
 use crate::session::{C2N_LABEL, Control, KeyGrant, N2C_LABEL, Opener, Sealer};
 
 type Kem = X25519HkdfSha256;
@@ -94,19 +94,6 @@ mod hex_list {
             .map(|text| hex::decode(text).map_err(D::Error::custom))
             .collect()
     }
-}
-
-fn initial_digest(initial: &[Vec<u8>]) -> [u8; 32] {
-    let mut out = Vec::with_capacity(4 + initial.len() * 96);
-    out.extend_from_slice(
-        &u32::try_from(initial.len())
-            .unwrap_or(u32::MAX)
-            .to_be_bytes(),
-    );
-    for sealed in initial {
-        put_prefixed(&mut out, sealed);
-    }
-    keccak256(&out)
 }
 
 type SessionKeys = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
@@ -251,7 +238,7 @@ impl Admitted {
             &self.transcript,
             &enc,
             self.deadline,
-            &initial_digest(&initial),
+            &initial_keys_digest(&initial),
         )?;
         let message = HandshakeMessage::AuthOk {
             enc,
@@ -397,7 +384,7 @@ impl AwaitingAuthOk {
             &self.transcript,
             enc,
             *session_deadline,
-            &initial_digest(initial),
+            &initial_keys_digest(initial),
         )?;
         let found = recover_payload_signer(&auth_ok_payload(&node_transcript), node_sig)?;
         if found != self.node {
@@ -479,7 +466,7 @@ mod tests {
     const T: u64 = 60;
 
     fn key(seed: u8) -> Signer {
-        Signer::from_secret_bytes([seed; 32]).expect("valid key")
+        Signer::from_secret(&[seed; 32].into()).expect("valid key")
     }
 
     fn governance() -> Signer {
@@ -770,7 +757,7 @@ mod tests {
             &client_transcript,
             &enc,
             session_deadline,
-            &initial_digest(&initial),
+            &initial_keys_digest(&initial),
         )
         .expect("encodes");
         let signed_elsewhere = HandshakeMessage::AuthOk {

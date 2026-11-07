@@ -58,7 +58,7 @@ async fn replay() -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::open(&cli.recording)
         .map_err(|e| format!("{}: {e}", cli.recording.display()))?;
     let records = oracle_ingest::record::read_records(std::io::BufReader::new(file))?;
-    let signer = Signer::from_secret_bytes([REPLAY_SIGNER_SEED; 32])?;
+    let signer = Signer::from_secret(&[REPLAY_SIGNER_SEED; 32].into())?;
 
     let outcome = oracle_replay::run(resolved, records, signer, cli.realtime).await?;
     for update in &outcome.updates {

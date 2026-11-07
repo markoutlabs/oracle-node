@@ -277,7 +277,7 @@ mod tests {
         let mut config = FeedConfig::spot(symbol(), feed_id(&symbol()), sources);
         config.min_sources = 2;
         let aggregator = Aggregator::new(vec![config]).expect("valid config");
-        let signer = Signer::from_secret_bytes([9; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[9; 32].into()).expect("valid key");
         Pipeline::new(aggregator, Arc::new(signer))
     }
 
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(update.update().feed_id, feed_id(&symbol()));
         assert_eq!(
             update.signer(),
-            Signer::from_secret_bytes([9; 32]).expect("key").address()
+            Signer::from_secret(&[9; 32].into()).expect("key").address()
         );
         assert_eq!(update.update().num_sources, 2);
         assert_eq!(pipeline.stats().observations, 2);
@@ -489,7 +489,7 @@ mod tests {
         broken.expo = -18;
 
         let aggregator = Aggregator::new(vec![healthy, broken]).expect("valid config");
-        let signer = Signer::from_secret_bytes([9; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[9; 32].into()).expect("valid key");
         let mut pipeline = Pipeline::new(aggregator, Arc::new(signer));
 
         pipeline.observe(&book(Venue::Binance, "64000", START));

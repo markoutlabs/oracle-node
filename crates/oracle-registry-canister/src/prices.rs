@@ -1,6 +1,6 @@
-//! Prices: nodes push signed batches or frames, and each listed feed resolves
-//! to the median of the nodes. A batch costs one signature recovery for all
-//! its updates.
+//! Prices: nodes push signed batches, and each listed feed resolves to the
+//! median of the nodes. A batch costs one signature recovery for all its
+//! updates.
 //!
 //! The checks and the median are the SDK's own code from `oracle-quorum`, so
 //! the canister's price for a set of frames is the SDK's price for them. No
@@ -11,125 +11,84 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use candid::CandidType;
-use oracle_quorum::{QuorumConfig, RejectReason, Resolved, Status, Verifier, VerifyConfig};
-use oracle_types::{FeedId, PriceUpdate, Symbol};
+use oracle_quorum::{
+    Concern, QuorumConfig, RejectReason, Resolved, Status, Verifier, VerifyConfig,
+};
+use oracle_types::{FeedId, Fixed, PriceUpdate, Symbol};
 use oracle_wire::{
-    Address, FRAME_TYPE_PRICE_BATCH, UnverifiedFrame, UnverifiedPriceBatch, VerifiedRegistry,
-    VerifyError, feed_id,
+    Address, PushPolicy, UnverifiedPriceBatch, VerifiedRegistry, VerifyError, feed_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-/// The most frames or batches that one push can carry: `inspect_message` recovers the signer of each.
-pub const MAX_FRAMES_PER_PUSH: usize = 4;
+pub use oracle_registry_api::{
+    ACCEPT_MAX_AGE, ACCEPT_MAX_SKEW, DEFAULT_PRICE_WINDOW, MAX_FRAMES_PER_PUSH, MAX_PRICE_WINDOW,
+    MAX_PUSH_BYTES, MIN_PRICE_WINDOW, PriceRecord, PriceStatus, Verdict,
+};
 
-/// The largest push argument that `inspect_message` decodes: a batch of 32 updates is 3,162 bytes.
-pub const MAX_PUSH_BYTES: usize = MAX_FRAMES_PER_PUSH * 4 * 1024;
+use crate::admission::{Admission, Refusal, SIGNED_START};
 
-/// How old a pushed frame can be. A node pushes its latest frame, which is
-/// at most one node heartbeat old, and ingress takes some seconds.
-pub const ACCEPT_MAX_AGE: Duration = Duration::from_secs(30);
-
-/// How far ahead of the canister's clock a frame can be. IC time can lag
-/// wall time.
-pub const ACCEPT_MAX_SKEW: Duration = Duration::from_secs(10);
-
-/// How long a node's latest update counts toward the quorum, until governance
-/// sets it: two push heartbeats of 30 s and a margin for ingress.
-pub const DEFAULT_PRICE_WINDOW: Duration = Duration::from_secs(75);
-
-/// The shortest price window: ingress alone takes some seconds.
-pub const MIN_PRICE_WINDOW: Duration = Duration::from_secs(10);
-
-/// The longest price window.
-pub const MAX_PRICE_WINDOW: Duration = Duration::from_secs(600);
-
-/// What `push` did with one frame.
-#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// Stored as the node's latest frame for its feed.
-    Accepted,
-    /// The feed is not on the canister's list.
-    UnknownFeed,
-    /// No registry is published yet.
-    NoRegistry,
-    /// Malformed, or a signature that is not valid.
-    Invalid,
-    /// The signer is not a listed node.
-    UnknownSigner,
-    /// The signer is a key that the registry retired.
-    RetiredKey,
-    /// The sequence does not advance: the frame or a newer one is stored.
-    Replayed,
-    /// Published more than 30 s ago.
-    TooOld,
-    /// More than 10 s ahead of the canister's clock.
-    FromTheFuture,
-    /// Observed after it was published.
-    Incoherent,
-}
-
-impl Verdict {
-    fn of(reason: &RejectReason) -> Self {
-        match reason {
-            RejectReason::Untrusted(VerifyError::UnknownSigner { .. }) => Self::UnknownSigner,
-            RejectReason::RetiredKey { .. } => Self::RetiredKey,
-            RejectReason::Replayed { .. } => Self::Replayed,
-            RejectReason::TooOld { .. } => Self::TooOld,
-            RejectReason::FromTheFuture { .. } => Self::FromTheFuture,
-            RejectReason::IncoherentTimestamps { .. } => Self::Incoherent,
-            _ => Self::Invalid,
-        }
+fn verdict_of(reason: &RejectReason) -> Verdict {
+    match reason {
+        RejectReason::Untrusted(VerifyError::UnknownSigner { .. }) => Verdict::UnknownSigner,
+        RejectReason::RetiredKey { .. } => Verdict::RetiredKey,
+        RejectReason::Replayed { .. } => Verdict::Replayed,
+        RejectReason::TooOld { .. } => Verdict::TooOld,
+        RejectReason::FromTheFuture { .. } => Verdict::FromTheFuture,
+        RejectReason::IncoherentTimestamps { .. } => Verdict::Incoherent,
+        _ => Verdict::Invalid,
     }
 }
 
-/// How much to trust a price, in Candid.
-#[derive(CandidType, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PriceStatus {
-    /// Enough nodes agree.
-    Ok,
-    /// Usable, but act on `conf`.
-    Degraded,
-    /// Not usable.
-    Halted,
-}
-
-/// One feed's price for another canister: integers at the feed's exponent.
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PriceRecord {
-    /// The 32-byte feed id: keccak256 of the symbol.
-    pub feed_id: ByteBuf,
-    /// The canonical symbol, such as `CRYPTO.BTC/USD`.
-    pub symbol: String,
-    /// How much to trust the price.
-    pub status: PriceStatus,
-    /// The median of the nodes, as a mantissa: price × 10^-expo.
-    pub price: Option<i64>,
-    /// The confidence half-width, as a mantissa.
-    pub conf: Option<u64>,
-    /// The decimal exponent of `price` and `conf`.
-    pub expo: i32,
-    /// The freshest contributing publish time, unix nanoseconds.
-    pub publish_time_ns: u64,
-    /// Nodes that contributed.
-    pub nodes: u32,
-    /// Nodes that reported the feed halted.
-    pub halted_nodes: u32,
-    /// Why the price is not `Ok`, such as `insufficient_nodes`.
-    pub concerns: Vec<String>,
-    /// The spread between the nodes, in basis points of the price.
-    pub spread_bps: Option<String>,
-    /// When the canister resolved the price, unix nanoseconds.
+/// One feed resolved at one time. `get_price` and `/prices.json` both come
+/// from it, so the two public shapes of a price cannot drift apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedPrice {
+    /// The feed's canonical symbol.
+    pub symbol: Symbol,
+    /// The SDK's resolution of the nodes' latest updates.
+    pub resolved: Resolved,
+    /// When the canister resolved it, unix nanoseconds.
     pub resolved_at_ns: u64,
 }
 
-impl PriceRecord {
-    fn of(symbol: Symbol, resolved: &Resolved, resolved_at_ns: u64) -> Self {
-        let expo = symbol.expo();
+/// One entry of `/prices.json`. A golden test freezes this shape: proxies and
+/// the JS SDK read it, so a field change is a breaking change.
+#[derive(Serialize, Debug)]
+pub struct PriceEntry<'a> {
+    /// The 32-byte feed id, as `0x` hex.
+    pub feed_id: FeedId,
+    /// The canonical symbol.
+    pub symbol: Symbol,
+    /// `ok`, `degraded` or `halted`.
+    pub status: Status,
+    /// The median of the nodes, as a decimal string.
+    pub price: Option<Fixed>,
+    /// The confidence half-width, as a decimal string.
+    pub conf: Option<Fixed>,
+    /// Nodes that contributed.
+    pub nodes: usize,
+    /// Nodes that reported the feed halted.
+    pub halted_nodes: usize,
+    /// Why the price is not `ok`.
+    pub concerns: &'a [Concern],
+    /// The freshest contributing publish time, unix nanoseconds, as a string.
+    #[serde(with = "oracle_types::num_str")]
+    pub publish_time_ns: u64,
+    /// The spread between the nodes, in basis points of the price.
+    pub spread_bps: Option<Fixed>,
+}
+
+impl FeedPrice {
+    /// The Candid record of `get_price`: integers at the feed's exponent.
+    #[must_use]
+    pub fn record(&self) -> PriceRecord {
+        let resolved = &self.resolved;
+        let expo = self.symbol.expo();
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        Self {
+        PriceRecord {
             feed_id: ByteBuf::from(resolved.feed_id.as_bytes().to_vec()),
-            symbol: symbol.to_string(),
+            symbol: self.symbol.to_string(),
             status: match resolved.status {
                 Status::Ok => PriceStatus::Ok,
                 Status::Degraded => PriceStatus::Degraded,
@@ -138,7 +97,8 @@ impl PriceRecord {
             price: resolved.price.and_then(|price| price.to_scaled(expo).ok()),
             conf: resolved
                 .conf
-                .and_then(|conf| conf.to_scaled_unsigned(expo).ok()),
+                // Rounded up: a band rounded down claims more precision than the nodes have.
+                .and_then(|conf| conf.to_scaled_unsigned_up(expo).ok()),
             expo,
             publish_time_ns: resolved.publish_time_ns,
             nodes: count(resolved.nodes),
@@ -149,7 +109,25 @@ impl PriceRecord {
                 .map(|concern| concern.as_str().to_owned())
                 .collect(),
             spread_bps: resolved.spread_bps.map(|spread| spread.to_string()),
-            resolved_at_ns,
+            resolved_at_ns: self.resolved_at_ns,
+        }
+    }
+
+    /// The entry of `/prices.json`: decimal strings at full precision.
+    #[must_use]
+    pub fn entry(&self) -> PriceEntry<'_> {
+        let resolved = &self.resolved;
+        PriceEntry {
+            feed_id: resolved.feed_id,
+            symbol: self.symbol,
+            status: resolved.status,
+            price: resolved.price,
+            conf: resolved.conf,
+            nodes: resolved.nodes,
+            halted_nodes: resolved.halted_nodes,
+            concerns: &resolved.concerns,
+            publish_time_ns: resolved.publish_time_ns,
+            spread_bps: resolved.spread_bps,
         }
     }
 }
@@ -159,18 +137,18 @@ impl PriceRecord {
 pub struct StoredPrices {
     /// The listed feeds, as canonical symbols.
     pub feeds: Vec<String>,
-    /// Each frame or batch that holds a node's latest update of a feed.
+    /// Each batch that holds a node's latest update of a feed.
     pub frames: Vec<ByteBuf>,
     /// The price window in seconds, when governance set one.
     pub window_secs: Option<u64>,
 }
 
-/// A frame or a batch that holds a node's latest update of some feeds.
+/// A batch that holds a node's latest update of some feeds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source<'a> {
     /// The node that signed it.
     pub node: Address,
-    /// The frame or batch, as the node pushed it.
+    /// The batch, as the node pushed it.
     pub bytes: &'a [u8],
     /// The feeds whose latest update from this node it holds.
     pub symbols: Vec<Symbol>,
@@ -183,6 +161,7 @@ pub struct Prices {
     quorum: usize,
     window: Option<Duration>,
     feeds: BTreeMap<FeedId, Feed>,
+    admission: Admission,
 }
 
 struct Feed {
@@ -201,14 +180,23 @@ impl Feed {
         }
     }
 
-    fn resolve(&self, config: &QuorumConfig, now_ns: u64) -> Resolved {
+    fn resolve(&self, config: &QuorumConfig, now_ns: u64) -> FeedPrice {
         let mut resolved = self.view.resolve(config, now_ns);
         resolved.symbol = Some(self.symbol);
-        resolved
+        FeedPrice {
+            symbol: self.symbol,
+            resolved,
+            resolved_at_ns: now_ns,
+        }
     }
 
+    /// SPEC §3.7 P6: the signer hint is not signed, so a copy with another
+    /// hint is the same batch.
     fn holds(&self, bytes: &[u8]) -> bool {
-        self.sources.values().any(|stored| **stored == *bytes)
+        let signed = bytes.get(SIGNED_START..);
+        self.sources
+            .values()
+            .any(|stored| stored.get(SIGNED_START..) == signed)
     }
 }
 
@@ -229,12 +217,18 @@ impl Prices {
             feeds.insert(id, feed);
         }
         self.feeds = feeds;
-        self.mark_slow();
+        self.set_feed_kinds();
     }
 
     /// The listed feeds: the id and the symbol of each.
     pub fn feeds(&self) -> impl Iterator<Item = (FeedId, Symbol)> + '_ {
         self.feeds.iter().map(|(id, feed)| (*id, feed.symbol))
+    }
+
+    /// The number of listed feeds.
+    #[must_use]
+    pub fn feed_count(&self) -> usize {
+        self.feeds.len()
     }
 
     /// Adopts a newly published registry. A de-listed node loses its seat at once.
@@ -245,6 +239,7 @@ impl Prices {
             feed.view.retain_nodes(&|node| listed.contains(node));
             feed.sources.retain(|node, _| listed.contains(node));
         }
+        self.admission.retain_nodes(|node| listed.contains(node));
         match &mut self.verifier {
             Some(verifier) => verifier.set_registry(registry),
             None => {
@@ -258,95 +253,93 @@ impl Prices {
                 ));
             }
         }
-        self.mark_slow();
+        self.set_feed_kinds();
     }
 
-    fn mark_slow(&mut self) {
+    /// Adopts the push pace of a newly published feed set (SPEC §3.7 P5).
+    pub fn set_pace(&mut self, pace: Option<PushPolicy>) {
+        self.admission.set_pace(pace);
+    }
+
+    /// The shortest time between two batches of one node.
+    #[must_use]
+    pub fn min_push_interval(&self) -> Duration {
+        self.admission.min_interval()
+    }
+
+    /// The kind sets each feed's age limit in the verifier.
+    fn set_feed_kinds(&mut self) {
         if let Some(verifier) = &mut self.verifier {
             for (id, feed) in &self.feeds {
-                if feed.symbol.kind().is_slow() {
-                    verifier.mark_slow(*id);
-                }
+                verifier.set_feed_kind(*id, feed.symbol.kind());
             }
         }
     }
 
-    /// Checks and stores each frame or batch. Returns one verdict for each
-    /// update, in order; a blob that does not parse gets one `Invalid`.
-    pub fn push(&mut self, blobs: &[impl AsRef<[u8]>], now_ns: u64) -> Vec<Verdict> {
-        blobs
+    /// Checks and stores each batch. Returns one verdict for each update, in
+    /// order; a batch that does not parse gets one `Invalid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Refusal`] of a push that breaks a rule for the whole push,
+    /// before any batch changes the state.
+    pub fn push(
+        &mut self,
+        blobs: &[impl AsRef<[u8]>],
+        now_ns: u64,
+    ) -> Result<Vec<Verdict>, Refusal> {
+        self.admission.check_frames(blobs, now_ns)?;
+        Ok(blobs
             .iter()
-            .flat_map(|blob| self.apply(blob.as_ref(), now_ns))
-            .collect()
+            .flat_map(|blob| self.apply_batch(blob.as_ref(), now_ns))
+            .collect())
     }
 
-    /// `true` when every frame or batch holds an update that `push` accepts; it stores them, like `push`.
-    pub fn accepts_all(&mut self, blobs: &[impl AsRef<[u8]>], now_ns: u64) -> bool {
-        // One fresh frame must not carry replays or junk in with it: each of
-        // those costs a signature recovery under consensus.
-        !blobs.is_empty()
-            && blobs.iter().all(|blob| {
-                self.apply(blob.as_ref(), now_ns)
-                    .contains(&Verdict::Accepted)
-            })
-    }
-
-    fn apply(&mut self, bytes: &[u8], now_ns: u64) -> Vec<Verdict> {
-        if bytes.first() == Some(&FRAME_TYPE_PRICE_BATCH) {
-            self.apply_batch(bytes, now_ns)
-        } else {
-            vec![self.apply_frame(bytes, now_ns)]
+    /// `inspect_message`'s check: every batch must hold an update that `push`
+    /// accepts. It stores them, like `push`; the IC drops what it stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the push must not reach the canister.
+    pub fn inspect(&mut self, blobs: &[impl AsRef<[u8]>], now_ns: u64) -> Result<(), Refusal> {
+        self.admission.check_frames(blobs, now_ns)?;
+        // SPEC §3.7 P10: one fresh batch must not carry replays or junk in with
+        // it, because each of those costs a signature recovery under consensus.
+        for blob in blobs {
+            if !self
+                .apply_batch(blob.as_ref(), now_ns)
+                .contains(&Verdict::Accepted)
+            {
+                return Err(Refusal::NothingNew);
+            }
         }
+        Ok(())
     }
 
-    /// The checks without a signature recovery, which costs the most. The
-    /// verifier repeats them.
+    /// SPEC §3.7 P7: the checks without a signature recovery, which costs the
+    /// most. The verifier repeats them.
     fn precheck(&self, update: &PriceUpdate, now_ns: u64) -> Option<Verdict> {
         if !self.feeds.contains_key(&update.feed_id) {
             return Some(Verdict::UnknownFeed);
         }
-        clock(update.publish_time_ns, now_ns)
-    }
-
-    fn apply_frame(&mut self, bytes: &[u8], now_ns: u64) -> Verdict {
-        let Ok(update) = UnverifiedFrame::parse(bytes).and_then(|frame| frame.decode_unverified())
-        else {
-            return Verdict::Invalid;
-        };
-        if let Some(verdict) = self.precheck(&update, now_ns) {
-            return verdict;
-        }
-        if self
-            .feeds
-            .get(&update.feed_id)
-            .is_some_and(|feed| feed.holds(bytes))
-        {
-            return Verdict::Replayed;
-        }
-        let Some(verifier) = self.verifier.as_mut() else {
-            return Verdict::NoRegistry;
-        };
-        match verifier.accept(bytes, now_ns) {
-            Ok(accepted) => {
-                self.record(accepted.signer, accepted.update, &Rc::from(bytes));
-                Verdict::Accepted
-            }
-            Err(reason) => Verdict::of(&reason),
-        }
+        Admission::clock(update.publish_time_ns, now_ns)
     }
 
     fn apply_batch(&mut self, bytes: &[u8], now_ns: u64) -> Vec<Verdict> {
-        let Ok(updates) =
-            UnverifiedPriceBatch::parse(bytes).and_then(|batch| batch.decode_unverified())
-        else {
+        let Ok(batch) = UnverifiedPriceBatch::parse(bytes) else {
             return vec![Verdict::Invalid];
         };
+        let Ok(updates) = batch.decode_unverified() else {
+            return vec![Verdict::Invalid];
+        };
+        let count = updates.len();
+        let all = |verdict: Verdict| vec![verdict; count];
         if updates.iter().any(|update| {
             self.feeds
                 .get(&update.feed_id)
                 .is_some_and(|feed| feed.holds(bytes))
         }) {
-            return vec![Verdict::Replayed; updates.len()];
+            return all(Verdict::Replayed);
         }
         let prechecks: Vec<Option<Verdict>> = updates
             .iter()
@@ -356,12 +349,33 @@ impl Prices {
             return prechecks.into_iter().flatten().collect();
         }
         let Some(verifier) = self.verifier.as_mut() else {
-            return vec![Verdict::NoRegistry; updates.len()];
+            return all(Verdict::NoRegistry);
         };
-        let accepted = match verifier.accept_batch(bytes, now_ns) {
+        // SPEC §3.7 P8: a batch from a node signs with that node's address as
+        // its hint, so another hint needs no recovery to refuse.
+        let hint = batch.signer_hint();
+        if verifier.registry().authorize(hint).is_err() {
+            return all(if verifier.is_retired(hint) {
+                Verdict::RetiredKey
+            } else {
+                Verdict::UnknownSigner
+            });
+        }
+        // One parse and one decode serve the cheap checks and the recovery.
+        let recovered = match batch.recover_decoded(updates) {
+            Ok(recovered) => recovered,
+            Err(error) => return all(verdict_of(&RejectReason::from(error))),
+        };
+        // SPEC §3.7 P9: the hint check comes before the verifier moves the
+        // sequence, so a relabeled copy cannot spend the node's genuine batch.
+        if recovered.signer() != hint {
+            return all(Verdict::Invalid);
+        }
+        let accepted = match verifier.accept_recovered_batch(recovered, now_ns) {
             Ok(accepted) => accepted,
-            Err(reason) => return vec![Verdict::of(&reason); updates.len()],
+            Err(reason) => return all(verdict_of(&reason)),
         };
+        self.admission.record_push(accepted.signer, now_ns);
         if prechecks.contains(&Some(Verdict::UnknownFeed)) {
             // The verifier marks every update of a batch, and a node must not
             // fill the heap with marks of feeds that the canister does not price.
@@ -378,7 +392,7 @@ impl Prices {
                     self.record(accepted.signer, update, &source);
                     Verdict::Accepted
                 }
-                (None, Err(reason)) => Verdict::of(&reason),
+                (None, Err(reason)) => verdict_of(&reason),
             })
             .collect()
     }
@@ -426,7 +440,7 @@ impl Prices {
 
     /// Resolves every listed feed at `now_ns`.
     #[must_use]
-    pub fn resolve_all(&self, now_ns: u64) -> Vec<Resolved> {
+    pub fn resolve_all(&self, now_ns: u64) -> Vec<FeedPrice> {
         let config = self.quorum_config();
         self.feeds
             .values()
@@ -438,43 +452,45 @@ impl Prices {
     #[must_use]
     pub fn price(&self, id: &FeedId, now_ns: u64) -> Option<PriceRecord> {
         let feed = self.feeds.get(id)?;
-        let resolved = feed.resolve(&self.quorum_config(), now_ns);
-        Some(PriceRecord::of(feed.symbol, &resolved, now_ns))
+        Some(feed.resolve(&self.quorum_config(), now_ns).record())
     }
 
     /// Every listed feed's price at `now_ns`.
     #[must_use]
     pub fn prices(&self, now_ns: u64) -> Vec<PriceRecord> {
-        let config = self.quorum_config();
-        self.feeds
-            .values()
-            .map(|feed| PriceRecord::of(feed.symbol, &feed.resolve(&config, now_ns), now_ns))
+        self.resolve_all(now_ns)
+            .iter()
+            .map(FeedPrice::record)
             .collect()
     }
 
-    /// Each frame or batch that holds a node's latest update of some feed, once.
+    /// Each batch that holds a node's latest update of some feed, once, in
+    /// the order of the feeds that first hold it.
     #[must_use]
     pub fn sources(&self) -> Vec<Source<'_>> {
-        let mut sources: Vec<(&Rc<[u8]>, Source<'_>)> = Vec::new();
+        let mut sources: Vec<Source<'_>> = Vec::new();
+        // Keyed by the shared allocation: one batch is one `Rc` for all its feeds.
+        let mut seen: BTreeMap<*const u8, usize> = BTreeMap::new();
         for feed in self.feeds.values() {
             for (node, bytes) in &feed.sources {
-                match sources.iter_mut().find(|(seen, _)| Rc::ptr_eq(seen, bytes)) {
-                    Some((_, source)) => source.symbols.push(feed.symbol),
-                    None => sources.push((
-                        bytes,
-                        Source {
+                let key = Rc::as_ptr(bytes).cast::<u8>();
+                match seen.get(&key).and_then(|&at| sources.get_mut(at)) {
+                    Some(source) => source.symbols.push(feed.symbol),
+                    None => {
+                        seen.insert(key, sources.len());
+                        sources.push(Source {
                             node: *node,
                             bytes,
                             symbols: vec![feed.symbol],
-                        },
-                    )),
+                        });
+                    }
                 }
             }
         }
-        sources.into_iter().map(|(_, source)| source).collect()
+        sources
     }
 
-    /// The feeds and the frames and batches, for stable memory.
+    /// The feeds and the batches, for stable memory.
     #[must_use]
     pub fn to_stored(&self) -> StoredPrices {
         StoredPrices {
@@ -492,9 +508,14 @@ impl Prices {
         }
     }
 
-    /// Rebuilds the prices after an upgrade, with the published registry.
+    /// Rebuilds the prices after an upgrade, with the published registry and
+    /// the feed set's pace. A single frame that an older canister stored is dropped.
     #[must_use]
-    pub fn restore(stored: &StoredPrices, registry: Option<VerifiedRegistry>) -> Self {
+    pub fn restore(
+        stored: &StoredPrices,
+        registry: Option<VerifiedRegistry>,
+        pace: Option<PushPolicy>,
+    ) -> Self {
         let symbols: Vec<Symbol> = stored
             .feeds
             .iter()
@@ -508,131 +529,205 @@ impl Prices {
         if let Some(registry) = registry {
             prices.set_registry(registry);
         }
+        prices.set_pace(pace);
         for blob in &stored.frames {
             // Each update passed the clock when it was pushed. At the newest
-            // publish time of its frame or batch it gets its replay mark back,
-            // and the quorum's age limit still drops it when it is too old.
+            // publish time of its batch it gets its replay mark back, and the
+            // quorum's age limit still drops it when it is too old.
             if let Some(published) = newest_publish_time(blob) {
-                prices.apply(blob, published);
+                prices.apply_batch(blob, published);
             }
         }
+        // The restore times are not push times, so no node waits for them.
+        prices.admission.forget_pushes();
         prices
     }
 }
 
 fn newest_publish_time(bytes: &[u8]) -> Option<u64> {
-    let updates = if bytes.first() == Some(&FRAME_TYPE_PRICE_BATCH) {
-        UnverifiedPriceBatch::parse(bytes)
-            .and_then(|batch| batch.decode_unverified())
-            .ok()?
-    } else {
-        vec![
-            UnverifiedFrame::parse(bytes)
-                .and_then(|frame| frame.decode_unverified())
-                .ok()?,
-        ]
-    };
-    updates.iter().map(|update| update.publish_time_ns).max()
-}
-
-fn clock(publish_time_ns: u64, now_ns: u64) -> Option<Verdict> {
-    let nanos = |limit: Duration| u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX);
-    if publish_time_ns > now_ns {
-        (publish_time_ns - now_ns > nanos(ACCEPT_MAX_SKEW)).then_some(Verdict::FromTheFuture)
-    } else {
-        (now_ns - publish_time_ns > nanos(ACCEPT_MAX_AGE)).then_some(Verdict::TooOld)
-    }
+    UnverifiedPriceBatch::parse(bytes)
+        .and_then(|batch| batch.decode_unverified())
+        .ok()?
+        .iter()
+        .map(|update| update.publish_time_ns)
+        .max()
 }
 
 #[cfg(test)]
 mod tests {
-    use oracle_quorum::testing::{REGISTRY_ISSUED_AT, TestNode, registry_with, update_at};
+    use oracle_quorum::testing::{NEXT_EPOCH_NS, TestNode, registry_with};
     use oracle_types::{Flags, NANOS_PER_SEC};
 
     use super::*;
+    use crate::admission::nanos;
+    use crate::testing::usd;
 
-    const NOW: u64 = (REGISTRY_ISSUED_AT + 600) * NANOS_PER_SEC;
+    /// Ten steps of [`TestNode::next`] after its first publish time: its first
+    /// updates are a few seconds old, inside the clock windows.
+    const NOW: u64 = NEXT_EPOCH_NS + 10 * NANOS_PER_SEC;
+    const BTC: &str = "CRYPTO.BTC/USD";
+    const ETH: &str = "CRYPTO.ETH/USD";
+    const SOL: &str = "CRYPTO.SOL/USD";
+    /// Past the shortest interval between two batches of one node, with no feed set pace.
+    const NEXT_PUSH: u64 = 2 * NANOS_PER_SEC;
 
-    fn nanos(limit: Duration) -> u64 {
-        u64::try_from(limit.as_nanos()).expect("fits in u64")
+    fn symbol(text: &str) -> Symbol {
+        text.parse().expect("a valid symbol")
     }
 
-    fn btc() -> Symbol {
-        "CRYPTO.BTC/USD".parse().expect("a valid symbol")
+    fn id(feed: &str) -> FeedId {
+        feed_id(&symbol(feed))
     }
 
-    fn frame(node: &TestNode, published: u64, seq: u64, price: i64) -> Vec<u8> {
-        let mut update = update_at(published, seq);
-        update.feed_id = feed_id(&btc());
-        update.price = price;
-        node.sign(&update)
+    /// The node's next batch: one next update of each feed, all at `price`.
+    fn batch(node: &TestNode, feeds: &[&str], price: i64) -> Vec<u8> {
+        let updates: Vec<PriceUpdate> = feeds
+            .iter()
+            .map(|feed| node.next(id(feed), price))
+            .collect();
+        node.sign_batch(&updates)
+    }
+
+    fn btc_batch(node: &TestNode, price: i64) -> Vec<u8> {
+        batch(node, &[BTC], price)
     }
 
     fn listed(nodes: &[&TestNode]) -> Prices {
         let mut prices = Prices::default();
-        prices.set_feeds(&[btc()]);
+        prices.set_feeds(&[symbol(BTC)]);
         prices.set_registry(registry_with(nodes));
         prices
     }
 
     fn btc_price(prices: &Prices, now: u64) -> PriceRecord {
-        prices.price(&feed_id(&btc()), now).expect("BTC is listed")
+        prices.price(&id(BTC), now).expect("BTC is listed")
+    }
+
+    fn push(prices: &mut Prices, blobs: &[&Vec<u8>], now: u64) -> Vec<Verdict> {
+        prices
+            .push(blobs, now)
+            .expect("the push passes the push rules")
+    }
+
+    /// The push time of the `step`-th push of one node in a test.
+    fn later(step: u64) -> u64 {
+        NOW + step * NEXT_PUSH
     }
 
     #[test]
     fn three_nodes_resolve_to_their_median() {
         let nodes = [TestNode::new(1), TestNode::new(2), TestNode::new(3)];
         let mut prices = listed(&[&nodes[0], &nodes[1], &nodes[2]]);
-        let frames: Vec<Vec<u8>> = nodes
+        let batches: Vec<Vec<u8>> = nodes
             .iter()
-            .zip([6_400_000_000_000, 6_401_000_000_000, 6_402_000_000_000])
-            .map(|(node, price)| frame(node, NOW, 1, price))
+            .zip([usd(64_000), usd(64_010), usd(64_020)])
+            .map(|(node, price)| btc_batch(node, price))
             .collect();
-        assert_eq!(prices.push(&frames, NOW), [Verdict::Accepted; 3]);
+        assert_eq!(prices.push(&batches, NOW), Ok(vec![Verdict::Accepted; 3]));
         let record = btc_price(&prices, NOW);
         assert_eq!(record.status, PriceStatus::Ok);
-        assert_eq!(record.price, Some(6_401_000_000_000));
+        assert_eq!(record.price, Some(usd(64_010)));
         assert_eq!((record.expo, record.nodes), (-8, 3));
-        assert_eq!(record.symbol, "CRYPTO.BTC/USD");
-        assert_eq!(record.feed_id.as_slice(), feed_id(&btc()).as_bytes());
+        assert_eq!(record.symbol, BTC);
+        assert_eq!(record.feed_id.as_slice(), id(BTC).as_bytes());
     }
 
     #[test]
     fn a_replay_and_an_older_sequence_are_refused() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let newer = frame(&node, NOW, 2, 1);
-        let older = frame(&node, NOW, 1, 1);
-        assert_eq!(prices.push(&[&newer], NOW), [Verdict::Accepted]);
+        let older = btc_batch(&node, 1);
+        let newer = btc_batch(&node, 1);
+        assert_eq!(push(&mut prices, &[&newer], NOW), [Verdict::Accepted]);
+        assert_eq!(push(&mut prices, &[&newer], later(1)), [Verdict::Replayed]);
+        assert_eq!(push(&mut prices, &[&older], later(2)), [Verdict::Replayed]);
         assert_eq!(
-            prices.push(&[&newer, &older], NOW),
-            [Verdict::Replayed, Verdict::Replayed]
+            prices.inspect(&[&older], later(3)),
+            Err(Refusal::NothingNew)
         );
-        assert!(!prices.accepts_all(&[&newer, &older], NOW));
+    }
+
+    /// SPEC §3.7 P6: the hint is outside the signature, so a copy with another
+    /// hint is a replay, found without a recovery.
+    #[test]
+    fn a_copy_with_another_hint_is_a_replay() {
+        let (node, other) = (TestNode::new(1), TestNode::new(2));
+        let mut prices = listed(&[&node, &other]);
+        let first = btc_batch(&node, 1);
+        assert_eq!(push(&mut prices, &[&first], NOW), [Verdict::Accepted]);
+        let mut copy = first.clone();
+        copy.splice(
+            1..SIGNED_START,
+            other.signing_address().as_bytes().iter().copied(),
+        );
+        assert_eq!(push(&mut prices, &[&copy], later(1)), [Verdict::Replayed]);
+    }
+
+    /// SPEC §3.7 P8, P9: the hint names the node, so another hint is refused,
+    /// before the recovery when it names no listed node.
+    #[test]
+    fn a_batch_whose_hint_is_not_its_signer_is_invalid() {
+        let (node, other, stranger) = (TestNode::new(1), TestNode::new(2), TestNode::new(9));
+        let mut prices = listed(&[&node, &other]);
+        let relabel = |hint: Address| {
+            let mut relabeled = btc_batch(&node, 1);
+            relabeled.splice(1..SIGNED_START, hint.as_bytes().iter().copied());
+            relabeled
+        };
+        assert_eq!(
+            push(&mut prices, &[&relabel(other.signing_address())], NOW),
+            [Verdict::Invalid]
+        );
+        assert_eq!(
+            push(&mut prices, &[&relabel(stranger.signing_address())], NOW),
+            [Verdict::UnknownSigner]
+        );
+        assert!(prices.sources().is_empty(), "no false hint is stored");
+    }
+
+    /// SPEC §3.7 P9: the hint check comes before the sequence moves, so a
+    /// relabeled copy cannot spend the node's genuine batch.
+    #[test]
+    fn a_relabeled_copy_leaves_the_genuine_batch_accepted() {
+        let (node, other) = (TestNode::new(1), TestNode::new(2));
+        let mut prices = listed(&[&node, &other]);
+        let genuine = btc_batch(&node, 1);
+        let mut copy = genuine.clone();
+        copy.splice(
+            1..SIGNED_START,
+            other.signing_address().as_bytes().iter().copied(),
+        );
+        assert_eq!(push(&mut prices, &[&copy], NOW), [Verdict::Invalid]);
+        assert_eq!(push(&mut prices, &[&genuine], NOW), [Verdict::Accepted]);
     }
 
     #[test]
-    fn a_fresh_frame_cannot_carry_junk_or_a_replay_past_inspection() {
-        let node = TestNode::new(1);
-        let mut prices = listed(&[&node]);
-        let first = frame(&node, NOW, 1, 1);
-        assert_eq!(prices.push(&[&first], NOW), [Verdict::Accepted]);
-        let mut forged = frame(&node, NOW, 9, 1);
-        let at = forged.len().saturating_sub(60);
+    fn a_fresh_batch_cannot_carry_junk_or_a_replay_past_inspection() {
+        let (node, other) = (TestNode::new(1), TestNode::new(2));
+        let mut prices = listed(&[&node, &other]);
+        let first = btc_batch(&other, 1);
+        assert_eq!(push(&mut prices, &[&first], NOW), [Verdict::Accepted]);
+        let mut forged = btc_batch(&other, 1);
+        // A flipped bit in the signature's `r` recovers another key, or none.
+        let at = forged.len().saturating_sub(oracle_wire::SIGNATURE_LEN) + 5;
         if let Some(byte) = forged.get_mut(at) {
             *byte ^= 1;
         }
-        assert!(
-            !prices.accepts_all(&[frame(&node, NOW, 2, 1), forged], NOW),
-            "junk after a fresh frame"
+        // The IC drops what an inspection stores; here it stays, so each check comes later.
+        assert_eq!(
+            prices.inspect(&[btc_batch(&node, 1), forged], later(1)),
+            Err(Refusal::NothingNew),
+            "junk after a fresh batch"
         );
-        assert!(
-            !prices.accepts_all(&[frame(&node, NOW, 3, 1), first], NOW),
-            "a replay after a fresh frame"
+        assert_eq!(
+            prices.inspect(&[btc_batch(&node, 1), first], later(2)),
+            Err(Refusal::NothingNew),
+            "a replay after a fresh batch"
         );
-        assert!(prices.accepts_all(&[frame(&node, NOW, 4, 1)], NOW));
-        assert!(
-            !prices.accepts_all(&Vec::<Vec<u8>>::new(), NOW),
+        assert_eq!(prices.inspect(&[btc_batch(&node, 1)], later(3)), Ok(()));
+        assert_eq!(
+            prices.inspect(&Vec::<Vec<u8>>::new(), later(4)),
+            Err(Refusal::FrameCount { count: 0 }),
             "an empty push"
         );
     }
@@ -641,18 +736,19 @@ mod tests {
     fn a_batch_leaves_no_marks_for_feeds_the_canister_does_not_price() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let batch = node.sign_batch(&[
-            update("CRYPTO.BTC/USD", NOW, 5, 1),
-            update("CRYPTO.SOL/USD", NOW, 5, 1),
-        ]);
+        // Taken first, so its `seq` is below that of the SOL update in the batch.
+        let earlier = node.next(id(SOL), 1);
+        let both = batch(&node, &[BTC, SOL], 1);
         assert_eq!(
-            prices.push(&[&batch], NOW),
+            push(&mut prices, &[&both], NOW),
             [Verdict::Accepted, Verdict::UnknownFeed]
         );
-        let sol: Symbol = "CRYPTO.SOL/USD".parse().expect("a valid symbol");
-        prices.set_feeds(&[btc(), sol]);
-        let later = node.sign_batch(&[update("CRYPTO.SOL/USD", NOW, 1, 1)]);
-        assert_eq!(prices.push(&[&later], NOW), [Verdict::Accepted]);
+        prices.set_feeds(&[symbol(BTC), symbol(SOL)]);
+        assert_eq!(
+            push(&mut prices, &[&node.sign_batch(&[earlier])], later(1)),
+            [Verdict::Accepted],
+            "the canister kept no SOL mark"
+        );
     }
 
     #[test]
@@ -660,10 +756,10 @@ mod tests {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
         assert_eq!(
-            prices.push(&[frame(&node, NOW, 1, 7)], NOW),
+            push(&mut prices, &[&btc_batch(&node, 7)], NOW),
             [Verdict::Accepted]
         );
-        prices.set_feeds(&[btc(), btc()]);
+        prices.set_feeds(&[symbol(BTC), symbol(BTC)]);
         assert_eq!(btc_price(&prices, NOW).nodes, 1);
     }
 
@@ -672,64 +768,91 @@ mod tests {
         let node = TestNode::new(1);
         let stranger = TestNode::new(9);
         let mut prices = listed(&[&node]);
-        let mut eth = update_at(NOW, 1);
-        eth.feed_id = feed_id(&"CRYPTO.ETH/USD".parse().expect("a valid symbol"));
-        let old = NOW - nanos(ACCEPT_MAX_AGE) - 1;
-        let ahead = NOW + nanos(ACCEPT_MAX_SKEW) + 1;
-        let verdicts = prices.push(
-            &[
-                node.sign(&eth),
-                frame(&node, old, 1, 1),
-                frame(&node, ahead, 1, 1),
-                frame(&stranger, NOW, 1, 1),
-                vec![0; 10],
-            ],
-            NOW,
-        );
-        assert_eq!(
-            verdicts,
-            [
+        let at = |publish_time_ns: u64| {
+            node.sign_batch(&[PriceUpdate {
+                publish_time_ns,
+                ..node.next(id(BTC), 1)
+            }])
+        };
+        let mut junk = btc_batch(&node, 1);
+        junk.truncate(100);
+        for (label, batch, verdict) in [
+            (
+                "an unlisted feed",
+                batch(&node, &[ETH], 1),
                 Verdict::UnknownFeed,
+            ),
+            (
+                "too old",
+                at(NOW - nanos(ACCEPT_MAX_AGE) - 1),
                 Verdict::TooOld,
+            ),
+            (
+                "ahead of the clock",
+                at(NOW + nanos(ACCEPT_MAX_SKEW) + 1),
                 Verdict::FromTheFuture,
+            ),
+            (
+                "a stranger",
+                btc_batch(&stranger, 1),
                 Verdict::UnknownSigner,
-                Verdict::Invalid,
-            ]
-        );
+            ),
+            ("junk", junk, Verdict::Invalid),
+        ] {
+            assert_eq!(push(&mut prices, &[&batch], NOW), [verdict], "{label}");
+        }
+    }
+
+    /// SPEC §3.7 P3: a node streams single frames to its clients and never a
+    /// batch, so a client can relay only single frames.
+    #[test]
+    fn a_single_price_frame_is_refused_whole() {
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        let single = node.sign(&node.next(id(BTC), 1));
+        assert_eq!(prices.push(&[&single], NOW), Err(Refusal::NotABatch));
+        assert_eq!(prices.inspect(&[&single], NOW), Err(Refusal::NotABatch));
+        assert!(prices.sources().is_empty());
     }
 
     #[test]
     fn no_registry_accepts_nothing() {
         let mut prices = Prices::default();
-        prices.set_feeds(&[btc()]);
-        let frames = [frame(&TestNode::new(1), NOW, 1, 1)];
-        assert_eq!(prices.push(&frames, NOW), [Verdict::NoRegistry]);
+        prices.set_feeds(&[symbol(BTC)]);
+        let node = TestNode::new(1);
+        assert_eq!(
+            push(&mut prices, &[&btc_batch(&node, 1)], NOW),
+            [Verdict::NoRegistry]
+        );
     }
 
     #[test]
     fn below_the_quorum_and_after_the_age_limit_the_feed_halts() {
         let nodes = [TestNode::new(1), TestNode::new(2), TestNode::new(3)];
         let mut prices = listed(&[&nodes[0], &nodes[1], &nodes[2]]);
-        let frames = [frame(&nodes[0], NOW, 1, 1), frame(&nodes[1], NOW, 1, 1)];
-        prices.push(&frames, NOW);
+        let two = [btc_batch(&nodes[0], 1), btc_batch(&nodes[1], 1)];
+        prices.push(&two, NOW).expect("passes the push rules");
         let record = btc_price(&prices, NOW);
         assert_eq!(record.status, PriceStatus::Halted);
         assert_eq!(record.concerns, ["insufficient_nodes"]);
 
-        prices.push(&[frame(&nodes[2], NOW, 1, 1)], NOW);
+        let third = btc_batch(&nodes[2], 1);
+        push(&mut prices, &[&third], NOW);
         assert_eq!(btc_price(&prices, NOW).status, PriceStatus::Ok);
-        let later = NOW + nanos(DEFAULT_PRICE_WINDOW) + 1;
-        assert_eq!(btc_price(&prices, later).status, PriceStatus::Halted);
+        // Every update is at most the first step old, so the window runs from there.
+        let stale = NEXT_EPOCH_NS + NANOS_PER_SEC + nanos(DEFAULT_PRICE_WINDOW) + 1;
+        assert_eq!(btc_price(&prices, stale).status, PriceStatus::Halted);
     }
 
     #[test]
     fn a_halted_node_does_not_count() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let mut update = update_at(NOW, 1);
-        update.feed_id = feed_id(&btc());
-        update.flags = Flags::HALTED;
-        prices.push(&[node.sign(&update)], NOW);
+        let halted = PriceUpdate {
+            flags: Flags::HALTED,
+            ..node.next(id(BTC), 1)
+        };
+        push(&mut prices, &[&node.sign_batch(&[halted])], NOW);
         let record = btc_price(&prices, NOW);
         assert_eq!(
             (record.status, record.halted_nodes),
@@ -741,13 +864,13 @@ mod tests {
     fn a_removed_node_loses_its_seat_and_its_key_is_retired() {
         let (kept, removed) = (TestNode::new(1), TestNode::new(2));
         let mut prices = listed(&[&kept, &removed]);
-        let frames = [frame(&kept, NOW, 1, 1), frame(&removed, NOW, 1, 1)];
-        prices.push(&frames, NOW);
+        let batches = [btc_batch(&kept, 1), btc_batch(&removed, 1)];
+        prices.push(&batches, NOW).expect("passes the push rules");
         prices.set_registry(registry_with(&[&kept]));
         assert_eq!(prices.sources().len(), 1);
         assert_eq!(btc_price(&prices, NOW).nodes, 1);
         assert_eq!(
-            prices.push(&[frame(&removed, NOW, 2, 1)], NOW),
+            push(&mut prices, &[&btc_batch(&removed, 1)], NOW),
             [Verdict::RetiredKey]
         );
     }
@@ -756,112 +879,88 @@ mod tests {
     fn a_feed_that_stays_listed_keeps_its_frames() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        prices.push(&[frame(&node, NOW, 1, 1)], NOW);
-        let eth: Symbol = "CRYPTO.ETH/USD".parse().expect("a valid symbol");
-        prices.set_feeds(&[eth, btc()]);
+        push(&mut prices, &[&btc_batch(&node, 1)], NOW);
+        prices.set_feeds(&[symbol(ETH), symbol(BTC)]);
         assert_eq!(prices.sources().len(), 1);
-        prices.set_feeds(&[eth]);
+        prices.set_feeds(&[symbol(ETH)]);
         assert_eq!(prices.sources().len(), 0);
-        assert!(prices.price(&feed_id(&btc()), NOW).is_none());
-    }
-
-    #[test]
-    fn a_restore_keeps_the_prices_and_the_replay_marks() {
-        let node = TestNode::new(1);
-        let mut prices = listed(&[&node]);
-        let stored_frame = frame(&node, NOW, 5, 6_400_000_000_000);
-        prices.push(&[&stored_frame], NOW);
-        let stored = prices.to_stored();
-
-        let later = NOW + 40 * NANOS_PER_SEC;
-        let mut restored = Prices::restore(&stored, Some(registry_with(&[&node])));
-        assert_eq!(btc_price(&restored, later).price, Some(6_400_000_000_000));
-        assert_eq!(
-            restored.push(&[frame(&node, later, 4, 1)], later),
-            [Verdict::Replayed]
-        );
-        assert_eq!(restored.to_stored(), stored);
-    }
-
-    fn update(symbol: &str, published: u64, seq: u64, price: i64) -> PriceUpdate {
-        let mut update = update_at(published, seq);
-        update.feed_id = feed_id(&symbol.parse().expect("a valid symbol"));
-        update.price = price;
-        update
+        assert!(prices.price(&id(BTC), NOW).is_none());
     }
 
     #[test]
     fn a_batch_gives_a_verdict_for_each_update() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let eth: Symbol = "CRYPTO.ETH/USD".parse().expect("a valid symbol");
-        prices.set_feeds(&[btc(), eth]);
-        let old = NOW - nanos(ACCEPT_MAX_AGE) - 1;
-        let batch = node.sign_batch(&[
-            update("CRYPTO.BTC/USD", NOW, 1, 6_400_000_000_000),
-            update("CRYPTO.SOL/USD", NOW, 1, 1),
-            update("CRYPTO.ETH/USD", old, 1, 1),
-        ]);
+        prices.set_feeds(&[symbol(BTC), symbol(ETH)]);
+        let old = PriceUpdate {
+            publish_time_ns: NOW - nanos(ACCEPT_MAX_AGE) - 1,
+            ..node.next(id(ETH), 1)
+        };
+        let mixed = node.sign_batch(&[node.next(id(BTC), usd(64_000)), node.next(id(SOL), 1), old]);
         assert_eq!(
-            prices.push(&[&batch], NOW),
+            push(&mut prices, &[&mixed], NOW),
             [Verdict::Accepted, Verdict::UnknownFeed, Verdict::TooOld]
         );
-        assert_eq!(btc_price(&prices, NOW).price, Some(6_400_000_000_000));
+        assert_eq!(btc_price(&prices, NOW).price, Some(usd(64_000)));
         let [source] = prices.sources().try_into().expect("one source");
         assert_eq!(
             (source.node, source.symbols),
-            (node.signing_address(), vec![btc()])
+            (node.signing_address(), vec![symbol(BTC)])
         );
-        assert_eq!(source.bytes, batch.as_slice());
+        assert_eq!(source.bytes, mixed.as_slice());
     }
 
     #[test]
     fn a_batch_replay_is_refused_without_a_recovery() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let batch = node.sign_batch(&[update("CRYPTO.BTC/USD", NOW, 2, 1)]);
-        assert_eq!(prices.push(&[&batch], NOW), [Verdict::Accepted]);
-        assert_eq!(prices.push(&[&batch], NOW), [Verdict::Replayed]);
-        assert!(!prices.accepts_all(&[&batch], NOW));
-        let single = frame(&node, NOW, 2, 1);
-        assert_eq!(
-            prices.push(&[&single], NOW),
-            [Verdict::Replayed],
-            "one sequence for both"
-        );
+        let once = btc_batch(&node, 1);
+        assert_eq!(push(&mut prices, &[&once], NOW), [Verdict::Accepted]);
+        assert_eq!(push(&mut prices, &[&once], later(1)), [Verdict::Replayed]);
+        assert_eq!(prices.inspect(&[&once], later(2)), Err(Refusal::NothingNew));
     }
 
     #[test]
     fn a_batch_from_a_stranger_or_junk_is_refused_whole() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        let stranger = TestNode::new(9).sign_batch(&[update("CRYPTO.BTC/USD", NOW, 1, 1)]);
-        assert_eq!(prices.push(&[&stranger], NOW), [Verdict::UnknownSigner]);
-        let mut junk = node.sign_batch(&[update("CRYPTO.BTC/USD", NOW, 1, 1)]);
+        let stranger = btc_batch(&TestNode::new(9), 1);
+        assert_eq!(
+            push(&mut prices, &[&stranger], NOW),
+            [Verdict::UnknownSigner]
+        );
+        let mut junk = btc_batch(&node, 1);
         junk.truncate(100);
-        assert_eq!(prices.push(&[&junk], NOW), [Verdict::Invalid]);
+        assert_eq!(push(&mut prices, &[&junk], NOW), [Verdict::Invalid]);
     }
 
     #[test]
     fn a_restore_keeps_the_prices_and_marks_of_a_batch() {
         let nodes = [TestNode::new(1), TestNode::new(2)];
         let mut prices = listed(&[&nodes[0], &nodes[1]]);
-        let eth: Symbol = "CRYPTO.ETH/USD".parse().expect("a valid symbol");
-        prices.set_feeds(&[btc(), eth]);
-        let batch = nodes[0].sign_batch(&[
-            update("CRYPTO.BTC/USD", NOW, 5, 6_400_000_000_000),
-            update("CRYPTO.ETH/USD", NOW, 5, 2_300_000_000_000),
+        prices.set_feeds(&[symbol(BTC), symbol(ETH)]);
+        // Taken first, so its `seq` is below that of the ETH update in the batch.
+        let older = nodes[0].next(id(ETH), 1);
+        let both = nodes[0].sign_batch(&[
+            nodes[0].next(id(BTC), usd(64_000)),
+            nodes[0].next(id(ETH), usd(23_000)),
         ]);
-        let single = frame(&nodes[1], NOW, 5, 6_402_000_000_000);
-        prices.push(&[&batch, &single], NOW);
+        let other = btc_batch(&nodes[1], usd(64_020));
+        prices
+            .push(&[&both, &other], NOW)
+            .expect("passes the push rules");
         let stored = prices.to_stored();
         assert_eq!(stored.frames.len(), 2, "the batch is stored once");
 
-        let later = NOW + 40 * NANOS_PER_SEC;
-        let mut restored = Prices::restore(&stored, Some(registry_with(&[&nodes[0], &nodes[1]])));
-        assert_eq!(btc_price(&restored, later).nodes, 2);
-        let older = nodes[0].sign_batch(&[update("CRYPTO.ETH/USD", later, 4, 1)]);
-        assert_eq!(restored.push(&[&older], later), [Verdict::Replayed]);
+        let restore_at = NOW + 20 * NANOS_PER_SEC;
+        let registry = registry_with(&[&nodes[0], &nodes[1]]);
+        let mut restored = Prices::restore(&stored, Some(registry), None);
+        assert_eq!(btc_price(&restored, restore_at).nodes, 2);
+        assert_eq!(btc_price(&restored, restore_at).price, Some(usd(64_010)));
+        assert_eq!(
+            push(&mut restored, &[&nodes[0].sign_batch(&[older])], restore_at),
+            [Verdict::Replayed]
+        );
         assert_eq!(restored.to_stored(), stored);
     }
 
@@ -869,12 +968,15 @@ mod tests {
     fn governance_sets_the_price_window() {
         let node = TestNode::new(1);
         let mut prices = listed(&[&node]);
-        prices.push(&[frame(&node, NOW, 1, 1)], NOW);
-        let at = |secs: u64| NOW + secs * NANOS_PER_SEC;
+        let update = node.next(id(BTC), 1);
+        let published = update.publish_time_ns;
+        push(&mut prices, &[&node.sign_batch(&[update])], NOW);
+        let at = |secs: u64| published + secs * NANOS_PER_SEC;
+        let default = DEFAULT_PRICE_WINDOW.as_secs();
+        assert_eq!(btc_price(&prices, at(default)).status, PriceStatus::Ok);
         assert_eq!(
-            btc_price(&prices, at(60)).status,
-            PriceStatus::Ok,
-            "75 s by default"
+            btc_price(&prices, at(default + 1)).status,
+            PriceStatus::Halted
         );
 
         prices
@@ -891,7 +993,7 @@ mod tests {
         }
         assert_eq!(prices.window(), Duration::from_secs(25));
 
-        let restored = Prices::restore(&prices.to_stored(), Some(registry_with(&[&node])));
+        let restored = Prices::restore(&prices.to_stored(), Some(registry_with(&[&node])), None);
         assert_eq!(
             restored.window(),
             Duration::from_secs(25),
@@ -899,14 +1001,55 @@ mod tests {
         );
     }
 
-    /// The current mainnet canister saved one value. The new one reads a
-    /// second, optional value, which is `None` in the old blob.
+    /// A band rounded down to zero would claim an exact price.
     #[test]
-    fn an_old_stable_blob_restores_without_prices() {
-        let old = candid::encode_args((b"{}".to_vec(),)).expect("encodes");
-        let mut decoder = candid::de::IDLDeserialize::new(&old).expect("decodes");
-        let (state, prices): (Vec<u8>, Option<StoredPrices>) =
-            candid::utils::ArgumentDecoder::decode(&mut decoder).expect("decodes");
-        assert_eq!((state.as_slice(), prices), (b"{}".as_slice(), None));
+    fn a_confidence_band_below_one_unit_publishes_as_one() {
+        /// Two digits finer than the feed's exponent, so one unit of the update is 0.01 of the feed's.
+        const FINER_EXPO: i32 = -10;
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        let tight = PriceUpdate {
+            expo: FINER_EXPO,
+            conf: 1,
+            ..node.next(id(BTC), usd(64_000) * 100)
+        };
+        prices
+            .push(&[node.sign_batch(&[tight])], NOW)
+            .expect("passes the push rules");
+        let [btc] = prices.resolve_all(NOW).try_into().expect("one feed");
+        let band = btc.resolved.conf.expect("a band");
+        assert_eq!(
+            band.to_scaled_unsigned(btc.symbol.expo()),
+            Ok(0),
+            "under one unit"
+        );
+        assert_eq!(btc.record().conf, Some(1));
+        assert_eq!(btc.record().price, Some(usd(64_000)));
+    }
+
+    /// The dedupe is keyed by the shared batch, not O(S²), and each batch is
+    /// one source with all its feeds, in feed order.
+    #[test]
+    fn each_batch_is_one_source_with_all_its_feeds() {
+        let nodes = [TestNode::new(1), TestNode::new(2)];
+        let mut prices = listed(&[&nodes[0], &nodes[1]]);
+        prices.set_feeds(&[symbol(BTC), symbol(ETH), symbol(SOL)]);
+        let all = batch(&nodes[0], &[BTC, ETH, SOL], 1);
+        let eth = batch(&nodes[1], &[ETH], 1);
+        prices
+            .push(&[&all, &eth], NOW)
+            .expect("passes the push rules");
+        let sources: Vec<(Address, usize)> = prices
+            .sources()
+            .iter()
+            .map(|source| (source.node, source.symbols.len()))
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                (nodes[0].signing_address(), 3),
+                (nodes[1].signing_address(), 1)
+            ]
+        );
     }
 }

@@ -19,10 +19,10 @@ use std::time::Duration;
 use futures_util::FutureExt as _;
 use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
 use serde_json::value::RawValue;
-use tracing::warn;
 
 use super::streams::{FUNDING_INFO_STREAM, StreamKind};
 use crate::transport::{Connector, Frame, Transport, TransportError};
+use crate::venues::rest_frames;
 
 /// Levels requested per side.
 pub const SNAPSHOT_LIMIT: usize = 1_000;
@@ -39,8 +39,6 @@ pub const FUTURES_FUNDING_INFO_REST: &str = "https://fapi.binance.com/fapi/v1/fu
 /// USD-margined futures' REST endpoint of one perpetual's open interest.
 /// Binance has no stream for it.
 pub const FUTURES_OPEN_INTEREST_REST: &str = "https://fapi.binance.com/fapi/v1/openInterest";
-
-const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Binance changes an interval rarely, and announces it ahead.
 const FUNDING_INFO_EVERY: Duration = Duration::from_secs(3_600);
@@ -71,13 +69,7 @@ impl<C> SnapshotConnector<C> {
     /// Returns [`TransportError::Connect`] if the HTTP client cannot be built,
     /// which means TLS is misconfigured in this binary.
     pub fn new(inner: C, routes: Vec<(String, String)>) -> Result<Self, TransportError> {
-        // reqwest leaves the crypto provider to the binary; tungstenite already
-        // brings `ring`.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .build()
-            .map_err(|e| TransportError::Connect(e.to_string()))?;
+        let client = rest_frames::client()?;
         Ok(Self {
             inner,
             routes,
@@ -203,7 +195,7 @@ impl<T> SnapshotTransport<T> {
         if self.awaiting.is_empty() {
             return;
         }
-        let Frame::Text(text) = frame else {
+        let Some(text) = frame.socket_text() else {
             return;
         };
         let Some(stream) = stream_name(text) else {
@@ -280,13 +272,11 @@ fn funding_info(client: reqwest::Client, rest: String) -> BoxStream<'static, Fra
         async move {
             tokio::time::sleep(wait).await;
             let fetched = fetch(&client, &rest).await;
-            let next = match &fetched {
-                Ok(_) => FUNDING_INFO_EVERY,
-                Err(error) => {
-                    // The decoder only counts the frame, so this is the one visible sign.
-                    warn!(%error, "the Binance funding intervals could not be fetched");
-                    FUNDING_INFO_RETRY
-                }
+            // The decoder counts a failed fetch, and the session warns.
+            let next = if fetched.is_ok() {
+                FUNDING_INFO_EVERY
+            } else {
+                FUNDING_INFO_RETRY
             };
             Some((frame(FUNDING_INFO_STREAM, fetched), next))
         }
@@ -302,34 +292,30 @@ fn open_interest(
     rest: String,
     symbols: Vec<String>,
 ) -> BoxStream<'static, Frame> {
-    let wait = OPEN_INTEREST_EVERY / u32::try_from(symbols.len().max(1)).unwrap_or(u32::MAX);
-    stream::unfold(0_usize, move |index| {
-        let (client, rest) = (client.clone(), rest.clone());
-        let symbol = symbols.get(index).cloned();
-        let next = (index + 1) % symbols.len().max(1);
-        async move {
-            let symbol = symbol?;
-            tokio::time::sleep(wait).await;
+    let reads = symbols
+        .into_iter()
+        .map(|symbol| {
             let url = format!("{rest}?symbol={}", symbol.to_ascii_uppercase());
-            let stream = format!(
-                "{}{}",
+            (
                 symbol.to_ascii_lowercase(),
-                StreamKind::OpenInterest.suffix()
-            );
-            Some((frame(&stream, fetch(&client, &url).await), next))
-        }
-    })
-    .boxed()
+                StreamKind::OpenInterest.suffix(),
+                url,
+            )
+        })
+        .collect();
+    rest_frames::records_as(
+        client,
+        reads,
+        OPEN_INTEREST_EVERY,
+        rest_frames::whole_body,
+        |suffix, symbol, fetched| frame(&format!("{symbol}{suffix}"), fetched),
+    )
 }
 
-/// One REST reply, as JSON.
+/// One REST reply, as JSON, with the shared limits: a body limit, a timeout
+/// and no redirect.
 async fn fetch(client: &reqwest::Client, url: &str) -> Result<Box<RawValue>, String> {
-    let body = async {
-        let response = client.get(url).send().await?.error_for_status()?;
-        response.text().await
-    };
-    let body = body.await.map_err(|error| error.to_string())?;
-    serde_json::from_str(&body).map_err(|error| error.to_string())
+    rest_frames::read(client.get(url), rest_frames::whole_body).await
 }
 
 /// A reply as a frame of `stream`: `data`, or `error` when the fetch failed.

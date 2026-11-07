@@ -34,15 +34,19 @@ pub mod clock;
 mod depth;
 mod error;
 mod event;
+mod health;
 mod instrument;
 pub mod record;
 pub mod session;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod transport;
 pub mod venues;
 
 pub use backoff::{Backoff, BackoffConfig};
 pub use error::{DecodeError, IngestError};
 pub use event::{IngestEvent, StreamId};
+pub use health::{HealthCounts, VenueHealth};
 pub use instrument::{InstrumentMap, InstrumentSpec};
 pub use record::{Record, RecordError, Recorder, RecordingConnector};
 pub use session::{Session, SessionConfig};
@@ -64,6 +68,11 @@ pub trait ExchangeAdapter: Send + Sync {
 
     /// A short label for logs and metrics, unique per adapter instance.
     fn label(&self) -> &str;
+
+    /// One handle for each connection, to read its counters while it runs.
+    fn health(&self) -> Vec<VenueHealth> {
+        Vec::new()
+    }
 
     /// Runs until `shutdown` fires.
     ///

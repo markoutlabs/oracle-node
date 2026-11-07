@@ -5,12 +5,15 @@
 //! resolves one price. Both are pure: time comes in as an argument and there
 //! is no I/O, so the SDK and the registry canister run the same code.
 
+pub mod age;
 pub mod quorum;
 pub mod testing;
 pub mod verify;
 
+pub use age::{AgeLimits, Frame};
+
 pub use quorum::{Concern, FeedView, NodeFeedState, QuorumConfig, Resolved, Status};
 pub use verify::{
-    Accepted, AcceptedBatch, AcceptedBook, AcceptedFunding, AcceptedVenues, RejectReason, Verifier,
-    VerifyConfig, verify_historical,
+    Accepted, AcceptedBatch, AcceptedBook, AcceptedFunding, AcceptedVenues, MAX_FEEDS_PER_NODE,
+    MAX_INSTRUMENTS_PER_NODE, RejectReason, Verifier, VerifyConfig, verify_historical,
 };

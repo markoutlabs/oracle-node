@@ -5,7 +5,6 @@
 //! verifies. A node that the registry does not list yet waits for governance.
 //! Then it serves until SIGTERM or SIGINT.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,7 +12,6 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
-use oracle_agg::{AggError, Cause};
 use oracle_ingest::IngestEvent;
 use oracle_ingest::clock::{MonotonicClock, Resync, wall_clock_unix_nanos};
 use oracle_ingest::{Recorder, RecordingConnector};
@@ -22,9 +20,8 @@ use oracle_node::publish::PushTarget;
 use oracle_node::{
     Adapter, LogFormat, NodeConfig, Pipeline, ResolvedConfig, build_adapters, logging,
 };
-use oracle_server::{Channel, NodeTransport, ServerState, TransportConfig, router, unix_now};
-use oracle_types::{FeedId, Symbol};
-use oracle_wire::{Address, Registry, SignedUpdate, Signer, VerifiedClientList, VerifiedFeedSet};
+use oracle_server::{NodeTransport, ServerState, TransportConfig, router, unix_now};
+use oracle_wire::{Address, Registry, Signer, VerifiedClientList, VerifiedFeedSet};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -32,8 +29,11 @@ use tracing::{error, info, warn};
 use crate::ingest::{Ingest, connectors};
 use crate::live_feeds::{FeedSetTask, Pace, Reconfigure, books_of, first_feed_set, names};
 use crate::notify;
-use crate::status::{NodeLatency, NodeStatus, STATUS_EVERY, Summary, log_venue_lag};
-use crate::tail::{log_observation, log_update};
+use crate::pipeline_task::PipelineTask;
+use crate::process::Signals;
+#[cfg(unix)]
+use crate::process::raise_open_files;
+use crate::status::{NodeLatency, Summary};
 
 /// Bound on the ingest queue.
 ///
@@ -44,9 +44,6 @@ const INGEST_CAPACITY: usize = 8_192;
 /// Open files beyond the client sockets and the venue connections: logs,
 /// recordings, the runtime.
 const SPARE_FILES: usize = 256;
-/// Events applied before the changed feeds are evaluated. A burst then costs one
-/// pass over the feeds it touched, not one per event, and stays bounded.
-const BATCH_MAX: usize = 256;
 /// How often the node clock re-anchors to wall time.
 const CLOCK_SYNC_EVERY: Duration = Duration::from_secs(1);
 /// Normal drift is microseconds a second. A correction this large means the host
@@ -119,8 +116,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
     let address = signer.address();
     let registry_version = registry.version;
     let feeds = resolved.symbols.len();
-    let place = registry.verify(governance, 0)?.authorize(address)?;
-    let nodes = registry.nodes.len();
+    let slot_registry = registry.clone();
     let symbols = names(&resolved.feeds);
 
     // Sequence numbers must never go backwards for this node, including across
@@ -174,6 +170,7 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         &clock,
     )?);
     let connections = adapters.connections();
+    let health = adapters.health();
     let (reconfigure, reconfigured) = mpsc::channel::<Reconfigure>(1);
     let restart = CancellationToken::new();
     let pipeline_task = tokio::spawn(
@@ -186,8 +183,10 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
             tail: args.tail,
             symbols,
             connections: Arc::clone(&connections),
+            health,
             latency: NodeLatency::default(),
             clock,
+            watchdog: notify::Watchdog::from_env(),
             shutdown: shutdown.clone(),
         }
         .run(),
@@ -200,8 +199,8 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
                 subscriptions,
                 version,
                 governance,
-                index: place,
-                nodes,
+                address,
+                registry: slot_registry,
                 slots: settings.slots(),
                 poll: Duration::from_secs(settings.poll_secs.max(1)),
                 cache: feed_set::cache_path(&args.config),
@@ -265,34 +264,6 @@ async fn serve(args: StartArgs, format: LogFormat) -> anyhow::Result<()> {
         return Err(RestartForFeeds.into());
     }
     Ok(())
-}
-
-/// Raises the open-file limit to its ceiling, and warns when it is still below
-/// `needed`: past it, the node cannot accept clients or reach venues.
-#[cfg(unix)]
-fn raise_open_files(needed: usize) {
-    use nix::sys::resource::{Resource, getrlimit, setrlimit};
-    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
-        return;
-    };
-    let needed = nix::libc::rlim_t::try_from(needed).unwrap_or(nix::libc::rlim_t::MAX);
-    // macOS refuses an unlimited soft limit, so the second try asks only for `needed`.
-    let limit = [hard, needed]
-        .into_iter()
-        .find(|&target| {
-            target > soft
-                && target <= hard
-                && setrlimit(Resource::RLIMIT_NOFILE, target, hard).is_ok()
-        })
-        .unwrap_or(soft);
-    if limit < needed {
-        warn!(
-            limit,
-            needed,
-            "the open-file limit is below what server.limits.max_sockets and the venues need; \
-             raise LimitNOFILE or lower max_sockets"
-        );
-    }
 }
 
 /// Loads the config and the key, and waits until the registry lists this
@@ -430,225 +401,6 @@ fn first_adapters(
     })
 }
 
-/// One task owns the pipeline. Events are applied in arrival order, which is
-/// what preserves the disconnect-before-reconnect guarantee.
-struct PipelineTask {
-    pipeline: Pipeline,
-    ingest: mpsc::Receiver<IngestEvent>,
-    /// A new network feed set, from the feed set task.
-    reconfigure: mpsc::Receiver<Reconfigure>,
-    state: Arc<ServerState>,
-    tick: Duration,
-    tail: bool,
-    /// Names each feed id in the tail.
-    symbols: HashMap<FeedId, Symbol>,
-    /// Shared with the venue adapters, which a feed set change replaces.
-    connections: Arc<std::sync::atomic::AtomicUsize>,
-    latency: NodeLatency,
-    clock: MonotonicClock,
-    shutdown: CancellationToken,
-}
-
-impl PipelineTask {
-    fn apply(&mut self, event: &IngestEvent) {
-        if self.tail {
-            log_observation(event);
-        }
-        if let IngestEvent::Observation(observation) = event {
-            self.latency.observed(observation);
-        }
-        self.pipeline.observe(event);
-    }
-
-    /// `timed` is `Some` after new input. Only a move or a flag change counts
-    /// as latency: a heartbeat repeats old data, and a halt carries none.
-    fn publish(
-        &mut self,
-        (signed, errors): (Vec<SignedUpdate>, Vec<AggError>),
-        published: &mut HashSet<FeedId>,
-        timed: Option<&MonotonicClock>,
-    ) {
-        for error in errors {
-            warn!(%error, "feed could not be encoded");
-        }
-        for update in signed {
-            if self.tail {
-                log_update(&update, self.symbols.get(&update.update().feed_id));
-            }
-            let feed_id = update.update().feed_id;
-            let reaction = self
-                .pipeline
-                .last_trigger(feed_id)
-                .filter(|trigger| matches!(trigger.cause, Cause::Moved | Cause::Flags))
-                .filter(|_| !update.update().flags.is_halted());
-            published.insert(feed_id);
-            let _ = self.state.publish(update);
-            if let (Some(clock), Some(trigger)) = (timed, reaction) {
-                self.latency.signed(trigger.observed_ns, clock.now_ns());
-            }
-        }
-    }
-
-    /// Venue reports, book frames and funding frames go out after each
-    /// evaluation.
-    fn publish_venues(&mut self, now_ns: u64) {
-        let hub = Arc::clone(self.state.hub());
-        let (reports, errors) = self
-            .pipeline
-            .venue_reports(now_ns, |feed| hub.has_subscriber(Channel::Venues, feed));
-        for error in errors {
-            warn!(%error, "venue report could not be encoded");
-        }
-        for report in reports {
-            let _ = self.state.publish_venues(report);
-        }
-        let (books, errors) = self
-            .pipeline
-            .book_updates(now_ns, |book| hub.has_book_subscriber(book));
-        for error in errors {
-            warn!(%error, "book update could not be encoded");
-        }
-        for update in books {
-            let _ = self.state.publish_book(update);
-        }
-        let (funding, errors) = self.pipeline.funding_updates(now_ns);
-        for error in errors {
-            warn!(%error, "funding update could not be encoded");
-        }
-        for update in funding {
-            let _ = self.state.publish_funding(update);
-        }
-    }
-
-    async fn run(mut self) {
-        let clock = self.clock.clone();
-        let mut ticker = tokio::time::interval(self.tick);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // `interval` fires at once; the first status is due after a full interval.
-        let mut status_ticker =
-            tokio::time::interval_at(tokio::time::Instant::now() + STATUS_EVERY, STATUS_EVERY);
-        let mut published: HashSet<FeedId> = HashSet::new();
-        let mut updates_before = 0;
-        loop {
-            let retry = self
-                .pipeline
-                .next_retry_ns()
-                .map(|at| Duration::from_nanos(at.saturating_sub(clock.now_ns())));
-            tokio::select! {
-                biased;
-                () = self.shutdown.cancelled() => break,
-                // The timers first: an ingest queue that is never empty would
-                // otherwise starve the heartbeats, the feed-set change and the status.
-                _ = ticker.tick() => {
-                    let polled = self.pipeline.tick(clock.now_ns());
-                    self.publish(polled, &mut published, None);
-                    self.publish_venues(clock.now_ns());
-                }
-                Some(change) = self.reconfigure.recv() => {
-                    // Above the floor of this run, and above every sequence the
-                    // old set used: `Aggregator::reconfigure` takes the larger.
-                    let floor = wall_clock_unix_nanos() / 1_000_000;
-                    let symbols = names(&change.feeds);
-                    let result = self
-                        .pipeline
-                        .reconfigure(change.feeds, floor)
-                        .map_err(|error| error.to_string());
-                    if result.is_ok() {
-                        self.symbols = symbols;
-                        published.clear();
-                    }
-                    let _ = change.reply.send(result);
-                }
-                _ = status_ticker.tick() => {
-                    let stats = self.pipeline.stats();
-                    let (signed, venues) = self.latency.take();
-                    let status = NodeStatus {
-                        feeds_published: published.len(),
-                        feeds: self.symbols.len(),
-                        clients: self.state.transport().session_count(),
-                        connections_up: stats.connections_up(),
-                        connections: self.connections.load(Ordering::Relaxed),
-                        updates: stats.published.saturating_sub(updates_before),
-                        client_list_version: self.state.transport().clients_version(),
-                        feed_set: self.state.feed_set_version(),
-                        signed,
-                    };
-                    status.log();
-                    log_venue_lag(&venues);
-                    notify::status(&status.to_string());
-                    published.clear();
-                    updates_before = stats.published;
-                }
-                event = self.ingest.recv() => {
-                    let Some(event) = event else { break };
-                    self.apply(&event);
-                    for _ in 1..BATCH_MAX {
-                        let Ok(event) = self.ingest.try_recv() else { break };
-                        self.apply(&event);
-                    }
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published, Some(&clock));
-                    self.publish_venues(clock.now_ns());
-                }
-                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.publish(polled, &mut published, Some(&clock));
-                    self.publish_venues(clock.now_ns());
-                }
-            }
-        }
-        let stats = self.pipeline.stats();
-        info!(
-            observations = stats.observations,
-            published = stats.published,
-            connects = stats.connects,
-            disconnects = stats.disconnects,
-            unencodable = stats.encode_errors,
-            "pipeline stopped"
-        );
-    }
-}
-
-/// SIGTERM and SIGINT, registered once at start. A signal that arrives
-/// between two waits then stays queued, and is not lost.
-struct Signals {
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-}
-
-impl Signals {
-    fn new() -> std::io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            Ok(Self {
-                terminate: signal(SignalKind::terminate())?,
-                interrupt: signal(SignalKind::interrupt())?,
-            })
-        }
-        #[cfg(not(unix))]
-        Ok(Self {})
-    }
-
-    /// Waits for the next signal, and names it.
-    async fn recv(&mut self) -> std::io::Result<&'static str> {
-        #[cfg(unix)]
-        {
-            tokio::select! {
-                _ = self.terminate.recv() => Ok("SIGTERM"),
-                _ = self.interrupt.recv() => Ok("SIGINT"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await?;
-            Ok("ctrl-c")
-        }
-    }
-}
-
 /// Keeps the node clock on wall time. A consumer compares publish times with its
 /// own clock.
 fn spawn_clock_sync(clock: MonotonicClock, shutdown: CancellationToken) {
@@ -724,18 +476,4 @@ fn spawn_transport_tasks(
             }
         }
     });
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use nix::sys::resource::{Resource, getrlimit};
-
-    #[test]
-    fn the_open_file_limit_rises_to_what_the_node_needs() {
-        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).expect("readable");
-        raise_open_files(2_048);
-        let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).expect("readable");
-        assert!(soft >= hard.min(2_048), "soft {soft}, hard {hard}");
-    }
 }

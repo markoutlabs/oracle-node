@@ -5,11 +5,13 @@
 //! `lib.rs` only adds the caller, the clock, and the threshold signature.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use oracle_types::Symbol;
 use oracle_wire::{
     Address, ClientEntry, ClientList, CompressedPublicKey, FeedContent, FeedSet, MAX_CLIENTS,
-    MAX_NODES, NodeEntry, NodeListing, Quorum, Registry, Signature, VerifiedRegistry, WireError,
+    MAX_NODES, NodeEntry, NodeListing, PushPolicy, Quorum, Registry, Signature, VerifiedRegistry,
+    WireError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,13 +28,28 @@ pub enum StateError {
     /// An address is listed once, ever, as a node or as a client.
     #[error("address {0} is or was already in the registry; use a new key")]
     AddressUsed(Address),
-    /// Removing the node would leave consumers unable to reach the quorum.
-    #[error("removing the node would leave {remaining} nodes, below min_nodes {min_nodes}")]
+    /// Removing the node would leave fewer nodes than the canister prices with.
+    #[error(
+        "removing the node would leave {remaining} nodes, below the quorum of {recommended} \
+         that the canister prices with, so every priced feed would halt; lower `recommended` \
+         with set_quorum first"
+    )]
     BelowQuorum {
         /// Nodes that would remain.
         remaining: usize,
-        /// The registry's `min_nodes`.
-        min_nodes: u16,
+        /// The registry's `recommended`.
+        recommended: u16,
+    },
+    /// Raising the quorum above the listed nodes halts every priced feed.
+    #[error(
+        "a quorum of {recommended} with {nodes} listed nodes halts every priced feed; \
+         list the nodes first"
+    )]
+    QuorumAboveNodes {
+        /// The `recommended` that governance asked for.
+        recommended: u16,
+        /// The listed nodes.
+        nodes: usize,
     },
     /// The wire format caps the node count.
     #[error("the registry already holds {MAX_NODES} nodes")]
@@ -120,51 +137,197 @@ pub struct ClientRecord {
     pub added_at: u64,
 }
 
-/// A registry document ready to sign.
+/// A document that the governance key signs: the registry, the client list or the feed set.
+pub trait SignedDocument: Sized {
+    /// What a version holds besides its version, its issue time and its signature.
+    type Content: Clone + fmt::Debug + PartialEq + Eq;
+
+    /// The canonical bytes that the governance key signs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::FieldTooLong`] if a field exceeds its cap.
+    fn signing_bytes(
+        version: u64,
+        effective_from: u64,
+        content: &Self::Content,
+    ) -> Result<Vec<u8>, WireError>;
+
+    /// The signed document.
+    fn seal(
+        version: u64,
+        effective_from: u64,
+        content: Self::Content,
+        governance_signature: Signature,
+    ) -> Self;
+}
+
+/// What a registry version lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedDocument {
-    /// `State::version + 1`.
-    pub version: u64,
-    /// The issue time, unix seconds.
-    pub effective_from: u64,
+pub struct RegistryContent {
     /// The listed nodes.
     pub nodes: Vec<NodeEntry>,
     /// The quorum guidance.
     pub quorum: Quorum,
-    /// `Registry::signing_bytes` over the above.
-    pub signing_bytes: Vec<u8>,
 }
 
-/// A client list ready to sign.
+/// What a client list version lists.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedClientList {
-    /// `State::clients_version + 1`.
-    pub version: u64,
-    /// The issue time, unix seconds.
-    pub effective_from: u64,
+pub struct ClientsContent {
     /// The broadcast-key epoch.
     pub epoch_secs: u64,
     /// The clients.
     pub clients: Vec<ClientEntry>,
-    /// `ClientList::signing_bytes` over the above.
-    pub signing_bytes: Vec<u8>,
 }
 
-/// A feed set ready to sign.
+impl SignedDocument for Registry {
+    type Content = RegistryContent;
+
+    fn signing_bytes(
+        version: u64,
+        at: u64,
+        content: &RegistryContent,
+    ) -> Result<Vec<u8>, WireError> {
+        Self::signing_bytes(version, at, &content.nodes, content.quorum)
+    }
+
+    fn seal(version: u64, at: u64, content: RegistryContent, signature: Signature) -> Self {
+        Self {
+            version,
+            effective_from: at,
+            nodes: content.nodes,
+            quorum: content.quorum,
+            governance_signature: signature,
+        }
+    }
+}
+
+impl SignedDocument for ClientList {
+    type Content = ClientsContent;
+
+    fn signing_bytes(
+        version: u64,
+        at: u64,
+        content: &ClientsContent,
+    ) -> Result<Vec<u8>, WireError> {
+        Self::signing_bytes(version, at, content.epoch_secs, &content.clients)
+    }
+
+    fn seal(version: u64, at: u64, content: ClientsContent, signature: Signature) -> Self {
+        Self {
+            version,
+            effective_from: at,
+            epoch_secs: content.epoch_secs,
+            clients: content.clients,
+            governance_signature: signature,
+        }
+    }
+}
+
+impl SignedDocument for FeedSet {
+    type Content = FeedContent;
+
+    fn signing_bytes(version: u64, at: u64, content: &FeedContent) -> Result<Vec<u8>, WireError> {
+        Self::signing_bytes(
+            version,
+            at,
+            &content.min_node_version,
+            content.push,
+            &content.feeds,
+        )
+    }
+
+    fn seal(version: u64, at: u64, content: FeedContent, signature: Signature) -> Self {
+        Self {
+            version,
+            effective_from: at,
+            min_node_version: content.min_node_version,
+            push: content.push,
+            feeds: content.feeds,
+            governance_signature: signature,
+        }
+    }
+}
+
+/// A document ready to sign: the next version, and its canonical bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedFeedSet {
-    /// `State::feeds_version + 1`.
+pub struct Unsigned<T: SignedDocument> {
+    /// The slot's version + 1.
     pub version: u64,
     /// The issue time, unix seconds.
     pub effective_from: u64,
-    /// The feeds and the settings that go with them.
-    pub content: FeedContent,
-    /// `FeedSet::signing_bytes` over the above.
+    /// What the version holds.
+    pub content: T::Content,
+    /// [`SignedDocument::signing_bytes`] over the above.
     pub signing_bytes: Vec<u8>,
 }
 
+/// One signed document and its version: each publish signs the next version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedSlot<T> {
+    /// Version of the last published document. Zero before the first.
+    pub version: u64,
+    /// The last signed document.
+    pub published: Option<T>,
+}
+
+impl<T> Default for SignedSlot<T> {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            published: None,
+        }
+    }
+}
+
+impl<T: SignedDocument> SignedSlot<T> {
+    /// Builds the next version of the document from its content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::Wire`] if a field exceeds its cap.
+    pub fn next(&self, now: u64, content: T::Content) -> Result<Unsigned<T>, StateError> {
+        let version = self.version.saturating_add(1);
+        let signing_bytes = T::signing_bytes(version, now, &content)?;
+        Ok(Unsigned {
+            version,
+            effective_from: now,
+            content,
+            signing_bytes,
+        })
+    }
+
+    /// Stores a signed document as the published one. Returns its version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::VersionMismatch`] if the document was built for
+    /// a version other than the next one.
+    pub fn publish(
+        &mut self,
+        unsigned: Unsigned<T>,
+        governance_signature: Signature,
+    ) -> Result<u64, StateError> {
+        let expected = self.version.saturating_add(1);
+        if unsigned.version != expected {
+            return Err(StateError::VersionMismatch {
+                expected,
+                got: unsigned.version,
+            });
+        }
+        self.published = Some(T::seal(
+            unsigned.version,
+            unsigned.effective_from,
+            unsigned.content,
+            governance_signature,
+        ));
+        self.version = unsigned.version;
+        Ok(self.version)
+    }
+}
+
 /// The whole canister state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     /// Install-time configuration.
     pub config: Config,
@@ -174,31 +337,20 @@ pub struct State {
     pub nodes: BTreeMap<Address, NodeRecord>,
     /// Nodes governance replaced or removed, by address.
     pub retired: BTreeMap<Address, RetiredNode>,
-    /// Version of the last published document. Zero before the first.
-    pub version: u64,
-    /// The last signed document.
-    pub published: Option<Registry>,
+    /// The registry document.
+    pub registry: SignedSlot<Registry>,
     /// The threshold public key, once fetched.
     pub governance_key: Option<CompressedPublicKey>,
     /// Authorised clients by address.
     pub clients: BTreeMap<Address, ClientRecord>,
     /// Clients governance removed. Their addresses are never listed again.
     pub removed_clients: BTreeSet<Address>,
-    /// Version of the last published client list. Zero before the first.
-    pub clients_version: u64,
-    /// The last signed client list.
-    pub clients_published: Option<ClientList>,
-    // The feed set came after the first mainnet install, so an older state
-    // loads with none of these fields.
+    /// The client list.
+    pub client_list: SignedSlot<ClientList>,
     /// The feed set governance last set, in canonical form. `None` before the first.
-    #[serde(default)]
     pub feed_content: Option<FeedContent>,
-    /// Version of the last published feed set. Zero before the first.
-    #[serde(default)]
-    pub feeds_version: u64,
-    /// The last signed feed set.
-    #[serde(default)]
-    pub feeds_published: Option<FeedSet>,
+    /// The feed set.
+    pub feed_set: SignedSlot<FeedSet>,
 }
 
 impl State {
@@ -214,16 +366,13 @@ impl State {
             quorum,
             nodes: BTreeMap::new(),
             retired: BTreeMap::new(),
-            version: 0,
-            published: None,
+            registry: SignedSlot::default(),
             governance_key: None,
             clients: BTreeMap::new(),
             removed_clients: BTreeSet::new(),
-            clients_version: 0,
-            clients_published: None,
+            client_list: SignedSlot::default(),
             feed_content: None,
-            feeds_version: 0,
-            feeds_published: None,
+            feed_set: SignedSlot::default(),
         })
     }
 
@@ -288,16 +437,17 @@ impl State {
     /// # Errors
     ///
     /// Returns an error if the node is unknown, or the remaining count would
-    /// fall below `quorum.min_nodes`.
+    /// fall below `quorum.recommended`, the quorum that the canister prices
+    /// with. That bound also keeps `quorum.min_nodes`.
     pub fn remove_node(&mut self, address: Address, now: u64) -> Result<(), StateError> {
         if !self.nodes.contains_key(&address) {
             return Err(StateError::UnknownNode(address));
         }
         let remaining = self.nodes.len().saturating_sub(1);
-        if remaining < usize::from(self.quorum.min_nodes) {
+        if remaining < usize::from(self.quorum.recommended) {
             return Err(StateError::BelowQuorum {
                 remaining,
-                min_nodes: self.quorum.min_nodes,
+                recommended: self.quorum.recommended,
             });
         }
         self.retire(address, now)?;
@@ -323,9 +473,19 @@ impl State {
     ///
     /// # Errors
     ///
-    /// Returns [`StateError::InvalidQuorum`] if the values are inconsistent.
+    /// Returns [`StateError::InvalidQuorum`] if the values are inconsistent,
+    /// and [`StateError::QuorumAboveNodes`] for a raise of `recommended` above
+    /// the listed nodes. Lowering it, or keeping it, always passes.
     pub fn set_quorum(&mut self, quorum: Quorum) -> Result<(), StateError> {
         check_quorum(quorum)?;
+        if usize::from(quorum.recommended) > self.nodes.len()
+            && quorum.recommended > self.quorum.recommended
+        {
+            return Err(StateError::QuorumAboveNodes {
+                recommended: quorum.recommended,
+                nodes: self.nodes.len(),
+            });
+        }
         self.quorum = quorum;
         Ok(())
     }
@@ -335,56 +495,25 @@ impl State {
         self.governance_key = Some(key);
     }
 
-    /// Builds the next document and its canonical bytes.
+    /// Builds the next registry document and its canonical bytes.
     ///
     /// # Errors
     ///
     /// Returns a wire error if the document does not encode, which means a
     /// listed entry broke a limit that `NodeEntry::validate` should have caught.
-    pub fn unsigned_document(&self, now: u64) -> Result<UnsignedDocument, StateError> {
-        let version = self.version.saturating_add(1);
-        let nodes: Vec<NodeEntry> = self
+    pub fn next_registry(&self, now: u64) -> Result<Unsigned<Registry>, StateError> {
+        let nodes = self
             .nodes
             .iter()
             .map(|(address, node)| node.entry(*address))
             .collect();
-        let signing_bytes = Registry::signing_bytes(version, now, &nodes, self.quorum)?;
-        Ok(UnsignedDocument {
-            version,
-            effective_from: now,
-            nodes,
-            quorum: self.quorum,
-            signing_bytes,
-        })
-    }
-
-    /// Stores a signed document as the published registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateError::VersionMismatch`] if the document was built for
-    /// a version other than the next one.
-    pub fn publish(
-        &mut self,
-        document: UnsignedDocument,
-        governance_signature: Signature,
-    ) -> Result<u64, StateError> {
-        let expected = self.version.saturating_add(1);
-        if document.version != expected {
-            return Err(StateError::VersionMismatch {
-                expected,
-                got: document.version,
-            });
-        }
-        self.published = Some(Registry {
-            version: document.version,
-            effective_from: document.effective_from,
-            nodes: document.nodes,
-            quorum: document.quorum,
-            governance_signature,
-        });
-        self.version = document.version;
-        Ok(self.version)
+        self.registry.next(
+            now,
+            RegistryContent {
+                nodes,
+                quorum: self.quorum,
+            },
+        )
     }
 
     /// Governance authorises a client until `expires_at`. Bumps the client list.
@@ -455,9 +584,8 @@ impl State {
     /// # Errors
     ///
     /// Returns a wire error if the list does not encode.
-    pub fn unsigned_client_list(&self, now: u64) -> Result<UnsignedClientList, StateError> {
-        let version = self.clients_version.saturating_add(1);
-        let clients: Vec<ClientEntry> = self
+    pub fn next_client_list(&self, now: u64) -> Result<Unsigned<ClientList>, StateError> {
+        let clients = self
             .clients
             .iter()
             .map(|(address, record)| ClientEntry {
@@ -465,44 +593,13 @@ impl State {
                 expires_at: record.expires_at,
             })
             .collect();
-        let signing_bytes =
-            ClientList::signing_bytes(version, now, self.config.epoch_secs, &clients)?;
-        Ok(UnsignedClientList {
-            version,
-            effective_from: now,
-            epoch_secs: self.config.epoch_secs,
-            clients,
-            signing_bytes,
-        })
-    }
-
-    /// Stores a signed client list as the published one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateError::VersionMismatch`] if the list was built for a
-    /// version other than the next one.
-    pub fn publish_clients(
-        &mut self,
-        list: UnsignedClientList,
-        governance_signature: Signature,
-    ) -> Result<u64, StateError> {
-        let expected = self.clients_version.saturating_add(1);
-        if list.version != expected {
-            return Err(StateError::VersionMismatch {
-                expected,
-                got: list.version,
-            });
-        }
-        self.clients_published = Some(ClientList {
-            version: list.version,
-            effective_from: list.effective_from,
-            epoch_secs: list.epoch_secs,
-            clients: list.clients,
-            governance_signature,
-        });
-        self.clients_version = list.version;
-        Ok(self.clients_version)
+        self.client_list.next(
+            now,
+            ClientsContent {
+                epoch_secs: self.config.epoch_secs,
+                clients,
+            },
+        )
     }
 
     /// Checks a feed set and keeps its canonical form for the next signing round.
@@ -521,52 +618,15 @@ impl State {
     ///
     /// Returns [`StateError::NoFeedSet`] before the first `set_feed_set`, and
     /// [`StateError::Wire`] if a field exceeds its cap.
-    pub fn unsigned_feed_set(&self, now: u64) -> Result<UnsignedFeedSet, StateError> {
-        let content = self.feed_content.as_ref().ok_or(StateError::NoFeedSet)?;
-        let version = self.feeds_version.saturating_add(1);
-        let signing_bytes = FeedSet::signing_bytes(
-            version,
-            now,
-            &content.min_node_version,
-            content.push,
-            &content.feeds,
-        )?;
-        Ok(UnsignedFeedSet {
-            version,
-            effective_from: now,
-            content: content.clone(),
-            signing_bytes,
-        })
+    pub fn next_feed_set(&self, now: u64) -> Result<Unsigned<FeedSet>, StateError> {
+        let content = self.feed_content.clone().ok_or(StateError::NoFeedSet)?;
+        self.feed_set.next(now, content)
     }
 
-    /// Stores a signed feed set as the published one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateError::VersionMismatch`] if the set was built for a
-    /// version other than the next one.
-    pub fn publish_feeds(
-        &mut self,
-        set: UnsignedFeedSet,
-        governance_signature: Signature,
-    ) -> Result<u64, StateError> {
-        let expected = self.feeds_version.saturating_add(1);
-        if set.version != expected {
-            return Err(StateError::VersionMismatch {
-                expected,
-                got: set.version,
-            });
-        }
-        self.feeds_published = Some(FeedSet {
-            version: set.version,
-            effective_from: set.effective_from,
-            min_node_version: set.content.min_node_version,
-            push: set.content.push,
-            feeds: set.content.feeds,
-            governance_signature,
-        });
-        self.feeds_version = set.version;
-        Ok(self.feeds_version)
+    /// The push pace of the published feed set, which the nodes follow.
+    #[must_use]
+    pub fn push_pace(&self) -> Option<PushPolicy> {
+        self.feed_set.published.as_ref().and_then(|set| set.push)
     }
 
     /// The first of `feeds` that the feed set does not list; `None` when it lists all, or when there is no set.
@@ -581,12 +641,38 @@ impl State {
         feeds.iter().find(|feed| !listed.contains(feed)).copied()
     }
 
+    /// The published documents whose signature fails against the governance
+    /// key, such as after a rollback that dropped a signed field.
+    #[must_use]
+    pub fn documents_that_do_not_verify(&self) -> Vec<&'static str> {
+        let Some(governance) = self.governance_key.and_then(|key| key.address().ok()) else {
+            return Vec::new();
+        };
+        let mut failed = Vec::new();
+        if let Some(registry) = &self.registry.published
+            && registry.verify(governance, 0).is_err()
+        {
+            failed.push("registry (republish)");
+        }
+        if let Some(list) = &self.client_list.published
+            && list.verify(governance, 0).is_err()
+        {
+            failed.push("client list (republish_clients)");
+        }
+        if let Some(set) = &self.feed_set.published
+            && set.verify(governance, 0).is_err()
+        {
+            failed.push("feed set (republish_feeds)");
+        }
+        failed
+    }
+
     /// The published document, verified against the governance key. The
     /// price checks use it.
     #[must_use]
     pub fn verified_registry(&self) -> Option<VerifiedRegistry> {
         let governance = self.governance_key?.address().ok()?;
-        self.published.as_ref()?.verify(governance, 0).ok()
+        self.registry.published.as_ref()?.verify(governance, 0).ok()
     }
 
     /// When a node address was listed, whether it still is or not.
@@ -638,38 +724,39 @@ fn check_quorum(quorum: Quorum) -> Result<(), StateError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use oracle_wire::Signer;
+    use zeroize::Zeroizing;
 
     use super::*;
 
     const NOW: u64 = 1_754_582_400;
 
-    fn config() -> Config {
+    pub(crate) fn config() -> Config {
         Config {
             key_name: "dfx_test_key".to_owned(),
             epoch_secs: 60,
         }
     }
 
-    fn quorum(min_nodes: u16) -> Quorum {
+    fn quorum(min_nodes: u16, recommended: u16) -> Quorum {
         Quorum {
             min_nodes,
-            recommended: min_nodes.max(3),
+            recommended,
         }
     }
 
-    fn governance_signer() -> Signer {
-        Signer::from_secret_bytes([0x33; 32]).expect("valid key")
+    pub(crate) fn governance_signer() -> Signer {
+        Signer::from_secret(&Zeroizing::new([0x33; 32])).expect("valid key")
     }
 
-    fn address(seed: u8) -> Address {
-        Signer::from_secret_bytes([seed; 32])
+    pub(crate) fn address(seed: u8) -> Address {
+        Signer::from_secret(&Zeroizing::new([seed; 32]))
             .expect("valid key")
             .address()
     }
 
-    fn entry(seed: u8) -> NodeEntry {
+    pub(crate) fn entry(seed: u8) -> NodeEntry {
         NodeEntry {
             address: address(seed),
             endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
@@ -679,15 +766,17 @@ mod tests {
 
     /// Signs and publishes the way the canister does, with an in-process key
     /// standing in for the threshold key.
-    fn publish(state: &mut State, now: u64) -> Registry {
-        let doc = state.unsigned_document(now).expect("encodes");
+    pub(crate) fn publish(state: &mut State, now: u64) -> Registry {
+        let doc = state.next_registry(now).expect("encodes");
         let signature = governance_signer().sign_payload(&doc.signing_bytes);
-        state.publish(doc, signature).expect("publishes");
-        state.published.clone().expect("published")
+        state.registry.publish(doc, signature).expect("publishes");
+        state.registry.published.clone().expect("published")
     }
 
-    fn listed(seeds: &[u8], min_nodes: u16) -> State {
-        let mut state = State::new(config(), quorum(min_nodes)).expect("valid");
+    /// Nodes from these seeds, a quorum of all of them, and one published registry.
+    pub(crate) fn listed(seeds: &[u8]) -> State {
+        let count = u16::try_from(seeds.len()).expect("a few nodes");
+        let mut state = State::new(config(), quorum(1, count.max(1))).expect("valid");
         for &seed in seeds {
             state.add_node(entry(seed), NOW).expect("adds");
         }
@@ -697,7 +786,7 @@ mod tests {
 
     #[test]
     fn added_nodes_publish_and_verify() {
-        let mut state = State::new(config(), quorum(3)).expect("valid");
+        let mut state = State::new(config(), quorum(3, 3)).expect("valid");
         for seed in 1..=3 {
             state.add_node(entry(seed), NOW).expect("adds");
         }
@@ -719,7 +808,7 @@ mod tests {
 
     #[test]
     fn invalid_entries_are_refused() {
-        let mut state = State::new(config(), quorum(1)).expect("valid");
+        let mut state = State::new(config(), quorum(1, 1)).expect("valid");
         let mutations: [fn(&mut NodeEntry); 3] = [
             |e| e.endpoints.clear(),
             |e| e.endpoints = vec!["https://node.example".to_owned()],
@@ -738,7 +827,7 @@ mod tests {
 
     #[test]
     fn a_replacement_swaps_the_address_in_one_version() {
-        let mut state = listed(&[1, 2], 2);
+        let mut state = listed(&[1, 2]);
         let later = NOW + 10;
         state
             .replace_node(address(1), address(50), later)
@@ -783,17 +872,24 @@ mod tests {
         }
     }
 
+    /// SPEC §3.6: the canister prices with `recommended`, so a removal below it
+    /// would halt every priced feed. Governance lowers the quorum first.
     #[test]
-    fn removal_never_goes_below_min_nodes_and_never_comes_back() {
-        let mut state = listed(&[1, 2, 3], 3);
+    fn removal_never_goes_below_the_price_quorum_and_never_comes_back() {
+        let mut state = listed(&[1, 2, 3]);
         assert_eq!(
             state.remove_node(address(3), NOW + 1),
             Err(StateError::BelowQuorum {
                 remaining: 2,
-                min_nodes: 3
+                recommended: 3
             })
         );
-        state.set_quorum(quorum(2)).expect("valid");
+        state.set_quorum(quorum(1, 3)).expect("valid");
+        assert!(
+            state.remove_node(address(3), NOW + 1).is_err(),
+            "min_nodes alone does not decide"
+        );
+        state.set_quorum(quorum(1, 2)).expect("a lower quorum");
         state.remove_node(address(3), NOW + 1).expect("removes");
         assert_eq!(
             state
@@ -811,11 +907,34 @@ mod tests {
         );
     }
 
+    /// A quorum above the listed nodes halts every priced feed, so a raise to
+    /// it is refused; a quorum that already was above them can stay.
+    #[test]
+    fn a_quorum_raise_above_the_listed_nodes_is_refused() {
+        let mut state = listed(&[1, 2]);
+        assert_eq!(
+            state.set_quorum(quorum(1, 3)),
+            Err(StateError::QuorumAboveNodes {
+                recommended: 3,
+                nodes: 2
+            })
+        );
+        state.set_quorum(quorum(1, 1)).expect("lower");
+        state
+            .set_quorum(quorum(2, 2))
+            .expect("up to the listed nodes");
+
+        let mut empty = State::new(config(), quorum(1, 3)).expect("valid");
+        empty
+            .set_quorum(quorum(2, 3))
+            .expect("the install quorum stays while nodes are listed");
+    }
+
     /// A client key lives on a consumer's machine. It must never become a
     /// price-signing key, and a revoked one must never come back.
     #[test]
     fn an_address_has_one_role_once() {
-        let mut state = listed(&[1], 1);
+        let mut state = listed(&[1]);
         assert_eq!(
             state.add_client(address(1), NOW + 60, NOW),
             Err(StateError::AddressUsed(address(1)))
@@ -842,7 +961,7 @@ mod tests {
 
     #[test]
     fn client_changes_follow_the_rules() {
-        let mut state = State::new(config(), quorum(1)).expect("valid");
+        let mut state = State::new(config(), quorum(1, 1)).expect("valid");
         state.add_client(address(1), NOW + 60, NOW).expect("adds");
         assert_eq!(
             state.add_client(address(1), NOW + 60, NOW),
@@ -870,15 +989,15 @@ mod tests {
 
     #[test]
     fn the_client_list_publishes_with_its_own_version() {
-        let mut state = listed(&[1], 1);
-        let registry_version = state.version;
+        let mut state = listed(&[1]);
+        let registry_version = state.registry.version;
         state.add_client(address(7), NOW + 600, NOW).expect("adds");
 
-        let list = state.unsigned_client_list(NOW).expect("encodes");
+        let list = state.next_client_list(NOW).expect("encodes");
         let signature = governance_signer().sign_payload(&list.signing_bytes);
-        assert_eq!(state.publish_clients(list.clone(), signature), Ok(1));
-        assert_eq!(state.version, registry_version);
-        let published = state.clients_published.clone().expect("published");
+        assert_eq!(state.client_list.publish(list.clone(), signature), Ok(1));
+        assert_eq!(state.registry.version, registry_version);
+        let published = state.client_list.published.clone().expect("published");
         let verified = published
             .verify(governance_signer().address(), 0)
             .expect("verifies with oracle-wire");
@@ -890,19 +1009,19 @@ mod tests {
 
         let signature = governance_signer().sign_payload(&list.signing_bytes);
         assert!(matches!(
-            state.publish_clients(list, signature),
+            state.client_list.publish(list, signature),
             Err(StateError::VersionMismatch { .. })
         ));
     }
 
     #[test]
     fn a_stale_signing_round_cannot_publish() {
-        let mut state = listed(&[1], 1);
-        let doc = state.unsigned_document(NOW + 5).expect("encodes");
+        let mut state = listed(&[1]);
+        let doc = state.next_registry(NOW + 5).expect("encodes");
         publish(&mut state, NOW + 6);
         let signature = governance_signer().sign_payload(&doc.signing_bytes);
         assert_eq!(
-            state.publish(doc, signature),
+            state.registry.publish(doc, signature),
             Err(StateError::VersionMismatch {
                 expected: 3,
                 got: 2,
@@ -910,23 +1029,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_state_round_trips_through_stable_memory() {
-        let mut state = listed(&[1, 2], 1);
-        state
-            .replace_node(address(1), address(3), NOW + 1)
-            .expect("replaces");
-        state.add_client(address(8), NOW + 60, NOW).expect("adds");
-        state.add_client(address(9), NOW + 60, NOW).expect("adds");
-        state.remove_client(address(9)).expect("removes");
-        publish(&mut state, NOW + 1);
-
-        let bytes = serde_json::to_vec(&state).expect("serialises");
-        let loaded: State = serde_json::from_slice(&bytes).expect("loads");
-        assert_eq!(loaded, state);
-    }
-
-    fn one_feed() -> FeedContent {
+    pub(crate) fn one_feed() -> FeedContent {
         FeedContent {
             min_node_version: String::new(),
             push: None,
@@ -946,13 +1049,13 @@ mod tests {
 
     #[test]
     fn a_feed_set_publishes_in_canonical_form_and_verifies() {
-        let mut state = listed(&[1], 1);
-        assert_eq!(state.unsigned_feed_set(NOW), Err(StateError::NoFeedSet));
+        let mut state = listed(&[1]);
+        assert_eq!(state.next_feed_set(NOW), Err(StateError::NoFeedSet));
         state.set_feed_content(&one_feed()).expect("passes");
-        let unsigned = state.unsigned_feed_set(NOW).expect("encodes");
+        let unsigned = state.next_feed_set(NOW).expect("encodes");
         let signature = governance_signer().sign_payload(&unsigned.signing_bytes);
-        assert_eq!(state.publish_feeds(unsigned.clone(), signature), Ok(1));
-        let published = state.feeds_published.clone().expect("published");
+        assert_eq!(state.feed_set.publish(unsigned.clone(), signature), Ok(1));
+        let published = state.feed_set.published.clone().expect("published");
         let verified = published
             .verify(governance_signer().address(), 0)
             .expect("verifies");
@@ -964,7 +1067,7 @@ mod tests {
             Some("0.5")
         );
         assert_eq!(
-            state.publish_feeds(unsigned, signature),
+            state.feed_set.publish(unsigned, signature),
             Err(StateError::VersionMismatch {
                 expected: 2,
                 got: 1,
@@ -980,36 +1083,5 @@ mod tests {
             state.set_feed_content(&bad),
             Err(StateError::InvalidFeedSet(_))
         ));
-    }
-
-    /// The mainnet state was saved before the feed set, so it lacks the fields.
-    #[test]
-    fn a_state_from_before_the_feed_set_loads() {
-        let mut state = listed(&[1], 1);
-        state.set_feed_content(&one_feed()).expect("passes");
-        let mut old = serde_json::to_value(&state).expect("serialises");
-        let fields = old.as_object_mut().expect("an object");
-        for field in ["feed_content", "feeds_version", "feeds_published"] {
-            fields.remove(field).expect("the field");
-        }
-        let loaded: State = serde_json::from_value(old).expect("loads");
-        assert_eq!(loaded.feed_content, None);
-        assert_eq!(loaded.feeds_version, 0);
-        assert_eq!(loaded.published, state.published);
-    }
-
-    /// Nothing was deployed with node ids, so there is no migration. An old
-    /// state fails to load, `post_upgrade` traps, and the old wasm stays.
-    #[test]
-    fn a_state_keyed_by_node_id_does_not_load() {
-        let state = listed(&[1], 1);
-        let mut old = serde_json::to_value(&state).expect("serialises");
-        let nodes = old.get_mut("nodes").expect("the nodes");
-        let node = nodes
-            .get(address(1).to_string())
-            .cloned()
-            .expect("the node");
-        *nodes = serde_json::json!({ "oracle-a": node });
-        assert!(serde_json::from_value::<State>(old).is_err());
     }
 }

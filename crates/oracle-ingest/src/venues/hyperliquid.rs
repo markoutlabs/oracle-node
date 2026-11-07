@@ -15,14 +15,14 @@
 
 use std::time::Duration;
 
-use oracle_types::{Fixed, NANOS_PER_SEC, ObsKind, Observation};
+use oracle_types::{NANOS_PER_SEC, ObsKind, Observation};
 use serde::Deserialize;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::{decimal, interval_funding};
+use super::{book_top, decimal, interval_funding, observation};
 
 /// The production endpoint.
 pub const URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -34,6 +34,9 @@ pub const KEEPALIVE: &str = r#"{"method":"ping"}"#;
 pub const KEEPALIVE_EVERY: Duration = Duration::from_secs(30);
 
 const HOUR_NS: u64 = 3_600 * NANOS_PER_SEC;
+
+/// Each `l2Book` message is a whole book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::WholeBook);
 
 /// Builds the subscribe frames for a set of coins, each with whether it wants
 /// the book. A perpetual also takes its context channel.
@@ -163,30 +166,17 @@ pub fn decode(
             let Some(entry) = map.lookup(bbo.coin) else {
                 return Err(DecodeError::UnknownInstrument(bbo.coin.to_owned()));
             };
-            let (Some(bid), Some(ask)) = bbo.bbo else {
-                // One side is empty: no quote.
-                return Err(DecodeError::Control);
+            let top = || {
+                let (Some(bid), Some(ask)) = &bbo.bbo else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    (decimal("bid px", bid.px)?, decimal("ask px", ask.px)?),
+                    (decimal("bid sz", bid.sz)?, decimal("ask sz", ask.sz)?),
+                )))
             };
-            let (bid_px, ask_px) = (decimal("bid px", bid.px)?, decimal("ask px", ask.px)?);
-            let mid = bid_px
-                .checked_add(ask_px)
-                .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-                .unwrap_or(bid_px);
-            out.push(Observation {
-                instrument: entry.instrument.clone(),
-                kind: ObsKind::BookTop,
-                price: mid,
-                bid: Some(bid_px),
-                ask: Some(ask_px),
-                bid_qty: Some(decimal("bid sz", bid.sz)?),
-                ask_qty: Some(decimal("ask sz", ask.sz)?),
-                depth_notional_1bp: None,
-                exchange_time_ns: Some(millis_to_nanos(bbo.time)),
-                local_recv_ns,
-                seq: None,
-                book: None,
-                funding: None,
-            });
+            let time = Some(millis_to_nanos(bbo.time));
+            out.push(book_top(entry, top, time, local_recv_ns)?);
             Ok(())
         }
         "trades" => {
@@ -197,19 +187,13 @@ pub fn decode(
                     continue;
                 };
                 out.push(Observation {
-                    instrument: entry.instrument.clone(),
-                    kind: ObsKind::Trade,
-                    price: decimal("px", trade.px)?,
-                    bid: None,
-                    ask: None,
-                    bid_qty: None,
-                    ask_qty: None,
-                    depth_notional_1bp: None,
                     exchange_time_ns: Some(millis_to_nanos(trade.time)),
-                    local_recv_ns,
-                    seq: None,
-                    book: None,
-                    funding: None,
+                    ..observation(
+                        entry,
+                        ObsKind::Trade,
+                        decimal("px", trade.px)?,
+                        local_recv_ns,
+                    )
                 });
                 emitted = true;
             }
@@ -224,25 +208,20 @@ pub fn decode(
             let Some(entry) = map.lookup(message.coin) else {
                 return Err(DecodeError::UnknownInstrument(message.coin.to_owned()));
             };
-            // Each message is a whole snapshot, so nothing can be missed.
-            let book = books.book(message.coin);
-            book.clear();
-            book.last_id = Some(message.time);
-            for (side, levels) in [
-                (Side::Bid, &message.levels.0),
-                (Side::Ask, &message.levels.1),
-            ] {
-                for level in levels {
-                    book.set(side, decimal("px", level.px)?, decimal("sz", level.sz)?);
-                }
-            }
-            books.emit(
-                message.coin,
-                entry.instrument.clone(),
-                Some(millis_to_nanos(message.time)),
-                local_recv_ns,
-                out,
-            )
+            let (bids, asks) = &message.levels;
+            let parsed = BookMsg::whole(bids, asks, |level| {
+                Ok(Change::new(
+                    decimal("px", level.px)?,
+                    decimal("sz", level.sz)?,
+                ))
+            })
+            .map(|whole| BookMsg {
+                next_id: Some(message.time),
+                ..whole.at(Some(millis_to_nanos(message.time)))
+            });
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         _ => {
             let message: AssetCtx<'_> = serde_json::from_str(data.get()).map_err(parse)?;
@@ -256,21 +235,12 @@ pub fn decode(
                 ("oraclePx", ObsKind::IndexPrice, ctx.oracle_px),
             ] {
                 let Some(raw) = raw else { continue };
-                out.push(Observation {
-                    instrument: entry.instrument.clone(),
+                out.push(observation(
+                    entry,
                     kind,
-                    price: decimal(field, raw)?,
-                    bid: None,
-                    ask: None,
-                    bid_qty: None,
-                    ask_qty: None,
-                    depth_notional_1bp: None,
-                    exchange_time_ns: None,
+                    decimal(field, raw)?,
                     local_recv_ns,
-                    seq: None,
-                    book: None,
-                    funding: None,
-                });
+                ));
                 emitted = true;
             }
             let rate = ctx.funding.map(|raw| decimal("funding", raw)).transpose()?;
@@ -280,7 +250,7 @@ pub fn decode(
                 .transpose()?;
             // The context repeats each second; the rate goes out when it or the
             // open interest changed.
-            let last = books.funding(message.coin);
+            let last = books.funding(&entry.instrument);
             if last.update(rate, open_interest) {
                 last.interval_ns = Some(HOUR_NS);
                 last.next_funding_time_ns = local_recv_ns
@@ -308,60 +278,53 @@ pub fn decode(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, fixed, instrument, kinds};
     use oracle_types::{FundingBasis, OpenInterestUnit};
     use oracle_types::{MarketKind, Venue};
 
-    /// 2026-10-25 07:29:54 UTC, inside the hour of the fixtures.
-    const RECV: u64 = 1_792_913_394_000_000_000;
+    /// 2026-10-25 07:29:54 UTC, inside the hour of the fixtures: the next
+    /// funding time is the next top of the hour after receipt.
+    const RECORDED_AT_NS: u64 = 1_792_913_394_000_000_000;
     const ASSET_CTX: &str = include_str!("../../tests/fixtures/funding/hyperliquid-asset-ctx.json");
     const BBO: &str = include_str!("../../tests/fixtures/funding/hyperliquid-bbo.json");
     const SPOT_BBO: &str = include_str!("../../tests/fixtures/funding/hyperliquid-bbo-spot.json");
     const BOOK: &str = include_str!("../../tests/fixtures/hyperliquid-book.json");
 
-    fn map(market: MarketKind, coin: &str, depth: bool) -> InstrumentMap {
-        let spec = InstrumentSpec::new(coin, market, "CRYPTO.BTC/USDC").expect("valid");
+    fn hyperliquid(market: MarketKind, coin: &str, depth: bool) -> Feed {
+        let spec = instrument(coin, market);
         let spec = if depth { spec.with_depth() } else { spec };
-        InstrumentMap::new(Venue::Hyperliquid, market, &[spec]).expect("valid")
+        Feed::venue(decode, Venue::Hyperliquid, market, &[spec]).at(RECORDED_AT_NS)
     }
 
-    fn decoded(payload: &str, map: &InstrumentMap, books: &mut Books) -> Vec<Observation> {
-        let mut out = Vec::new();
-        decode(payload.as_bytes(), map, books, RECV, &mut out).expect("decodes");
-        out
-    }
-
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
+    fn btc_perp() -> Feed {
+        hyperliquid(MarketKind::LinearPerp, "BTC", false)
     }
 
     #[test]
     fn the_top_of_book_is_a_quote_with_its_sizes() {
-        let perp = map(MarketKind::LinearPerp, "BTC", false);
-        let out = decoded(BBO, &perp, &mut Books::default());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, ObsKind::BookTop);
+        let out = btc_perp().decoded(BBO);
+        assert_eq!(kinds(&out), [ObsKind::BookTop]);
         assert_eq!(out[0].bid, Some(fixed("80560.0")));
         assert_eq!(out[0].ask, Some(fixed("80561.0")));
         assert_eq!(out[0].price, fixed("80560.5"));
         assert_eq!(out[0].bid_qty, Some(fixed("0.98523")));
-        assert_eq!(out[0].exchange_time_ns, Some(1_792_913_436_085_000_000));
+        assert_eq!(
+            out[0].exchange_time_ns,
+            Some(millis_to_nanos(1_792_913_436_085))
+        );
 
         // A spot pair is named by its index.
-        let spot = map(MarketKind::Spot, "@142", false);
-        let out = decoded(SPOT_BBO, &spot, &mut Books::default());
+        let out = hyperliquid(MarketKind::Spot, "@142", false).decoded(SPOT_BBO);
         assert_eq!(out[0].bid, Some(fixed("80501.0")));
         assert_eq!(&*out[0].instrument.symbol, "@142");
     }
 
     #[test]
     fn the_context_gives_mark_index_and_hourly_funding_with_open_interest() {
-        let perp = map(MarketKind::LinearPerp, "BTC", false);
-        let mut books = Books::default();
-        let out = decoded(ASSET_CTX, &perp, &mut books);
-        let kinds: Vec<_> = out.iter().map(|o| o.kind).collect();
+        let mut perp = btc_perp();
+        let out = perp.decoded(ASSET_CTX);
         assert_eq!(
-            kinds,
+            kinds(&out),
             [ObsKind::MarkPrice, ObsKind::IndexPrice, ObsKind::Funding]
         );
         assert_eq!(out[0].price, fixed("80560.0"));
@@ -370,7 +333,7 @@ mod tests {
         let info = out[2].funding.as_deref().expect("info");
         assert_eq!(info.basis, FundingBasis::Interval);
         assert_eq!(info.interval_ns, Some(HOUR_NS));
-        // The next top of the hour after RECV: 08:00:00 UTC.
+        // The next top of the hour after receipt: 08:00:00 UTC.
         assert_eq!(info.next_funding_time_ns, Some(1_792_915_200_000_000_000));
         assert_eq!(
             info.open_interest,
@@ -378,25 +341,28 @@ mod tests {
         );
 
         // The same context again: the prices, but no second funding observation.
-        let again = decoded(ASSET_CTX, &perp, &mut books);
-        assert!(again.iter().all(|o| o.kind != ObsKind::Funding));
+        assert_eq!(
+            kinds(&perp.decoded(ASSET_CTX)),
+            [ObsKind::MarkPrice, ObsKind::IndexPrice]
+        );
     }
 
     #[test]
     fn a_book_message_is_a_whole_snapshot() {
-        let perp = map(MarketKind::LinearPerp, "BTC", true);
-        let mut books = Books::default();
-        let out = decoded(BOOK, &perp, &mut books);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, ObsKind::Depth);
+        let mut perp = hyperliquid(MarketKind::LinearPerp, "BTC", true);
+        let out = perp.decoded(BOOK);
+        assert_eq!(kinds(&out), [ObsKind::Depth]);
         let book = out[0].book.as_deref().expect("levels");
-        assert!(book.bids[0].price < book.asks[0].price);
         assert_eq!(book.bids[0].price, fixed("80560.0"));
-        assert_eq!(out[0].seq, Some(1_792_913_435_816));
+        assert_eq!(
+            out[0].seq,
+            Some(1_792_913_435_816),
+            "the book's time is its sequence"
+        );
 
         // A later snapshot replaces the first, levels and all.
         let moved = BOOK.replace(r#""px":"80560.0""#, r#""px":"80559.5""#);
-        let out = decoded(&moved, &perp, &mut books);
+        let out = perp.decoded(moved);
         let book = out[0].book.as_deref().expect("levels");
         assert_eq!(book.bids[0].price, fixed("80559.5"));
         assert!(
@@ -408,20 +374,16 @@ mod tests {
 
     #[test]
     fn trades_are_prints_of_tracked_coins_only() {
-        let perp = map(MarketKind::LinearPerp, "BTC", false);
         let trades = r#"{"channel":"trades","data":[
             {"coin":"BTC","side":"A","px":"80564.0","sz":"0.001","time":1792913373012,"hash":"0x0","tid":1,"users":["0xa","0xb"]},
             {"coin":"ETH","side":"B","px":"2344.4","sz":"1","time":1792913373013,"hash":"0x0","tid":2,"users":["0xa","0xb"]}]}"#;
-        let out = decoded(trades, &perp, &mut Books::default());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, ObsKind::Trade);
+        let out = btc_perp().decoded(trades);
+        assert_eq!(kinds(&out), [ObsKind::Trade]);
         assert_eq!(out[0].price, fixed("80564.0"));
     }
 
     #[test]
     fn replies_pongs_and_spot_contexts_are_benign_and_errors_are_not() {
-        let perp = map(MarketKind::LinearPerp, "BTC", false);
-        let mut out = Vec::new();
         for control in [
             r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}}"#,
             r#"{"channel":"pong"}"#,
@@ -429,28 +391,12 @@ mod tests {
             r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bbo":[{"px":"1","sz":"1","n":1},{"px":"2","sz":"1","n":1}]}}"#,
             r#"{"channel":"bbo","data":{"coin":"BTC","time":1,"bbo":[null,{"px":"2","sz":"1","n":1}]}}"#,
         ] {
-            let error = decode(
-                control.as_bytes(),
-                &perp,
-                &mut Books::default(),
-                RECV,
-                &mut out,
-            )
-            .expect_err("not market data");
+            let error = btc_perp().refused(control);
             assert!(error.is_benign(), "got {error:?} for {control}");
         }
-        assert!(out.is_empty());
         let refused =
             r#"{"channel":"error","data":"Error parsing JSON into valid websocket request"}"#;
-        let error = decode(
-            refused.as_bytes(),
-            &perp,
-            &mut Books::default(),
-            RECV,
-            &mut out,
-        )
-        .expect_err("an error");
-        assert!(!error.is_benign());
+        assert!(!btc_perp().refused(refused).is_benign());
     }
 
     #[test]

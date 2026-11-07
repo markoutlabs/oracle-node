@@ -4,34 +4,33 @@
 # governance: the identity that controls the canister. Each node takes the new
 # set while it runs, in its own slot (SPEC §3.8).
 #
-#   scripts/publish-feeds.sh --identity tapray
-#   PUSH=7,10,5 scripts/publish-feeds.sh --identity tapray
-#   ENV=local scripts/publish-feeds.sh --identity oracle-e2e
+#   PUSH=60,2,60 scripts/publish-feeds.sh --identity tapray
+#   ENV=local PUSH=2,10,1 scripts/publish-feeds.sh --identity oracle-e2e
 #
 # PUSH sets every node's push pace: heartbeat seconds, deviation in basis
-# points, and minimum interval seconds. Without it, each node keeps its own.
+# points, and minimum interval seconds. It is required: without it, each node
+# pushes at its own pace, and the canister pays for each push. The production
+# pace is PUSH=60,2,60 with a 180 s price window (SPEC §3.7).
 # The script shows which feeds the publish adds, removes and changes, against
 # the set the canister serves now.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
-flags "identity" "usage: [PUSH=H,D,I] scripts/publish-feeds.sh --identity NAME" "$@"
+flags "identity" "usage: PUSH=H,D,I scripts/publish-feeds.sh --identity NAME" "$@"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-PACE=()
-if [ -n "${PUSH:-}" ]; then
-  IFS=, read -r heartbeat deviation interval <<<"$PUSH"
-  [ -n "${interval:-}" ] || die "PUSH takes three numbers: heartbeat,deviation,interval"
-  PACE=(--push-heartbeat-secs "$heartbeat" --push-deviation-bps "$deviation"
-    --push-min-interval-secs "$interval")
-fi
+[ -n "${PUSH:-}" ] || die "PUSH is required: heartbeat,deviation,interval, such as PUSH=60,2,60 (SPEC §3.7)"
+IFS=, read -r heartbeat deviation interval <<<"$PUSH"
+[ -n "${interval:-}" ] || die "PUSH takes three numbers: heartbeat,deviation,interval"
+PACE=(--push-heartbeat-secs "$heartbeat" --push-deviation-bps "$deviation"
+  --push-min-interval-secs "$interval")
 # A first build takes minutes, so cargo shows its progress.
 echo "building oracle-node for the export" >&2
 (cd "$ROOT" && cargo build --release -p oracle-node --bin oracle-node)
 (cd "$ROOT" && target/release/oracle-node export-feeds \
-  node/all-feeds.toml node/assets.toml --candid "$WORK/args.bin" ${PACE[@]+"${PACE[@]}"}) >"$WORK/content.json"
+  node/all-feeds.toml node/assets.toml --candid "$WORK/args.bin" "${PACE[@]}") >"$WORK/content.json"
 
 # The published set, as the nodes read it, for the diff only: the canister signs
 # what this sends. Before the first publish there is none.

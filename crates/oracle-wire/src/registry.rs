@@ -253,8 +253,12 @@ impl Registry {
             governance,
         )?;
 
-        let mut by_address: HashMap<Address, usize> = HashMap::with_capacity(self.nodes.len());
-        for (index, node) in self.nodes.iter().enumerate() {
+        // The signature covers the nodes in address order and not the JSON
+        // order, so a node's index is its position in address order.
+        let mut registry = self.clone();
+        registry.nodes.sort_by_key(|node| node.address);
+        let mut by_address: HashMap<Address, usize> = HashMap::with_capacity(registry.nodes.len());
+        for (index, node) in registry.nodes.iter().enumerate() {
             // One key counted as two nodes would defeat the quorum it is
             // counted against.
             if by_address.insert(node.address, index).is_some() {
@@ -266,7 +270,7 @@ impl Registry {
         }
 
         Ok(VerifiedRegistry {
-            registry: self.clone(),
+            registry,
             by_address,
             governance,
         })
@@ -335,25 +339,26 @@ impl VerifiedRegistry {
         self.registry.quorum
     }
 
-    /// Returns the nodes.
+    /// Returns the nodes in address order: the order the signature covers.
     #[must_use]
     pub fn nodes(&self) -> &[NodeEntry] {
         &self.registry.nodes
     }
 
-    /// Returns a node by index.
+    /// Returns a node by its index: its position in address order.
     #[must_use]
     pub fn node(&self, index: usize) -> Option<&NodeEntry> {
         self.registry.nodes.get(index)
     }
 
-    /// Returns the underlying registry.
+    /// Returns the underlying registry, with its nodes in address order.
     #[must_use]
     pub const fn as_registry(&self) -> &Registry {
         &self.registry
     }
 
-    /// Resolves a recovered signer to the index of its node.
+    /// Resolves a recovered signer to the index of its node: its position in
+    /// address order, which the signature covers, and not in the JSON array.
     ///
     /// # Errors
     ///
@@ -371,11 +376,11 @@ mod tests {
     use super::*;
 
     fn governance() -> Signer {
-        Signer::from_secret_bytes([0x91; 32]).expect("valid key")
+        Signer::from_secret(&[0x91; 32].into()).expect("valid key")
     }
 
     fn node(index: u8) -> (NodeEntry, Signer) {
-        let key = Signer::from_secret_bytes([index; 32]).expect("valid key");
+        let key = Signer::from_secret(&[index; 32].into()).expect("valid key");
         (
             NodeEntry {
                 address: key.address(),
@@ -419,10 +424,35 @@ mod tests {
         assert_eq!(verified.nodes().len(), 3);
     }
 
+    /// A relay can reorder the JSON array without breaking the signature, so
+    /// the index must not depend on it.
+    #[test]
+    fn a_node_index_is_its_position_in_address_order_whatever_the_json_order() {
+        let (registry, keys) = registry(1_000_000);
+        let mut reversed = registry.clone();
+        reversed.nodes.reverse();
+        let mut sorted: Vec<Address> = keys.iter().map(Signer::address).collect();
+        sorted.sort();
+        for document in [&registry, &reversed] {
+            let verified = document
+                .verify(governance().address(), 0)
+                .expect("the order is not signed");
+            let listed: Vec<Address> = verified.nodes().iter().map(|node| node.address).collect();
+            assert_eq!(listed, sorted);
+            for (index, address) in sorted.iter().enumerate() {
+                assert_eq!(verified.authorize(*address), Ok(index));
+                assert_eq!(
+                    verified.node(index).map(|node| node.address),
+                    Some(*address)
+                );
+            }
+        }
+    }
+
     #[test]
     fn rejects_a_different_governance_key() {
         let (registry, _) = registry(1_000_000);
-        let impostor = Signer::from_secret_bytes([0x99; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0x99; 32].into()).expect("valid key");
         assert!(matches!(
             registry.verify(impostor.address(), 0),
             Err(VerifyError::UntrustedGovernance { .. })
@@ -521,7 +551,7 @@ mod tests {
                 Some(key.address())
             );
         }
-        let stranger = Signer::from_secret_bytes([0xAA; 32]).expect("valid key");
+        let stranger = Signer::from_secret(&[0xAA; 32].into()).expect("valid key");
         assert!(matches!(
             verified.authorize(stranger.address()),
             Err(VerifyError::UnknownSigner { .. })
@@ -557,7 +587,7 @@ mod tests {
         // A newer version signed by anyone else is refused, which is the whole
         // point of carrying the governance key rather than accepting one
         // alongside the document it is supposed to vouch for.
-        let impostor = Signer::from_secret_bytes([0x99; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0x99; 32].into()).expect("valid key");
         let forged = Registry::sign(&impostor, 9, now, spare.nodes, spare.quorum).expect("signs");
         assert!(matches!(
             verified.accept_successor(&forged),

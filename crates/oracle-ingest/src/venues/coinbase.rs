@@ -15,10 +15,10 @@
 use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity, Halts};
 use crate::{DecodeError, InstrumentMap};
 
-use super::{decimal, rfc3339_to_unix_nanos};
+use super::{decimal, observation, parse, rfc3339_to_unix_nanos};
 
 /// The public endpoint.
 pub const URL: &str = "wss://ws-feed.exchange.coinbase.com";
@@ -28,6 +28,9 @@ pub const URL: &str = "wss://ws-feed.exchange.coinbase.com";
 /// missed message could not be detected. Advanced Trade's `level2` is keyless
 /// and numbers every message on the connection.
 pub const BOOK_URL: &str = "wss://advanced-trade-ws.coinbase.com";
+
+/// The connection numbers every message, so a book needs no id of its own.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::Connection);
 
 /// The most products on one book connection. Coinbase refuses more than 30
 /// with "too many L2 streams requested in a single session".
@@ -124,75 +127,50 @@ pub fn decode_book(
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let envelope: BookEnvelope<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let envelope: BookEnvelope<'_> = serde_json::from_slice(payload)?;
     let Some(sequence) = envelope.sequence_num else {
         // A subscription error carries `type` and `message`, and no number.
         return Err(DecodeError::Malformed(
             String::from_utf8_lossy(payload).into_owned(),
         ));
     };
-    if let Some(last) = books.sequence
-        && last.checked_add(1) != Some(sequence)
-    {
-        return Err(DecodeError::Resync(format!(
-            "message {sequence} does not follow {last}"
-        )));
-    }
-    books.sequence = Some(sequence);
+    books.keeper.next_message(sequence)?;
     let (Some("l2_data"), Some(events)) = (envelope.channel, envelope.events) else {
         return Err(DecodeError::Control);
     };
-    let events: Vec<BookEvent<'_>> =
-        serde_json::from_str(events.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let exchange_time_ns = envelope.timestamp.and_then(rfc3339_to_unix_nanos);
+    let events: Vec<BookEvent<'_>> = parse(events).map_err(|e| BOOK_RULE.unparsed(e))?;
+    let time = envelope.timestamp.and_then(rfc3339_to_unix_nanos);
+    // One product's empty side must not stop the others: the message number
+    // has passed already.
+    let mut halts = Halts::default();
     for event in events {
         let Some(entry) = map.lookup(event.product_id) else {
             continue;
         };
-        let book = books.book(event.product_id);
-        if event.kind == "snapshot" {
-            book.clear();
-        }
-        for update in &event.updates {
-            let side = match update.side {
-                "bid" => Side::Bid,
-                "offer" => Side::Ask,
-                other => return Err(DecodeError::Malformed(format!("book side `{other}`"))),
-            };
-            let level = crate::depth::level(update.price_level, update.new_quantity)?;
-            book.set(side, level.price, level.qty);
-        }
-        let emit = if entry.depth {
-            Books::emit
-        } else {
-            Books::emit_top
-        };
-        emit(
-            books,
-            event.product_id,
-            entry.instrument.clone(),
-            exchange_time_ns,
-            local_recv_ns,
-            out,
-        )?;
+        let parsed = book_message(&event).map(|message| message.at(time));
+        let applied = books
+            .keeper
+            .apply(BOOK_RULE, entry, parsed, local_recv_ns, out);
+        halts.absorb(&entry.instrument, applied)?;
     }
-    Ok(())
+    halts.finish(Ok(()))
 }
 
-/// The session's entry point: [`decode_payload`], with the connection's books.
-///
-/// # Errors
-///
-/// As [`decode_payload`].
-pub fn decode(
-    payload: &[u8],
-    map: &InstrumentMap,
-    _books: &mut crate::book::Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    decode_payload(payload, map, local_recv_ns, out)
+/// One product's event: a snapshot, or the levels that changed.
+fn book_message(event: &BookEvent<'_>) -> Result<BookMsg<'static>, DecodeError> {
+    let mut message = BookMsg {
+        snapshot: event.kind == "snapshot",
+        ..BookMsg::default()
+    };
+    for update in &event.updates {
+        let level = crate::depth::level(update.price_level, update.new_quantity)?;
+        match update.side {
+            "bid" => message.bids.push(Change::from(level)),
+            "offer" => message.asks.push(Change::from(level)),
+            other => return Err(DecodeError::Malformed(format!("book side `{other}`"))),
+        }
+    }
+    Ok(message)
 }
 
 /// Decodes one Coinbase Exchange payload: a `ticker` yields its trade. Its best
@@ -201,14 +179,14 @@ pub fn decode(
 /// # Errors
 ///
 /// Returns [`DecodeError`]. Subscription confirmations and heartbeats are benign.
-pub fn decode_payload(
+pub fn decode(
     payload: &[u8],
     map: &InstrumentMap,
+    _books: &mut Books,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let message: Message<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let message: Message<'_> = serde_json::from_slice(payload)?;
 
     if message.kind == "error" {
         // Surfaced as malformed rather than benign: a subscribe that Coinbase
@@ -231,19 +209,14 @@ pub fn decode_payload(
         return Err(DecodeError::Control);
     };
     out.push(Observation {
-        instrument: entry.instrument.clone(),
-        kind: ObsKind::Trade,
-        price: decimal("price", price)?,
-        bid: None,
-        ask: None,
-        bid_qty: None,
-        ask_qty: None,
-        depth_notional_1bp: None,
         exchange_time_ns: message.time.and_then(rfc3339_to_unix_nanos),
-        local_recv_ns,
         seq: message.sequence,
-        book: None,
-        funding: None,
+        ..observation(
+            entry,
+            ObsKind::Trade,
+            decimal("price", price)?,
+            local_recv_ns,
+        )
     });
     Ok(())
 }
@@ -251,27 +224,29 @@ pub fn decode_payload(
 #[cfg(test)]
 #[expect(
     clippy::indexing_slicing,
-    reason = "fixtures are fixed-shape; an out-of-range index is a failing test, \
-              which is exactly what should happen if decoding changed"
+    reason = "fixed payloads; an out-of-range index is a failing test"
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, fixed, instrument};
     use oracle_types::{MarketKind, Venue};
 
-    const RECV: u64 = 1_754_582_400_500_000_000;
-
-    fn map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new("BTC-USD", MarketKind::Spot, "CRYPTO.BTC/USD").expect("valid"),
-        ];
-        InstrumentMap::new(Venue::Coinbase, MarketKind::Spot, &specs).expect("valid")
+    fn btc_usd(depth: bool) -> crate::InstrumentSpec {
+        let spec = instrument("BTC-USD", MarketKind::Spot);
+        if depth { spec.with_depth() } else { spec }
     }
 
-    fn decode(payload: &str) -> Vec<Observation> {
-        let mut out = Vec::new();
-        decode_payload(payload.as_bytes(), &map(), RECV, &mut out).expect("decodes");
-        out
+    fn ticker() -> Feed {
+        Feed::venue(decode, Venue::Coinbase, MarketKind::Spot, &[btc_usd(false)])
+    }
+
+    fn book(depth: bool) -> Feed {
+        Feed::venue(
+            decode_book,
+            Venue::Coinbase,
+            MarketKind::Spot,
+            &[btc_usd(depth)],
+        )
     }
 
     const TICKER: &str = r#"{"type":"ticker","sequence":12345,"product_id":"BTC-USD",
@@ -281,73 +256,70 @@ mod tests {
         "side":"buy","time":"2026-08-07T16:00:00.123456Z","trade_id":999,
         "last_size":"0.01"}"#;
 
+    /// Recorded from Coinbase Advanced Trade on 2026-10-06. The snapshot is cut
+    /// to its best 200 levels a side; the updates and their numbers are as sent.
+    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/coinbase-level2.jsonl");
+
     /// The ticker's best bid and ask are as old as the last trade, so they must
     /// not reach the book slot: the level2 book gives the top.
     #[test]
     fn a_ticker_yields_only_its_trade() {
-        let observations = decode(TICKER);
-        assert_eq!(observations.len(), 1);
-        let trade = &observations[0];
+        let observations = ticker().decoded(TICKER);
+        let [trade] = observations.as_slice() else {
+            panic!("one observation: {observations:?}");
+        };
         assert_eq!(trade.kind, ObsKind::Trade);
-        assert_eq!(trade.price, "64312.1".parse().expect("valid"));
+        assert_eq!(trade.price, fixed("64312.1"));
         assert_eq!(trade.seq, Some(12_345));
         assert!(trade.bid.is_none());
     }
 
     #[test]
     fn the_rfc3339_timestamp_is_parsed() {
-        let observations = decode(TICKER);
+        let trade = &ticker().decoded(TICKER)[0];
         // 2026-08-07T16:00:00.123456Z
-        assert_eq!(
-            observations[0].exchange_time_ns,
-            Some(1_786_118_400 * 1_000_000_000 + 123_456_000)
-        );
+        let stamped = 1_786_118_400 * 1_000_000_000 + 123_456_000;
+        assert_eq!(trade.exchange_time_ns, Some(stamped));
     }
 
     #[test]
     fn a_ticker_without_a_book_still_yields_the_trade() {
         let no_book = r#"{"type":"ticker","product_id":"BTC-USD","price":"64312.10",
             "time":"2026-08-07T16:00:00Z"}"#;
-        let observations = decode(no_book);
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].kind, ObsKind::Trade);
+        let observations = ticker().decoded(no_book);
+        assert_eq!(
+            observations.iter().map(|o| o.kind).collect::<Vec<_>>(),
+            [ObsKind::Trade]
+        );
     }
 
     #[test]
     fn subscriptions_and_heartbeats_are_benign() {
-        let mut out = Vec::new();
+        let mut ticker = ticker();
         for control in [
             r#"{"type":"subscriptions","channels":[{"name":"ticker","product_ids":["BTC-USD"]}]}"#,
             r#"{"type":"heartbeat","sequence":1,"last_trade_id":1,"product_id":"BTC-USD","time":"2026-08-07T16:00:00Z"}"#,
         ] {
-            let error = decode_payload(control.as_bytes(), &map(), RECV, &mut out)
-                .expect_err("not market data");
+            let error = ticker.refused(control);
             assert!(error.is_benign(), "got {error:?}");
         }
-        assert!(out.is_empty());
     }
 
     /// A rejected subscribe is a configuration problem, not routine traffic.
     #[test]
     fn an_error_message_is_not_benign() {
-        let mut out = Vec::new();
-        let error = decode_payload(
-            br#"{"type":"error","message":"Failed to subscribe","reason":"nope"}"#,
-            &map(),
-            RECV,
-            &mut out,
-        )
-        .expect_err("an error");
+        let error =
+            ticker().refused(r#"{"type":"error","message":"Failed to subscribe","reason":"nope"}"#);
         assert!(!error.is_benign(), "a rejected subscribe must be visible");
     }
 
     #[test]
     fn untracked_products_are_benign() {
-        let other = TICKER.replace("BTC-USD", "ETH-USD");
-        let mut out = Vec::new();
-        let error =
-            decode_payload(other.as_bytes(), &map(), RECV, &mut out).expect_err("untracked");
-        assert!(error.is_benign());
+        assert!(
+            ticker()
+                .refused(TICKER.replace("BTC-USD", "ETH-USD"))
+                .is_benign()
+        );
     }
 
     #[test]
@@ -358,51 +330,72 @@ mod tests {
         assert!(frame.contains(r#""ticker""#));
     }
 
-    /// Recorded from Coinbase Advanced Trade on 2026-10-06. The snapshot is cut
-    /// to its best 200 levels a side; the updates and their numbers are as sent.
-    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/coinbase-level2.jsonl");
-
-    fn book_map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new("BTC-USD", MarketKind::Spot, "CRYPTO.BTC/USD")
-                .expect("valid")
-                .with_depth(),
-        ];
-        InstrumentMap::new(Venue::Coinbase, MarketKind::Spot, &specs).expect("valid")
-    }
-
-    fn replay(map: &InstrumentMap) -> (Books, Vec<Observation>) {
-        let mut books = Books::default();
-        let mut all = Vec::new();
-        for line in RECORDED_BOOK.lines() {
-            let mut out = Vec::new();
-            match decode_book(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => {}
-                Err(error) if error.is_benign() => {}
-                Err(error) => panic!("{error}: {line}"),
-            }
-            all.extend(out);
-        }
-        (books, all)
-    }
-
     /// A product without depth still gets its top from the book, on every book
     /// change, so a quiet coin with no trades keeps a live quote.
     #[test]
     fn a_book_without_depth_yields_its_best_bid_and_ask() {
-        let (mut books, observations) = replay(&map());
-        assert!(observations.len() >= 20, "{}", observations.len());
-        assert!(
-            observations
-                .iter()
-                .all(|o| o.kind == ObsKind::BookTop && o.book.is_none())
+        let tops = book(false).replay(RECORDED_BOOK.lines());
+        let depths = book(true).replay(RECORDED_BOOK.lines());
+        assert_eq!(tops.len(), depths.len(), "one top for each book change");
+        for (top, depth) in tops.iter().zip(&depths) {
+            assert_eq!((top.kind, top.book.as_ref()), (ObsKind::BookTop, None));
+            let quote = |o: &Observation| (o.bid, o.ask, o.bid_qty, o.ask_qty);
+            assert_eq!(quote(top), quote(depth), "the top is the book's best level");
+        }
+    }
+
+    /// The side, the price and the new size of one level.
+    type Update<'a> = (&'a str, &'a str, &'a str);
+
+    /// One `l2_data` message of `events`, each a type, a product and its updates.
+    fn level2(sequence: u64, events: &[(&str, &str, &[Update<'_>])]) -> String {
+        let events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|(kind, product, updates)| {
+                let updates: Vec<serde_json::Value> = updates
+                    .iter()
+                    .map(|(side, price, size)| {
+                        serde_json::json!({ "side": side, "price_level": price, "new_quantity": size })
+                    })
+                    .collect();
+                serde_json::json!({ "type": kind, "product_id": product, "updates": updates })
+            })
+            .collect();
+        serde_json::json!({ "channel": "l2_data", "sequence_num": sequence, "events": events })
+            .to_string()
+    }
+
+    /// One product's empty side must not stop the other product of the same
+    /// message, since the message number has passed.
+    #[test]
+    fn a_halted_product_does_not_stop_the_others_in_its_message() {
+        let pairs = [btc_usd(false), instrument("ETH-USD", MarketKind::Spot)];
+        let mut feed = Feed::venue(decode_book, Venue::Coinbase, MarketKind::Spot, &pairs);
+        let book: &[Update<'_>] = &[("bid", "100", "1"), ("offer", "101", "1")];
+        let _ = feed.decoded(level2(
+            1,
+            &[("snapshot", "BTC-USD", book), ("snapshot", "ETH-USD", book)],
+        ));
+        let (observations, halted) = feed.halted(level2(
+            2,
+            &[
+                ("update", "BTC-USD", &[("offer", "101", "0")]),
+                ("update", "ETH-USD", &[("bid", "100.5", "2")]),
+            ],
+        ));
+        assert_eq!(halted, ["BTC-USD"]);
+        let [eth] = observations.as_slice() else {
+            panic!("the ETH quote: {observations:?}");
+        };
+        assert_eq!(
+            (&*eth.instrument.symbol, eth.bid),
+            ("ETH-USD", Some(fixed("100.5")))
         );
-        let last = observations.last().expect("one");
-        let book = books.book("BTC-USD");
-        assert_eq!(last.bid, Some(book.top(Side::Bid, 1)[0].price));
-        assert_eq!(last.ask, Some(book.top(Side::Ask, 1)[0].price));
-        assert_eq!(last.bid_qty, Some(book.top(Side::Bid, 1)[0].qty));
-        assert!(last.bid < last.ask);
+        let next = feed.decoded(level2(
+            3,
+            &[("update", "ETH-USD", &[("bid", "100.6", "1")])],
+        ));
+        assert_eq!(next.len(), 1, "the next message follows");
     }
 
     #[test]
@@ -411,35 +404,5 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].contains(r#""channel":"level2""#));
         assert!(frames[1].contains(r#""channel":"heartbeats""#));
-    }
-
-    #[test]
-    fn a_recorded_book_follows_its_message_numbers() {
-        let (mut books, observations) = replay(&book_map());
-        assert!(observations.len() >= 20, "{}", observations.len());
-        assert!(
-            observations
-                .iter()
-                .all(|o| o.kind == ObsKind::Depth && o.book.is_some())
-        );
-        let book = books.book("BTC-USD");
-        assert!(book.top(Side::Bid, 1)[0].price < book.top(Side::Ask, 1)[0].price);
-    }
-
-    #[test]
-    fn a_skipped_message_asks_for_a_resync() {
-        let map = book_map();
-        let mut books = Books::default();
-        let mut lines = RECORDED_BOOK
-            .lines()
-            .filter(|line| line.contains("l2_data"));
-        let snapshot = lines.next().expect("a snapshot");
-        decode_book(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
-        let _skipped = lines.next().expect("an update");
-        let after = lines.next().expect("a later update");
-        assert!(matches!(
-            decode_book(after.as_bytes(), &map, &mut books, RECV, &mut Vec::new()),
-            Err(DecodeError::Resync(_))
-        ));
     }
 }

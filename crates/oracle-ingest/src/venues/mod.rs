@@ -15,6 +15,8 @@ pub mod bitget;
 pub mod bitstamp;
 pub mod bybit;
 pub mod coinbase;
+#[cfg(test)]
+mod conformance;
 pub mod deribit;
 pub mod dydx;
 pub mod gate;
@@ -33,11 +35,43 @@ pub use adapter::{DecodeFn, VenueAdapter, VenueHandler, VenueSpec};
 
 use std::sync::Arc;
 
-use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenInterestUnit};
+use oracle_types::{
+    Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenInterestUnit, Venue,
+};
 
 use crate::DecodeError;
 use crate::book::LastFunding;
 use crate::instrument::InstrumentEntry;
+
+/// The moving values that a venue's subscription gives one instrument, for the
+/// silence check. It follows each venue's `subscribe_frames`.
+pub(crate) fn moving_kinds(venue: Venue, entry: &InstrumentEntry) -> Vec<ObsKind> {
+    let perp = entry.instrument.market.is_perp();
+    // Some venues send the top of every market and the book beside it; the
+    // others send a market its book in place of its top.
+    let top_and_depth = matches!(
+        (venue, perp),
+        (
+            Venue::Bybit | Venue::Okx | Venue::Kraken | Venue::Deribit | Venue::Hyperliquid,
+            _
+        ) | (Venue::Mexc, false)
+            | (Venue::Kucoin, _)
+    );
+    let mut kinds = match (top_and_depth, entry.depth) {
+        (true, true) => vec![ObsKind::BookTop, ObsKind::Depth],
+        (_, true) => vec![ObsKind::Depth],
+        (_, false) => vec![ObsKind::BookTop],
+    };
+    let marks: &[ObsKind] = match venue {
+        Venue::Okx | Venue::Dydx => &[ObsKind::MarkPrice],
+        Venue::Coinbase | Venue::Bitstamp => &[],
+        _ => &[ObsKind::MarkPrice, ObsKind::IndexPrice],
+    };
+    if perp {
+        kinds.extend_from_slice(marks);
+    }
+    kinds
+}
 
 /// An observation of `kind` at `price`, with nothing else set.
 pub(crate) fn observation(
@@ -101,17 +135,28 @@ pub(crate) fn to_base_units(amount: Fixed, price: Fixed, inverse: bool) -> Optio
     amount.checked_div(price)
 }
 
-/// A best bid and ask as a book top, priced at the mid. A side at zero or
-/// below is an empty book, not a quote.
+/// A best bid and ask, then their sizes; `None` when a side is absent.
+pub(crate) type Top = Option<((Fixed, Fixed), (Fixed, Fixed))>;
+
+/// A best bid and ask as a book top, priced at the mid. `parse` reads the
+/// quote, so that its errors name the instrument.
+///
+/// # Errors
+///
+/// [`DecodeError::Halted`] for an absent side or one at zero or below: the book
+/// is empty. [`DecodeError::Lost`] when `parse` fails, so the old quote stops too.
 pub(crate) fn book_top(
     entry: &InstrumentEntry,
-    (bid, ask): (Fixed, Fixed),
-    (bid_qty, ask_qty): (Fixed, Fixed),
+    parse: impl FnOnce() -> Result<Top, DecodeError>,
     exchange_time_ns: Option<u64>,
     local_recv_ns: u64,
 ) -> Result<Observation, DecodeError> {
+    let top = parse().map_err(|error| DecodeError::lost(&entry.instrument, error))?;
+    let Some(((bid, ask), (bid_qty, ask_qty))) = top else {
+        return Err(DecodeError::halted(&entry.instrument));
+    };
     if !bid.is_positive() || !ask.is_positive() {
-        return Err(DecodeError::Control);
+        return Err(DecodeError::halted(&entry.instrument));
     }
     Ok(Observation {
         bid: Some(bid),
@@ -195,6 +240,35 @@ pub(crate) fn rfc3339_to_unix_nanos(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::InstrumentMap;
+    use crate::testing::instrument;
+    use oracle_types::MarketKind;
+
+    fn kinds_of(venue: Venue, market: MarketKind, depth: bool) -> Vec<ObsKind> {
+        let spec = instrument("X", market);
+        let spec = if depth { spec.with_depth() } else { spec };
+        let map = InstrumentMap::new(venue, market, &[spec]).expect("a map");
+        moving_kinds(venue, map.lookup("X").expect("the instrument"))
+    }
+
+    /// The silence check expects what each subscription sends, no more.
+    #[test]
+    fn each_venue_expects_the_moving_values_it_subscribes_to() {
+        use ObsKind::{BookTop, Depth, IndexPrice, MarkPrice};
+        let perp = MarketKind::LinearPerp;
+        assert_eq!(
+            kinds_of(Venue::Okx, perp, true),
+            [BookTop, Depth, MarkPrice]
+        );
+        assert_eq!(kinds_of(Venue::Gate, MarketKind::Spot, true), [Depth]);
+        assert_eq!(kinds_of(Venue::Gate, MarketKind::Spot, false), [BookTop]);
+        assert_eq!(
+            kinds_of(Venue::Deribit, MarketKind::InversePerp, false),
+            [BookTop, MarkPrice, IndexPrice]
+        );
+        assert_eq!(kinds_of(Venue::Dydx, perp, true), [Depth, MarkPrice]);
+        assert_eq!(kinds_of(Venue::Coinbase, MarketKind::Spot, true), [Depth]);
+    }
 
     #[test]
     fn rfc3339_parses_the_shapes_coinbase_sends() {

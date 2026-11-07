@@ -23,9 +23,8 @@ use oracle_types::{Fixed, MarketKind, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity, Halts};
 use crate::clock::millis_to_nanos;
-use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
 
 use super::{book_top, decimal, integer, interval_funding, observation, parse, to_base_units};
@@ -52,6 +51,9 @@ const _: () = assert!(FUTURES_MARKETS_PER_CONNECTION * 4 <= MAX_CHANNELS);
 
 /// The full book: deep enough for every impact size, and what the venue keeps.
 const BOOK_DEPTH: usize = 1_000;
+
+/// Each change names the `seq` of the one before it as `pseq`.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::UpdateId).depth(BOOK_DEPTH);
 
 const fn inst_type(market: MarketKind) -> &'static str {
     match market {
@@ -210,35 +212,35 @@ pub fn decode(
     let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
     match arg.topic {
         "books1" => {
-            for book in parse::<Vec<Book<'_>>>(data)? {
-                let (Some(bid), Some(ask)) = (book.b.first(), book.a.first()) else {
-                    return Err(DecodeError::Control);
+            let books = parse::<Vec<Book<'_>>>(data)
+                .map_err(|e| DecodeError::lost(&entry.instrument, e))?;
+            let mut halts = Halts::default();
+            for book in books {
+                let top = || {
+                    let (Some(bid), Some(ask)) = (book.b.first(), book.a.first()) else {
+                        return Ok(None);
+                    };
+                    let ((bid, bid_qty), (ask, ask_qty)) =
+                        (level(*bid, market)?, level(*ask, market)?);
+                    Ok(Some(((bid, ask), (bid_qty, ask_qty))))
                 };
-                let ((bid, bid_qty), (ask, ask_qty)) = (level(*bid, market)?, level(*ask, market)?);
-                out.push(book_top(
-                    entry,
-                    (bid, ask),
-                    (bid_qty, ask_qty),
-                    millis("ts", book.ts)?,
-                    local_recv_ns,
-                )?);
+                let time = millis("ts", book.ts)?;
+                let quote = book_top(entry, top, time, local_recv_ns).map(|top| out.push(top));
+                halts.absorb(&entry.instrument, quote)?;
             }
-            Ok(())
+            halts.finish(Ok(()))
         }
         "books" => {
             let snapshot = envelope.action == Some("snapshot");
-            for change in parse::<Vec<Book<'_>>>(data)? {
-                depth(
-                    arg.symbol,
-                    entry,
-                    snapshot,
-                    &change,
-                    books,
-                    local_recv_ns,
-                    out,
-                )?;
+            let mut halts = Halts::default();
+            for change in parse::<Vec<Book<'_>>>(data).map_err(|e| BOOK_RULE.unparsed(e))? {
+                let parsed = book_message(&change, snapshot, market);
+                let applied = books
+                    .keeper
+                    .apply(BOOK_RULE, entry, parsed, local_recv_ns, out);
+                halts.absorb(&entry.instrument, applied)?;
             }
-            Ok(())
+            halts.finish(Ok(()))
         }
         // The snapshot at subscribe holds old trades: a price that may be hours old is no news.
         "publicTrade" if envelope.action == Some("snapshot") => Err(DecodeError::Control),
@@ -266,7 +268,8 @@ pub fn decode(
                 }
                 // The open interest goes out with the next funding message, at most a minute later.
                 if let Some(coins) = ticker.open_interest.filter(|text| !text.is_empty()) {
-                    books.funding(arg.symbol).open_interest = Some(decimal("openInterest", coins)?);
+                    books.funding(&entry.instrument).open_interest =
+                        Some(decimal("openInterest", coins)?);
                 }
             }
             Ok(())
@@ -276,7 +279,7 @@ pub fn decode(
                 let hours = integer("fundingRateInterval", funding.funding_rate_interval)?;
                 let interval_ns = hours.checked_mul(3_600_000_000_000).filter(|ns| *ns > 0);
                 let next_ns = millis("nextUpdate", Some(funding.next_update))?;
-                let state = books.funding(arg.symbol);
+                let state = books.funding(&entry.instrument);
                 state.rate = Some(decimal("fundingRate", funding.funding_rate)?);
                 state.interval_ns = interval_ns;
                 state.next_funding_time_ns = next_ns;
@@ -298,40 +301,30 @@ pub fn decode(
     }
 }
 
-/// Applies a snapshot or a change of the full book, and emits it.
-fn depth(
-    symbol: &str,
-    entry: &InstrumentEntry,
-    snapshot: bool,
+/// A snapshot or a change of the full book. A change without its ids cannot
+/// prove that it follows the last one.
+fn book_message(
     change: &Book<'_>,
-    books: &mut Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let book = books.book(symbol);
-    if snapshot {
-        book.clear();
-    } else if change.pseq != book.last_id {
-        return Err(DecodeError::Resync(format!(
-            "{symbol}: change follows {:?} but the book is at {:?}",
-            change.pseq, book.last_id
-        )));
-    }
-    book.last_id = change.seq;
-    for (side, levels) in [(Side::Bid, &change.b), (Side::Ask, &change.a)] {
-        for raw in levels {
-            let (price, size) = level(*raw, entry.instrument.market)?;
-            book.set(side, price, size);
-        }
-    }
-    book.truncate(BOOK_DEPTH);
-    books.emit(
-        symbol,
-        entry.instrument.clone(),
-        millis("ts", change.ts)?,
-        local_recv_ns,
-        out,
-    )
+    snapshot: bool,
+    market: MarketKind,
+) -> Result<BookMsg<'static>, DecodeError> {
+    let seq = change.seq.ok_or(DecodeError::MissingField("seq"))?;
+    let pseq = if snapshot {
+        change.pseq
+    } else {
+        Some(change.pseq.ok_or(DecodeError::MissingField("pseq"))?)
+    };
+    let level = |raw: &(&str, &str)| {
+        let (price, size) = level(*raw, market)?;
+        Ok(Change::new(price, size))
+    };
+    Ok(BookMsg {
+        snapshot,
+        prev_id: pseq,
+        next_id: Some(seq),
+        time: millis("ts", change.ts)?,
+        ..BookMsg::changes(&change.b, &change.a, level)?
+    })
 }
 
 #[cfg(test)]
@@ -341,10 +334,9 @@ fn depth(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, Replayed, instrument, of};
     use oracle_types::{FundingBasis, OpenInterestUnit, Venue};
 
-    const RECV: u64 = 1_793_213_200_000_000_000;
     /// Recorded from Bitget on 2026-10-28: BTC's top and trades, ETH's full book
     /// (its snapshot cut to 30 levels) and trades, a refused symbol and a pong.
     const SPOT: &str = include_str!("../../tests/fixtures/bitget-spot.jsonl");
@@ -354,44 +346,31 @@ mod tests {
     /// Recorded from Bitget on 2026-10-28: the coin-margined BTC perpetual.
     const COIN: &str = include_str!("../../tests/fixtures/bitget-coin.jsonl");
 
-    fn map(market: MarketKind, symbols: &[(&str, bool)]) -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = symbols
+    const EIGHT_HOURS_NS: u64 = 8 * 3_600_000_000_000;
+
+    /// One connection of `market`, each symbol with whether it wants the book.
+    fn bitget(market: MarketKind, symbols: &[(&str, bool)]) -> Feed {
+        let specs: Vec<_> = symbols
             .iter()
             .map(|(symbol, depth)| {
-                let spec = InstrumentSpec::new(*symbol, market, "CRYPTO.X/USD").expect("valid");
+                let spec = instrument(symbol, market);
                 if *depth { spec.with_depth() } else { spec }
             })
             .collect();
-        InstrumentMap::new(Venue::Bitget, market, &specs).expect("valid")
-    }
-
-    fn replay(session: &str, map: &InstrumentMap) -> (Vec<Observation>, Vec<String>) {
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for line in session.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
-    }
-
-    fn of<'a>(all: &'a [Observation], symbol: &str, kind: ObsKind) -> Vec<&'a Observation> {
-        all.iter()
-            .filter(|o| &*o.instrument.symbol == symbol && o.kind == kind)
-            .collect()
+        Feed::venue(decode, Venue::Bitget, market, &specs)
     }
 
     #[test]
     fn a_spot_session_gives_tops_a_full_book_and_trades() {
-        let map = map(MarketKind::Spot, &[("BTCUSDT", false), ("ETHUSDT", true)]);
-        let (all, errors) = replay(SPOT, &map);
-        // Only the refused symbol is an error.
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("NOPEUSDT"), "{errors:?}");
+        let mut spot = bitget(MarketKind::Spot, &[("BTCUSDT", false), ("ETHUSDT", true)]);
+        let Replayed {
+            observations: all,
+            errors,
+        } = spot.replay_all(SPOT.lines());
+        let [refused] = errors.as_slice() else {
+            panic!("only the refused symbol is an error: {errors:?}");
+        };
+        assert!(refused.to_string().contains("NOPEUSDT"), "{refused}");
 
         let tops = of(&all, "BTCUSDT", ObsKind::BookTop);
         assert_eq!(tops.len(), 3);
@@ -400,36 +379,35 @@ mod tests {
                 .all(|o| o.bid < o.ask && o.exchange_time_ns.is_some())
         );
         // The snapshot and its six changes follow one another.
-        let depth = of(&all, "ETHUSDT", ObsKind::Depth);
-        assert_eq!(depth.len(), 7);
-        let book = depth[6].book.as_deref().expect("levels");
-        assert!(book.bids[0].price < book.asks[0].price);
-        assert_eq!(of(&all, "ETHUSDT", ObsKind::BookTop).len(), 0);
+        assert_eq!(of(&all, "ETHUSDT", ObsKind::Depth).len(), 7);
+        assert!(of(&all, "ETHUSDT", ObsKind::BookTop).is_empty());
         assert_eq!(of(&all, "BTCUSDT", ObsKind::Trade).len(), 3);
     }
 
     #[test]
     fn a_perpetual_session_gives_marks_and_funding_with_its_interval() {
-        let map = map(
+        let mut perps = bitget(
             MarketKind::LinearPerp,
             &[("BTCUSDT", true), ("ETHUSDT", false)],
         );
-        let (all, errors) = replay(FUTURES, &map);
+        let Replayed {
+            observations: all,
+            errors,
+        } = perps.replay_all(FUTURES.lines());
         assert!(errors.is_empty(), "{errors:?}");
 
         assert_eq!(of(&all, "BTCUSDT", ObsKind::Depth).len(), 7);
         assert_eq!(of(&all, "ETHUSDT", ObsKind::BookTop).len(), 3);
-        let mark = of(&all, "BTCUSDT", ObsKind::MarkPrice);
-        let index = of(&all, "BTCUSDT", ObsKind::IndexPrice);
-        assert_eq!((mark.len(), index.len()), (2, 2));
+        assert_eq!(of(&all, "BTCUSDT", ObsKind::MarkPrice).len(), 2);
+        assert_eq!(of(&all, "BTCUSDT", ObsKind::IndexPrice).len(), 2);
 
         let funding = of(&all, "BTCUSDT", ObsKind::Funding);
         let info = funding[0].funding.as_deref().expect("funding");
         assert_eq!(info.basis, FundingBasis::Interval);
-        assert_eq!(info.interval_ns, Some(8 * 3_600_000_000_000));
+        assert_eq!(info.interval_ns, Some(EIGHT_HOURS_NS));
         let next = info.next_funding_time_ns.expect("next");
         let (_, settled_at) = info.settled.expect("settled");
-        assert_eq!(next - settled_at, 8 * 3_600_000_000_000);
+        assert_eq!(next - settled_at, EIGHT_HOURS_NS);
         // The first funding message came before any ticker; the next one carries its open interest.
         assert!(info.open_interest.is_none());
         let last = funding
@@ -443,8 +421,11 @@ mod tests {
 
     #[test]
     fn a_coin_margined_perpetual_sizes_in_coins() {
-        let map = map(MarketKind::InversePerp, &[("BTCUSD_CM", false)]);
-        let (all, errors) = replay(COIN, &map);
+        let mut coin = bitget(MarketKind::InversePerp, &[("BTCUSD_CM", false)]);
+        let Replayed {
+            observations: all,
+            errors,
+        } = coin.replay_all(COIN.lines());
         assert!(errors.is_empty(), "{errors:?}");
         let top = of(&all, "BTCUSD_CM", ObsKind::BookTop)[0];
         let (bid, qty) = (top.bid.expect("bid"), top.bid_qty.expect("size"));
@@ -453,20 +434,6 @@ mod tests {
         assert!(qty < usd, "{qty} coins at {bid}");
         assert_eq!(of(&all, "BTCUSD_CM", ObsKind::MarkPrice).len(), 2);
         assert_eq!(of(&all, "BTCUSD_CM", ObsKind::Funding).len(), 1);
-    }
-
-    #[test]
-    fn a_change_that_skips_one_ends_the_connection() {
-        let map = map(MarketKind::Spot, &[("ETHUSDT", true)]);
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let snapshot = r#"{"action":"snapshot","arg":{"instType":"spot","topic":"books","symbol":"ETHUSDT"},"data":[{"a":[["2400","1"]],"b":[["2399","1"]],"seq":10,"pseq":0,"ts":"1"}]}"#;
-        let skip = r#"{"action":"update","arg":{"instType":"spot","topic":"books","symbol":"ETHUSDT"},"data":[{"a":[["2401","1"]],"b":[],"seq":12,"pseq":11,"ts":"2"}]}"#;
-        assert!(decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut out).is_ok());
-        assert!(matches!(
-            decode(skip.as_bytes(), &map, &mut books, RECV, &mut out),
-            Err(DecodeError::Resync(_))
-        ));
     }
 
     #[test]
@@ -486,15 +453,27 @@ mod tests {
         assert_eq!(value["args"][3]["topic"], "funding-rate");
     }
 
+    /// A venue that leaves out `seq` and `pseq` everywhere would pass a check
+    /// of one missing id against another, so a book without them resyncs.
+    #[test]
+    fn a_book_without_its_ids_resyncs() {
+        let mut spot = bitget(MarketKind::Spot, &[("ETHUSDT", true)]);
+        let snapshot = SPOT
+            .lines()
+            .find(|line| {
+                line.contains(r#""action":"snapshot""#) && line.contains(r#""topic":"books","#)
+            })
+            .expect("a book snapshot");
+        let without = snapshot
+            .replace(r#""seq":"#, r#""a_seq":"#)
+            .replace(r#""pseq":"#, r#""a_pseq":"#);
+        assert!(matches!(spot.refused(without), DecodeError::Resync(_)));
+    }
+
     #[test]
     fn the_trades_at_subscribe_are_old_and_left_out() {
-        let map = map(MarketKind::Spot, &[("BTCUSDT", false)]);
-        let mut books = Books::default();
-        let mut out = Vec::new();
         let old = r#"{"action":"snapshot","arg":{"instType":"spot","topic":"publicTrade","symbol":"BTCUSDT"},"data":[{"p":"80000","v":"1","T":"1"}]}"#;
-        assert!(
-            decode(old.as_bytes(), &map, &mut books, RECV, &mut out).is_err_and(|e| e.is_benign())
-        );
-        assert!(out.is_empty());
+        let error = bitget(MarketKind::Spot, &[("BTCUSDT", false)]).refused(old);
+        assert!(error.is_benign());
     }
 }

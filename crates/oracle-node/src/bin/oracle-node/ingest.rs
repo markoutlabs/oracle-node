@@ -2,17 +2,17 @@
 //! set replaces one venue while the others run.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use oracle_ingest::IngestEvent;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::binance::snapshot::SnapshotConnector;
 use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::kucoin_connect::KucoinConnector;
 use oracle_ingest::venues::mexc_connect::MexcConnector;
+use oracle_ingest::{IngestEvent, VenueHealth};
 use oracle_node::config::VenueConnection;
 use oracle_node::{Adapter, build_venue_adapters};
 use oracle_types::Venue;
@@ -42,7 +42,12 @@ struct Running {
     stop: CancellationToken,
     task: JoinHandle<()>,
     connections: usize,
+    health: Vec<VenueHealth>,
 }
+
+/// The counters of every running connection, for the status line. A feed set
+/// change replaces the handles of the venues that it swaps.
+pub(crate) type Health = Arc<Mutex<Vec<VenueHealth>>>;
 
 /// The venue adapters, one task each.
 pub(crate) struct Ingest {
@@ -50,6 +55,7 @@ pub(crate) struct Ingest {
     running: BTreeMap<Venue, Running>,
     /// The connections of every adapter, for the status line.
     connections: Arc<AtomicUsize>,
+    health: Health,
     clock: MonotonicClock,
     shutdown: CancellationToken,
 }
@@ -64,9 +70,15 @@ impl Ingest {
             events,
             running: BTreeMap::new(),
             connections: Arc::new(AtomicUsize::new(0)),
+            health: Health::default(),
             clock,
             shutdown,
         }
+    }
+
+    /// The connection counters, shared with the status line.
+    pub(crate) fn health(&self) -> Health {
+        Arc::clone(&self.health)
     }
 
     /// The connection count, shared with the status line.
@@ -79,6 +91,14 @@ impl Ingest {
             sum.saturating_add(running.connections)
         });
         self.connections.store(total, Ordering::Relaxed);
+        let health = self
+            .running
+            .values()
+            .flat_map(|running| running.health.iter().cloned())
+            .collect();
+        if let Ok(mut shared) = self.health.lock() {
+            *shared = health;
+        }
     }
 
     /// Starts each adapter as its own task.
@@ -89,6 +109,8 @@ impl Ingest {
             connections,
         } in adapters
         {
+            // `run` takes the adapter, so the handles come first.
+            let health = adapter.health();
             let stop = self.shutdown.child_token();
             let token = stop.clone();
             let events = self.events.clone();
@@ -107,6 +129,7 @@ impl Ingest {
                     stop,
                     task,
                     connections,
+                    health,
                 },
             );
         }

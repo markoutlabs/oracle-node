@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 oracle-wire = { path = "../oracle-wire", version = "0.2.0", default-features = false, features = ["pure-rust"] }
 oracle-quorum = { workspace = true, features = ["pure-rust"] }
 oracle-types.workspace = true
+oracle-registry-api.workspace = true
 
 candid.workspace = true
 ic-cdk.workspace = true
@@ -32,9 +33,17 @@ thiserror.workspace = true
 oracle-client = { workspace = true, features = ["pure-rust"] }
 pocket-ic.workspace = true
 
-[dev-dependencies]
+# Native only: `examples/price_caller.rs` builds for wasm32, and tokio's `net` does not.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 ic-response-verification.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time"] }
+# Test keys go to `Signer::from_secret` as the node's keys do.
+zeroize.workspace = true
+
+# The canister that calls this one in the tests of callers that are canisters.
+[[example]]
+name = "price_caller"
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true

@@ -21,7 +21,7 @@ pub mod streams;
 
 use std::time::Duration;
 
-use oracle_types::{MarketKind, Observation, Venue};
+use oracle_types::{InstrumentId, MarketKind, ObsKind, Observation, Venue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,7 @@ use crate::clock::MonotonicClock;
 use crate::session::{MessageHandler, Session, SessionConfig, SessionStats};
 use crate::{
     Connector, DecodeError, ExchangeAdapter, IngestError, IngestEvent, InstrumentMap,
-    InstrumentSpec, StreamId,
+    InstrumentSpec, StreamId, VenueHealth,
 };
 
 use streams::{
@@ -135,6 +135,7 @@ pub struct BinanceHandler {
     map: InstrumentMap,
     books: book::BinanceBooks,
     intervals: decode::FundingIntervals,
+    subscribed: Vec<(InstrumentId, Option<ObsKind>)>,
 }
 
 impl BinanceHandler {
@@ -145,7 +146,33 @@ impl BinanceHandler {
             map,
             books: book::BinanceBooks::default(),
             intervals: decode::FundingIntervals::default(),
+            subscribed: Vec::new(),
         }
+    }
+
+    /// Expects a value from each moving stream that `url` subscribes to. The
+    /// map holds every instrument of the market, and one connection carries
+    /// only some of their streams.
+    #[must_use]
+    pub fn expecting(mut self, url: &str) -> Self {
+        let streams = url
+            .split_once("streams=")
+            .map_or("", |(_, streams)| streams);
+        self.subscribed = streams
+            .split('/')
+            .filter_map(|stream| {
+                let kind = match StreamKind::from_stream_name(stream)? {
+                    StreamKind::BookTicker => ObsKind::BookTop,
+                    StreamKind::Depth => ObsKind::Depth,
+                    StreamKind::MarkPrice => ObsKind::MarkPrice,
+                    _ => return None,
+                };
+                let symbol = stream.split('@').next()?;
+                let entry = self.map.lookup(symbol)?;
+                Some((entry.instrument.clone(), Some(kind)))
+            })
+            .collect();
+        self
     }
 }
 
@@ -170,6 +197,10 @@ impl MessageHandler for BinanceHandler {
         // The intervals stay: the new connection fetches them again.
         self.books.clear();
     }
+
+    fn subscribed(&self) -> Vec<(InstrumentId, Option<ObsKind>)> {
+        self.subscribed.clone()
+    }
 }
 
 /// The Binance adapter.
@@ -178,6 +209,7 @@ pub struct BinanceAdapter<C> {
     connector: C,
     label: String,
     clock: MonotonicClock,
+    health: Vec<VenueHealth>,
 }
 
 impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
@@ -198,12 +230,19 @@ impl<C: Connector + Clone + 'static> BinanceAdapter<C> {
         // dropping a feed at runtime.
         InstrumentMap::new(Venue::Binance, MarketKind::Spot, &config.spot)?;
         InstrumentMap::new(Venue::Binance, MarketKind::LinearPerp, &config.perp)?;
-        Ok(Self {
+        let mut adapter = Self {
             config,
             connector,
             clock: MonotonicClock::new(),
             label: "binance".to_owned(),
-        })
+            health: Vec::new(),
+        };
+        adapter.health = adapter
+            .plan()?
+            .iter()
+            .map(|(session, _, _)| VenueHealth::new(session.stream, session.url.clone()))
+            .collect();
+        Ok(adapter)
     }
 
     /// Stamps observations with `clock` instead of real time.
@@ -285,6 +324,10 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for BinanceAdapter<C> {
         &self.label
     }
 
+    fn health(&self) -> Vec<VenueHealth> {
+        self.health.clone()
+    }
+
     async fn run(
         self: Box<Self>,
         out: mpsc::Sender<IngestEvent>,
@@ -293,13 +336,15 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for BinanceAdapter<C> {
         let plan = self.plan()?;
         let mut sessions = Vec::with_capacity(plan.len());
 
-        for (config, _market, map) in plan {
-            let session = Session::new(
-                config,
-                self.connector.clone(),
-                BinanceHandler::new(map),
-                self.clock.clone(),
-            );
+        for (index, (config, _market, map)) in plan.into_iter().enumerate() {
+            let handler = BinanceHandler::new(map).expecting(&config.url);
+            let health = self
+                .health
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| VenueHealth::new(config.stream, config.url.clone()));
+            let session = Session::new(config, self.connector.clone(), handler, self.clock.clone())
+                .with_health(health);
             sessions.push(session.run(out.clone(), shutdown.clone()));
         }
 
@@ -318,66 +363,20 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for BinanceAdapter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{Frame, Transport, TransportError};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::testing::{Script, ScriptedConnector, instrument, run_adapter_until_connected};
 
-    #[derive(Clone)]
-    struct NullConnector;
-
-    struct NullConn;
-
-    impl Transport for NullConn {
-        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
-            Ok(None)
-        }
-        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
-            Ok(())
-        }
-        async fn send_ping(&mut self) -> Result<(), TransportError> {
-            Ok(())
-        }
-    }
-
-    impl Connector for NullConnector {
-        type Conn = NullConn;
-        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
-            Ok(NullConn)
-        }
-    }
-
-    /// Records every URL it is asked to connect to.
-    #[derive(Clone)]
-    struct RecordingConnector {
-        urls: Arc<std::sync::Mutex<Vec<String>>>,
-        opens: Arc<AtomicUsize>,
-    }
-
-    impl Connector for RecordingConnector {
-        type Conn = NullConn;
-        async fn connect(&self, url: &str) -> Result<Self::Conn, TransportError> {
-            self.opens.fetch_add(1, Ordering::SeqCst);
-            if let Ok(mut urls) = self.urls.lock() {
-                urls.push(url.to_owned());
-            }
-            Ok(NullConn)
-        }
+    /// Each connection closes at once, so the adapter reconnects at its backoff.
+    fn closing() -> ScriptedConnector {
+        ScriptedConnector::repeating(Script::new().close())
     }
 
     fn config() -> BinanceConfig {
         BinanceConfig {
             spot: vec![
-                InstrumentSpec::new("BTCUSDT", MarketKind::Spot, "CRYPTO.BTC/USDT").expect("valid"),
-                InstrumentSpec::new("ETHUSDT", MarketKind::Spot, "CRYPTO.ETH/USDT").expect("valid"),
+                instrument("BTCUSDT", MarketKind::Spot),
+                instrument("ETHUSDT", MarketKind::Spot),
             ],
-            perp: vec![
-                InstrumentSpec::new(
-                    "BTCUSDT",
-                    MarketKind::LinearPerp,
-                    "CRYPTO.BTC/USDT.PERP_MARK",
-                )
-                .expect("valid"),
-            ],
+            perp: vec![instrument("BTCUSDT", MarketKind::LinearPerp)],
             ..BinanceConfig::default()
         }
     }
@@ -385,7 +384,7 @@ mod tests {
     #[test]
     fn empty_configuration_is_rejected() {
         assert!(matches!(
-            BinanceAdapter::new(BinanceConfig::default(), NullConnector),
+            BinanceAdapter::new(BinanceConfig::default(), closing()),
             Err(IngestError::NoInstruments {
                 venue: Venue::Binance
             })
@@ -395,18 +394,16 @@ mod tests {
     #[test]
     fn duplicate_instruments_fail_at_construction_not_at_runtime() {
         let mut config = config();
-        config.spot.push(
-            InstrumentSpec::new("btcusdt", MarketKind::Spot, "CRYPTO.BTC/USDT").expect("valid"),
-        );
+        config.spot.push(instrument("btcusdt", MarketKind::Spot));
         assert!(matches!(
-            BinanceAdapter::new(config, NullConnector),
+            BinanceAdapter::new(config, closing()),
             Err(IngestError::DuplicateInstrument { .. })
         ));
     }
 
     #[test]
     fn plan_separates_spot_from_perpetuals() {
-        let adapter = BinanceAdapter::new(config(), NullConnector).expect("valid");
+        let adapter = BinanceAdapter::new(config(), closing()).expect("valid");
         let plan = adapter.plan().expect("plans");
         assert_eq!(
             plan.len(),
@@ -441,16 +438,8 @@ mod tests {
     #[test]
     fn perp_depth_gets_its_own_connection() {
         let mut config = config();
-        config.perp = vec![
-            InstrumentSpec::new(
-                "BTCUSDT",
-                MarketKind::LinearPerp,
-                "CRYPTO.BTC/USDT.PERP_MARK",
-            )
-            .expect("valid")
-            .with_depth(),
-        ];
-        let adapter = BinanceAdapter::new(config, NullConnector).expect("valid");
+        config.perp = vec![instrument("BTCUSDT", MarketKind::LinearPerp).with_depth()];
+        let adapter = BinanceAdapter::new(config, closing()).expect("valid");
         let perp: Vec<String> = adapter
             .plan()
             .expect("plans")
@@ -473,7 +462,7 @@ mod tests {
 
     #[test]
     fn sessions_recycle_below_the_venue_limit() {
-        let adapter = BinanceAdapter::new(config(), NullConnector).expect("valid");
+        let adapter = BinanceAdapter::new(config(), closing()).expect("valid");
         for (session, _, _) in adapter.plan().expect("plans") {
             assert!(
                 session.max_session < Duration::from_secs(24 * 3_600),
@@ -486,7 +475,7 @@ mod tests {
     fn spot_only_configuration_opens_one_connection() {
         let mut config = config();
         config.perp.clear();
-        let adapter = BinanceAdapter::new(config, NullConnector).expect("valid");
+        let adapter = BinanceAdapter::new(config, closing()).expect("valid");
         let plan = adapter.plan().expect("plans");
         assert_eq!(plan.len(), 1);
         assert_eq!(
@@ -497,32 +486,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn run_opens_both_endpoints_and_stops_on_shutdown() {
-        let urls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let connector = RecordingConnector {
-            urls: Arc::clone(&urls),
-            opens: Arc::new(AtomicUsize::new(0)),
-        };
-        let adapter = Box::new(BinanceAdapter::new(config(), connector).expect("valid"));
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let shutdown = CancellationToken::new();
-        let handle = tokio::spawn(adapter.run(tx, shutdown.clone()));
-
-        // Let both sessions connect at least once.
-        let mut connected = 0;
-        while connected < 2 {
-            match rx.recv().await {
-                Some(IngestEvent::Connected { .. }) => connected += 1,
-                Some(_) => {}
-                None => break,
-            }
-        }
-        shutdown.cancel();
-        // Drain so the sessions are never blocked on a full channel.
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        handle.await.expect("joins").expect("runs");
-
-        let urls = urls.lock().expect("lock").clone();
+        let connector = closing();
+        let adapter = BinanceAdapter::new(config(), connector.clone()).expect("valid");
+        run_adapter_until_connected(Box::new(adapter), 2).await;
+        let urls = connector.urls();
         assert!(urls.iter().any(|u| u.starts_with(streams::SPOT_BASE)));
         assert!(urls.iter().any(|u| u.starts_with(streams::FUTURES_BASE)));
     }

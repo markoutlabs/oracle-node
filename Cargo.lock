@@ -2985,11 +2985,13 @@ dependencies = [
 name = "oracle-ingest"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "backon",
  "crc32fast",
  "futures-util",
  "hex",
+ "oracle-ingest",
  "oracle-types",
  "prost",
  "reqwest 0.13.5",
@@ -3027,6 +3029,7 @@ dependencies = [
  "oracle-agg",
  "oracle-client",
  "oracle-ingest",
+ "oracle-registry-api",
  "oracle-registry-canister",
  "oracle-server",
  "oracle-types",
@@ -3064,6 +3067,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-registry-api"
+version = "0.2.0"
+dependencies = [
+ "candid",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
 name = "oracle-registry-canister"
 version = "0.2.0"
 dependencies = [
@@ -3075,6 +3087,7 @@ dependencies = [
  "ic-response-verification",
  "oracle-client",
  "oracle-quorum",
+ "oracle-registry-api",
  "oracle-types",
  "oracle-wire",
  "pocket-ic",
@@ -3083,6 +3096,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

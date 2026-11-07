@@ -56,6 +56,8 @@ struct Health {
     feeds: usize,
     /// The network's feed set version; zero for the node's own feeds.
     feed_set: u64,
+    /// The client list in use, so an operator sees a revocation land.
+    client_list: u64,
     subscribers: usize,
     publishing: usize,
 }
@@ -66,6 +68,7 @@ pub(super) async fn health(State(web): State<Arc<Web>>) -> Response {
         address: state.transport.address(),
         feeds: state.feeds().len(),
         feed_set: state.feed_set_version(),
+        client_list: state.transport.clients_version(),
         subscribers: state.hub.subscriber_count(),
         publishing: state.hub.latest_all().len(),
     })

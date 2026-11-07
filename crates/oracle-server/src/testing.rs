@@ -18,7 +18,7 @@ use crate::transport::{NodeTransport, TransportConfig, unix_now};
 /// Cannot panic: the seed is a valid curve scalar.
 #[must_use]
 pub fn signing_key() -> Signer {
-    Signer::from_secret_bytes([0x41; 32]).expect("valid test key")
+    Signer::from_secret(&[0x41; 32].into()).expect("valid test key")
 }
 
 /// Returns the governance key that signs the fixture registry.
@@ -28,7 +28,7 @@ pub fn signing_key() -> Signer {
 /// Cannot panic: the seed is a valid curve scalar.
 #[must_use]
 pub fn governance_key() -> Signer {
-    Signer::from_secret_bytes([0xC0; 32]).expect("valid test key")
+    Signer::from_secret(&[0xC0; 32].into()).expect("valid test key")
 }
 
 /// Builds a signed single-node registry.
@@ -86,7 +86,7 @@ pub fn sample_update(feed_id: FeedId) -> PriceUpdate {
 /// Cannot panic: the seed is a valid curve scalar.
 #[must_use]
 pub fn client_key() -> Signer {
-    Signer::from_secret_bytes([0x51; 32]).expect("valid test key")
+    Signer::from_secret(&[0x51; 32].into()).expect("valid test key")
 }
 
 /// A client list naming [`client_key`] for a day, signed by [`governance_key`].

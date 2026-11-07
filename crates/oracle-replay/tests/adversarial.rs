@@ -48,7 +48,7 @@ async fn replay(records: Vec<Record>) -> Outcome {
         .expect("loads")
         .resolve()
         .expect("resolves");
-    let signer = Signer::from_secret_bytes([0x5E; 32]).expect("valid key");
+    let signer = Signer::from_secret(&[0x5E; 32].into()).expect("valid key");
     oracle_replay::run(resolved, records, signer, false)
         .await
         .expect("replays")

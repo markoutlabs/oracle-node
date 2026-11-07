@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
 use serde_json::value::RawValue;
-use tracing::warn;
 
-use crate::transport::{Frame, Transport, TransportError};
+use crate::transport::{Frame, Transport, TransportError, install_tls_provider};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// One contract's record is a few kilobytes.
+/// The largest reply, a Binance depth snapshot of 1,000 levels a side, is
+/// about 70 KB; one contract's record is a few kilobytes.
 const MAX_BODY: usize = 256 * 1024;
 
 /// Takes the `data` of a venue's reply, or says why the reply failed.
@@ -26,11 +26,18 @@ pub(crate) type DataOf = fn(&[u8]) -> Result<Box<RawValue>, String>;
 /// One REST read: the contract, the frame's subject, and the URL.
 pub(crate) type Read = (String, &'static str, String);
 
+/// Makes the frame of one read: the subject, the contract, and the reply.
+pub(crate) type FrameOf = fn(&str, &str, Result<Box<RawValue>, String>) -> Frame;
+
+/// The whole body of a JSON reply.
+pub(crate) fn whole_body(body: &[u8]) -> Result<Box<RawValue>, String> {
+    serde_json::from_slice(body).map_err(|error| error.to_string())
+}
+
 /// An HTTP client that follows no redirect and gives up after 10 s.
 pub(crate) fn client() -> Result<reqwest::Client, TransportError> {
-    // reqwest leaves the crypto provider to the binary; tungstenite already
-    // brings `ring`.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // reqwest leaves the crypto provider to the binary.
+    install_tls_provider();
     reqwest::Client::builder()
         .timeout(TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -84,6 +91,17 @@ pub(crate) fn records(
     every: Duration,
     data_of: DataOf,
 ) -> BoxStream<'static, Frame> {
+    records_as(client, reads, every, data_of, frame)
+}
+
+/// As [`records`], each frame made by `frame_of`.
+pub(crate) fn records_as(
+    client: reqwest::Client,
+    reads: Vec<Read>,
+    every: Duration,
+    data_of: DataOf,
+    frame_of: FrameOf,
+) -> BoxStream<'static, Frame> {
     let steps = reads.len().max(1);
     let wait = every / u32::try_from(steps).unwrap_or(u32::MAX);
     stream::unfold(0_usize, move |n| {
@@ -94,11 +112,10 @@ pub(crate) fn records(
             if n >= 2 {
                 tokio::time::sleep(wait).await;
             }
+            // A failed read is a frame too: the decoder counts it, and the
+            // session warns at most once a minute.
             let fetched = read(client.get(url), data_of).await;
-            if let Err(error) = &fetched {
-                warn!(%contract, %error, "a contract record could not be read");
-            }
-            Some((frame(subject, &contract, fetched), n + 1))
+            Some((frame_of(subject, &contract, fetched), n + 1))
         }
     })
     .boxed()

@@ -70,6 +70,20 @@ pub fn auth_ok_transcript(
     Ok(keccak256(&out))
 }
 
+/// Hashes the sealed initial keys of `auth_ok`: a `u32` count, then each key
+/// with a `u32` length, all big-endian (SPEC §6.1).
+#[must_use]
+pub fn initial_keys_digest(initial: &[impl AsRef<[u8]>]) -> [u8; 32] {
+    let mut out = Vec::with_capacity(4 + initial.len() * 96);
+    out.put_u32(u32::try_from(initial.len()).unwrap_or(u32::MAX));
+    for sealed in initial {
+        let sealed = sealed.as_ref();
+        out.put_u32(u32::try_from(sealed.len()).unwrap_or(u32::MAX));
+        out.put_bytes(sealed);
+    }
+    keccak256(&out)
+}
+
 /// The payload a node's live signing key signs.
 #[must_use]
 pub fn auth_ok_payload(transcript: &[u8; 32]) -> [u8; AUTH_PAYLOAD_SIZE] {
@@ -90,7 +104,7 @@ mod tests {
     use crate::{Signer, decode_price_update, recover_payload_signer};
 
     fn key(seed: u8) -> Signer {
-        Signer::from_secret_bytes([seed; 32]).expect("valid key")
+        Signer::from_secret(&[seed; 32].into()).expect("valid key")
     }
 
     fn transcript(node: u8, challenge: u8, nonce: u8, client: u8, eph: u8) -> [u8; 32] {

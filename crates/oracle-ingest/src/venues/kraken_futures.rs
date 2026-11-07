@@ -21,15 +21,16 @@
 use std::sync::Arc;
 
 use oracle_types::{
-    Fixed, FundingBasis, FundingInfo, NANOS_PER_SEC, ObsKind, Observation, OpenInterestUnit,
+    FundingBasis, FundingInfo, NANOS_PER_SEC, ObsKind, Observation, OpenInterestUnit,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::book::{Books, Halts};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
-use super::decimal_literal;
+use super::{book_top, decimal_literal, observation};
 
 /// Kraken Futures pays funding every hour.
 const FUNDING_INTERVAL_NS: u64 = 3_600 * NANOS_PER_SEC;
@@ -52,21 +53,17 @@ pub fn subscribe_frame<'a>(product_ids: impl Iterator<Item = &'a str>) -> String
     .to_string()
 }
 
-/// The feed is read first and the payload deferred, so that an `event` frame —
-/// `info`, `subscribed`, `alert` — cannot fail to deserialize as a ticker and be
-/// counted as malformed.
+/// A ticker, or an `event` frame — `info`, `subscribed`, `alert`. Every field
+/// is optional, so one parse reads either, and an event cannot count as a
+/// malformed ticker.
 #[derive(Deserialize)]
-struct Envelope<'a> {
+struct Ticker<'a> {
     #[serde(borrow, default)]
     feed: Option<&'a str>,
     #[serde(borrow, default)]
     event: Option<&'a str>,
-}
-
-#[derive(Deserialize)]
-struct Ticker<'a> {
-    #[serde(rename = "product_id", borrow)]
-    product_id: &'a str,
+    #[serde(rename = "product_id", borrow, default)]
+    product_id: Option<&'a str>,
     #[serde(borrow, default)]
     bid: Option<&'a RawValue>,
     #[serde(rename = "bid_size", borrow, default)]
@@ -104,86 +101,61 @@ struct Ticker<'a> {
     suspended: Option<bool>,
 }
 
-/// The session's entry point: [`decode_payload`], with the connection's books.
-///
-/// # Errors
-///
-/// As [`decode_payload`].
-pub fn decode(
-    payload: &[u8],
-    map: &InstrumentMap,
-    _books: &mut crate::book::Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    decode_payload(payload, map, local_recv_ns, out)
-}
-
 /// Decodes one Kraken Futures payload.
 ///
 /// # Errors
 ///
 /// Returns [`DecodeError`]. Subscription acknowledgements, `info` frames and
 /// heartbeats are benign.
-pub fn decode_payload(
+pub fn decode(
     payload: &[u8],
     map: &InstrumentMap,
+    _books: &mut Books,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let envelope: Envelope<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    if envelope.event.is_some() {
+    let ticker: Ticker<'_> = serde_json::from_slice(payload)?;
+    let (None, Some(feed)) = (ticker.event, ticker.feed) else {
         // `{"event":"info","version":1}`, `{"event":"subscribed",...}`, alerts.
-        return Err(DecodeError::Control);
-    }
-    let Some(feed) = envelope.feed else {
         return Err(DecodeError::Control);
     };
     // `ticker_snapshot` is the initial burst and carries the same shape.
     if feed != "ticker" && feed != "ticker_snapshot" {
         return Err(DecodeError::UnhandledStream(feed.to_owned()));
     }
-
-    let ticker: Ticker<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let Some(entry) = map.lookup(ticker.product_id) else {
+    let product_id = ticker
+        .product_id
+        .ok_or(DecodeError::MissingField("product_id"))?;
+    let Some(entry) = map.lookup(product_id) else {
         return Err(DecodeError::Control);
     };
     // A suspended contract still publishes a stale-looking book. The session
     // stops confirming its last values, so the staleness filter sheds them.
     if ticker.suspended == Some(true) {
-        return Err(DecodeError::Halted(entry.instrument.clone()));
+        return Err(DecodeError::Suspended(entry.instrument.clone()));
     }
     let exchange_time_ns = ticker.time.map(millis_to_nanos);
+    let before = out.len();
 
-    let mut emitted = false;
-    if let (Some(bid), Some(bid_size), Some(ask), Some(ask_size)) =
-        (ticker.bid, ticker.bid_size, ticker.ask, ticker.ask_size)
-    {
-        let bid = decimal_literal("bid", bid)?;
-        let ask = decimal_literal("ask", ask)?;
-        let mid = bid
-            .checked_add(ask)
-            .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-            .unwrap_or(bid);
-        out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind: ObsKind::BookTop,
-            price: mid,
-            bid: Some(bid),
-            ask: Some(ask),
-            bid_qty: Some(decimal_literal("bid_size", bid_size)?),
-            ask_qty: Some(decimal_literal("ask_size", ask_size)?),
-            depth_notional_1bp: None,
-            exchange_time_ns,
-            local_recv_ns,
-            seq: None,
-            book: None,
-            funding: None,
-        });
-        emitted = true;
-    }
+    // An absent, null or zero side has no quote: the rest of the ticker
+    // stands, and the book stops counting.
+    let top = || {
+        let (Some(bid), Some(bid_size), Some(ask), Some(ask_size)) =
+            (ticker.bid, ticker.bid_size, ticker.ask, ticker.ask_size)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            (decimal_literal("bid", bid)?, decimal_literal("ask", ask)?),
+            (
+                decimal_literal("bid_size", bid_size)?,
+                decimal_literal("ask_size", ask_size)?,
+            ),
+        )))
+    };
+    let quote = book_top(entry, top, exchange_time_ns, local_recv_ns).map(|top| out.push(top));
+    let mut halts = Halts::default();
+    halts.absorb(&entry.instrument, quote)?;
 
     let funding = ticker
         .relative_funding_rate
@@ -220,30 +192,20 @@ pub fn decode_payload(
     ] {
         let Some(raw) = raw else { continue };
         out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind,
-            price: decimal_literal(field, raw)?,
-            bid: None,
-            ask: None,
-            bid_qty: None,
-            ask_qty: None,
-            depth_notional_1bp: None,
             exchange_time_ns,
-            local_recv_ns,
-            seq: None,
-            book: None,
             funding: (kind == ObsKind::Funding)
                 .then(|| funding.clone())
                 .flatten(),
+            ..observation(entry, kind, decimal_literal(field, raw)?, local_recv_ns)
         });
-        emitted = true;
     }
 
-    if emitted {
-        Ok(())
-    } else {
+    let empty = if out.len() == before {
         Err(DecodeError::Control)
-    }
+    } else {
+        Ok(())
+    };
+    halts.finish(empty)
 }
 
 #[cfg(test)]
@@ -254,23 +216,12 @@ pub fn decode_payload(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, fixed, instrument, kinds};
     use oracle_types::{MarketKind, Venue};
 
-    const RECV: u64 = 1_754_582_400_500_000_000;
-
-    fn map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new("PF_XBTUSD", MarketKind::LinearPerp, "CRYPTO.BTC/USD")
-                .expect("valid"),
-        ];
-        InstrumentMap::new(Venue::Kraken, MarketKind::LinearPerp, &specs).expect("valid")
-    }
-
-    fn decode(payload: &str) -> Vec<Observation> {
-        let mut out = Vec::new();
-        decode_payload(payload.as_bytes(), &map(), RECV, &mut out).expect("decodes");
-        out
+    fn ticker() -> Feed {
+        let perp = instrument("PF_XBTUSD", MarketKind::LinearPerp);
+        Feed::venue(decode, Venue::Kraken, MarketKind::LinearPerp, &[perp])
     }
 
     /// The shape Kraken documents, bare numbers and all.
@@ -287,10 +238,9 @@ mod tests {
 
     #[test]
     fn a_ticker_yields_book_trade_mark_index_and_funding() {
-        let observations = decode(TICKER);
-        let kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
+        let observations = ticker().decoded(TICKER);
         assert_eq!(
-            kinds,
+            kinds(&observations),
             [
                 ObsKind::BookTop,
                 ObsKind::Trade,
@@ -299,25 +249,25 @@ mod tests {
                 ObsKind::Funding,
             ]
         );
-        assert_eq!(observations[0].bid, Some("21978.5".parse().expect("valid")));
-        assert_eq!(observations[0].ask, Some("21987".parse().expect("valid")));
+        assert_eq!(observations[0].bid, Some(fixed("21978.5")));
+        assert_eq!(observations[0].ask, Some(fixed("21987")));
         assert_eq!(
             observations[0].price,
-            "21982.75".parse().expect("valid"),
+            fixed("21982.75"),
             "the mid of the two sides"
         );
-        assert_eq!(observations[1].price, "21983.5".parse().expect("valid"));
-        assert_eq!(observations[3].price, "21984.54".parse().expect("valid"));
+        assert_eq!(observations[1].price, fixed("21983.5"));
+        assert_eq!(observations[3].price, fixed("21984.54"));
     }
 
     /// The reason every field goes through `RawValue`: a double would round the
     /// mark price's last digits away.
     #[test]
     fn bare_json_numbers_keep_every_digit() {
-        let observations = decode(TICKER);
+        let observations = ticker().decoded(TICKER);
         assert_eq!(
             observations[2].price,
-            "21979.68641534714".parse().expect("valid"),
+            fixed("21979.68641534714"),
             "the mark price must survive with every digit the venue sent"
         );
     }
@@ -327,16 +277,13 @@ mod tests {
     /// orders of magnitude off into a funding feed.
     #[test]
     fn funding_uses_the_relative_rate_not_the_absolute_one() {
-        let observations = decode(TICKER);
-        assert_eq!(
-            observations[4].price,
-            "-0.000001380384722222".parse().expect("valid")
-        );
+        let observations = ticker().decoded(TICKER);
+        assert_eq!(observations[4].price, fixed("-0.000001380384722222"));
     }
 
     #[test]
     fn the_timestamp_is_read_as_milliseconds() {
-        let observations = decode(TICKER);
+        let observations = ticker().decoded(TICKER);
         assert_eq!(
             observations[0].exchange_time_ns,
             Some(1_676_393_235_406_000_000)
@@ -346,49 +293,39 @@ mod tests {
     #[test]
     fn a_suspended_contract_publishes_nothing() {
         let suspended = TICKER.replace(r#""suspended":false"#, r#""suspended":true"#);
-        let mut out = Vec::new();
-        let error =
-            decode_payload(suspended.as_bytes(), &map(), RECV, &mut out).expect_err("suspended");
-        assert!(matches!(error, DecodeError::Halted(_)), "got {error:?}");
-        assert!(
-            out.is_empty(),
-            "a market nobody can trade must not reach the aggregator"
-        );
+        // A market nobody can trade must not reach the aggregator.
+        let error = ticker().refused(suspended);
+        assert!(matches!(error, DecodeError::Suspended(_)), "got {error:?}");
     }
 
     #[test]
     fn event_frames_and_heartbeats_are_benign() {
-        let mut out = Vec::new();
+        let mut ticker = ticker();
         for control in [
             r#"{"event":"info","version":1}"#,
             r#"{"event":"subscribed","feed":"ticker","product_ids":["PF_XBTUSD"]}"#,
             r#"{"event":"alert","message":"some notice"}"#,
             r#"{"feed":"heartbeat","time":1676393235406}"#,
         ] {
-            let error = decode_payload(control.as_bytes(), &map(), RECV, &mut out)
-                .expect_err("not market data");
+            let error = ticker.refused(control);
             assert!(error.is_benign(), "got {error:?} for {control}");
         }
-        assert!(out.is_empty());
     }
 
     #[test]
     fn untracked_products_are_benign() {
         let other = TICKER.replace("PF_XBTUSD", "PF_ETHUSD");
-        let mut out = Vec::new();
-        let error =
-            decode_payload(other.as_bytes(), &map(), RECV, &mut out).expect_err("untracked");
-        assert!(error.is_benign());
+        assert!(ticker().refused(other).is_benign());
     }
 
     /// Kraken sends every field on every update, but a partial frame must still
     /// yield what it does carry rather than nothing.
     #[test]
-    fn a_ticker_missing_the_book_still_yields_the_mark() {
+    fn a_ticker_without_its_book_halts_the_quote_and_keeps_the_mark() {
         let partial = r#"{"feed":"ticker","product_id":"PF_XBTUSD","markPrice":21979.5}"#;
-        let observations = decode(partial);
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].kind, ObsKind::MarkPrice);
+        let (observations, halted) = ticker().halted(partial);
+        assert_eq!(kinds(&observations), [ObsKind::MarkPrice]);
+        assert_eq!(halted, ["PF_XBTUSD"]);
     }
 
     #[test]

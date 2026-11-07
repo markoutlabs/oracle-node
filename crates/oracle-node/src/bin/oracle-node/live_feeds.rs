@@ -12,7 +12,7 @@ use oracle_node::feed_set::{self, Chosen, Subscriptions};
 use oracle_node::publish::PushPace;
 use oracle_server::{ServerState, unix_now};
 use oracle_types::{FeedId, InstrumentId, Symbol};
-use oracle_wire::{Address, VerifiedFeedSet};
+use oracle_wire::{Address, Registry, VerifiedFeedSet};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -137,9 +137,10 @@ pub(crate) struct FeedSetTask {
     pub(crate) subscriptions: Subscriptions,
     pub(crate) version: u64,
     pub(crate) governance: Address,
-    /// This node's place in the registry, and the node count.
-    pub(crate) index: usize,
-    pub(crate) nodes: usize,
+    /// This node's address, which gives its change slot in the registry.
+    pub(crate) address: Address,
+    /// The newest registry that the node read.
+    pub(crate) registry: Registry,
     pub(crate) slots: oracle_wire::Slots,
     pub(crate) poll: Duration,
     pub(crate) cache: PathBuf,
@@ -197,13 +198,17 @@ impl FeedSetTask {
                 }
             };
             cache(&self.cache, chosen.set.as_feed_set());
+            self.refresh_registry().await;
+            let place = feed_set::place(&self.registry.nodes, self.address);
             let now = unix_now();
-            let at = self
-                .slots
-                .apply_at(chosen.set.effective_from(), self.index, self.nodes, now);
+            let at =
+                self.slots
+                    .apply_at(chosen.set.effective_from(), place.index, place.nodes, now);
             info!(
                 version = chosen.set.version(),
                 in_secs = at.saturating_sub(now),
+                slot = place.index,
+                nodes = place.nodes,
                 "new network feed set; the node takes it in its slot"
             );
             tokio::select! {
@@ -222,6 +227,20 @@ impl FeedSetTask {
                 self.restart.cancel();
                 return;
             }
+        }
+    }
+
+    /// A rotation since the start changes the address order, so the slot needs
+    /// the registry of now. A failed fetch keeps the last one read.
+    async fn refresh_registry(&mut self) {
+        match self.config.fetch_registry().await {
+            Ok(registry) if registry.version >= self.registry.version => self.registry = registry,
+            Ok(_) => {}
+            Err(error) => warn!(
+                %error,
+                version = self.registry.version,
+                "the registry could not be fetched; the slot comes from the last one read"
+            ),
         }
     }
 

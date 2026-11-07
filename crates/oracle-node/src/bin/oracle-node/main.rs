@@ -11,6 +11,8 @@ mod ingest;
 mod init;
 mod live_feeds;
 mod notify;
+mod pipeline_task;
+mod process;
 mod publish;
 mod rotate;
 mod start;

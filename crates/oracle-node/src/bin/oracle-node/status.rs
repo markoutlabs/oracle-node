@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use console::style;
 use oracle_client::{LatencyHistogram, Percentiles};
+use oracle_ingest::VenueHealth;
 use oracle_types::{Observation, Venue};
 use oracle_wire::Address;
 use tracing::info;
@@ -96,7 +97,8 @@ pub(crate) struct NodeStatus {
 }
 
 impl NodeStatus {
-    pub(crate) fn log(&self) {
+    /// `connections` are the venue connections, with their counters (SPEC §9.3).
+    pub(crate) fn log(&self, connections: &[VenueHealth]) {
         info!(
             feeds = %format_args!("{}/{}", self.feeds_published, self.feeds),
             clients = self.clients,
@@ -106,9 +108,37 @@ impl NodeStatus {
             feed_set = self.feed_set,
             signed_p50_ms = %format_args!("{:.2}", millis(self.signed.p50)),
             signed_p99_ms = %format_args!("{:.2}", millis(self.signed.p99)),
+            venue_health = %venue_health(connections),
             "status"
         );
     }
+}
+
+/// Each connection with its counters since it was built, numbered within its
+/// venue and market. The URL drops its query, which only lists the streams.
+fn venue_health(connections: &[VenueHealth]) -> String {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    connections
+        .iter()
+        .map(|connection| {
+            let stream = connection.stream().to_string();
+            let place = seen.entry(stream.clone()).or_default();
+            let number = *place;
+            *place = place.saturating_add(1);
+            let url = connection.url().split('?').next().unwrap_or_default();
+            let counts = connection.counts();
+            format!(
+                "{stream}#{number} {url} connects {} decode_errors {} resyncs {} \
+                 resubscribes {} idle_timeouts {}",
+                counts.connects,
+                counts.decode_errors,
+                counts.resyncs,
+                counts.resubscribes,
+                counts.idle_timeouts,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn millis(value: Duration) -> f64 {
@@ -256,6 +286,23 @@ mod tests {
             latency.take().1.is_empty(),
             "each take starts a new interval"
         );
+    }
+
+    #[test]
+    fn each_venue_connection_shows_its_counters_and_its_place_in_its_market() {
+        let stream = oracle_ingest::StreamId::new(Venue::Bitfinex, MarketKind::Spot);
+        let url = "wss://api-pub.bitfinex.com/ws/2";
+        let connections = [
+            VenueHealth::new(stream, url),
+            VenueHealth::new(stream, format!("{url}?streams=a/b")),
+        ];
+        let text = venue_health(&connections);
+        let counters = "connects 0 decode_errors 0 resyncs 0 resubscribes 0 idle_timeouts 0";
+        assert_eq!(
+            text,
+            format!("bitfinex:spot#0 {url} {counters}; bitfinex:spot#1 {url} {counters}")
+        );
+        assert!(venue_health(&[]).is_empty());
     }
 
     #[test]

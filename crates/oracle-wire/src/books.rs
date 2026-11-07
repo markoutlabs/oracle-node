@@ -417,11 +417,11 @@ mod tests {
     use oracle_types::{FeedId, VenueReport};
 
     fn node() -> Signer {
-        Signer::from_secret_bytes([0x21; 32]).expect("valid key")
+        Signer::from_secret(&[0x21; 32].into()).expect("valid key")
     }
 
     fn registry() -> VerifiedRegistry {
-        let governance = Signer::from_secret_bytes([0x91; 32]).expect("valid key");
+        let governance = Signer::from_secret(&[0x91; 32].into()).expect("valid key");
         let entry = NodeEntry {
             address: node().address(),
             endpoints: vec!["wss://eu1.example/v2/ws".to_owned()],
@@ -485,7 +485,7 @@ mod tests {
             frame.verify(&registry()).expect("verifies").update(),
             &snapshot()
         );
-        let stranger = Signer::from_secret_bytes([0x33; 32]).expect("valid key");
+        let stranger = Signer::from_secret(&[0x33; 32].into()).expect("valid key");
         let forged = stranger.sign_book_update(&snapshot()).expect("signs");
         let frame = UnverifiedBookFrame::parse(&forged.encode_frame()).expect("parses");
         assert!(frame.verify(&registry()).is_err());

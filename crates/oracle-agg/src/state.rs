@@ -643,8 +643,10 @@ impl FeedRuntime {
                 expo,
                 source,
             })?;
+        // Up, not to the nearest unit: a band below the computed one claims more
+        // precision than the sources give (SPEC §5.5).
         let conf_mantissa =
-            conf.to_scaled_unsigned(expo)
+            conf.to_scaled_unsigned_up(expo)
                 .map_err(|source| AggError::Unrepresentable {
                     symbol: self.config.symbol.to_string(),
                     value: conf.to_string(),
@@ -1084,6 +1086,27 @@ mod tests {
         assert!(update.flags.is_none());
         assert!(update.sources_consistent());
         assert!(update.timestamps_coherent());
+    }
+
+    /// At $0.00001 the 1 bp floor is a tenth of one unit at exponent -8, and
+    /// the nearest unit is zero.
+    #[test]
+    fn a_band_below_one_unit_publishes_as_one_unit_not_zero() {
+        let mut aggregator = aggregator();
+        feed(
+            &mut aggregator,
+            SECOND,
+            &[
+                (Venue::Binance, "0.0000100", "0.000010001"),
+                (Venue::Bybit, "0.0000100", "0.000010001"),
+                (Venue::Okx, "0.0000100", "0.000010001"),
+            ],
+        );
+        let update = aggregator
+            .poll(feed_id(), SECOND)
+            .expect("no error")
+            .expect("publishes");
+        assert_eq!(update.conf, 1);
     }
 
     #[test]

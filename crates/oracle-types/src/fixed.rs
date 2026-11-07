@@ -247,6 +247,45 @@ impl Fixed {
         u64::try_from(scaled).map_err(|_| FixedError::Overflow)
     }
 
+    /// Converts to an unsigned mantissa at the given decimal exponent, rounding up.
+    ///
+    /// For a confidence band: a band rounded down claims more precision than we have.
+    ///
+    /// # Errors
+    ///
+    /// The same errors and the same `i64::MAX` bound as [`Fixed::to_scaled_unsigned`].
+    pub fn to_scaled_unsigned_up(self, expo: i32) -> Result<u64, FixedError> {
+        if self.0 < 0 {
+            return Err(FixedError::Negative);
+        }
+        let shift = expo
+            .checked_sub(SCALE_EXPO)
+            .ok_or(FixedError::ExponentOutOfRange(expo))?;
+        let scaled = if shift >= 0 {
+            let divisor = u32::try_from(shift)
+                .ok()
+                .and_then(pow10)
+                .ok_or(FixedError::ExponentOutOfRange(expo))?;
+            let whole = self.0 / divisor;
+            if self.0 % divisor == 0 {
+                whole
+            } else {
+                whole.checked_add(1).ok_or(FixedError::Overflow)?
+            }
+        } else {
+            let factor = shift
+                .checked_neg()
+                .and_then(|s| u32::try_from(s).ok())
+                .and_then(pow10)
+                .ok_or(FixedError::ExponentOutOfRange(expo))?;
+            self.0.checked_mul(factor).ok_or(FixedError::Overflow)?
+        };
+        i64::try_from(scaled)
+            .ok()
+            .and_then(|scaled| u64::try_from(scaled).ok())
+            .ok_or(FixedError::Overflow)
+    }
+
     /// Returns the absolute value, or `None` on `MIN`.
     #[inline]
     #[must_use]
@@ -586,6 +625,53 @@ mod tests {
     fn unsigned_conversion_rejects_negatives() {
         let negative: Fixed = "-1".parse().expect("valid");
         assert_eq!(negative.to_scaled_unsigned(-8), Err(FixedError::Negative));
+        assert_eq!(
+            negative.to_scaled_unsigned_up(-8),
+            Err(FixedError::Negative)
+        );
+    }
+
+    #[test]
+    fn a_band_has_the_bound_of_the_nearest_conversion() {
+        let units = |value: i128| Fixed::from_raw(value * 10_000);
+        let max = i128::from(i64::MAX);
+        assert_eq!(
+            units(max).to_scaled_unsigned(-8),
+            Ok(i64::MAX.unsigned_abs())
+        );
+        assert_eq!(
+            units(max).to_scaled_unsigned_up(-8),
+            Ok(i64::MAX.unsigned_abs())
+        );
+        let above = Fixed::from_raw(max * 10_000 + 1);
+        assert_eq!(
+            above.to_scaled_unsigned_up(-8),
+            Err(FixedError::Overflow),
+            "rounds past"
+        );
+        for value in [units(max + 1), units(i128::from(u64::MAX))] {
+            assert_eq!(value.to_scaled_unsigned(-8), Err(FixedError::Overflow));
+            assert_eq!(value.to_scaled_unsigned_up(-8), Err(FixedError::Overflow));
+        }
+        assert_eq!(
+            Fixed::MAX.to_scaled_unsigned_up(-30),
+            Err(FixedError::Overflow)
+        );
+    }
+
+    #[test]
+    fn a_band_rounds_up_and_never_to_zero() {
+        let at = |text: &str, expo| {
+            text.parse::<Fixed>()
+                .expect("valid")
+                .to_scaled_unsigned_up(expo)
+        };
+        assert_eq!(at("1.001", -2), Ok(101), "below a half still rounds up");
+        assert_eq!(at("0.000000000001", -8), Ok(1), "a tiny band is one unit");
+        assert_eq!(at("1.5", -1), Ok(15), "an exact value stays");
+        assert_eq!(at("0", -8), Ok(0));
+        assert_eq!(at("12", 1), Ok(2));
+        assert_eq!(at("1.25", -14), Ok(125_000_000_000_000));
     }
 
     #[test]

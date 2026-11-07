@@ -12,10 +12,16 @@ use oracle_types::{
     BookLevel, BookUpdate, FeedId, Flags, FundingBasis, FundingUpdate, MarketKind, NANOS_PER_SEC,
     PriceUpdate, SourceStatus, Venue, VenueEntry, VenueReport, VenueSet,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use oracle_wire::{Address, NodeEntry, Quorum, Registry, Signer, VerifiedRegistry};
 
 /// Issue time of test registries, unix seconds. Tests use it as their clock.
 pub const REGISTRY_ISSUED_AT: u64 = 1_754_582_400;
+
+/// Where the publish times of [`TestNode::next`] start: ten minutes after the
+/// test registry's issue time, unix nanoseconds.
+pub const NEXT_EPOCH_NS: u64 = (REGISTRY_ISSUED_AT + 600) * NANOS_PER_SEC;
 
 /// Seed for the governance key that signs test registries.
 const GOVERNANCE_SEED: u8 = 0xC0;
@@ -27,7 +33,7 @@ const GOVERNANCE_SEED: u8 = 0xC0;
 /// Cannot panic: the seed is a valid curve scalar.
 #[must_use]
 pub fn governance() -> Signer {
-    Signer::from_secret_bytes([GOVERNANCE_SEED; 32]).expect("valid test key")
+    Signer::from_secret(&[GOVERNANCE_SEED; 32].into()).expect("valid test key")
 }
 
 /// A fake oracle node. Its signing key's address is its id.
@@ -35,6 +41,7 @@ pub struct TestNode {
     signing: Signer,
     outgoing: Option<Signer>,
     seed: u8,
+    steps: AtomicU64,
 }
 
 impl TestNode {
@@ -47,10 +54,25 @@ impl TestNode {
     pub fn new(seed: u8) -> Self {
         assert!(seed != 0, "seed 0 is not a valid secret key");
         Self {
-            signing: Signer::from_secret_bytes([seed.wrapping_add(0x40).max(1); 32])
+            signing: Signer::from_secret(&[seed.wrapping_add(0x40).max(1); 32].into())
                 .expect("valid test key"),
             outgoing: None,
             seed,
+            steps: AtomicU64::new(0),
+        }
+    }
+
+    /// The node's next healthy update of `feed` at `price`, so a test never
+    /// picks a sequence or a clock. Each call takes the next `seq` from 1 and a
+    /// publish time one second later, from [`NEXT_EPOCH_NS`].
+    #[must_use]
+    pub fn next(&self, feed: FeedId, price: i64) -> PriceUpdate {
+        let step = self.steps.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let published = NEXT_EPOCH_NS.saturating_add(step.saturating_mul(NANOS_PER_SEC));
+        PriceUpdate {
+            feed_id: feed,
+            price,
+            ..update_at(published, step)
         }
     }
 
@@ -58,6 +80,12 @@ impl TestNode {
     #[must_use]
     pub fn signing_address(&self) -> Address {
         self.signing.address()
+    }
+
+    /// Returns the node's current key, for a test that plays the node's side of a handshake.
+    #[must_use]
+    pub const fn signer(&self) -> &Signer {
+        &self.signing
     }
 
     /// Rotates to a fresh key, as governance's `replace_node` does. The old
@@ -76,7 +104,7 @@ impl TestNode {
         // Derived from the node's own seed, so rotating one node can never
         // collide with another node's key and quietly turn a two-node test into
         // a one-node one.
-        let next = Signer::from_secret_bytes([self.seed.wrapping_add(0x80).max(1); 32])
+        let next = Signer::from_secret(&[self.seed.wrapping_add(0x80).max(1); 32].into())
             .expect("valid test key");
         assert_ne!(
             next.address(),
@@ -212,7 +240,7 @@ pub fn signed_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
 /// Panics if the entries cannot form a valid registry.
 #[must_use]
 pub fn forged_registry(version: u64, entries: Vec<NodeEntry>) -> Registry {
-    let impostor = Signer::from_secret_bytes([0xF0; 32]).expect("valid test key");
+    let impostor = Signer::from_secret(&[0xF0; 32].into()).expect("valid test key");
     let quorum = Quorum {
         min_nodes: u16::try_from(entries.len()).unwrap_or(u16::MAX),
         recommended: u16::try_from(entries.len()).unwrap_or(u16::MAX),
@@ -310,5 +338,25 @@ pub fn update_at(publish_time_ns: u64, seq: u64) -> PriceUpdate {
         seq,
         num_sources: 5,
         sources: Venue::ALL.into_iter().collect::<VenueSet>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_moves_the_sequence_and_the_clock_of_one_node() {
+        let (node, other) = (TestNode::new(1), TestNode::new(2));
+        let feed = FeedId::from_bytes([7; 32]);
+        let first = node.next(feed, 1);
+        let second = node.next(feed, 2);
+        assert_eq!((first.seq, second.seq), (1, 2));
+        assert_eq!(
+            second.publish_time_ns - first.publish_time_ns,
+            NANOS_PER_SEC
+        );
+        assert_eq!((second.feed_id, second.price), (feed, 2));
+        assert_eq!(other.next(feed, 1).seq, 1, "each node counts its own");
     }
 }

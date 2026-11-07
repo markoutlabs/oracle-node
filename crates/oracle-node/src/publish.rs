@@ -10,16 +10,13 @@ use std::time::Duration;
 
 use ic_agent::export::Principal;
 use ic_agent::export::reqwest::Url;
+use oracle_registry_api::MAX_FRAME_AGE;
 use oracle_types::{FeedId, Flags, PriceUpdate};
 
 use crate::config::{ConfigError, NodeConfig};
 
 /// The most updates in one push: one batch holds this many.
 pub const MAX_UPDATES_PER_PUSH: usize = oracle_wire::MAX_BATCH_UPDATES;
-
-/// The canister refuses an update older than 30 s. An older latest update
-/// means the feed stopped, and a push of it would only be refused.
-pub const MAX_FRAME_AGE: Duration = Duration::from_secs(25);
 
 /// When to push a feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -15,8 +15,10 @@ static SECP: LazyLock<Secp256k1<All>> = LazyLock::new(Secp256k1::new);
 pub(crate) struct SecretKey(secp256k1::SecretKey);
 
 impl SecretKey {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, WireError> {
-        secp256k1::SecretKey::from_byte_array(bytes)
+    pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Result<Self, WireError> {
+        // The library takes the array by value. It inlines the call, so the
+        // copy lives in this frame, and no API here avoids it.
+        secp256k1::SecretKey::from_byte_array(*bytes)
             .map(Self)
             .map_err(|_| WireError::InvalidSecretKey)
     }

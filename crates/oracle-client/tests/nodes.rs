@@ -35,7 +35,7 @@ fn client(nodes: &[TestNode], endpoint: &str) -> OracleClient {
         .expect("test registry verifies");
     OracleClient::builder(verified)
         .quorum(3)
-        .client_key(Signer::from_secret_bytes([0x51; 32]).expect("valid key"))
+        .client_key(Signer::from_secret(&[0x51; 32].into()).expect("valid key"))
         .build()
         .expect("builds")
 }

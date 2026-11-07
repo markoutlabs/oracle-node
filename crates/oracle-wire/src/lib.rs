@@ -52,7 +52,7 @@
 //! use oracle_types::{FeedId, Flags, PriceUpdate, Venue};
 //! use oracle_wire::{Signer, UnverifiedFrame};
 //!
-//! let signer = Signer::from_secret_bytes([7u8; 32])?;
+//! let signer = Signer::from_secret(&[7u8; 32].into())?;
 //! let update = PriceUpdate {
 //!     feed_id: FeedId::from_bytes([0x11; 32]),
 //!     flags: Flags::NONE,
@@ -99,7 +99,7 @@ mod venues;
 pub use address::{Address, CompressedPublicKey};
 pub use auth::{
     AUTH_PAYLOAD_SIZE, TRANSPORT_PROTOCOL, auth_ok_payload, auth_ok_transcript,
-    client_auth_payload, client_auth_transcript,
+    client_auth_payload, client_auth_transcript, initial_keys_digest,
 };
 pub use backend::name as backend_name;
 pub use batch::{

@@ -26,7 +26,7 @@ use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::clock::millis_to_nanos;
 use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
@@ -211,46 +211,44 @@ struct Contract<'a> {
     open_interest: Option<&'a str>,
 }
 
+fn lost(entry: &InstrumentEntry, error: DecodeError) -> DecodeError {
+    DecodeError::lost(&entry.instrument, error)
+}
+
+/// Each depth message is a whole book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::WholeBook);
+
 /// Replaces the book with a whole snapshot, and emits it.
 fn depth(
     data: &RawValue,
-    symbol: &str,
     entry: &InstrumentEntry,
     books: &mut Books,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let snapshot: Depth<'_> = parse(data)?;
-    let book = books.book(symbol);
-    book.clear();
-    for (side, levels) in [(Side::Ask, &snapshot.asks), (Side::Bid, &snapshot.bids)] {
-        for (price, size) in levels {
-            let price = decimal_literal("depth price", price)?;
+    let parsed = parse::<Depth<'_>>(data).and_then(|snapshot| {
+        let whole = BookMsg::whole(&snapshot.bids, &snapshot.asks, |(price, size)| {
             let size = base_units(decimal_literal("depth size", size)?, entry.contract_size);
-            book.set(side, price, size);
-        }
-    }
-    books.emit(
-        symbol,
-        entry.instrument.clone(),
-        snapshot.timestamp.map(millis_to_nanos),
-        local_recv_ns,
-        out,
-    )
+            Ok(Change::new(decimal_literal("depth price", price)?, size))
+        })?;
+        Ok(whole.at(snapshot.timestamp.map(millis_to_nanos)))
+    });
+    books
+        .keeper
+        .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
 }
 
 /// The topic's channel and symbol, and the symbol's entry.
-fn route<'a>(
+fn route<'a, 'm>(
     topic: Option<&'a str>,
-    map: &InstrumentMap,
-) -> Result<(&'a str, &'a str, InstrumentEntry), DecodeError> {
+    map: &'m InstrumentMap,
+) -> Result<(&'a str, &'a str, &'m InstrumentEntry), DecodeError> {
     let topic = topic.ok_or(DecodeError::MissingField("topic"))?;
     let (channel, symbol) = topic
         .split_once(':')
         .ok_or_else(|| DecodeError::UnhandledStream(topic.to_owned()))?;
     let entry = map
         .lookup(symbol)
-        .cloned()
         .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))?;
     Ok((channel, symbol, entry))
 }
@@ -282,35 +280,34 @@ pub fn decode_spot(
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
     let envelope = envelope(payload)?;
-    let (channel, symbol, entry) = route(envelope.topic, map)?;
+    let (channel, _, entry) = route(envelope.topic, map)?;
     let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
     match channel {
         "/market/ticker" => {
-            let ticker: SpotTicker<'_> = parse(data)?;
-            let prices = (
-                decimal("bestBid", ticker.best_bid)?,
-                decimal("bestAsk", ticker.best_ask)?,
-            );
-            let sizes = (
-                decimal("bestBidSize", ticker.best_bid_size)?,
-                decimal("bestAskSize", ticker.best_ask_size)?,
-            );
-            out.push(book_top(
-                &entry,
-                prices,
-                sizes,
-                ticker.time.map(millis_to_nanos),
-                local_recv_ns,
-            )?);
+            let ticker: SpotTicker<'_> = parse(data).map_err(|e| lost(entry, e))?;
+            let top = || {
+                Ok(Some((
+                    (
+                        decimal("bestBid", ticker.best_bid)?,
+                        decimal("bestAsk", ticker.best_ask)?,
+                    ),
+                    (
+                        decimal("bestBidSize", ticker.best_bid_size)?,
+                        decimal("bestAskSize", ticker.best_ask_size)?,
+                    ),
+                )))
+            };
+            let time = ticker.time.map(millis_to_nanos);
+            out.push(book_top(entry, top, time, local_recv_ns)?);
             Ok(())
         }
-        "/spotMarket/level2Depth50" => depth(data, symbol, &entry, books, local_recv_ns, out),
+        "/spotMarket/level2Depth50" => depth(data, entry, books, local_recv_ns, out),
         "/market/match" => {
             let trade: SpotMatch<'_> = parse(data)?;
             out.push(Observation {
                 exchange_time_ns: trade.time.map(|time| integer("time", time)).transpose()?,
                 ..observation(
-                    &entry,
+                    entry,
                     ObsKind::Trade,
                     decimal("price", trade.price)?,
                     local_recv_ns,
@@ -346,33 +343,32 @@ pub fn decode_futures(
     let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
     match (channel, envelope.subject.unwrap_or_default()) {
         ("/contractMarket/tickerV2", _) => {
-            let ticker: FuturesTicker<'_> = parse(data)?;
-            let prices = (
-                decimal("bestBidPrice", ticker.best_bid_price)?,
-                decimal("bestAskPrice", ticker.best_ask_price)?,
-            );
-            let sizes = (
-                base_units(
-                    decimal_literal("bestBidSize", ticker.best_bid_size)?,
-                    entry.contract_size,
-                ),
-                base_units(
-                    decimal_literal("bestAskSize", ticker.best_ask_size)?,
-                    entry.contract_size,
-                ),
-            );
-            out.push(book_top(&entry, prices, sizes, ticker.ts, local_recv_ns)?);
+            let ticker: FuturesTicker<'_> = parse(data).map_err(|e| lost(entry, e))?;
+            let size = |field, raw| {
+                decimal_literal(field, raw).map(|size| base_units(size, entry.contract_size))
+            };
+            let top = || {
+                Ok(Some((
+                    (
+                        decimal("bestBidPrice", ticker.best_bid_price)?,
+                        decimal("bestAskPrice", ticker.best_ask_price)?,
+                    ),
+                    (
+                        size("bestBidSize", ticker.best_bid_size)?,
+                        size("bestAskSize", ticker.best_ask_size)?,
+                    ),
+                )))
+            };
+            out.push(book_top(entry, top, ticker.ts, local_recv_ns)?);
             Ok(())
         }
-        ("/contractMarket/level2Depth50", _) => {
-            depth(data, symbol, &entry, books, local_recv_ns, out)
-        }
+        ("/contractMarket/level2Depth50", _) => depth(data, entry, books, local_recv_ns, out),
         ("/contractMarket/execution", _) => {
             let trade: Execution<'_> = parse(data)?;
             out.push(Observation {
                 exchange_time_ns: trade.ts,
                 ..observation(
-                    &entry,
+                    entry,
                     ObsKind::Trade,
                     decimal("price", trade.price)?,
                     local_recv_ns,
@@ -389,24 +385,25 @@ pub fn decode_futures(
             ] {
                 out.push(Observation {
                     exchange_time_ns: time,
-                    ..observation(&entry, kind, decimal_literal("price", raw)?, local_recv_ns)
+                    ..observation(entry, kind, decimal_literal("price", raw)?, local_recv_ns)
                 });
             }
             Ok(())
         }
         ("/contract/instrument", "funding.rate") => {
             let rate: FundingRate<'_> = parse(data)?;
-            books.funding(symbol).rate = Some(decimal_literal("fundingRate", rate.funding_rate)?);
+            books.funding(&entry.instrument).rate =
+                Some(decimal_literal("fundingRate", rate.funding_rate)?);
             out.extend(interval_funding(
-                &entry,
-                books.funding(symbol),
+                entry,
+                books.funding(&entry.instrument),
                 local_recv_ns,
             ));
             Ok(())
         }
         ("/rest", "funding.current") => {
             let current: FundingCurrent<'_> = parse(data)?;
-            let state = books.funding(symbol);
+            let state = books.funding(&entry.instrument);
             state.rate = Some(decimal_literal("value", current.value)?);
             state.interval_ns = Some(millis_to_nanos(current.granularity)).filter(|ns| *ns > 0);
             state.next_funding_time_ns = Some(millis_to_nanos(current.funding_time));
@@ -417,19 +414,19 @@ pub fn decode_futures(
                 )),
                 None => None,
             };
-            out.extend(interval_funding(&entry, state, local_recv_ns));
+            out.extend(interval_funding(entry, state, local_recv_ns));
             Ok(())
         }
         ("/rest", "contract") => {
             let contract: Contract<'_> = parse(data)?;
             if let Some(open_interest) = contract.open_interest {
                 let contracts = decimal("openInterest", open_interest)?;
-                books.funding(symbol).open_interest =
+                books.funding(&entry.instrument).open_interest =
                     Some(base_units(contracts, entry.contract_size));
             }
             out.extend(interval_funding(
-                &entry,
-                books.funding(symbol),
+                entry,
+                books.funding(&entry.instrument),
                 local_recv_ns,
             ));
             Ok(())
@@ -445,10 +442,9 @@ pub fn decode_futures(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, Replayed, contracts_of, fixed, instrument, of};
     use oracle_types::{Fixed, MarketKind, OpenInterestUnit, Venue};
 
-    const RECV: u64 = 1_792_936_300_000_000_000;
     /// Recorded from KuCoin on 2026-10-25: the BTC and ETH spot quotes, BTC's
     /// book and trades.
     const SPOT: &str = include_str!("../../tests/fixtures/kucoin-spot.jsonl");
@@ -457,60 +453,34 @@ mod tests {
     /// records of BTC as the connector frames them, then a failed read.
     const FUTURES: &str = include_str!("../../tests/fixtures/kucoin-futures.jsonl");
 
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
+    fn spot(depth: bool) -> Feed {
+        let btc = instrument("BTC-USDT", MarketKind::Spot);
+        let pairs = [
+            if depth { btc.with_depth() } else { btc },
+            instrument("ETH-USDT", MarketKind::Spot),
+        ];
+        Feed::venue(decode_spot, Venue::Kucoin, MarketKind::Spot, &pairs)
     }
 
-    fn spot_map(depth: bool) -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = [("BTC-USDT", depth), ("ETH-USDT", false)]
-            .into_iter()
-            .map(|(symbol, depth)| {
-                let spec =
-                    InstrumentSpec::new(symbol, MarketKind::Spot, "CRYPTO.X/USD").expect("valid");
-                if depth { spec.with_depth() } else { spec }
-            })
-            .collect();
-        InstrumentMap::new(Venue::Kucoin, MarketKind::Spot, &specs).expect("valid")
-    }
-
-    fn futures_map() -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = [("XBTUSDTM", "0.001", true), ("ETHUSDTM", "0.01", false)]
-            .into_iter()
-            .map(|(symbol, size, depth)| {
-                let spec = InstrumentSpec {
-                    contract_size: Some(fixed(size)),
-                    ..InstrumentSpec::new(symbol, MarketKind::LinearPerp, "CRYPTO.X/USDT.PERP_MARK")
-                        .expect("valid")
-                };
-                if depth { spec.with_depth() } else { spec }
-            })
-            .collect();
-        InstrumentMap::new(Venue::Kucoin, MarketKind::LinearPerp, &specs).expect("valid")
-    }
-
-    /// Runs a session through one map; returns the observations and the errors
-    /// that are not benign.
-    fn replay(
-        session: &str,
-        map: &InstrumentMap,
-        decode: super::super::DecodeFn,
-    ) -> (Vec<Observation>, Vec<String>) {
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for line in session.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
+    fn futures() -> Feed {
+        let perps = [
+            contracts_of(instrument("XBTUSDTM", MarketKind::LinearPerp), "0.001").with_depth(),
+            contracts_of(instrument("ETHUSDTM", MarketKind::LinearPerp), "0.01"),
+        ];
+        Feed::venue(
+            decode_futures,
+            Venue::Kucoin,
+            MarketKind::LinearPerp,
+            &perps,
+        )
     }
 
     #[test]
     fn a_spot_session_gives_quotes_trades_and_a_book() {
-        let (all, errors) = replay(SPOT, &spot_map(true), decode_spot);
+        let Replayed {
+            observations: all,
+            errors,
+        } = spot(true).replay_all(SPOT.lines());
         assert!(errors.is_empty(), "{errors:?}");
         let top = all
             .iter()
@@ -523,65 +493,51 @@ mod tests {
             .iter()
             .find(|o| o.kind == ObsKind::Trade)
             .expect("a trade");
+        // A time after 2023: the milliseconds were read, not the seconds.
         assert!(
             trade
                 .exchange_time_ns
                 .is_some_and(|ns| ns > 1_700_000_000_000_000_000)
         );
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
+        let depth = *of(&all, "BTC-USDT", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
-        assert!(book.bids[0].price < book.asks[0].price);
         assert_eq!(depth.bid, Some(book.bids[0].price));
         // The 5-level book of ETH is not subscribed by this build.
-        assert!(
-            all.iter()
-                .all(|o| o.kind != ObsKind::Depth || &*o.instrument.symbol == "BTC-USDT")
-        );
+        assert!(of(&all, "ETH-USDT", ObsKind::Depth).is_empty());
     }
 
     #[test]
     fn a_futures_session_sizes_in_coins_and_carries_the_rest_funding() {
-        let (all, errors) = replay(FUTURES, &futures_map(), decode_futures);
-        // Only the failed REST read is an error.
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("ETHUSDTM"), "{errors:?}");
+        let Replayed {
+            observations: all,
+            errors,
+        } = futures().replay_all(FUTURES.lines());
+        let [failed] = errors.as_slice() else {
+            panic!("only the failed REST read is an error: {errors:?}");
+        };
+        assert!(failed.to_string().contains("ETHUSDTM"), "{failed}");
 
-        let top = all
-            .iter()
-            .find(|o| o.kind == ObsKind::BookTop && &*o.instrument.symbol == "ETHUSDTM")
-            .expect("a quote");
+        let top = of(&all, "ETHUSDTM", ObsKind::BookTop)[0];
         // 411 contracts of 0.01 ETH.
         assert_eq!(top.bid_qty, Some(fixed("4.11")));
         assert!(top.bid < top.ask);
 
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
+        let depth = *of(&all, "XBTUSDTM", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
         assert!(book.bids[0].price < book.asks[0].price);
 
-        let mark = all
-            .iter()
-            .find(|o| o.kind == ObsKind::MarkPrice)
-            .expect("a mark");
-        assert_eq!(mark.price, fixed("80346.90"));
-        let index = all
-            .iter()
-            .find(|o| o.kind == ObsKind::IndexPrice)
-            .expect("an index");
-        assert_eq!(index.price, fixed("80379.74"));
+        assert_eq!(
+            of(&all, "XBTUSDTM", ObsKind::MarkPrice)[0].price,
+            fixed("80346.90")
+        );
+        assert_eq!(
+            of(&all, "XBTUSDTM", ObsKind::IndexPrice)[0].price,
+            fixed("80379.74")
+        );
 
-        let funding: Vec<&Observation> = all
-            .iter()
-            .filter(|o| o.kind == ObsKind::Funding && &*o.instrument.symbol == "XBTUSDTM")
-            .collect();
-        let last = funding.last().expect("funding");
+        let last = *of(&all, "XBTUSDTM", ObsKind::Funding)
+            .last()
+            .expect("funding");
         assert_eq!(last.price, fixed("0.0001"));
         let info = last.funding.as_deref().expect("info");
         assert_eq!(info.interval_ns, Some(8 * 3_600 * 1_000_000_000));
@@ -600,25 +556,18 @@ mod tests {
 
     #[test]
     fn control_messages_are_benign_and_a_refusal_is_not() {
-        let map = spot_map(false);
-        let mut books = Books::default();
-        let mut out = Vec::new();
+        let mut spot = spot(false);
         for control in [
             r#"{"id":"capture1","type":"welcome"}"#,
             r#"{"id":"0","type":"ack"}"#,
             r#"{"id":"ping","type":"pong","timestamp":1792936290000000}"#,
             r#"{"type":"message","topic":"/market/ticker:DOGE-USDT","subject":"trade.ticker","data":{}}"#,
         ] {
-            let error = decode_spot(control.as_bytes(), &map, &mut books, RECV, &mut out)
-                .expect_err("not market data");
+            let error = spot.refused(control);
             assert!(error.is_benign(), "got {error:?} for {control}");
         }
         let refused = r#"{"id":"1","type":"error","code":404,"data":"topic /market/x:BTC-USDT is not found"}"#;
-        assert!(
-            !decode_spot(refused.as_bytes(), &map, &mut books, RECV, &mut out)
-                .expect_err("an error")
-                .is_benign()
-        );
+        assert!(!spot.refused(refused).is_benign());
     }
 
     #[test]

@@ -236,6 +236,40 @@ impl UnverifiedPriceBatch {
         let updates = decode_price_batch(&self.raw.payload)?;
         Ok(Recovered::new(updates, self.raw.recover_signer()?))
     }
+
+    /// [`Self::recover`] for the updates of [`Self::decode_unverified`], with no second decode.
+    ///
+    /// The signature binds the bytes, so each update must encode to its own slot of the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::NonCanonical`] if `updates` are not this payload,
+    /// and the errors of [`Self::recover`].
+    pub fn recover_decoded(
+        &self,
+        updates: Vec<PriceUpdate>,
+    ) -> Result<Recovered<Vec<PriceUpdate>>, VerifyError> {
+        check_updates(&updates)?;
+        let count = u16::try_from(updates.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes();
+        let header = [PAYLOAD_VERSION, KIND_PRICE_BATCH, count[0], count[1]];
+        let (head, body) = self
+            .raw
+            .payload
+            .split_at_checked(HEADER_SIZE)
+            .unwrap_or_default();
+        let same = head == header
+            && body.len() == updates.len() * PRICE_UPDATE_SIZE
+            && body
+                .chunks_exact(PRICE_UPDATE_SIZE)
+                .zip(&updates)
+                .all(|(slot, update)| slot == encode_price_update(update));
+        if !same {
+            return Err(WireError::NonCanonical("the updates are not this batch's payload").into());
+        }
+        Ok(Recovered::new(updates, self.raw.recover_signer()?))
+    }
 }
 
 impl Recovered<Vec<PriceUpdate>> {
@@ -297,11 +331,11 @@ mod tests {
     use crate::registry::{NodeEntry, Quorum, Registry};
 
     fn node() -> Signer {
-        Signer::from_secret_bytes([0x21; 32]).expect("valid key")
+        Signer::from_secret(&[0x21; 32].into()).expect("valid key")
     }
 
     fn registry() -> VerifiedRegistry {
-        let governance = Signer::from_secret_bytes([0x91; 32]).expect("valid key");
+        let governance = Signer::from_secret(&[0x91; 32].into()).expect("valid key");
         let entry = NodeEntry {
             address: node().address(),
             endpoints: vec!["wss://eu1.example/v2/ws".to_owned()],
@@ -344,6 +378,31 @@ mod tests {
         let verified = parsed.verify(&registry()).expect("verifies");
         assert_eq!(verified.updates(), updates);
         assert_eq!(verified.signer(), node().address());
+    }
+
+    #[test]
+    fn a_decoded_batch_recovers_only_with_its_own_updates() {
+        let updates = vec![update(1, 7), update(2, 8)];
+        let frame = node()
+            .sign_price_batch(&updates)
+            .expect("signs")
+            .encode_frame();
+        let parsed = UnverifiedPriceBatch::parse(&frame).expect("parses");
+        let decoded = parsed.decode_unverified().expect("decodes");
+        let recovered = parsed.recover_decoded(decoded).expect("recovers");
+        assert_eq!(recovered.signer(), node().address());
+        assert_eq!(recovered.unverified(), &updates);
+
+        let mut forged = updates.clone();
+        if let Some(first) = forged.first_mut() {
+            first.price += 1;
+        }
+        for other in [forged, vec![update(1, 7)], vec![update(2, 8), update(1, 7)]] {
+            assert!(matches!(
+                parsed.recover_decoded(other),
+                Err(VerifyError::Wire(WireError::NonCanonical(_)))
+            ));
+        }
     }
 
     #[test]

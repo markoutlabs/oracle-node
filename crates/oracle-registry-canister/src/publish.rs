@@ -3,9 +3,9 @@
 use std::cell::Cell;
 
 use crate::certify::certify_documents;
-use crate::runtime::{STATE, adopt_registry, now_secs, read_state};
+use crate::runtime::{STATE, adopt_published, now_secs, read_state};
 use crate::signing::{ensure_governance_key, sign};
-use crate::state::{State, StateError};
+use crate::state::{SignedDocument, SignedSlot, State, StateError, Unsigned};
 
 thread_local! {
     /// A signing round is in flight.
@@ -64,32 +64,33 @@ async fn round(
     let now = now_secs();
     let version = match document {
         Document::Registry => {
-            let unsigned = next
-                .unsigned_document(now)
-                .map_err(|error| error.to_string())?;
-            let signature = sign(&unsigned.signing_bytes).await?;
-            next.publish(unsigned, signature)
-                .map_err(|error| error.to_string())?
+            let unsigned = next.next_registry(now).map_err(text)?;
+            sign_into(&mut next.registry, unsigned).await?
         }
         Document::Clients => {
-            let unsigned = next
-                .unsigned_client_list(now)
-                .map_err(|error| error.to_string())?;
-            let signature = sign(&unsigned.signing_bytes).await?;
-            next.publish_clients(unsigned, signature)
-                .map_err(|error| error.to_string())?
+            let unsigned = next.next_client_list(now).map_err(text)?;
+            sign_into(&mut next.client_list, unsigned).await?
         }
         Document::Feeds => {
-            let unsigned = next
-                .unsigned_feed_set(now)
-                .map_err(|error| error.to_string())?;
-            let signature = sign(&unsigned.signing_bytes).await?;
-            next.publish_feeds(unsigned, signature)
-                .map_err(|error| error.to_string())?
+            let unsigned = next.next_feed_set(now).map_err(text)?;
+            sign_into(&mut next.feed_set, unsigned).await?
         }
     };
     STATE.with(|cell| *cell.borrow_mut() = Some(next));
-    adopt_registry();
+    adopt_published();
     certify_documents();
     Ok(version)
+}
+
+/// The one signing step of every document: sign the next version, then publish it.
+async fn sign_into<T: SignedDocument>(
+    slot: &mut SignedSlot<T>,
+    unsigned: Unsigned<T>,
+) -> Result<u64, String> {
+    let signature = sign(&unsigned.signing_bytes).await?;
+    slot.publish(unsigned, signature).map_err(text)
+}
+
+fn text(error: StateError) -> String {
+    error.to_string()
 }

@@ -19,13 +19,24 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use oracle_types::{
-    BookUpdate, FUNDING_HEARTBEAT, FeedId, FundingUpdate, InstrumentId, NANOS_PER_SEC, PriceUpdate,
-    SLOW_HEARTBEAT, VenueReport,
+    BookUpdate, FeedId, FeedKind, FundingUpdate, InstrumentId, NANOS_PER_SEC, PriceUpdate,
+    VenueReport,
 };
 use oracle_wire::{
-    Address, NodeListing, Recovered, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
-    UnverifiedPriceBatch, UnverifiedVenueFrame, VerifiedRegistry, VerifyError,
+    Address, MAX_FEEDS, NodeListing, Recovered, UnverifiedBookFrame, UnverifiedFrame,
+    UnverifiedFundingFrame, UnverifiedPriceBatch, UnverifiedVenueFrame, VerifiedRegistry,
+    VerifyError,
 };
+
+use crate::age::{AgeLimits, Frame};
+pub use crate::age::{FUNDING_MAX_AGE, SLOW_MAX_AGE};
+
+/// The most feeds that one node holds a price or a venue report mark for: a feed set's limit.
+pub const MAX_FEEDS_PER_NODE: usize = MAX_FEEDS;
+
+/// The most books, and the most perpetuals, that one node holds a mark for.
+// About seven times the 1,163 sources of the network feed set on 2026-11-06.
+pub const MAX_INSTRUMENTS_PER_NODE: usize = 8_192;
 
 /// Freshness policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +49,7 @@ pub struct VerifyConfig {
     pub max_age: Duration,
 
     /// The same limit for a slow feed (funding, open interest), which nodes
-    /// publish on a 10 s heartbeat. See [`Verifier::mark_slow`].
+    /// publish on a 10 s heartbeat. See [`Verifier::set_feed_kind`].
     pub slow_max_age: Duration,
 
     /// Tolerance for a node's clock running ahead of ours.
@@ -51,22 +62,25 @@ pub struct VerifyConfig {
 
 impl Default for VerifyConfig {
     fn default() -> Self {
+        let ages = AgeLimits::default();
         Self {
-            max_age: Duration::from_secs(2),
-            slow_max_age: SLOW_MAX_AGE,
+            max_age: ages.max_age,
+            slow_max_age: ages.slow_max_age,
             max_skew: Duration::from_millis(500),
         }
     }
 }
 
-/// Two slow heartbeats and a margin, so one lost heartbeat does not make a slow
-/// feed stale.
-pub const SLOW_MAX_AGE: Duration = Duration::from_secs(25);
-const _: () = assert!(SLOW_MAX_AGE.as_secs() > 2 * SLOW_HEARTBEAT.as_secs());
-
-/// How old a funding frame may be. A new subscriber gets the node's latest
-/// frame, which can be a whole heartbeat old.
-pub const FUNDING_MAX_AGE: Duration = FUNDING_HEARTBEAT.saturating_mul(2);
+impl VerifyConfig {
+    /// The age limits of this policy.
+    #[must_use]
+    pub const fn ages(&self) -> AgeLimits {
+        AgeLimits {
+            max_age: self.max_age,
+            slow_max_age: self.slow_max_age,
+        }
+    }
+}
 
 /// Why an update was refused.
 ///
@@ -135,6 +149,24 @@ pub enum RejectReason {
         /// The signing node.
         signer: Address,
     },
+
+    /// A book or funding frame for an instrument that the signed feed set does not list.
+    #[error("update from {signer} is for {instrument}, which the feed set does not list")]
+    Unlisted {
+        /// The signing node.
+        signer: Address,
+        /// The instrument of the frame.
+        instrument: InstrumentId,
+    },
+
+    /// The node holds marks for `limit` feeds or instruments, and the frame names one more.
+    #[error("update from {signer} names a new feed or book past the limit of {limit}")]
+    OverLimit {
+        /// The signing node.
+        signer: Address,
+        /// The limit of that kind of frame.
+        limit: usize,
+    },
 }
 
 /// A book update that passed every check.
@@ -142,6 +174,8 @@ pub enum RejectReason {
 pub struct AcceptedBook {
     /// The update.
     pub update: BookUpdate,
+    /// The venue instrument of the update.
+    pub instrument: InstrumentId,
     /// The node that signed it.
     pub signer: Address,
     /// That node's index in the registry it was verified against.
@@ -195,6 +229,56 @@ pub struct AcceptedBatch {
     pub updates: Vec<Result<PriceUpdate, RejectReason>>,
 }
 
+/// The sequence marks of one kind of frame, per node, with a limit on the keys of each node.
+struct Marks<K> {
+    per_node: HashMap<Address, HashMap<K, u64>>,
+    limit: usize,
+}
+
+impl<K: Clone + Eq + Hash> Marks<K> {
+    fn new(limit: usize) -> Self {
+        Self {
+            per_node: HashMap::new(),
+            limit,
+        }
+    }
+
+    // The limit: a listed node could otherwise name a new feed or book in each
+    // frame, and every mark would stay in memory.
+    fn advance(&mut self, signer: Address, key: &K, seq: u64) -> Result<(), RejectReason> {
+        let marks = self.per_node.entry(signer).or_default();
+        if let Some(last_seq) = marks.get_mut(key) {
+            if seq <= *last_seq {
+                return Err(RejectReason::Replayed {
+                    signer,
+                    seq,
+                    last_seq: *last_seq,
+                });
+            }
+            *last_seq = seq;
+            return Ok(());
+        }
+        if marks.len() >= self.limit {
+            return Err(RejectReason::OverLimit {
+                signer,
+                limit: self.limit,
+            });
+        }
+        marks.insert(key.clone(), seq);
+        Ok(())
+    }
+
+    fn retain_nodes(&mut self, keep: impl Fn(&Address) -> bool) {
+        self.per_node.retain(|node, _| keep(node));
+    }
+
+    fn retain_keys(&mut self, keep: impl Fn(&K) -> bool) {
+        for marks in self.per_node.values_mut() {
+            marks.retain(|key, _| keep(key));
+        }
+    }
+}
+
 /// Verifies frames against a pinned registry and a freshness policy.
 ///
 /// Holds the per-`(node, feed)` sequence high-water marks, so it must persist
@@ -208,17 +292,19 @@ pub struct AcceptedBatch {
 pub struct Verifier {
     registry: VerifiedRegistry,
     config: VerifyConfig,
-    high_water: HashMap<(Address, FeedId), u64>,
+    high_water: Marks<FeedId>,
     /// Venue reports count their own sequence, apart from prices.
-    venue_high_water: HashMap<(Address, FeedId), u64>,
-    book_high_water: HashMap<(Address, InstrumentId), u64>,
-    funding_high_water: HashMap<(Address, InstrumentId), u64>,
+    venue_high_water: Marks<FeedId>,
+    book_high_water: Marks<InstrumentId>,
+    funding_high_water: Marks<InstrumentId>,
     /// Addresses that a registry this verifier once trusted listed, and the
     /// current one does not. Reported as [`RejectReason::RetiredKey`] rather than
     /// unknown, so the client does not go looking for a registry it already has.
     retired: HashSet<Address>,
-    /// Feeds held to `slow_max_age`. A feed id does not show its kind.
-    slow: HashSet<FeedId>,
+    /// A feed id does not show its kind, and the kind sets the age limit.
+    kinds: HashMap<FeedId, FeedKind>,
+    /// `None` until the caller has a signed feed set.
+    instruments: Option<HashSet<InstrumentId>>,
 }
 
 impl Verifier {
@@ -228,27 +314,45 @@ impl Verifier {
         Self {
             registry,
             config,
-            high_water: HashMap::new(),
-            venue_high_water: HashMap::new(),
-            book_high_water: HashMap::new(),
-            funding_high_water: HashMap::new(),
+            high_water: Marks::new(MAX_FEEDS_PER_NODE),
+            venue_high_water: Marks::new(MAX_FEEDS_PER_NODE),
+            book_high_water: Marks::new(MAX_INSTRUMENTS_PER_NODE),
+            funding_high_water: Marks::new(MAX_INSTRUMENTS_PER_NODE),
             retired: HashSet::new(),
-            slow: HashSet::new(),
+            kinds: HashMap::new(),
+            instruments: None,
         }
     }
 
-    /// Holds this feed's prices and venue reports to `slow_max_age`. The client
-    /// calls it for each funding or open interest feed that it subscribes to.
+    /// Holds this feed's prices and venue reports to the age limit of `kind`.
+    pub fn set_feed_kind(&mut self, feed_id: FeedId, kind: FeedKind) {
+        self.kinds.insert(feed_id, kind);
+    }
+
+    /// Holds this feed's prices and venue reports to `slow_max_age`, like [`Self::set_feed_kind`].
     pub fn mark_slow(&mut self, feed_id: FeedId) {
-        self.slow.insert(feed_id);
+        // Funding stands for every slow kind: the age rule reads only `is_slow`.
+        if !self.feed_kind(feed_id).is_slow() {
+            self.kinds.insert(feed_id, FeedKind::Funding8h);
+        }
     }
 
-    fn max_age(&self, feed_id: FeedId) -> Duration {
-        if self.slow.contains(&feed_id) {
-            self.config.slow_max_age
-        } else {
-            self.config.max_age
-        }
+    /// Accepts book and funding frames only for `instruments`, the sources of a signed feed set.
+    /// `None` accepts any, up to [`MAX_INSTRUMENTS_PER_NODE`] for each node.
+    pub fn set_instruments(&mut self, instruments: Option<HashSet<InstrumentId>>) {
+        // The marks of an instrument that leaves stay, within the limit, so a
+        // frame accepted before cannot pass again when the instrument comes back.
+        self.instruments = instruments;
+    }
+
+    /// The kind of a feed from [`Self::set_feed_kind`], or a price feed when unknown.
+    #[must_use]
+    pub fn feed_kind(&self, feed_id: FeedId) -> FeedKind {
+        self.kinds.get(&feed_id).copied().unwrap_or_default()
+    }
+
+    fn max_age(&self, frame: Frame) -> Duration {
+        self.config.ages().max_age(frame)
     }
 
     /// Returns the registry in use.
@@ -267,20 +371,20 @@ impl Verifier {
             }
         }
         // A retired address never verifies again, so its marks are dead weight.
-        self.high_water
-            .retain(|(node, _), _| still_listed.contains(node));
-        self.venue_high_water
-            .retain(|(node, _), _| still_listed.contains(node));
-        self.book_high_water
-            .retain(|(node, _), _| still_listed.contains(node));
-        self.funding_high_water
-            .retain(|(node, _), _| still_listed.contains(node));
+        let listed = |node: &Address| still_listed.contains(node);
+        self.high_water.retain_nodes(listed);
+        self.venue_high_water.retain_nodes(listed);
+        self.book_high_water.retain_nodes(listed);
+        self.funding_high_water.retain_nodes(listed);
         self.registry = registry;
     }
 
-    /// Drops the price sequence marks of every feed that `keep` refuses.
+    /// Drops the price and venue report marks of every feed that `keep` refuses.
+    ///
+    /// A frame of a dropped feed that is still younger than its age limit can then pass once more.
     pub fn retain_feeds(&mut self, keep: impl Fn(&FeedId) -> bool) {
-        self.high_water.retain(|(_, feed), _| keep(feed));
+        self.high_water.retain_keys(&keep);
+        self.venue_high_water.retain_keys(&keep);
     }
 
     /// Returns `true` if a registry this verifier once trusted listed `signer`
@@ -339,7 +443,37 @@ impl Verifier {
         now_ns: u64,
     ) -> Result<AcceptedBatch, RejectReason> {
         let parsed = UnverifiedPriceBatch::parse(frame).map_err(VerifyError::from)?;
-        let verified = self.trusted(parsed.verify(&self.registry))?;
+        let updates = parsed.decode_unverified().map_err(VerifyError::from)?;
+        self.accept_parsed_batch(&parsed, updates, now_ns)
+    }
+
+    /// [`Self::accept_batch`] for a batch that the caller parsed and decoded already.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::accept_batch`], and [`RejectReason::Untrusted`] if
+    /// `updates` are not the decode of `batch`.
+    pub fn accept_parsed_batch(
+        &mut self,
+        batch: &UnverifiedPriceBatch,
+        updates: Vec<PriceUpdate>,
+        now_ns: u64,
+    ) -> Result<AcceptedBatch, RejectReason> {
+        self.accept_recovered_batch(batch.recover_decoded(updates)?, now_ns)
+    }
+
+    /// [`Self::accept_batch`] for a batch recovered elsewhere, so a caller can
+    /// compare the signer with the frame's hint before any sequence moves.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::accept_batch`] after the recovery.
+    pub fn accept_recovered_batch(
+        &mut self,
+        recovered: Recovered<Vec<PriceUpdate>>,
+        now_ns: u64,
+    ) -> Result<AcceptedBatch, RejectReason> {
+        let verified = self.trusted(recovered.authorize(&self.registry))?;
         let signer = verified.signer();
         let node_index = verified.node_index();
         let updates = verified
@@ -360,23 +494,16 @@ impl Verifier {
         update: PriceUpdate,
         now_ns: u64,
     ) -> Result<PriceUpdate, RejectReason> {
-        if update.observation_time_ns > update.publish_time_ns {
+        // SPEC §7 step 5, and a previous publish after this one.
+        if !update.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
         // Clock checks before the sequence update, so a rejected frame cannot
         // advance the high-water mark and lock out the legitimate one behind it.
-        self.check_clock(
-            signer,
-            update.publish_time_ns,
-            now_ns,
-            self.max_age(update.feed_id),
-        )?;
-        advance(
-            &mut self.high_water,
-            (signer, update.feed_id),
-            update.seq,
-            signer,
-        )?;
+        let max_age = self.max_age(Frame::Price(self.feed_kind(update.feed_id)));
+        self.check_clock(signer, update.publish_time_ns, now_ns, max_age)?;
+        self.high_water
+            .advance(signer, &update.feed_id, update.seq)?;
         Ok(update)
     }
 
@@ -413,18 +540,10 @@ impl Verifier {
         if !report.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-        self.check_clock(
-            signer,
-            report.publish_time_ns,
-            now_ns,
-            self.max_age(report.feed_id),
-        )?;
-        advance(
-            &mut self.venue_high_water,
-            (signer, report.feed_id),
-            report.seq,
-            signer,
-        )?;
+        let max_age = self.max_age(Frame::VenueReport(self.feed_kind(report.feed_id)));
+        self.check_clock(signer, report.publish_time_ns, now_ns, max_age)?;
+        self.venue_high_water
+            .advance(signer, &report.feed_id, report.seq)?;
         Ok(AcceptedVenues {
             report,
             signer,
@@ -460,19 +579,22 @@ impl Verifier {
         let verified = self.trusted(recovered.authorize(&self.registry))?;
         let (signer, node_index) = (verified.signer(), verified.node_index());
         let update = verified.into_update();
+        let instrument = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        self.listed(signer, &instrument)?;
         if !update.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-        self.check_clock(signer, update.publish_time_ns, now_ns, self.config.max_age)?;
-        let book = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
-        advance(
-            &mut self.book_high_water,
-            (signer, book),
-            update.seq,
+        self.check_clock(
             signer,
+            update.publish_time_ns,
+            now_ns,
+            self.max_age(Frame::Book),
         )?;
+        self.book_high_water
+            .advance(signer, &instrument, update.seq)?;
         Ok(AcceptedBook {
             update,
+            instrument,
             signer,
             node_index,
         })
@@ -509,17 +631,19 @@ impl Verifier {
         let verified = self.trusted(recovered.authorize(&self.registry))?;
         let (signer, node_index) = (verified.signer(), verified.node_index());
         let update = verified.into_update();
+        let perpetual = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
+        self.listed(signer, &perpetual)?;
         if !update.timestamps_coherent() {
             return Err(RejectReason::IncoherentTimestamps { signer });
         }
-        self.check_clock(signer, update.publish_time_ns, now_ns, FUNDING_MAX_AGE)?;
-        let perpetual = InstrumentId::new(update.venue, update.market, update.symbol.as_str());
-        advance(
-            &mut self.funding_high_water,
-            (signer, perpetual),
-            update.seq,
+        self.check_clock(
             signer,
+            update.publish_time_ns,
+            now_ns,
+            self.max_age(Frame::Funding),
         )?;
+        self.funding_high_water
+            .advance(signer, &perpetual, update.seq)?;
         Ok(AcceptedFunding {
             update,
             signer,
@@ -536,6 +660,16 @@ impl Verifier {
             }
             error => error.into(),
         })
+    }
+
+    fn listed(&self, signer: Address, instrument: &InstrumentId) -> Result<(), RejectReason> {
+        match &self.instruments {
+            Some(listed) if !listed.contains(instrument) => Err(RejectReason::Unlisted {
+                signer,
+                instrument: instrument.clone(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn check_clock(
@@ -568,27 +702,6 @@ impl Verifier {
         }
         Ok(())
     }
-}
-
-/// Raises the high-water mark for `key`, or refuses a sequence that does not
-/// advance.
-fn advance<K: Eq + Hash>(
-    marks: &mut HashMap<K, u64>,
-    key: K,
-    seq: u64,
-    signer: Address,
-) -> Result<(), RejectReason> {
-    if let Some(last_seq) = marks.get(&key).copied()
-        && seq <= last_seq
-    {
-        return Err(RejectReason::Replayed {
-            signer,
-            seq,
-            last_seq,
-        });
-    }
-    marks.insert(key, seq);
-    Ok(())
 }
 
 /// Verifies a stored frame against the node that was listed when it was
@@ -640,8 +753,8 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{TestNode, registry_with, update_at, venues_at};
-    use oracle_types::NANOS_PER_SEC;
+    use crate::testing::{TestNode, book_at, funding_at, registry_with, update_at, venues_at};
+    use oracle_types::{MarketKind, NANOS_PER_SEC, Venue};
 
     const NOW: u64 = 1_754_582_400 * NANOS_PER_SEC;
 
@@ -671,6 +784,68 @@ mod tests {
         };
         assert_eq!(fresh.as_ref().map(|update| update.seq), Ok(5));
         assert!(matches!(old, Err(RejectReason::TooOld { .. })), "{old:?}");
+    }
+
+    #[test]
+    fn a_parsed_batch_takes_the_same_checks_without_a_second_decode() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let batch = node.sign_batch(&[update_at(NOW, 5), on_feed(update_at(NOW, 6), 2)]);
+        let parsed = UnverifiedPriceBatch::parse(&batch).expect("parses");
+        let updates = parsed.decode_unverified().expect("decodes");
+        let accepted = verifier
+            .accept_parsed_batch(&parsed, updates.clone(), NOW)
+            .expect("the signature passes");
+        assert!(accepted.updates.iter().all(Result::is_ok));
+        let mut forged = updates;
+        if let Some(first) = forged.first_mut() {
+            first.price = 1;
+        }
+        assert!(matches!(
+            verifier.accept_parsed_batch(&parsed, forged, NOW),
+            Err(RejectReason::Untrusted(VerifyError::Wire(_)))
+        ));
+    }
+
+    #[test]
+    fn a_recovered_batch_moves_no_sequence_before_the_caller_accepts_it() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let batch = node.sign_batch(&[update_at(NOW, 5)]);
+        let recovered = UnverifiedPriceBatch::parse(&batch)
+            .expect("parses")
+            .recover()
+            .expect("recovers");
+        assert_eq!(recovered.signer(), node.signing_address());
+        assert!(verifier.accept(&node.sign(&update_at(NOW, 5)), NOW).is_ok());
+        let accepted = verifier
+            .accept_recovered_batch(recovered, NOW)
+            .expect("the signer is listed");
+        assert!(matches!(
+            accepted.updates.as_slice(),
+            [Err(RejectReason::Replayed { .. })]
+        ));
+    }
+
+    #[test]
+    fn retain_feeds_drops_the_price_and_venue_marks_of_a_dropped_feed() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        assert!(verifier.accept(&node.sign(&update_at(NOW, 5)), NOW).is_ok());
+        assert!(
+            verifier
+                .accept_venues(&node.sign_venues(&venues_at(NOW, 5)), NOW)
+                .is_ok()
+        );
+        verifier.retain_feeds(|_| false);
+        assert!(verifier.high_water.per_node.values().all(HashMap::is_empty));
+        assert!(
+            verifier
+                .venue_high_water
+                .per_node
+                .values()
+                .all(HashMap::is_empty)
+        );
     }
 
     #[test]
@@ -735,6 +910,133 @@ mod tests {
             verifier.accept(&too_old, NOW),
             Err(RejectReason::TooOld { .. })
         ));
+    }
+
+    #[test]
+    fn a_feed_kind_sets_the_age_of_its_prices_and_reports() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let open_interest = on_feed(update_at(NOW - 9 * NANOS_PER_SEC, 1), 3);
+        verifier.set_feed_kind(open_interest.feed_id, FeedKind::OpenInterest);
+        assert!(verifier.accept(&node.sign(&open_interest), NOW).is_ok());
+        let mark = on_feed(update_at(NOW - 9 * NANOS_PER_SEC, 1), 4);
+        verifier.set_feed_kind(mark.feed_id, FeedKind::PerpMark);
+        assert!(matches!(
+            verifier.accept(&node.sign(&mark), NOW),
+            Err(RejectReason::TooOld {
+                limit_ms: 2_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_previous_publish_after_the_publish_is_incoherent() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let mut update = update_at(NOW, 1);
+        update.prev_publish_time_ns = NOW + 1;
+        assert!(matches!(
+            verifier.accept(&node.sign(&update), NOW),
+            Err(RejectReason::IncoherentTimestamps { .. })
+        ));
+        update.prev_publish_time_ns = NOW;
+        assert!(verifier.accept(&node.sign(&update), NOW).is_ok());
+    }
+
+    /// The live view, the tap and an archive must hold the same signed value.
+    #[test]
+    fn a_venue_time_after_the_signature_stays_as_signed() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let ahead = Some(NOW + 3_600 * NANOS_PER_SEC);
+        let book = BookUpdate {
+            exchange_time_ns: ahead,
+            ..book_at(NOW, 1, true, 100)
+        };
+        let accepted = verifier
+            .accept_book(&node.sign_book(&book), NOW)
+            .expect("accepted");
+        assert_eq!(accepted.update.exchange_time_ns, ahead);
+        assert_eq!(
+            accepted.instrument,
+            InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT")
+        );
+        let funding = FundingUpdate {
+            exchange_time_ns: ahead,
+            ..funding_at(NOW, 1, 100)
+        };
+        let accepted = verifier
+            .accept_funding(&node.sign_funding(&funding), NOW)
+            .expect("accepted");
+        assert_eq!(accepted.update.exchange_time_ns, ahead);
+    }
+
+    /// An instrument that leaves the feed set and comes back keeps its mark,
+    /// so a frame accepted before cannot pass a second time.
+    #[test]
+    fn an_instrument_that_leaves_the_feed_set_and_comes_back_keeps_its_mark() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let listed = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        let other = InstrumentId::new(Venue::Okx, MarketKind::Spot, "BTC-USDT");
+        verifier.set_instruments(Some(HashSet::from([listed.clone()])));
+        let frame = node.sign_book(&book_at(NOW, 5, true, 100));
+        assert!(verifier.accept_book(&frame, NOW).is_ok());
+        verifier.set_instruments(Some(HashSet::from([other])));
+        verifier.set_instruments(Some(HashSet::from([listed])));
+        assert!(matches!(
+            verifier.accept_book(&frame, NOW),
+            Err(RejectReason::Replayed { .. })
+        ));
+    }
+
+    /// The refusal comes before the mark, so a node that invents instruments
+    /// leaves nothing behind.
+    #[test]
+    fn a_book_or_perpetual_outside_the_feed_set_is_refused() {
+        let node = TestNode::new(1);
+        let mut verifier = verifier(&node);
+        let other = InstrumentId::new(Venue::Okx, MarketKind::Spot, "BTC-USDT");
+        verifier.set_instruments(Some(HashSet::from([other])));
+        assert!(matches!(
+            verifier.accept_book(&node.sign_book(&book_at(NOW, 1, true, 100)), NOW),
+            Err(RejectReason::Unlisted { .. })
+        ));
+        assert!(matches!(
+            verifier.accept_funding(&node.sign_funding(&funding_at(NOW, 1, 100)), NOW),
+            Err(RejectReason::Unlisted { .. })
+        ));
+        assert!(verifier.book_high_water.per_node.is_empty());
+        let listed = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        verifier.set_instruments(Some(HashSet::from([listed])));
+        assert!(
+            verifier
+                .accept_book(&node.sign_book(&book_at(NOW, 1, true, 100)), NOW)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_new_key_past_the_limit_is_refused_and_known_keys_still_advance() {
+        let node = Address::from_bytes([1; 20]);
+        let mut marks: Marks<u8> = Marks::new(2);
+        assert!(marks.advance(node, &1, 1).is_ok());
+        assert!(marks.advance(node, &2, 1).is_ok());
+        assert_eq!(
+            marks.advance(node, &3, 1),
+            Err(RejectReason::OverLimit {
+                signer: node,
+                limit: 2
+            })
+        );
+        assert!(marks.advance(node, &1, 2).is_ok());
+        assert!(
+            marks.advance(Address::from_bytes([2; 20]), &3, 1).is_ok(),
+            "the limit is for each node"
+        );
+        marks.retain_keys(|key| *key != 1);
+        assert!(marks.advance(node, &3, 1).is_ok());
     }
 
     #[test]

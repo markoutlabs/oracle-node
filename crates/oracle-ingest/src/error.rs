@@ -78,10 +78,33 @@ pub enum DecodeError {
     #[error("book out of sync: {0}")]
     Resync(String),
 
-    /// The venue halted trading in this instrument, and the session stops
-    /// confirming its last values, so they go stale.
-    #[error("trading halted in {0}")]
-    Halted(InstrumentId),
+    /// These instruments' books have an empty side, so they have no quote. The
+    /// session keeps the other observations and stops confirming these books.
+    #[error("no two-sided book in {}", joined(.0))]
+    Halted(Vec<InstrumentId>),
+
+    /// The venue suspended trading in this instrument. The session stops
+    /// confirming all its values.
+    #[error("trading suspended in {0}")]
+    Suspended(InstrumentId),
+
+    /// A book or quote message of this instrument did not decode. The session
+    /// counts it and stops confirming the book, so an old quote cannot stay live.
+    #[error("{instrument}: {error}")]
+    Lost {
+        /// The instrument whose book or quote is lost.
+        instrument: InstrumentId,
+        /// Why the message did not decode.
+        error: Box<DecodeError>,
+    },
+}
+
+fn joined(instruments: &[InstrumentId]) -> String {
+    instruments
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl From<serde_json::Error> for DecodeError {
@@ -97,6 +120,25 @@ impl From<prost::DecodeError> for DecodeError {
 }
 
 impl DecodeError {
+    /// A halt of one instrument's book.
+    #[must_use]
+    pub fn halted(instrument: &InstrumentId) -> Self {
+        Self::Halted(vec![instrument.clone()])
+    }
+
+    /// `error` from a book or quote message of `instrument`. A benign error and
+    /// a resync stay as they are.
+    #[must_use]
+    pub fn lost(instrument: &InstrumentId, error: Self) -> Self {
+        if error.is_benign() || matches!(error, Self::Resync(_) | Self::Lost { .. }) {
+            return error;
+        }
+        Self::Lost {
+            instrument: instrument.clone(),
+            error: Box::new(error),
+        }
+    }
+
     /// Returns `true` if this outcome is routine and should not be logged as a fault.
     ///
     /// Subscription acknowledgements and streams we do not track arrive
@@ -106,7 +148,11 @@ impl DecodeError {
     pub const fn is_benign(&self) -> bool {
         matches!(
             self,
-            Self::Control | Self::UnhandledStream(_) | Self::UnknownInstrument(_) | Self::Halted(_)
+            Self::Control
+                | Self::UnhandledStream(_)
+                | Self::UnknownInstrument(_)
+                | Self::Halted(_)
+                | Self::Suspended(_)
         )
     }
 }

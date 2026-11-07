@@ -329,11 +329,11 @@ mod tests {
     const NOW_SECS: u64 = 1_754_582_400;
 
     fn governance() -> Signer {
-        Signer::from_secret_bytes([0x91; 32]).expect("valid key")
+        Signer::from_secret(&[0x91; 32].into()).expect("valid key")
     }
 
     fn hot() -> Signer {
-        Signer::from_secret_bytes([0x21; 32]).expect("valid key")
+        Signer::from_secret(&[0x21; 32].into()).expect("valid key")
     }
 
     fn verified_registry() -> VerifiedRegistry {
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn a_forged_update_recovers_but_is_not_authorized() {
-        let impostor = Signer::from_secret_bytes([0xDD; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0xDD; 32].into()).expect("valid key");
         let frame = impostor.sign_update(&update()).encode_frame();
         let recovered = UnverifiedFrame::parse(&frame)
             .expect("parses")
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn a_forged_update_recovers_cleanly_but_fails_verification() {
         // The whole point: recovery is not verification.
-        let impostor = Signer::from_secret_bytes([0xDD; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0xDD; 32].into()).expect("valid key");
         let mut forged = update();
         forged.price = 1;
         let frame = impostor.sign_update(&forged).encode_frame();
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn rewriting_the_hint_does_not_grant_trust() {
-        let impostor = Signer::from_secret_bytes([0xDD; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0xDD; 32].into()).expect("valid key");
         let mut frame = impostor.sign_update(&update()).encode_frame();
         // Claim to be the legitimate node.
         frame[1..PAYLOAD_START].copy_from_slice(hot().address().as_bytes());

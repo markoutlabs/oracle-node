@@ -8,11 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use candid::{CandidType, Decode, Deserialize, Encode};
+use candid::{Decode, Encode};
 use ic_agent::Agent;
 use ic_agent::export::Principal;
 use oracle_ingest::clock::wall_clock_unix_nanos;
 use oracle_node::publish::{PushPace, PushPlanner, PushTarget};
+use oracle_registry_api::{FeedInfo, Verdict};
 use oracle_server::ServerState;
 use oracle_types::{FeedId, PriceUpdate};
 use oracle_wire::Signer;
@@ -30,27 +31,6 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 const FEEDS_EVERY: Duration = Duration::from_secs(600);
 /// How soon the node reads the feed list again after a failed read.
 const FEEDS_RETRY: Duration = Duration::from_secs(30);
-
-/// The canister's `Verdict` on one frame.
-#[derive(CandidType, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-enum Verdict {
-    Accepted,
-    UnknownFeed,
-    NoRegistry,
-    Invalid,
-    UnknownSigner,
-    RetiredKey,
-    Replayed,
-    TooOld,
-    FromTheFuture,
-    Incoherent,
-}
-
-/// The part of the canister's `FeedInfo` that the node reads.
-#[derive(CandidType, Deserialize)]
-struct FeedInfo {
-    feed_id: ByteBuf,
-}
 
 /// The pushes over one status interval.
 #[derive(Default)]
@@ -275,30 +255,4 @@ async fn push(agent: &Agent, canister: &Principal, batch: Vec<u8>) -> Result<Vec
         .await
         .map_err(|error| error.to_string())?;
     Decode!(&reply, Result<Vec<Verdict>, String>).map_err(|error| error.to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use candid::{CandidType, Decode, Encode};
-    use serde_bytes::ByteBuf;
-
-    // The node decodes the canister's replies with its own copies of these
-    // types, so a change on either side must fail here, not on mainnet.
-    #[test]
-    fn the_push_types_match_the_canister() {
-        assert_eq!(
-            super::Verdict::ty(),
-            oracle_registry_canister::prices::Verdict::ty()
-        );
-        let listed = vec![oracle_registry_canister::FeedInfo {
-            feed_id: ByteBuf::from(vec![7; 32]),
-            symbol: "CRYPTO.BTC/USD".to_owned(),
-        }];
-        let bytes = Encode!(&listed).expect("encodes");
-        let feeds = Decode!(&bytes, Vec<super::FeedInfo>).expect("the node reads the feed list");
-        assert_eq!(
-            feeds.first().map(|feed| feed.feed_id.to_vec()),
-            Some(vec![7; 32])
-        );
-    }
 }

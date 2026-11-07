@@ -236,20 +236,20 @@ impl<T: Transport> Transport for RecordingConn<T> {
         let t = self.recorder.now_ns();
         let url = self.url.clone();
         match &received {
-            Ok(Some(Frame::Text(text))) => self.recorder.write(&Record::Text {
+            Ok(Some(Frame::Utf8(text))) => self.recorder.write(&Record::Text {
                 t,
                 url,
-                text: text.clone(),
+                text: text.as_str().to_owned(),
             }),
             Ok(Some(Frame::Rest(text))) => self.recorder.write(&Record::Rest {
                 t,
                 url,
                 text: text.clone(),
             }),
-            Ok(Some(Frame::Binary(bytes))) => self.recorder.write(&Record::Binary {
+            Ok(Some(Frame::Bytes(bytes))) => self.recorder.write(&Record::Binary {
                 t,
                 url,
-                bytes: bytes.clone(),
+                bytes: bytes.to_vec(),
             }),
             Ok(Some(Frame::Ping | Frame::Pong)) => {
                 self.recorder.write(&Record::Control { t, url });

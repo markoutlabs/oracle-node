@@ -3,7 +3,9 @@
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
 #   ORACLE_SIGNING_KEY=4141414141414141414141414141414141414141414141414141414141414141 \
-#     cargo run -p oracle-node -- start node/all-feeds.toml --tail
+#     cargo run -p oracle-node --features dev-key-env -- start node/all-feeds.toml --tail
+#
+# Only a `dev-key-env` build reads `signing.key_env`: a release node refuses it.
 #
 # The key and governance address below are the deterministic ones
 # `gen_local_registry --nodes 1` prints. They are derived from small integers and

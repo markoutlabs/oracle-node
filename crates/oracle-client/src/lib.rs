@@ -82,7 +82,7 @@ pub mod source;
 pub mod tap;
 pub mod testing;
 
-pub use oracle_quorum::{quorum, verify};
+pub use oracle_quorum::{age, quorum, verify};
 
 /// The shared types, at the SDK's own version: `Fixed`, `Symbol`, `InstrumentId`.
 pub use oracle_types as types;

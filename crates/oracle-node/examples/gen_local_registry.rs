@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let governance = Signer::from_secret_bytes([GOVERNANCE_SEED; 32])?;
+    let governance = Signer::from_secret(&[GOVERNANCE_SEED; 32].into())?;
 
     let mut entries = Vec::with_capacity(usize::from(options.nodes) + options.entries.len());
     for index in 1..=options.nodes {
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(&registry)?);
 
     if let Some(path) = &options.clients {
-        let client = Signer::from_secret_bytes([CLIENT_SEED; 32])?;
+        let client = Signer::from_secret(&[CLIENT_SEED; 32].into())?;
         let list = ClientList::sign(
             &governance,
             options.version,
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn entry(index: u8, options: &Options) -> Result<NodeEntry, WireError> {
-    let signing = Signer::from_secret_bytes([signing_seed(index); 32])?;
+    let signing = Signer::from_secret(&[signing_seed(index); 32].into())?;
     Ok(NodeEntry {
         address: signing.address(),
         endpoints: vec![format!(

@@ -172,6 +172,8 @@ sudo systemctl restart oracle-node  # after a config edit
 The unit:
 
 - starts the node as `Type=notify`, so systemd knows when the node serves;
+- sets `WatchdogSec=30s`: the node pings every 15 s, and systemd restarts a
+  node that hangs;
 - stops the node with SIGTERM, for a clean shutdown;
 - restarts the node after a failure, but not after exit code 78, which is a
   config error;
@@ -186,8 +188,10 @@ To keep the passphrase encrypted on disk, use `systemd-creds encrypt` and
 
 Without sudo, `oracle-node init` writes the files only, to a directory that you
 choose. At a terminal, it is a wizard. It can also write a systemd unit for you
-to install. For scripts, `init --out DIR` takes every value from flags. Start
-the node with:
+to install. For scripts, `init --out DIR` takes every value from flags.
+Without `--out`, init prints the secret seed. When stdout is a pipe or a file,
+as in CI or `| tee`, it refuses unless you add `--print-secret`, because a log
+would keep the seed. Start the node with:
 
 ```bash
 oracle-node start <dir>/config.toml
@@ -197,7 +201,10 @@ oracle-node start <dir>/config.toml
 
 Each minute the node writes a `status` line: feeds published, clients
 connected, venue connections, and the latency from venue data to signed price.
-A `venue lag` line follows, with the delay of each venue.
+Its `venue_health` field lists each venue connection with its counters since
+the start: connects, decode errors, resyncs, resubscribes and idle timeouts. A
+decode error does not close a connection, so a venue that renames a field shows
+only there. A `venue lag` line follows, with the delay of each venue.
 
 To see what each venue sends, start the node with `--tail`:
 
@@ -273,33 +280,39 @@ oracle-client = { git = "https://github.com/markoutlabs/oracle-node", tag = "v0.
 
 The nodes push their signed prices to the registry canister, which checks each
 signature and serves the median of the nodes. A canister calls `get_price` with
-the feed's 32-byte id, keccak256 of its symbol:
+the feed's 32-byte id, keccak256 of its symbol, and attaches
+`PRICE_CALL_CYCLES` (10M cycles) to pay for the call. A call without them is
+refused. The `oracle-registry-api` crate holds the canister's Candid types and
+has no Internet Computer runtime:
+
+```toml
+[dependencies]
+oracle-registry-api = { git = "https://github.com/markoutlabs/oracle-node" }
+```
 
 ```rust
-use candid::{CandidType, Deserialize, Principal};
+use candid::Principal;
 use ic_cdk::call::Call;
+use oracle_registry_api::{PRICE_CALL_CYCLES, PriceRecord, PriceStatus};
 use serde_bytes::ByteBuf;
-
-#[derive(CandidType, Deserialize)]
-enum PriceStatus { Ok, Degraded, Halted }
-
-/// The fields you need. Candid ignores the others.
-#[derive(CandidType, Deserialize)]
-struct PriceRecord { status: PriceStatus, price: Option<i64>, expo: i32, publish_time_ns: u64 }
 
 // CRYPTO.BTC/USD
 let feed_id = hex::decode("0523e79c7ed211911a19afaa4def68c896bc72d674bf33c5c64d4d7089e320e2")?;
 let oracle = Principal::from_text("xb5gv-diaaa-aaaaf-qg5qa-cai")?;
 let reply = Call::bounded_wait(oracle, "get_price")
     .with_arg(ByteBuf::from(feed_id))
+    .with_cycles(PRICE_CALL_CYCLES)
     .await?;
 let btc: Option<PriceRecord> = reply.candid()?;
+let usable = btc.filter(|price| price.status != PriceStatus::Halted);
 ```
 
 The price is `price × 10^expo`. Use it only when the status is `Ok` or
 `Degraded`. A feed whose nodes stop pushing goes `Halted` after the canister's
-price window, 75 s by default (`get_price_window`).
-`get_feeds` lists the priced feeds and their ids.
+price window, 180 s by default (`get_price_window`).
+`get_prices` returns every priced feed with its id, for the same fee. The other
+methods refuse calls from canisters, because the canister pays for each call;
+query them from an agent, such as `get_feeds` for the priced feeds and their ids.
 
 ### Certified, over HTTPS
 
@@ -311,8 +324,8 @@ The gateway checks the canister's certificate before it serves the document.
 To check it yourself, fetch from the `raw` domain and verify it with
 `ic-response-verification`, as the SDK does for `/registry.json`. The document
 is resolved when the last frame arrived, so also check `resolved_at_ns`.
-`/frames.json` holds the nodes' signed batches and frames, for a client that
-checks the nodes itself.
+`/frames.json` holds the nodes' signed batches, for a client that checks the
+nodes itself.
 
 ### From a browser
 
@@ -344,6 +357,7 @@ signature and the quorum, and serves the result as JSON over a WebSocket.
 | `oracle-client` | The consumer SDK. |
 | `oracle-node` | The node binary: `init`, `start`, `rotate`. |
 | `oracle-registry-canister` | The registry canister. |
+| `oracle-registry-api` | The canister's Candid price types and push limits, without the IC runtime. |
 | `oracle-replay` | Replays recorded venue data through the pipeline. |
 
 Other folders:
@@ -433,25 +447,36 @@ make governance ENV=ic IDENTITY=<identity>    # prints the canister id and gover
 
 The canister signs with the `key_1` threshold key. Each signature costs cycles,
 and so does each push from a node. A node signs each push as one batch, so the
-canister checks one signature for it: about 21M cycles a push, or 1.9T cycles a
-month for each node at the 30 s heartbeat (SPEC §3.7). Keep the canister funded.
+canister checks one signature for it: about 22M cycles a push, or 0.94T cycles a
+month for each node at the production pace (SPEC §3.7). Keep the canister
+funded. Below 0.5T cycles it refuses pushes, so that governance can still sign.
 
 On an installed canister, `make deploy` upgrades it and keeps every node,
-client and price. After the first upgrade with prices, governance lists the
-priced feeds. The 14 defaults are in the install arguments in `icp.yaml`:
+client and price. A fresh install prices no feed. The canister prices feeds only
+under a published feed set with a push pace (SPEC §3.7 P11), so the order is:
 
-```bash
-icp canister call oracle_registry set_feeds '(vec { "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD" })' -e ic
-```
+1. Governance publishes the network's feed set from `node/all-feeds.toml` and
+   `node/assets.toml`. The script runs every check a node runs, shows what the
+   publish adds, removes and changes, and asks before the call. `PUSH` sets
+   every node's push pace, and the script refuses to run without it. The
+   production pace is one push a minute for each node, with a 180 s price
+   window:
 
-Governance publishes the network's feed set from `node/all-feeds.toml` and
-`node/assets.toml`. The script runs every check a node runs, shows what the
-publish adds, removes and changes, and asks before the call. `PUSH` sets every
-node's push pace:
+   ```bash
+   PUSH=60,2,60 scripts/publish-feeds.sh --identity tapray
+   ```
 
-```bash
-PUSH=7,10,5 scripts/publish-feeds.sh --identity tapray
-```
+2. Then governance lists the feeds that the canister prices, all of them in the
+   feed set. These are the 14 that mainnet prices:
+
+   ```bash
+   icp canister call oracle_registry set_feeds '(vec { "CRYPTO.USDT/USD"; "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD"; "CRYPTO.SOL/USD"; "CRYPTO.BTC/USDT"; "CRYPTO.BTC/USD.PERP_MARK"; "CRYPTO.ETH/USD.PERP_MARK"; "CRYPTO.BTC/USD.PERP_INDEX"; "CRYPTO.BTC/USDT.PERP_MARK"; "CRYPTO.ETH/USDT.PERP_MARK"; "CRYPTO.BTC/USDT.PERP_MID"; "CRYPTO.ETH/USDT.PERP_MID"; "CRYPTO.BTC/USD.FUNDING_8H"; "CRYPTO.ETH/USD.FUNDING_8H" })' -e ic --identity tapray
+   ```
+
+The canister refuses `set_feeds` before a paced feed set exists, and it refuses
+a feed set without a pace while it prices feeds. To remove a node, lower the
+quorum first: the canister refuses a removal below `recommended`, the quorum
+that it prices with.
 
 ## License
 

@@ -188,7 +188,9 @@ pub(crate) const fn rejected_node(reason: &RejectReason) -> Option<Address> {
         RejectReason::Replayed { signer, .. }
         | RejectReason::TooOld { signer, .. }
         | RejectReason::FromTheFuture { signer, .. }
-        | RejectReason::IncoherentTimestamps { signer } => Some(*signer),
+        | RejectReason::IncoherentTimestamps { signer }
+        | RejectReason::Unlisted { signer, .. }
+        | RejectReason::OverLimit { signer, .. } => Some(*signer),
         RejectReason::Untrusted(_) | RejectReason::RetiredKey { .. } => None,
         // Non-exhaustive outside oracle-quorum.
         _ => None,

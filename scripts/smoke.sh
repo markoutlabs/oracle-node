@@ -2,7 +2,8 @@
 # The icp-cli path on a local network, which the Rust end-to-end test
 # (crates/oracle-node/tests/e2e.rs) does not touch: icp.yaml and its build
 # step, `icp deploy`, `make governance`, and the `icp canister call` lines that
-# `oracle-node init` and `rotate` print for governance. No node runs and no
+# `oracle-node init` and `rotate` print for governance, and the order of a
+# fresh install: a paced feed set first, then `set_feeds`. No node runs and no
 # venue is contacted.
 #
 # Needs: icp-cli, ic-wasm, candid-extractor, the wasm32-unknown-unknown target,
@@ -50,8 +51,24 @@ read -r GATEWAY ROOT_KEY < <(icp network status --json \
   | python3 -c 'import sys,json; s=json.load(sys.stdin); print(s["gateway_url"].rstrip("/"), s["root_key"])')
 echo "$GOVERNANCE"
 
-say "init prints add_node"
 rm -rf "$DIR" && mkdir -p "$DIR"
+
+say "a paced feed set, then the priced feeds"
+# The canister prices feeds only under a feed set with a push pace (SPEC §3.7 P11).
+PRICED='(vec { "CRYPTO.BTC/USD" })'
+refused=$(icp canister call oracle_registry set_feeds "$PRICED" --identity "$IDENTITY" 2>&1 || true)
+grep -q "Err" <<<"$refused" || die "set_feeds before a paced feed set was not refused: $refused"
+IFS=, read -r HEARTBEAT DEVIATION INTERVAL <<<"${PUSH:-60,2,60}"
+$NODE export-feeds node/all-feeds.toml --candid "$DIR/feed-set.bin" \
+  --push-heartbeat-secs "$HEARTBEAT" --push-deviation-bps "$DEVIATION" \
+  --push-min-interval-secs "$INTERVAL" >/dev/null
+icp canister call oracle_registry set_feed_set --args-file "$DIR/feed-set.bin" --args-format bin \
+  --identity "$IDENTITY" | grep -q "Ok = 1 " || die "set_feed_set did not publish v1"
+icp canister call oracle_registry set_feeds "$PRICED" --identity "$IDENTITY" \
+  | grep -q "Ok" || die "set_feeds after the paced feed set failed"
+echo "feed set v1 at PUSH=${PUSH:-60,2,60}, and $PRICED priced"
+
+say "init prints add_node"
 echo "smoke" > "$DIR/passphrase"
 $NODE init --out "$DIR/node" --canister "$CANISTER" \
   --gateway "$GATEWAY" --root-key "$ROOT_KEY" --governance "$GOV" \

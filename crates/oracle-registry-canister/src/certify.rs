@@ -10,7 +10,9 @@ use ic_http_certification::{
     HttpCertificationTree, HttpCertificationTreeEntry, HttpResponse, StatusCode,
 };
 
-use crate::{frames_document, get_clients, get_feed_set, get_registry, prices_document};
+use crate::prices::{FeedPrice, PriceEntry, Prices};
+use crate::runtime::{now_ns, read_prices};
+use crate::{get_clients, get_feed_set, get_registry};
 
 const REGISTRY_PATH: &str = "/registry.json";
 const CLIENTS_PATH: &str = "/clients.json";
@@ -99,15 +101,44 @@ fn certified(
     }
 }
 
+/// `/prices.json`: each feed resolved at `now_ns`, the time of the last accepted batch.
+pub(crate) fn prices_document(prices: &Prices, now_ns: u64) -> String {
+    let resolved = prices.resolve_all(now_ns);
+    let entries: Vec<PriceEntry<'_>> = resolved.iter().map(FeedPrice::entry).collect();
+    serde_json::json!({ "resolved_at_ns": now_ns.to_string(), "prices": entries }).to_string()
+}
+
+/// `/frames.json`: each batch that holds a node's latest update of a feed, for
+/// clients that verify the nodes themselves.
+pub(crate) fn frames_document(prices: &Prices) -> String {
+    let frames: Vec<serde_json::Value> = prices
+        .sources()
+        .into_iter()
+        .map(|source| {
+            let symbols: Vec<String> = source.symbols.iter().map(ToString::to_string).collect();
+            serde_json::json!({
+                "node": source.node.to_checksummed(),
+                // Readers of the document read the kind; the canister takes batches only.
+                "kind": "batch",
+                "symbols": symbols,
+                "bytes": format!("0x{}", hex::encode(source.bytes)),
+            })
+        })
+        .collect();
+    serde_json::json!({ "frames": frames }).to_string()
+}
+
 fn live_documents() -> Vec<CertifiedResponse> {
+    let (prices, frames) =
+        read_prices(|prices| (prices_document(prices, now_ns()), frames_document(prices)));
     vec![
         certified(
             HttpCertificationPath::exact(PRICES_PATH),
-            document(Some(prices_document()), b""),
+            document(Some(prices), b""),
         ),
         certified(
             HttpCertificationPath::exact(FRAMES_PATH),
-            document(Some(frames_document()), b""),
+            document(Some(frames), b""),
         ),
     ]
 }
@@ -179,5 +210,60 @@ pub(crate) fn certify_prices() {
     });
     if !renewed {
         certify_documents();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oracle_quorum::testing::{REGISTRY_ISSUED_AT, TestNode, registry_with, update_at};
+    use oracle_types::{NANOS_PER_SEC, PriceUpdate, Symbol};
+    use oracle_wire::feed_id;
+
+    use super::*;
+    use crate::testing::usd;
+
+    /// `/prices.json` as the canister served it before its own price schema.
+    const GOLDEN: &str = include_str!("../tests/fixtures/prices.json");
+    const PUBLISHED_NS: u64 = (REGISTRY_ISSUED_AT + 600) * NANOS_PER_SEC;
+    const RESOLVED_NS: u64 = PUBLISHED_NS + 2 * NANOS_PER_SEC;
+
+    /// A fixed time and `seq`, not `TestNode::next`: the golden document came from these.
+    fn update(feed: &str, price: i64) -> PriceUpdate {
+        let symbol: Symbol = feed.parse().expect("a valid symbol");
+        let mut update = update_at(PUBLISHED_NS, 1);
+        update.feed_id = feed_id(&symbol);
+        update.price = price;
+        update
+    }
+
+    /// SPEC §3.7: proxies and the JS SDK read this document, so its shape is
+    /// frozen, key order and number spelling too.
+    #[test]
+    fn the_prices_document_keeps_its_shape() {
+        let nodes = [TestNode::new(1), TestNode::new(2), TestNode::new(3)];
+        let mut prices = Prices::default();
+        prices.set_feeds(&[
+            "CRYPTO.BTC/USD".parse().expect("a symbol"),
+            "CRYPTO.ETH/USD".parse().expect("a symbol"),
+        ]);
+        prices.set_registry(registry_with(&[&nodes[0], &nodes[1], &nodes[2]]));
+        let batches = [
+            nodes[0].sign_batch(&[
+                update("CRYPTO.BTC/USD", usd(64_000)),
+                update("CRYPTO.ETH/USD", usd(2_300)),
+            ]),
+            nodes[1].sign_batch(&[update("CRYPTO.BTC/USD", usd(64_010))]),
+            nodes[2].sign_batch(&[update("CRYPTO.BTC/USD", usd(64_025))]),
+        ];
+        prices
+            .push(&batches, PUBLISHED_NS)
+            .expect("passes the push rules");
+
+        let golden: serde_json::Value = serde_json::from_str(GOLDEN).expect("JSON");
+        assert_eq!(
+            prices_document(&prices, RESOLVED_NS),
+            golden.to_string(),
+            "the served bytes are the golden document"
+        );
     }
 }

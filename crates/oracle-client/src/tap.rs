@@ -66,6 +66,8 @@ impl Verdict {
             RejectReason::Replayed { .. } => Some(Self::Replayed),
             RejectReason::IncoherentTimestamps { .. } => Some(Self::Incoherent),
             RejectReason::Untrusted(_) | RejectReason::RetiredKey { .. } => None,
+            // Not copied: an archive must not store what a node invents.
+            RejectReason::Unlisted { .. } | RejectReason::OverLimit { .. } => None,
             // Non-exhaustive outside oracle-quorum.
             _ => None,
         }

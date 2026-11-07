@@ -232,11 +232,11 @@ mod tests {
     const NOW: u64 = 1_754_582_400;
 
     fn governance() -> Signer {
-        Signer::from_secret_bytes([0xC0; 32]).expect("valid key")
+        Signer::from_secret(&[0xC0; 32].into()).expect("valid key")
     }
 
     fn address(seed: u8) -> Address {
-        Signer::from_secret_bytes([seed; 32])
+        Signer::from_secret(&[seed; 32].into())
             .expect("valid key")
             .address()
     }
@@ -316,7 +316,7 @@ mod tests {
                 minimum: 3
             })
         ));
-        let impostor = Signer::from_secret_bytes([0xF0; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0xF0; 32].into()).expect("valid key");
         let forged = ClientList::sign(&impostor, 4, NOW, 60, vec![client(1)]).expect("signs");
         assert!(matches!(
             forged.verify(gov, 3),

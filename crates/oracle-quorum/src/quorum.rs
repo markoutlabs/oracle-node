@@ -27,6 +27,8 @@ use oracle_types::{FeedId, FeedKind, Fixed, PriceUpdate, Symbol};
 use oracle_wire::Address;
 use serde::{Deserialize, Serialize};
 
+use crate::age::{AgeLimits, Frame};
+
 /// Quorum and divergence policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuorumConfig {
@@ -50,24 +52,30 @@ pub struct QuorumConfig {
 
 impl Default for QuorumConfig {
     fn default() -> Self {
+        let ages = AgeLimits::default();
         Self {
             quorum: 3,
             max_divergence_bps: Fixed::from_raw(50 * 1_000_000_000_000),
-            max_age: Duration::from_secs(2),
-            slow_max_age: crate::verify::SLOW_MAX_AGE,
+            max_age: ages.max_age,
+            slow_max_age: ages.slow_max_age,
         }
     }
 }
 
 impl QuorumConfig {
-    /// Returns the staleness limit for a feed of this kind.
+    /// The age limits of this policy.
+    #[must_use]
+    pub const fn ages(&self) -> AgeLimits {
+        AgeLimits {
+            max_age: self.max_age,
+            slow_max_age: self.slow_max_age,
+        }
+    }
+
+    /// Returns the staleness limit for a price of a feed of this kind.
     #[must_use]
     pub const fn max_age_for(&self, kind: FeedKind) -> Duration {
-        if kind.is_slow() {
-            self.slow_max_age
-        } else {
-            self.max_age
-        }
+        self.ages().max_age(Frame::Price(kind))
     }
 }
 
@@ -248,6 +256,11 @@ impl FeedView {
         self.kind
     }
 
+    /// Sets the feed's kind, which sets its staleness limit.
+    pub const fn set_kind(&mut self, kind: FeedKind) {
+        self.kind = kind;
+    }
+
     /// Records a node's latest update, keeping the newer of the two.
     ///
     /// Out-of-order arrival across nodes is normal; the verifier guarantees
@@ -299,9 +312,12 @@ impl FeedView {
     pub fn resolve(&self, config: &QuorumConfig, now_ns: u64) -> Resolved {
         let mut concerns = Vec::new();
         let mut halted_nodes = 0;
+        let mut degraded = false;
+        let mut publish_time_ns = 0;
         let max_age = config.max_age_for(self.kind);
 
-        let mut live: Vec<(&PriceUpdate, Fixed, Fixed)> = Vec::with_capacity(self.per_node.len());
+        let mut prices: Vec<Fixed> = Vec::with_capacity(self.per_node.len());
+        let mut confs: Vec<Fixed> = Vec::with_capacity(self.per_node.len());
         for update in self.per_node.values() {
             match NodeFeedState::of(update, max_age, now_ns) {
                 NodeFeedState::Halted => halted_nodes += 1,
@@ -310,19 +326,23 @@ impl FeedView {
                     // A price that does not convert cannot enter the median, so it
                     // must not count toward the quorum either.
                     if let (Ok(price), Ok(conf)) = (update.price_fixed(), update.conf_fixed()) {
-                        live.push((update, price, conf));
+                        prices.push(price);
+                        confs.push(conf);
+                        degraded |= update.flags.is_degraded();
+                        publish_time_ns = publish_time_ns.max(update.publish_time_ns);
                     }
                 }
             }
         }
+        let nodes = prices.len();
         if halted_nodes > 0 {
             concerns.push(Concern::NodeReportedHalted);
         }
-        if live.iter().any(|(update, ..)| update.flags.is_degraded()) {
+        if degraded {
             concerns.push(Concern::NodeReportedDegraded);
         }
 
-        if live.len() < config.quorum {
+        if nodes < config.quorum {
             concerns.push(Concern::InsufficientNodes);
             return Resolved {
                 feed_id: self.feed_id,
@@ -330,7 +350,7 @@ impl FeedView {
                 status: Status::Halted,
                 price: None,
                 conf: None,
-                nodes: live.len(),
+                nodes,
                 halted_nodes,
                 concerns,
                 publish_time_ns: 0,
@@ -338,17 +358,15 @@ impl FeedView {
             };
         }
 
-        let mut prices: Vec<Fixed> = live.iter().map(|(_, price, _)| *price).collect();
-        let mut confs: Vec<Fixed> = live.iter().map(|(_, _, conf)| *conf).collect();
-
-        let price = stats::median(&mut prices);
-        let conf = stats::median(&mut confs).unwrap_or(Fixed::ZERO);
-
+        // The spread sets the `conf` floor and the divergence check, so it comes
+        // from its own minimum and maximum, not from the order `median` leaves.
         // A spread too wide to compute is the widest disagreement there is.
-        let spread = match (prices.first(), prices.last()) {
+        let spread = match (prices.iter().min(), prices.iter().max()) {
             (Some(low), Some(high)) => high.checked_sub(*low).unwrap_or(Fixed::MAX),
             _ => Fixed::ZERO,
         };
+        let price = stats::median(&mut prices);
+        let conf = stats::median(&mut confs).unwrap_or(Fixed::ZERO);
         // Half the inter-node spread is a floor on the published confidence, so a
         // consumer that reads only `conf` sees a disagreeing node. Halving the raw
         // value, rounded up, cannot overflow.
@@ -369,11 +387,6 @@ impl FeedView {
         } else {
             Status::Degraded
         };
-        let publish_time_ns = live
-            .iter()
-            .map(|(update, ..)| update.publish_time_ns)
-            .max()
-            .unwrap_or(0);
 
         Resolved {
             feed_id: self.feed_id,
@@ -381,7 +394,7 @@ impl FeedView {
             status,
             price,
             conf: Some(conf),
-            nodes: live.len(),
+            nodes,
             halted_nodes,
             concerns,
             publish_time_ns,

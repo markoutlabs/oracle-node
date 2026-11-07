@@ -2,7 +2,7 @@
 """Checks golden.json with a second implementation of the wire format.
 
 Every payload is built again from its JSON fields with `struct`, from the
-tables in SPEC §3.3, §3.3.1, §3.3.2, §3.3.3 and §3.8, and hashed with foundry's `cast keccak`.
+tables in SPEC §3.3, §3.3.1, §3.3.2, §3.3.3, §3.6, §3.8 and §6.1, and hashed with foundry's `cast keccak`.
 Nothing here shares code with the Rust encoder.
 
     python3 check_layout.py golden.json
@@ -214,6 +214,60 @@ def feed_set(s: dict) -> bytes:
     return out
 
 
+def client_list(c: dict) -> bytes:
+    """SPEC §3.6: the clients in address order, each address and its expiry."""
+    out = struct.pack(">BBQQQI", 1, 0x85, c["version"], c["effective_from"], c["epoch_secs"], len(c["clients"]))
+    for client in sorted(c["clients"], key=lambda entry: unhex(entry["address"])):
+        out += unhex(client["address"]) + struct.pack(">Q", client["expires_at"])
+    return out
+
+
+def client_auth(a: dict) -> tuple:
+    """SPEC §6.1: T_auth and the 34-byte payload that the client key signs."""
+    transcript = keccak(
+        text("price-oracle/2 client-auth")
+        + unhex(a["node"])
+        + unhex(a["challenge"])
+        + unhex(a["client_nonce"])
+        + unhex(a["client_pubkey"])
+        + unhex(a["eph_public"])
+    )
+    return transcript, bytes([1, 0x83]) + transcript
+
+
+def initial_digest(keys: list) -> bytes:
+    """SPEC §6.1: a u32 count, then each sealed key with a u32 length."""
+    out = struct.pack(">I", len(keys))
+    for key in keys:
+        data = unhex(key)
+        out += struct.pack(">I", len(data)) + data
+    return keccak(out)
+
+
+def auth_ok(a: dict) -> tuple:
+    """SPEC §6.1: H_ok and the 34-byte payload that the node key signs."""
+    transcript = keccak(
+        text("price-oracle/2 auth-ok")
+        + unhex(a["client_auth"])
+        + unhex(a["enc"])
+        + struct.pack(">Q", a["session_deadline"])
+        + unhex(a["initial_digest"])
+    )
+    return transcript, bytes([1, 0x84]) + transcript
+
+
+def check_signed(name: str, vector: dict, payload: bytes, separator: bytes) -> list:
+    """A governance document or a handshake payload: the bytes and the digest."""
+    errors = []
+    stored = vector.get("signing_bytes", vector.get("payload"))
+    if payload != unhex(stored):
+        errors.append(f"{name}: bytes differ\n  ours   0x{payload.hex()}\n  stored {stored}")
+    digest = keccak(b"\x19\x01" + separator + keccak(payload))
+    if digest != unhex(vector["digest"]):
+        errors.append(f"{name}: digest differs: ours 0x{digest.hex()}, stored {vector['digest']}")
+    return errors
+
+
 def check(kind: str, vector: dict, payload: bytes, separator: bytes) -> list:
     name = f"{kind} `{vector['name']}`"
     errors = []
@@ -255,13 +309,24 @@ def main() -> int:
         errors += check("batch", vector, price_batch(vector["updates"]), separator)
         count += 1
     vector = golden["feed_set"]
-    payload = feed_set(vector["feed_set"])
-    if payload != unhex(vector["signing_bytes"]):
-        errors.append(f"feed set: bytes differ\n  ours   0x{payload.hex()}\n  stored {vector['signing_bytes']}")
-    digest = keccak(b"\x19\x01" + separator + keccak(payload))
-    if digest != unhex(vector["digest"]):
-        errors.append(f"feed set: digest differs: ours 0x{digest.hex()}, stored {vector['digest']}")
+    errors += check_signed("feed set", vector, feed_set(vector["feed_set"]), separator)
     count += 1
+    vector = golden["client_list"]
+    errors += check_signed("client list", vector, client_list(vector["client_list"]), separator)
+    count += 1
+    for name, build in [("client_auth", client_auth), ("auth_ok", auth_ok)]:
+        vector = golden[name]
+        transcript, payload = build(vector)
+        if transcript != unhex(vector["transcript"]):
+            errors.append(f"{name}: transcript differs: ours 0x{transcript.hex()}, stored {vector['transcript']}")
+        errors += check_signed(name, vector, payload, separator)
+        count += 1
+    if unhex(golden["auth_ok"]["client_auth"]) != unhex(golden["client_auth"]["transcript"]):
+        errors.append("auth_ok: client_auth is not the client_auth transcript")
+    vector = golden["auth_ok"]
+    digest = initial_digest(vector["initial"])
+    if digest != unhex(vector["initial_digest"]):
+        errors.append(f"auth_ok: initial digest differs: ours 0x{digest.hex()}, stored {vector['initial_digest']}")
     for error in errors:
         print(error)
     print(f"{count} vectors checked, {len(errors)} differences")

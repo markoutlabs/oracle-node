@@ -27,7 +27,7 @@ const BTC: &str = "CRYPTO.BTC/USD";
 const WAIT: Duration = Duration::from_secs(5);
 
 fn key(seed: u8) -> Signer {
-    Signer::from_secret_bytes([seed; 32]).expect("valid key")
+    Signer::from_secret(&[seed; 32].into()).expect("valid key")
 }
 
 fn client_list(version: u64, epoch_secs: u64, clients: &[(u8, u64)]) -> ClientList {

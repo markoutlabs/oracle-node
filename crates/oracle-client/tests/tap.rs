@@ -18,7 +18,7 @@ fn client(nodes: &[&TestNode]) -> OracleClient {
     OracleClient::builder(verified)
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()
-        .client_key(Signer::from_secret_bytes([0x51; 32]).expect("valid key"))
+        .client_key(Signer::from_secret(&[0x51; 32].into()).expect("valid key"))
         .build()
         .expect("builds")
 }

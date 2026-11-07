@@ -30,7 +30,7 @@ use oracle_types::{Fixed, NANOS_PER_SEC, ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, LocalBook, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity, LocalBook, Side};
 use crate::clock::millis_to_nanos;
 use crate::{DecodeError, InstrumentMap};
 
@@ -60,6 +60,12 @@ const BOOK_LEN: &str = "25";
 const CHECKSUM_LEVELS: usize = 25;
 
 const EIGHT_HOURS_NS: u64 = 8 * 3_600 * NANOS_PER_SEC;
+
+/// The changes carry no ids; the checksum messages prove the book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::Checksum).checksum(checksum);
+
+/// The channels the decoder reads, by the name the venue gives them.
+const CHANNELS: [&str; 3] = ["book", "trades", "status"];
 
 /// The `status` key of a perpetual.
 fn status_key(symbol: &str) -> String {
@@ -174,9 +180,11 @@ pub fn decode(
                     .symbol
                     .or_else(|| event.key.and_then(|key| key.strip_prefix("deriv:")))
                     .ok_or(DecodeError::MissingField("symbol"))?;
-                books
-                    .channels
-                    .insert(id, (channel.to_owned(), symbol.to_owned()));
+                let channel = CHANNELS
+                    .into_iter()
+                    .find(|known| *known == channel)
+                    .unwrap_or("other");
+                books.channels.insert(id, (channel, symbol.to_owned()));
                 Err(DecodeError::Control)
             }
             // 20051 restarts the server; 20060 starts maintenance, which leaves the
@@ -200,11 +208,12 @@ pub fn decode(
         return Err(DecodeError::Malformed("an empty array".to_owned()));
     };
     let id: u64 = serde_json::from_str(id.get()).map_err(malformed)?;
-    let Some((channel, symbol)) = books.channels.get(&id).cloned() else {
+    let Some((channel, symbol)) = books.channels.get(&id) else {
         return Err(DecodeError::UnhandledStream(format!("channel {id}")));
     };
-    let Some(entry) = map.lookup(&symbol).cloned() else {
-        return Err(DecodeError::UnknownInstrument(symbol));
+    let channel = *channel;
+    let Some(entry) = map.lookup(symbol) else {
+        return Err(DecodeError::UnknownInstrument(symbol.clone()));
     };
     // A heartbeat, or a trade update that repeats an executed trade.
     if body.get() == r#""hb""# || body.get() == r#""tu""# {
@@ -218,13 +227,13 @@ pub fn decode(
                 .get(),
         )
         .map_err(malformed)?;
-        return if checksum(books.book(&symbol)) == Some(sent) {
-            Err(DecodeError::Control)
-        } else {
-            Err(DecodeError::Resync(format!("{symbol}: checksum mismatch")))
-        };
+        let key = &entry.instrument.symbol;
+        books
+            .keeper
+            .check(BOOK_RULE, key, u32::from_ne_bytes(sent.to_ne_bytes()))?;
+        return Err(DecodeError::Control);
     }
-    match channel.as_str() {
+    match channel {
         "trades" => {
             // `[id, "te", [ID, MTS, AMOUNT, PRICE]]`; the snapshot of past trades is skipped.
             if body.get() != r#""te""# {
@@ -243,58 +252,15 @@ pub fn decode(
                 .and_then(|raw| serde_json::from_str(raw.get()).ok());
             out.push(Observation {
                 exchange_time_ns: time.map(millis_to_nanos),
-                ..observation(&entry, ObsKind::Trade, price, local_recv_ns)
+                ..observation(entry, ObsKind::Trade, price, local_recv_ns)
             });
             Ok(())
         }
         "book" => {
-            let levels: Vec<Vec<&RawValue>> = match serde_json::from_str(body.get()) {
-                Ok(snapshot) => {
-                    books.book(&symbol).clear();
-                    snapshot
-                }
-                Err(_) => vec![serde_json::from_str(body.get()).map_err(malformed)?],
-            };
-            let book = books.book(&symbol);
-            for level in levels {
-                let (Some(price_text), Some(amount_text)) = (level.first(), level.get(2)) else {
-                    return Err(DecodeError::MissingField("PRICE or AMOUNT"));
-                };
-                let price =
-                    number("PRICE", Some(price_text))?.ok_or(DecodeError::MissingField("PRICE"))?;
-                let count = number("COUNT", level.get(1))?.unwrap_or(Fixed::ZERO);
-                let amount = number("AMOUNT", Some(amount_text))?.unwrap_or(Fixed::ZERO);
-                // A positive amount is a bid, a negative one an ask; a count of 0 removes the level.
-                let side = if amount.is_positive() {
-                    Side::Bid
-                } else {
-                    Side::Ask
-                };
-                let qty = if count.is_positive() {
-                    amount.checked_abs().unwrap_or(Fixed::ZERO)
-                } else {
-                    Fixed::ZERO
-                };
-                book.set_with_text(
-                    side,
-                    price,
-                    qty,
-                    Some((price_text.get(), amount_text.get())),
-                );
-            }
-            let emit = if entry.depth {
-                Books::emit
-            } else {
-                Books::emit_top
-            };
-            emit(
-                books,
-                &symbol,
-                entry.instrument.clone(),
-                None,
-                local_recv_ns,
-                out,
-            )
+            let parsed = book_message(body);
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "status" => {
             let fields: Vec<&RawValue> = serde_json::from_str(body.get()).map_err(malformed)?;
@@ -304,7 +270,7 @@ pub fn decode(
                 ("SPOT_PRICE", ObsKind::IndexPrice, 3),
             ] {
                 if let Some(price) = number(field, fields.get(index))? {
-                    out.push(observation(&entry, kind, price, local_recv_ns));
+                    out.push(observation(entry, kind, price, local_recv_ns));
                     emitted = true;
                 }
             }
@@ -320,12 +286,12 @@ pub fn decode(
             let next_ns = next_ms.map(millis_to_nanos);
             let set_at = next_ns.and_then(|next| next.checked_sub(EIGHT_HOURS_NS));
             // The status repeats each second: the rate goes out when it or the open interest changed.
-            let last = books.funding(&symbol);
+            let last = books.funding(&entry.instrument);
             if last.update(rate, open_interest) {
                 last.interval_ns = Some(EIGHT_HOURS_NS);
                 last.next_funding_time_ns = next_ns;
                 last.settled = set.zip(set_at);
-                if let Some(funding) = interval_funding(&entry, last, local_recv_ns) {
+                if let Some(funding) = interval_funding(entry, last, local_recv_ns) {
                     out.push(funding);
                     emitted = true;
                 }
@@ -340,10 +306,51 @@ pub fn decode(
     }
 }
 
-/// Bitfinex's CRC32, as a signed integer: the best bid, then the best ask, then
-/// the next of each, each price and amount as sent (an ask's amount is
-/// negative), joined by colons. A shorter side adds nothing past its end.
-fn checksum(book: &LocalBook) -> Option<i32> {
+/// A book message: a snapshot `[[price, count, amount], …]`, or one level
+/// `[price, count, amount]`. A positive amount is a bid and a negative one an
+/// ask; a count of 0 removes the level.
+fn book_message<'a>(body: &'a RawValue) -> Result<BookMsg<'a>, DecodeError> {
+    let malformed = |e: serde_json::Error| DecodeError::Malformed(e.to_string());
+    let (snapshot, levels): (bool, Vec<Vec<&RawValue>>) = match serde_json::from_str(body.get()) {
+        Ok(snapshot) => (true, snapshot),
+        Err(_) => (
+            false,
+            vec![serde_json::from_str(body.get()).map_err(malformed)?],
+        ),
+    };
+    let mut message = BookMsg {
+        snapshot,
+        ..BookMsg::default()
+    };
+    for level in levels {
+        let (Some(price_text), Some(amount_text)) = (level.first(), level.get(2)) else {
+            return Err(DecodeError::MissingField("PRICE or AMOUNT"));
+        };
+        let price = number("PRICE", Some(price_text))?.ok_or(DecodeError::MissingField("PRICE"))?;
+        let count = number("COUNT", level.get(1))?.unwrap_or(Fixed::ZERO);
+        let amount = number("AMOUNT", Some(amount_text))?.unwrap_or(Fixed::ZERO);
+        let qty = if count.is_positive() {
+            amount.checked_abs().unwrap_or(Fixed::ZERO)
+        } else {
+            Fixed::ZERO
+        };
+        let change = Change {
+            text: Some((price_text.get(), amount_text.get())),
+            ..Change::new(price, qty)
+        };
+        if amount.is_positive() {
+            message.bids.push(change);
+        } else {
+            message.asks.push(change);
+        }
+    }
+    Ok(message)
+}
+
+/// Bitfinex's CRC32: the best bid, then the best ask, then the next of each,
+/// each price and amount as sent (an ask's amount is negative), joined by
+/// colons. A shorter side adds nothing past its end.
+fn checksum(book: &LocalBook) -> Option<u32> {
     let bids = book.top_text(Side::Bid, CHECKSUM_LEVELS)?;
     let asks = book.top_text(Side::Ask, CHECKSUM_LEVELS)?;
     let mut parts = Vec::with_capacity(CHECKSUM_LEVELS * 4);
@@ -354,76 +361,50 @@ fn checksum(book: &LocalBook) -> Option<i32> {
             }
         }
     }
-    let crc = crc32fast::hash(parts.join(":").as_bytes());
-    Some(i32::from_ne_bytes(crc.to_ne_bytes()))
+    Some(crc32fast::hash(parts.join(":").as_bytes()))
 }
 
 #[cfg(test)]
 #[expect(
     clippy::indexing_slicing,
-    reason = "fixed-shape fixtures; an out-of-range index is a failing test"
+    reason = "fixed payloads; an out-of-range index is a failing test"
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, fixed, instrument, of};
     use oracle_types::OpenInterestUnit;
     use oracle_types::{MarketKind, Venue};
 
-    const RECV: u64 = 1_792_928_910_000_000_000;
     /// Recorded from Bitfinex on 2026-10-25: the subscribe replies, then the
     /// first messages of a spot ticker, trades and book, and a perpetual's
     /// ticker and status. The decoder no longer takes the tickers.
     const SESSION: &str = include_str!("../../tests/fixtures/bitfinex-session.jsonl");
 
-    fn maps() -> (InstrumentMap, InstrumentMap) {
-        let spot = InstrumentSpec::new("tBTCUSD", MarketKind::Spot, "CRYPTO.BTC/USD")
-            .expect("valid")
-            .with_depth();
-        let perp = InstrumentSpec::new(
-            "tBTCF0:USTF0",
-            MarketKind::LinearPerp,
-            "CRYPTO.BTC/USDT.PERP_MARK",
-        )
-        .expect("valid");
-        (
-            InstrumentMap::new(Venue::Bitfinex, MarketKind::Spot, &[spot]).expect("valid"),
-            InstrumentMap::new(Venue::Bitfinex, MarketKind::LinearPerp, &[perp]).expect("valid"),
-        )
+    fn spot(depth: bool) -> Feed {
+        let spec = instrument("tBTCUSD", MarketKind::Spot);
+        let spec = if depth { spec.with_depth() } else { spec };
+        Feed::venue(decode, Venue::Bitfinex, MarketKind::Spot, &[spec])
     }
 
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
+    fn perp(symbol: &str, depth: bool) -> Feed {
+        let spec = instrument(symbol, MarketKind::LinearPerp);
+        let spec = if depth { spec.with_depth() } else { spec };
+        Feed::venue(decode, Venue::Bitfinex, MarketKind::LinearPerp, &[spec])
     }
 
-    /// Runs the session through one map, as one connection would.
-    fn replay(map: &InstrumentMap) -> Vec<Observation> {
-        let mut books = Books::default();
-        let mut all = Vec::new();
-        for line in SESSION.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => panic!("{error}: {line}"),
-            }
-        }
-        all
-    }
+    /// Book channel 5 of `tBTCUSD`, opened by its subscribe reply.
+    const BOOK_5: &str =
+        r#"{"event":"subscribed","channel":"book","chanId":5,"symbol":"tBTCUSD","prec":"P0"}"#;
 
     #[test]
     fn a_recorded_spot_session_gives_trades_and_a_book_with_its_quote() {
-        let (spot, _) = maps();
-        let all = replay(&spot);
-        assert!(all.iter().any(|o| o.kind == ObsKind::Trade));
+        let all = spot(true).replay(SESSION.lines());
+        assert!(!of(&all, "tBTCUSD", ObsKind::Trade).is_empty());
         assert!(
-            all.iter().all(|o| o.kind != ObsKind::BookTop),
+            of(&all, "tBTCUSD", ObsKind::BookTop).is_empty(),
             "no ticker quote"
         );
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
+        let depth = *of(&all, "tBTCUSD", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
         assert!(book.bids[0].price < book.asks[0].price);
         assert!(book.bids.iter().all(|level| level.qty.is_positive()));
@@ -434,15 +415,10 @@ mod tests {
     /// A market without depth still takes its quote from the book.
     #[test]
     fn a_market_without_depth_gets_its_quote_from_the_book() {
-        let spec =
-            InstrumentSpec::new("tBTCUSD", MarketKind::Spot, "CRYPTO.BTC/USD").expect("valid");
-        let map = InstrumentMap::new(Venue::Bitfinex, MarketKind::Spot, &[spec]).expect("valid");
-        let all = replay(&map);
-        assert!(all.iter().all(|o| o.kind != ObsKind::Depth));
-        let top = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::BookTop)
+        let all = spot(false).replay(SESSION.lines());
+        assert!(of(&all, "tBTCUSD", ObsKind::Depth).is_empty());
+        let top = *of(&all, "tBTCUSD", ObsKind::BookTop)
+            .last()
             .expect("a quote");
         assert!(top.bid < top.ask);
         assert!(top.book.is_none());
@@ -450,24 +426,18 @@ mod tests {
 
     #[test]
     fn a_perpetual_status_gives_mark_index_and_eight_hour_funding() {
-        let (_, perp) = maps();
-        let all = replay(&perp);
-        let mark = all
-            .iter()
-            .find(|o| o.kind == ObsKind::MarkPrice)
-            .expect("a mark");
-        assert_eq!(mark.price, fixed("80543.2212"));
-        let index = all
-            .iter()
-            .find(|o| o.kind == ObsKind::IndexPrice)
-            .expect("an index");
-        assert_eq!(index.price, fixed("80556"));
-        let funding: Vec<&Observation> =
-            all.iter().filter(|o| o.kind == ObsKind::Funding).collect();
-        assert!(!funding.is_empty());
+        let all = perp("tBTCF0:USTF0", false).replay(SESSION.lines());
+        let first = |kind| {
+            *of(&all, "tBTCF0:USTF0", kind)
+                .first()
+                .expect("one of each kind")
+        };
+        assert_eq!(first(ObsKind::MarkPrice).price, fixed("80543.2212"));
+        assert_eq!(first(ObsKind::IndexPrice).price, fixed("80556"));
+        let funding = first(ObsKind::Funding);
         // Accrued 0.00027518 sits inside the 0.0005 band: nothing would be paid now.
-        assert_eq!(funding[0].price, Fixed::ZERO);
-        let info = funding[0].funding.as_deref().expect("info");
+        assert_eq!(funding.price, Fixed::ZERO);
+        let info = funding.funding.as_deref().expect("info");
         assert_eq!(info.interval_ns, Some(EIGHT_HOURS_NS));
         assert_eq!(info.next_funding_time_ns, Some(1_792_944_000_000_000_000));
         // The rate set at 08:00 UTC, eight hours before the next event.
@@ -501,16 +471,9 @@ mod tests {
 
     #[test]
     fn a_book_update_with_a_count_of_zero_removes_the_level() {
-        let (spot, _) = maps();
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let subscribed =
-            r#"{"event":"subscribed","channel":"book","chanId":5,"symbol":"tBTCUSD","prec":"P0"}"#;
         let snapshot = "[5,[[100,1,2],[99,1,3],[101,1,-1],[102,2,-4]]]";
-        for line in [subscribed, snapshot, "[5,[100,0,1]]", "[5,[101,0,-1]]"] {
-            let _ = decode(line.as_bytes(), &spot, &mut books, RECV, &mut out);
-        }
-        let book = out.last().and_then(|o| o.book.as_deref()).expect("a book");
+        let all = spot(true).replay([BOOK_5, snapshot, "[5,[100,0,1]]", "[5,[101,0,-1]]"]);
+        let book = all.last().and_then(|o| o.book.as_deref()).expect("a book");
         assert_eq!(book.bids[0].price, fixed("99"));
         assert_eq!(book.asks[0].price, fixed("102"));
         assert_eq!(book.asks[0].qty, fixed("4"));
@@ -518,9 +481,7 @@ mod tests {
 
     #[test]
     fn events_heartbeats_and_unknown_channels_are_benign_and_errors_are_not() {
-        let (spot, _) = maps();
-        let mut books = Books::default();
-        let mut out = Vec::new();
+        let mut spot = spot(true);
         for control in [
             r#"{"event":"info","version":2,"serverId":"x","platform":{"status":1}}"#,
             r#"{"event":"pong","cid":1,"ts":1792928908844}"#,
@@ -528,71 +489,13 @@ mod tests {
             r#"[7,"hb"]"#,
             r#"[8,[1,2,3,4]]"#,
         ] {
-            let error = decode(control.as_bytes(), &spot, &mut books, RECV, &mut out)
-                .expect_err("not market data");
+            let error = spot.refused(control);
             assert!(error.is_benign(), "got {error:?} for {control}");
         }
         let limit = r#"{"event":"error","msg":"subscribe: limit","code":10305}"#;
-        assert!(
-            !decode(limit.as_bytes(), &spot, &mut books, RECV, &mut out)
-                .expect_err("an error")
-                .is_benign()
-        );
+        assert!(!spot.refused(limit).is_benign());
         let restart = r#"{"event":"info","code":20051,"msg":"Stopping. Please try to reconnect"}"#;
-        assert!(matches!(
-            decode(restart.as_bytes(), &spot, &mut books, RECV, &mut out),
-            Err(DecodeError::Resync(_))
-        ));
-    }
-
-    /// Recorded from Bitfinex on 2026-10-29 with [`CONF`]: one perpetual's book
-    /// from its snapshot through 57 updates and two checksums.
-    const CHECKSUMS: &str = include_str!("../../tests/fixtures/bitfinex-checksum.jsonl");
-
-    fn perp_book_map() -> InstrumentMap {
-        let spec = InstrumentSpec::new(
-            "tETHF0:USTF0",
-            MarketKind::LinearPerp,
-            "CRYPTO.ETH/USDT.PERP_MARK",
-        )
-        .expect("valid")
-        .with_depth();
-        InstrumentMap::new(Venue::Bitfinex, MarketKind::LinearPerp, &[spec]).expect("valid")
-    }
-
-    /// Decodes each line and returns how many checksums matched, or the first resync.
-    fn checksums_through(lines: &[&str]) -> Result<usize, DecodeError> {
-        let map = perp_book_map();
-        let mut books = Books::default();
-        let mut matched = 0;
-        for line in lines {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
-                Err(DecodeError::Control) if line.contains(r#","cs","#) => matched += 1,
-                Err(error @ DecodeError::Resync(_)) => return Err(error),
-                Ok(()) => {}
-                Err(error) if error.is_benign() => {}
-                Err(error) => panic!("{error}: {line}"),
-            }
-        }
-        Ok(matched)
-    }
-
-    #[test]
-    fn the_recorded_checksums_match_the_book() {
-        let lines: Vec<&str> = CHECKSUMS.lines().collect();
-        assert_eq!(checksums_through(&lines).expect("no resync"), 2);
-    }
-
-    #[test]
-    fn a_missed_update_fails_the_next_checksum() {
-        let mut lines: Vec<&str> = CHECKSUMS.lines().collect();
-        // Line 0 is the conf reply, 1 the subscribe reply, 2 the snapshot.
-        lines.remove(10);
-        assert!(matches!(
-            checksums_through(&lines),
-            Err(DecodeError::Resync(_))
-        ));
+        assert!(matches!(spot.refused(restart), DecodeError::Resync(_)));
     }
 
     /// The checksum takes the amount as sent, in exponent form too, and a
@@ -600,22 +503,12 @@ mod tests {
     /// `zlib.crc32(b"100:2:101:-1e-8:99:3:102:-4")` as a signed integer.
     #[test]
     fn the_checksum_takes_the_text_as_sent() {
-        let (spot, _) = maps();
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let subscribed =
-            r#"{"event":"subscribed","channel":"book","chanId":5,"symbol":"tBTCUSD","prec":"P0"}"#;
-        let snapshot = "[5,[[100,1,2],[99,1,3],[101,1,-1e-8],[102,1,-4]]]";
-        for line in [subscribed, snapshot] {
-            let _ = decode(line.as_bytes(), &spot, &mut books, RECV, &mut out);
-        }
+        let mut spot = spot(true);
+        let _ = spot.replay([BOOK_5, "[5,[[100,1,2],[99,1,3],[101,1,-1e-8],[102,1,-4]]]"]);
+        assert_eq!(spot.refused(r#"[5,"cs",524973713]"#), DecodeError::Control);
         assert!(matches!(
-            decode(br#"[5,"cs",524973713]"#, &spot, &mut books, RECV, &mut out),
-            Err(DecodeError::Control)
-        ));
-        assert!(matches!(
-            decode(br#"[5,"cs",524973714]"#, &spot, &mut books, RECV, &mut out),
-            Err(DecodeError::Resync(_))
+            spot.refused(r#"[5,"cs",524973714]"#),
+            DecodeError::Resync(_)
         ));
     }
 

@@ -92,7 +92,7 @@ impl Seed {
             if retry > 0 {
                 label.push(retry);
             }
-            match Signer::from_secret_bytes(*self.derive(&label)) {
+            match Signer::from_secret(&self.derive(&label)) {
                 Ok(signer) => return Ok(signer),
                 Err(e) => error = Some(e),
             }
@@ -235,7 +235,7 @@ mod tests {
         let keys = NodeKeys::from_text(&format!("{}\n", &*text)).expect("a seed");
         assert!(keys.publisher.is_some());
 
-        let legacy = Signer::from_secret_bytes([9; 32]).expect("valid");
+        let legacy = Signer::from_secret(&[9; 32].into()).expect("valid");
         let keys = NodeKeys::from_text(&legacy.to_secret_hex()).expect("a key");
         assert_eq!(keys.signing.address(), legacy.address());
         assert!(keys.publisher.is_none());

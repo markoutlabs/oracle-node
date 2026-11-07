@@ -156,6 +156,11 @@ impl InstrumentMap {
         self.by_symbol.keys().map(String::as_str)
     }
 
+    /// Iterates the instruments, in unspecified order.
+    pub fn entries(&self) -> impl Iterator<Item = &InstrumentEntry> {
+        self.by_symbol.values()
+    }
+
     /// Iterates the venue symbols that want depth snapshots, in unspecified order.
     pub fn depth_symbols(&self) -> impl Iterator<Item = &str> {
         self.by_symbol

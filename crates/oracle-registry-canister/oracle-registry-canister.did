@@ -172,15 +172,15 @@ type Result = variant { Ok : nat64; Err : text };
 type Result_1 = variant { Ok : vec Verdict; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok; Err : text };
-// What `push` did with one frame.
+// What `push` did with one update.
 type Verdict = variant {
-  // Malformed, or a signature that is not valid.
+  // Malformed, a signature that is not valid, or a signer hint that is not the signer.
   Invalid;
   // The feed is not on the canister's list.
   UnknownFeed;
   // More than 10 s ahead of the canister's clock.
   FromTheFuture;
-  // Stored as the node's latest frame for its feed.
+  // Stored as the node's latest batch for its feed.
   Accepted;
   // Observed after it was published.
   Incoherent;
@@ -192,7 +192,7 @@ type Verdict = variant {
   RetiredKey;
   // Published more than 30 s ago.
   TooOld;
-  // The sequence does not advance: the frame or a newer one is stored.
+  // The sequence does not advance: the batch or a newer one is stored.
   Replayed;
 };
 service : (InitArgs) -> {
@@ -212,11 +212,13 @@ service : (InitArgs) -> {
   get_governance : () -> (opt text) query;
   // When a node address was listed, as JSON, for stored-frame verification.
   get_node_listing : (text) -> (opt text) query;
-  // One feed's price, resolved now, by its 32-byte feed id.
+  // One feed's price, resolved now, by its 32-byte feed id. Another canister
+  // attaches 10M cycles (`PRICE_CALL_CYCLES`).
   get_price : (blob) -> (opt PriceRecord) query;
   // How long a node's latest update counts toward the quorum, in seconds.
   get_price_window : () -> (nat64) query;
-  // Every listed feed's price, resolved now.
+  // Every listed feed's price, resolved now. Another canister attaches 10M
+  // cycles (`PRICE_CALL_CYCLES`).
   get_prices : () -> (vec PriceRecord) query;
   // The last published registry document as JSON, if any.
   get_registry : () -> (opt text) query;
@@ -225,8 +227,8 @@ service : (InitArgs) -> {
   // Serves `/registry.json`, `/clients.json`, `/feeds.json`, `/prices.json`,
   // `/frames.json`, and a 404 for every other path, as certified query responses.
   http_request : (HttpRequest) -> (HttpResponse) query;
-  // A node pushes its latest updates as one batch, or as single frames.
-  // Returns one verdict for each update, in order.
+  // A node pushes its latest updates as one price batch. Returns one verdict
+  // for each update, in order.
   push : (vec blob) -> (Result_1);
   // Fetches the threshold public key if it is not cached. Returns the
   // governance address consumers pin.
@@ -247,15 +249,14 @@ service : (InitArgs) -> {
   republish_feeds : () -> (Result);
   // Governance moves a client's expiry. Returns the new client-list version.
   set_client_expiry : (text, nat64) -> (Result);
-  // Governance publishes the network's feed set: every feed the nodes serve.
-  // `content_json` is `{ "min_node_version", "push", "feeds" }`, with each feed
-  // as in a node config. Returns the new feed set version.
+  // Governance publishes the network's feed set, `{ "min_node_version", "push", "feeds" }` as JSON.
+  // Returns the new feed set version.
   set_feed_set : (text) -> (Result);
   // Governance sets the feeds that the canister prices, as canonical symbols.
   // A feed that stays keeps its frames.
   set_feeds : (vec text) -> (Result_3);
   // Governance sets how long a node's latest update counts toward the quorum,
-  // in seconds. About three push intervals: 25 for pushes every 7 s.
+  // in seconds. About three push intervals: 180 for pushes every 60 s.
   set_price_window : (nat64) -> (Result_3);
   // Governance changes the quorum guidance. Returns the new version.
   set_quorum : (nat16, nat16) -> (Result);

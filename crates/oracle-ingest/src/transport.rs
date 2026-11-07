@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Bytes, Message, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 /// A transport-level failure. Always recoverable by reconnecting.
@@ -34,10 +34,10 @@ pub enum TransportError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Frame {
-    /// A text frame, the only kind any venue in scope uses for market data.
-    Text(String),
-    /// A binary frame.
-    Binary(Vec<u8>),
+    /// A text frame, in the socket's own buffer.
+    Utf8(Utf8Bytes),
+    /// A binary frame, in the socket's own buffer.
+    Bytes(Bytes),
     /// A ping. Replying is the transport's job; the session counts it as liveness.
     Ping,
     /// A pong, usually answering our own probe.
@@ -52,9 +52,19 @@ impl Frame {
     #[must_use]
     pub fn payload(&self) -> Option<&[u8]> {
         match self {
-            Self::Text(text) | Self::Rest(text) => Some(text.as_bytes()),
-            Self::Binary(bytes) => Some(bytes),
+            Self::Rest(text) => Some(text.as_bytes()),
+            Self::Utf8(text) => Some(text.as_bytes()),
+            Self::Bytes(bytes) => Some(bytes),
             Self::Ping | Self::Pong => None,
+        }
+    }
+
+    /// The text of a text frame from the socket.
+    #[must_use]
+    pub fn socket_text(&self) -> Option<&str> {
+        match self {
+            Self::Utf8(text) => Some(text.as_str()),
+            _ => None,
         }
     }
 }
@@ -122,8 +132,8 @@ impl Transport for WebSocket {
             };
             let message = message.map_err(|e| TransportError::Io(e.to_string()))?;
             return Ok(Some(match message {
-                Message::Text(text) => Frame::Text(text.to_string()),
-                Message::Binary(bytes) => Frame::Binary(bytes.to_vec()),
+                Message::Text(text) => Frame::Utf8(text),
+                Message::Binary(bytes) => Frame::Bytes(bytes),
                 Message::Ping(_) => Frame::Ping,
                 Message::Pong(_) => Frame::Pong,
                 Message::Close(_) => return Ok(None),
@@ -162,6 +172,11 @@ static TLS_PROVIDER: LazyLock<()> = LazyLock::new(|| {
     let _ = rustls::crypto::ring::default_provider().install_default();
 });
 
+/// Installs the `rustls` crypto provider, the one place in this crate that does.
+pub(crate) fn install_tls_provider() {
+    LazyLock::force(&TLS_PROVIDER);
+}
+
 /// Connects over TLS using `rustls` with the webpki root store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WebSocketConnector;
@@ -170,7 +185,7 @@ impl Connector for WebSocketConnector {
     type Conn = WebSocket;
 
     async fn connect(&self, url: &str) -> Result<Self::Conn, TransportError> {
-        LazyLock::force(&TLS_PROVIDER);
+        install_tls_provider();
         let (inner, _response) = connect_async(url)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
@@ -185,10 +200,17 @@ mod tests {
     #[test]
     fn frame_payloads() {
         assert_eq!(
-            Frame::Text("hi".to_owned()).payload(),
+            Frame::Rest("hi".to_owned()).payload(),
             Some(b"hi".as_slice())
         );
-        assert_eq!(Frame::Binary(vec![1, 2]).payload(), Some([1, 2].as_slice()));
+        assert_eq!(
+            Frame::Utf8(Utf8Bytes::from_static("hi")).payload(),
+            Some(b"hi".as_slice())
+        );
+        assert_eq!(
+            Frame::Bytes(Bytes::from_static(&[1, 2])).payload(),
+            Some([1, 2].as_slice())
+        );
         assert_eq!(Frame::Ping.payload(), None);
         assert_eq!(Frame::Pong.payload(), None);
     }

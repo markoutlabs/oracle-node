@@ -445,11 +445,11 @@ mod tests {
     use oracle_types::{Flags, PriceUpdate, VenueSet};
 
     fn node() -> Signer {
-        Signer::from_secret_bytes([0x21; 32]).expect("valid key")
+        Signer::from_secret(&[0x21; 32].into()).expect("valid key")
     }
 
     fn registry() -> VerifiedRegistry {
-        let governance = Signer::from_secret_bytes([0x91; 32]).expect("valid key");
+        let governance = Signer::from_secret(&[0x91; 32].into()).expect("valid key");
         let entry = NodeEntry {
             address: node().address(),
             endpoints: vec!["wss://eu1.example/v2/ws".to_owned()],
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn a_stranger_is_refused() {
-        let stranger = Signer::from_secret_bytes([0x33; 32]).expect("valid key");
+        let stranger = Signer::from_secret(&[0x33; 32].into()).expect("valid key");
         let signed = stranger.sign_venue_report(&report()).expect("signs");
         let frame = UnverifiedVenueFrame::parse(&signed.encode_frame()).expect("parses");
         assert!(frame.verify(&registry()).is_err());

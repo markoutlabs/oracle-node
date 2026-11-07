@@ -24,7 +24,7 @@ use oracle_wire::{NodeEntry, Signer};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
-use common::{BINARY, Node, READY, fields_of, free_port};
+use common::{BINARY, Node, fields_of, free_port};
 
 /// The feed whose last venue report and books the run prints.
 const SHOWN: &str = "CRYPTO.BTC/USDT";
@@ -76,7 +76,7 @@ fn live_latency_from_the_venues_to_the_sdk() {
         Ok(1)
     );
     let node = Node::spawn(common::start(&config, "json"), dir.join("node.log"));
-    node.wait(READY);
+    node.serving(port);
 
     let source = HttpRegistrySource::new(&canister.url("registry.json"), canister.certification())
         .expect("builds");

@@ -33,11 +33,12 @@ use oracle_types::{
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity, Halts};
 use crate::clock::millis_to_nanos;
+use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
 
-use super::{decimal_literal, to_base_units};
+use super::{book_top, decimal_literal, observation, parse, to_base_units};
 
 /// The production endpoint.
 pub const URL: &str = "wss://www.deribit.com/ws/api/v2";
@@ -60,6 +61,9 @@ pub const TICKER_INTERVAL: &str = "100ms";
 /// The book channel: a full snapshot, then the changes every 100ms, each
 /// naming the change before it.
 const BOOK_INTERVAL: &str = "100ms";
+
+/// Each change names the `change_id` of the one before it as `prev_change_id`.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::UpdateId);
 
 /// Builds the subscribe frames for a set of Deribit instrument names, each with
 /// whether it wants depth snapshots.
@@ -169,13 +173,12 @@ struct Book<'a> {
     asks: Vec<(&'a str, &'a RawValue, &'a RawValue)>,
 }
 
-/// The session's entry point: the book channel is kept in `books`; every other
-/// channel goes to [`decode_payload`].
+/// Decodes one Deribit payload. The book channel is kept in `books`.
 ///
 /// # Errors
 ///
-/// As [`decode_payload`], and [`DecodeError::Resync`] when a change does not
-/// follow the last one.
+/// Returns [`DecodeError`]. Subscribe replies and heartbeats are benign; a
+/// book change that does not follow the last one is [`DecodeError::Resync`].
 pub fn decode(
     payload: &[u8],
     map: &InstrumentMap,
@@ -183,136 +186,120 @@ pub fn decode(
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let envelope: Envelope<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let book_data = match envelope.params {
-        Some(Params {
-            channel: Some(channel),
-            data: Some(data),
-        }) if envelope.method == Some("subscription") && channel.starts_with("book.") => data,
-        _ => return decode_payload(payload, map, local_recv_ns, out),
-    };
-    let message: Book<'_> =
-        serde_json::from_str(book_data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let name = message.instrument_name;
-    let Some(entry) = map.lookup(name) else {
+    let envelope: Envelope<'_> = serde_json::from_slice(payload)?;
+    // Replies to our own requests carry `id` and `result`, never `method`.
+    let (Some("subscription"), Some(params)) = (envelope.method, envelope.params) else {
         return Err(DecodeError::Control);
     };
-    let inverse = entry.instrument.market == MarketKind::InversePerp;
-    let book = books.book(name);
-    if message.kind == "snapshot" {
-        book.clear();
-    } else if message.prev_change_id != book.last_id {
-        return Err(DecodeError::Resync(format!(
-            "{name}: change follows {:?} but the book is at {:?}",
-            message.prev_change_id, book.last_id
-        )));
+    let (Some(channel), Some(data)) = (params.channel, params.data) else {
+        return Err(DecodeError::Control);
+    };
+    if channel.starts_with("book.") {
+        return decode_book(data, map, books, local_recv_ns, out);
     }
-    book.last_id = Some(message.change_id);
-    for (side, levels) in [(Side::Bid, &message.bids), (Side::Ask, &message.asks)] {
-        for (action, price, amount) in levels {
-            let price = decimal_literal("book price", price)?;
-            let qty = if *action == "delete" {
-                Fixed::ZERO
-            } else {
-                let amount = decimal_literal("book amount", amount)?;
-                to_base_units(amount, price, inverse).unwrap_or(Fixed::ZERO)
-            };
-            book.set(side, price, qty);
-        }
+    if channel.starts_with("ticker.") {
+        return decode_ticker(data, map, local_recv_ns, out);
     }
-    books.emit(
-        name,
-        entry.instrument.clone(),
-        message.timestamp.map(millis_to_nanos),
-        local_recv_ns,
-        out,
-    )
+    Err(DecodeError::UnhandledStream(channel.to_owned()))
 }
 
-/// Decodes one Deribit payload.
-///
-/// # Errors
-///
-/// Returns [`DecodeError`]. Subscribe replies and heartbeats are benign.
-pub fn decode_payload(
-    payload: &[u8],
+fn decode_book(
+    data: &RawValue,
+    map: &InstrumentMap,
+    books: &mut Books,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
+    let message: Book<'_> = parse(data).map_err(|e| BOOK_RULE.unparsed(e))?;
+    let Some(entry) = map.lookup(message.instrument_name) else {
+        return Err(DecodeError::Control);
+    };
+    let parsed = book_message(&message, entry);
+    books
+        .keeper
+        .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
+}
+
+/// One book message, with an inverse contract's USD sizes in coins.
+fn book_message(
+    message: &Book<'_>,
+    entry: &InstrumentEntry,
+) -> Result<BookMsg<'static>, DecodeError> {
+    let inverse = entry.instrument.market == MarketKind::InversePerp;
+    let change = |(action, price, amount): &(&str, &RawValue, &RawValue)| {
+        let price = decimal_literal("book price", price)?;
+        if *action == "delete" {
+            return Ok(Change::new(price, Fixed::ZERO));
+        }
+        let amount = decimal_literal("book amount", amount)?;
+        let qty = to_base_units(amount, price, inverse)
+            .ok_or_else(|| DecodeError::Malformed(format!("amount {amount} at price {price}")))?;
+        Ok(Change::new(price, qty))
+    };
+    Ok(BookMsg {
+        snapshot: message.kind == "snapshot",
+        prev_id: message.prev_change_id,
+        next_id: Some(message.change_id),
+        time: message.timestamp.map(millis_to_nanos),
+        ..BookMsg::changes(&message.bids, &message.asks, change)?
+    })
+}
+
+fn decode_ticker(
+    data: &RawValue,
     map: &InstrumentMap,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let envelope: Envelope<'_> =
-        serde_json::from_slice(payload).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-
-    // Replies to our own requests carry `id` and `result`, never `method`.
-    let Some("subscription") = envelope.method else {
-        return Err(DecodeError::Control);
-    };
-    let (Some(channel), Some(data)) = envelope
-        .params
-        .map_or((None, None), |params| (params.channel, params.data))
-    else {
-        return Err(DecodeError::Control);
-    };
-    if !channel.starts_with("ticker.") {
-        return Err(DecodeError::UnhandledStream(channel.to_owned()));
-    }
-
-    let ticker: Ticker<'_> =
-        serde_json::from_str(data.get()).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let ticker: Ticker<'_> = parse(data)?;
     let Some(entry) = map.lookup(ticker.instrument_name) else {
         return Err(DecodeError::Control);
     };
     // Deribit keeps publishing a ticker for a closed instrument. The session
     // stops confirming its last values, so the staleness filter sheds them.
     if ticker.state.is_some_and(|state| state != "open") {
-        return Err(DecodeError::Halted(entry.instrument.clone()));
+        return Err(DecodeError::Suspended(entry.instrument.clone()));
     }
     let exchange_time_ns = ticker.timestamp.map(millis_to_nanos);
     let inverse = entry.instrument.market == MarketKind::InversePerp;
+    let before = out.len();
 
-    let mut emitted = false;
-    if let (Some(bid), Some(ask)) = (ticker.best_bid_price, ticker.best_ask_price) {
-        let bid = decimal_literal("best_bid_price", bid)?;
-        let ask = decimal_literal("best_ask_price", ask)?;
-        // Deribit reports a zero top of book on an empty side rather than
-        // omitting it, and a zero bid is not a quote.
-        if bid.is_positive() && ask.is_positive() {
-            let mid = bid
-                .checked_add(ask)
-                .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-                .unwrap_or(bid);
-            let bid_qty = ticker
-                .best_bid_amount
-                .map(|raw| decimal_literal("best_bid_amount", raw))
-                .transpose()?
-                .and_then(|amount| to_base_units(amount, bid, inverse));
-            let ask_qty = ticker
-                .best_ask_amount
-                .map(|raw| decimal_literal("best_ask_amount", raw))
-                .transpose()?
-                .and_then(|amount| to_base_units(amount, ask, inverse));
+    // Deribit gives an empty side as a null or a zero price. The rest of the
+    // ticker stands, and the book stops counting.
+    let lost = |error| DecodeError::lost(&entry.instrument, error);
+    let price = |raw: Option<&RawValue>, field| {
+        raw.map(|raw| decimal_literal(field, raw))
+            .transpose()
+            .map_err(lost)
+    };
+    let bid = price(ticker.best_bid_price, "best_bid_price")?;
+    let ask = price(ticker.best_ask_price, "best_ask_price")?;
+    let size = |raw: Option<&RawValue>, field, price: Option<Fixed>| {
+        let amount = raw.map(|raw| decimal_literal(field, raw)).transpose();
+        amount.map_err(lost).map(|amount| {
+            amount
+                .zip(price)
+                .and_then(|(amount, price)| to_base_units(amount, price, inverse))
+        })
+    };
+    let bid_qty = size(ticker.best_bid_amount, "best_bid_amount", bid)?;
+    let ask_qty = size(ticker.best_ask_amount, "best_ask_amount", ask)?;
+    let sizes = (
+        bid_qty.unwrap_or(Fixed::ZERO),
+        ask_qty.unwrap_or(Fixed::ZERO),
+    );
+    let top = || Ok(bid.zip(ask).map(|prices| (prices, sizes)));
+    let quote = book_top(entry, top, exchange_time_ns, local_recv_ns).map(|top| {
+        out.push(Observation {
+            bid_qty,
+            ask_qty,
+            ..top
+        });
+    });
+    let mut halts = Halts::default();
+    halts.absorb(&entry.instrument, quote)?;
 
-            out.push(Observation {
-                instrument: entry.instrument.clone(),
-                kind: ObsKind::BookTop,
-                price: mid,
-                bid: Some(bid),
-                ask: Some(ask),
-                bid_qty,
-                ask_qty,
-                depth_notional_1bp: None,
-                exchange_time_ns,
-                local_recv_ns,
-                seq: None,
-                book: None,
-                funding: None,
-            });
-            emitted = true;
-        }
-    }
-
-    let unit = if entry.instrument.market == MarketKind::InversePerp {
+    let unit = if inverse {
         OpenInterestUnit::Quote
     } else {
         OpenInterestUnit::Base
@@ -333,52 +320,37 @@ pub fn decode_payload(
     ] {
         let Some(raw) = raw else { continue };
         out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind,
-            price: decimal_literal(field, raw)?,
-            bid: None,
-            ask: None,
-            bid_qty: None,
-            ask_qty: None,
-            depth_notional_1bp: None,
             exchange_time_ns,
-            local_recv_ns,
-            seq: None,
-            book: None,
             funding: (kind == ObsKind::Funding).then(|| Arc::clone(&funding)),
+            ..observation(entry, kind, decimal_literal(field, raw)?, local_recv_ns)
         });
-        emitted = true;
     }
 
-    if emitted {
-        Ok(())
-    } else {
+    let empty = if out.len() == before {
         Err(DecodeError::Control)
-    }
+    } else {
+        Ok(())
+    };
+    halts.finish(empty)
 }
 
 #[cfg(test)]
 #[expect(
     clippy::indexing_slicing,
-    reason = "fixtures are fixed-shape; an out-of-range index is a failing test, \
-              which is exactly what should happen if decoding changed"
+    reason = "fixed payloads; an out-of-range index is a failing test"
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, fixed, instrument, kinds};
     use oracle_types::Venue;
 
-    const RECV: u64 = 1_754_582_400_500_000_000;
-
-    fn map(market: MarketKind, name: &str) -> InstrumentMap {
-        let specs = vec![InstrumentSpec::new(name, market, "CRYPTO.BTC/USD").expect("valid")];
-        InstrumentMap::new(Venue::Deribit, market, &specs).expect("valid")
+    fn deribit(market: MarketKind, name: &str) -> Feed {
+        Feed::venue(decode, Venue::Deribit, market, &[instrument(name, market)])
     }
 
-    fn decode(payload: &str, market: MarketKind, name: &str) -> Vec<Observation> {
-        let mut out = Vec::new();
-        decode_payload(payload.as_bytes(), &map(market, name), RECV, &mut out).expect("decodes");
-        out
+    /// The inverse BTC perpetual, whose sizes are USD.
+    fn inverse() -> Feed {
+        deribit(MarketKind::InversePerp, "BTC-PERPETUAL")
     }
 
     /// The documented notification shape, wrapped in its JSON-RPC envelope.
@@ -395,10 +367,9 @@ mod tests {
 
     #[test]
     fn a_ticker_yields_book_trade_mark_index_and_funding() {
-        let observations = decode(TICKER, MarketKind::InversePerp, "BTC-PERPETUAL");
-        let kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
+        let observations = inverse().decoded(TICKER);
         assert_eq!(
-            kinds,
+            kinds(&observations),
             [
                 ObsKind::BookTop,
                 ObsKind::Trade,
@@ -407,11 +378,11 @@ mod tests {
                 ObsKind::Funding,
             ]
         );
-        assert_eq!(observations[0].bid, Some("36442.5".parse().expect("valid")));
-        assert_eq!(observations[0].ask, Some("36443".parse().expect("valid")));
-        assert_eq!(observations[0].price, "36442.75".parse().expect("valid"));
-        assert_eq!(observations[2].price, "36446.51".parse().expect("valid"));
-        assert_eq!(observations[4].price, "0.0000211".parse().expect("valid"));
+        assert_eq!(observations[0].bid, Some(fixed("36442.5")));
+        assert_eq!(observations[0].ask, Some(fixed("36443")));
+        assert_eq!(observations[0].price, fixed("36442.75"));
+        assert_eq!(observations[2].price, fixed("36446.51"));
+        assert_eq!(observations[4].price, fixed("0.0000211"));
     }
 
     /// An inverse contract's `best_bid_amount` is USD. Reporting it unconverted
@@ -419,15 +390,14 @@ mod tests {
     /// venue fills with base units.
     #[test]
     fn inverse_contract_sizes_are_converted_to_base_units() {
-        let observations = decode(TICKER, MarketKind::InversePerp, "BTC-PERPETUAL");
+        let quote = &inverse().decoded(TICKER)[0];
         // 5000 USD at 36442.5 is about 0.13719 BTC.
-        let expected = Fixed::from_int(5000)
-            .expect("valid")
-            .checked_div("36442.5".parse().expect("valid"))
+        let expected = fixed("5000")
+            .checked_div(fixed("36442.5"))
             .expect("representable");
-        assert_eq!(observations[0].bid_qty, Some(expected));
+        assert_eq!(quote.bid_qty, Some(expected));
         assert!(
-            observations[0].bid_qty < Some(Fixed::from_int(1).expect("valid")),
+            quote.bid_qty < Some(fixed("1")),
             "a 5000 USD bid is a fraction of a BTC, not five thousand of them"
         );
     }
@@ -437,11 +407,8 @@ mod tests {
     #[test]
     fn linear_contract_sizes_are_passed_through() {
         let linear = TICKER.replace("BTC-PERPETUAL", "BTC_USDC-PERPETUAL");
-        let observations = decode(&linear, MarketKind::LinearPerp, "BTC_USDC-PERPETUAL");
-        assert_eq!(
-            observations[0].bid_qty,
-            Some(Fixed::from_int(5000).expect("valid"))
-        );
+        let quote = &deribit(MarketKind::LinearPerp, "BTC_USDC-PERPETUAL").decoded(linear)[0];
+        assert_eq!(quote.bid_qty, Some(fixed("5000")));
     }
 
     #[test]
@@ -455,11 +422,11 @@ mod tests {
     /// The one venue here whose funding needs no interval metadata.
     #[test]
     fn funding_is_the_eight_hour_figure() {
-        let observations = decode(TICKER, MarketKind::InversePerp, "BTC-PERPETUAL");
-        assert_eq!(observations[4].kind, ObsKind::Funding);
+        let funding = &inverse().decoded(TICKER)[4];
+        assert_eq!(funding.kind, ObsKind::Funding);
         assert_eq!(
-            observations[4].price,
-            "0.0000211".parse().expect("valid"),
+            funding.price,
+            fixed("0.0000211"),
             "funding_8h, not current_funding, which is 0 here"
         );
     }
@@ -470,54 +437,53 @@ mod tests {
             "\"mark_price\":36446.51",
             "\"mark_price\":36446.123456789012",
         );
-        let observations = decode(&precise, MarketKind::InversePerp, "BTC-PERPETUAL");
-        assert_eq!(
-            observations[2].price,
-            "36446.123456789012".parse().expect("valid")
-        );
+        let mark = &inverse().decoded(precise)[2];
+        assert_eq!(mark.price, fixed("36446.123456789012"));
     }
 
     #[test]
     fn the_timestamp_is_read_as_milliseconds() {
-        let observations = decode(TICKER, MarketKind::InversePerp, "BTC-PERPETUAL");
+        let quote = &inverse().decoded(TICKER)[0];
         assert_eq!(
-            observations[0].exchange_time_ns,
-            Some(1_623_060_194_301_000_000)
+            quote.exchange_time_ns,
+            Some(millis_to_nanos(1_623_060_194_301))
         );
     }
 
     #[test]
-    fn a_closed_instrument_publishes_nothing() {
+    fn a_closed_instrument_is_suspended() {
         let closed = TICKER.replace(r#""state":"open""#, r#""state":"closed""#);
-        let mut out = Vec::new();
-        let error = decode_payload(
-            closed.as_bytes(),
-            &map(MarketKind::InversePerp, "BTC-PERPETUAL"),
-            RECV,
-            &mut out,
-        )
-        .expect_err("closed");
-        assert!(matches!(error, DecodeError::Halted(_)), "got {error:?}");
-        assert!(out.is_empty());
+        let error = inverse().refused(closed);
+        assert!(matches!(error, DecodeError::Suspended(_)), "got {error:?}");
     }
 
-    /// Deribit zeroes an empty side rather than omitting it, so a zero bid must
-    /// not become a quote at half the ask.
+    /// Deribit gives an empty side as a zero or a null price. Neither may
+    /// become a quote at half the ask, and the last quote stops counting.
     #[test]
-    fn a_zeroed_side_is_not_a_quote() {
-        let empty = TICKER.replace(r#""best_bid_price":36442.5"#, r#""best_bid_price":0"#);
-        let observations = decode(&empty, MarketKind::InversePerp, "BTC-PERPETUAL");
-        assert!(
-            observations.iter().all(|o| o.kind != ObsKind::BookTop),
-            "a zero bid must not produce a book observation"
-        );
-        // The rest of the ticker is still perfectly good.
-        assert!(observations.iter().any(|o| o.kind == ObsKind::MarkPrice));
+    fn a_zeroed_side_halts_the_book_and_keeps_the_rest() {
+        for empty in ["0", "null"] {
+            let ticker = TICKER.replace(
+                r#""best_bid_price":36442.5"#,
+                &format!(r#""best_bid_price":{empty}"#),
+            );
+            let (observations, halted) = inverse().halted(ticker);
+            assert_eq!(halted, ["BTC-PERPETUAL"], "{empty}");
+            assert_eq!(
+                kinds(&observations),
+                [
+                    ObsKind::Trade,
+                    ObsKind::MarkPrice,
+                    ObsKind::IndexPrice,
+                    ObsKind::Funding
+                ],
+                "{empty}"
+            );
+        }
     }
 
     #[test]
     fn jsonrpc_replies_and_heartbeats_are_benign() {
-        let mut out = Vec::new();
+        let mut inverse = inverse();
         for control in [
             r#"{"jsonrpc":"2.0","id":1,"result":["ticker.BTC-PERPETUAL.100ms"]}"#,
             r#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#,
@@ -525,30 +491,15 @@ mod tests {
             // The reply to the keepalive, as Deribit sent it.
             r#"{"jsonrpc":"2.0","id":2,"result":{"version":"1.2.26"},"usIn":1791613428196921,"usOut":1791613428196968,"usDiff":47,"testnet":false}"#,
         ] {
-            let error = decode_payload(
-                control.as_bytes(),
-                &map(MarketKind::InversePerp, "BTC-PERPETUAL"),
-                RECV,
-                &mut out,
-            )
-            .expect_err("not market data");
+            let error = inverse.refused(control);
             assert!(error.is_benign(), "got {error:?} for {control}");
         }
-        assert!(out.is_empty());
     }
 
     #[test]
     fn untracked_instruments_are_benign() {
         let other = TICKER.replace("BTC-PERPETUAL", "ETH-PERPETUAL");
-        let mut out = Vec::new();
-        let error = decode_payload(
-            other.as_bytes(),
-            &map(MarketKind::InversePerp, "BTC-PERPETUAL"),
-            RECV,
-            &mut out,
-        )
-        .expect_err("untracked");
-        assert!(error.is_benign());
+        assert!(inverse().refused(other).is_benign());
     }
 
     #[test]
@@ -575,59 +526,22 @@ mod tests {
         assert!(frames[0].contains("book.BTC-PERPETUAL.100ms"));
     }
 
-    /// Recorded from Deribit on 2026-10-06: the subscribe reply, a full
-    /// snapshot, and the changes after it.
-    const RECORDED_BOOK: &str = include_str!("../../tests/fixtures/deribit-book.jsonl");
-
-    fn book_map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new(
-                "BTC-PERPETUAL",
-                MarketKind::InversePerp,
-                "CRYPTO.BTC/USD.PERP_MARK",
-            )
-            .expect("valid")
-            .with_depth(),
-        ];
-        InstrumentMap::new(Venue::Deribit, MarketKind::InversePerp, &specs).expect("valid")
-    }
-
+    /// The recorded book of the inverse perpetual counts in USD; its levels
+    /// reach the book in BTC.
     #[test]
     fn a_recorded_book_follows_its_changes_in_base_units() {
-        let map = book_map();
-        let mut books = Books::default();
-        let mut last = None;
-        for line in RECORDED_BOOK.lines() {
-            let mut out = Vec::new();
-            match super::decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
-                Ok(()) => {}
-                Err(error) if error.is_benign() => {}
-                Err(error) => panic!("{error}: {line}"),
-            }
-            last = out.pop().or(last);
-        }
-        let depth = last.expect("a depth observation");
+        // Recorded from Deribit on 2026-10-06: a full snapshot and its changes.
+        let recorded = include_str!("../../tests/fixtures/deribit-book.jsonl");
+        let book = instrument("BTC-PERPETUAL", MarketKind::InversePerp).with_depth();
+        let mut feed = Feed::venue(decode, Venue::Deribit, MarketKind::InversePerp, &[book]);
+        let depth = feed
+            .replay(recorded.lines())
+            .pop()
+            .expect("a depth observation");
         assert_eq!(depth.kind, ObsKind::Depth);
-        // USD amounts become BTC: a level is worth well under 1000 BTC.
-        let book = depth.book.as_deref().expect("levels");
-        assert!(book.bids[0].qty < "1000".parse().expect("valid"));
-        assert!(book.bids[0].price < book.asks[0].price);
-    }
-
-    #[test]
-    fn a_change_that_skips_one_asks_for_a_resync() {
-        let map = book_map();
-        let mut books = Books::default();
-        let mut lines = RECORDED_BOOK
-            .lines()
-            .filter(|line| line.contains(r#""type":"#));
-        let snapshot = lines.next().expect("a snapshot");
-        super::decode(snapshot.as_bytes(), &map, &mut books, RECV, &mut Vec::new()).expect("valid");
-        let _skipped = lines.next().expect("a change");
-        let after = lines.next().expect("a later change");
-        assert!(matches!(
-            super::decode(after.as_bytes(), &map, &mut books, RECV, &mut Vec::new()),
-            Err(DecodeError::Resync(_))
-        ));
+        let levels = depth.book.as_deref().expect("levels");
+        // A level of thousands of USD is well under 1000 BTC.
+        assert!(levels.bids[0].qty < fixed("1000"));
+        assert!(levels.bids[0].price < levels.asks[0].price);
     }
 }

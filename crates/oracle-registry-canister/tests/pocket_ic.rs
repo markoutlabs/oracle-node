@@ -4,24 +4,47 @@
 //! verifies with the unchanged `Registry::verify` against the governance
 //! address the canister reports. Everything else in M5.5 rests on that.
 //!
-//! The canister wasm is built by `oracle_registry_canister::testing`, which
-//! also says how the PocketIC server is found.
+//! `oracle_registry_canister::testing` supplies the canister wasm and says how
+//! the PocketIC server is found.
 
-use candid::{Encode, Principal};
+use candid::Encode;
 use ic_http_certification::StatusCode;
 use ic_response_verification::types::VerificationInfo;
 use ic_response_verification::{ResponseVerificationError, verify_request_response_pair};
 use oracle_client::{
     Certification, FetchError, HttpDocumentSource, HttpRegistrySource, RegistrySource as _,
 };
-use oracle_registry_canister::testing::{Harness, WASM};
-use oracle_registry_canister::{HttpRequest, HttpResponse};
-use oracle_wire::{ClientList, FeedSet, NodeEntry, Registry, Signer, VerifyError};
+use oracle_registry_canister::testing::{Harness, Scenario, WASM, outsider};
+use oracle_registry_canister::{HttpRequest, HttpResponse, InitArgs};
+use oracle_types::NANOS_PER_SEC;
+use oracle_wire::{ClientList, FeedSet, Registry, Signer, VerifyError};
+use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 const REGISTRY: &str = "/registry.json";
 const CLIENTS: &str = "/clients.json";
 const FEEDS: &str = "/feeds.json";
+const DOCUMENTS: [&str; 3] = [REGISTRY, CLIENTS, FEEDS];
+/// The certificate age that an HTTP gateway accepts.
 const MAX_CERT_AGE_NS: u128 = 300 * 1_000_000_000;
+/// Response verification v2, which certifies the request path too.
+const CERTIFICATE_VERSION: u8 = 2;
+/// One minute past the 5 min certificate age that the SDK accepts.
+const REPLAY_DELAY_NS: u64 = 6 * 60 * NANOS_PER_SEC;
+const DAY_SECS: u64 = 86_400;
+/// The broadcast-key epoch until governance sets another.
+const DEFAULT_EPOCH_SECS: u64 = 60;
+/// The key that a rotation moves a node to.
+const ROTATED_SEED: u8 = 50;
+const CLIENT_SEED: u8 = 0x42;
+/// The push heartbeat of the test feed set.
+const HEARTBEAT_SECS: u64 = 30;
+/// Below two heartbeats, so a quiet feed would fall out of the price window.
+const SHORT_WINDOW_SECS: u64 = 40;
+/// A price window that two heartbeats of the test feed set fit in.
+const NARROW_WINDOW_SECS: u64 = 100;
+/// More than half of the narrow price window.
+const SLOW_HEARTBEAT_SECS: u64 = 60;
 
 /// The HTTP side: what a gateway, the SDK and the nodes check on a response.
 trait Http {
@@ -37,6 +60,8 @@ trait Http {
         response: &HttpResponse<'static>,
         now_ns: u64,
     ) -> Result<Vec<u8>, FetchError>;
+    /// The document at `path`, served and certified the way a gateway checks it.
+    fn certified<T: DeserializeOwned>(&self, path: &str) -> T;
 }
 
 impl Http for Harness {
@@ -45,7 +70,6 @@ impl Http for Harness {
         self.query("http_request", Encode!(&request).expect("encodes"))
     }
 
-    /// The check an HTTP gateway runs on a query response.
     fn verify_http(
         &self,
         path: &str,
@@ -56,14 +80,13 @@ impl Http for Harness {
             HttpRequest::get(format!("{path}?x=1")).build(),
             response,
             self.canister.as_slice(),
-            u128::from(self.pic.get_time().as_nanos_since_unix_epoch()),
+            u128::from(self.now_ns()),
             MAX_CERT_AGE_NS,
             &root_key,
-            2,
+            CERTIFICATE_VERSION,
         )
     }
 
-    /// The check the SDK and the nodes run on a fetched document, at `now_ns`.
     fn sdk_check(
         &self,
         path: &str,
@@ -78,286 +101,19 @@ impl Http for Harness {
             now_ns,
         )
     }
+
+    fn certified<T: DeserializeOwned>(&self, path: &str) -> T {
+        let response = self.get_json(path);
+        assert_eq!(response.status_code(), StatusCode::OK, "{path}");
+        let document = serde_json::from_slice(response.body()).expect("parses");
+        self.verify_http(path, response)
+            .unwrap_or_else(|error| panic!("{path} is certified: {error}"));
+        document
+    }
 }
 
 fn key(seed: u8) -> Signer {
-    Signer::from_secret_bytes([seed; 32]).expect("valid key")
-}
-
-fn node(seed: u8) -> NodeEntry {
-    NodeEntry {
-        address: key(seed).address(),
-        endpoints: vec![format!("wss://node{seed}.example/v2/ws")],
-        weight: 1,
-    }
-}
-
-#[test]
-fn the_canister_publishes_a_registry_that_verifies_with_oracle_wire() {
-    let h = Harness::new(3, "dfx_test_key", None);
-    let empty = h.get_json(REGISTRY);
-    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    h.verify_http(REGISTRY, empty)
-        .expect("the empty state is certified at init");
-    let (a, b, c) = (node(1), node(2), node(3));
-
-    // Ingress from anyone but governance is dropped before it executes.
-    let stranger = Principal::self_authenticating(b"stranger");
-    for (method, args) in [
-        ("add_node", Harness::add_args(&a)),
-        ("refresh_governance_key", Encode!().expect("encodes")),
-    ] {
-        assert!(
-            h.pic
-                .update_call(h.canister, stranger, method, args)
-                .is_err(),
-            "{method} must refuse a non-controller"
-        );
-    }
-    let version: u64 = h.query("get_version", Encode!().expect("encodes"));
-    assert_eq!(version, 0);
-
-    assert_eq!(h.add_node(&a), Ok(1));
-    assert_eq!(h.add_node(&b), Ok(2));
-    assert_eq!(h.add_node(&c), Ok(3));
-    assert!(
-        h.add_node(&a)
-            .expect_err("listed once")
-            .contains("already in the registry")
-    );
-
-    // The crux: the threshold signature verifies through the unchanged path.
-    let governance = h.governance_address();
-    let registry = h.registry();
-    assert_eq!(registry.version, 3);
-    let verified = registry
-        .verify(governance, 0)
-        .expect("the threshold signature verifies");
-    assert_eq!(verified.nodes().len(), 3);
-    assert!(matches!(
-        registry.verify(governance, 3),
-        Err(VerifyError::StaleRegistry { .. })
-    ));
-
-    // A plain query, certified the way an HTTP gateway checks it.
-    let response = h.get_json(REGISTRY);
-    assert_eq!(response.status_code(), StatusCode::OK);
-    assert_eq!(response.upgrade(), None);
-    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
-    assert_eq!(served, registry);
-    let tampered = HttpResponse::builder()
-        .with_status_code(StatusCode::OK)
-        .with_headers(response.headers().to_vec())
-        .with_body(b"{}".to_vec())
-        .build();
-    let checked = h
-        .verify_http(REGISTRY, response)
-        .expect("the gateway accepts it");
-    assert_eq!(checked.verification_version, 2);
-    assert!(
-        h.verify_http(REGISTRY, tampered).is_err(),
-        "a changed body must fail"
-    );
-    // Every other path gets a 404 that is certified too, or a gateway would
-    // answer with a verification error instead.
-    for other in ["/other", "/", "/registry.json/x"] {
-        let missing = h.get_json(other);
-        assert_eq!(missing.status_code(), StatusCode::NOT_FOUND, "{other}");
-        h.verify_http(other, missing)
-            .unwrap_or_else(|error| panic!("{other}: the 404 is certified: {error}"));
-    }
-
-    // Rotation: one call puts a new address in place of the old one.
-    let new_a = key(50).address();
-    assert!(
-        h.pic
-            .update_call(
-                h.canister,
-                stranger,
-                "replace_node",
-                Encode!(&a.address.to_string(), &new_a.to_string()).expect("encodes"),
-            )
-            .is_err(),
-        "only governance may rotate"
-    );
-    assert_eq!(h.replace_node(a.address, new_a), Ok(4));
-    let registry = h.registry();
-    registry.verify(governance, 3).expect("v4 verifies");
-    let response = h.get_json(REGISTRY);
-    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
-    assert_eq!(served, registry, "each publish re-certifies");
-    h.verify_http(REGISTRY, response).expect("v4 is certified");
-    assert_eq!(registry.nodes.len(), 3);
-    let listed_a = registry
-        .nodes
-        .iter()
-        .find(|n| n.address == new_a)
-        .expect("the new address is listed");
-    assert_eq!(listed_a.endpoints, a.endpoints);
-    assert!(registry.nodes.iter().all(|n| n.address != a.address));
-    let retired = h.listing(a.address).expect("the old address is known");
-    assert!(retired.removed_at.is_some());
-    assert_eq!(h.listing(new_a).map(|l| l.removed_at), Some(None));
-
-    // Removal never goes below min_nodes; the listing survives it.
-    assert!(
-        h.remove_node(c.address)
-            .expect_err("3 of 3")
-            .contains("below")
-    );
-    let version: Result<u64, String> = h.update(
-        h.governance,
-        "set_quorum",
-        Encode!(&2_u16, &3_u16).expect("encodes"),
-    );
-    assert_eq!(version, Ok(5));
-    assert_eq!(h.remove_node(c.address), Ok(6));
-    let registry = h.registry();
-    assert_eq!(registry.nodes.len(), 2);
-    registry.verify(governance, 5).expect("v6 verifies");
-    assert!(
-        h.listing(c.address)
-            .is_some_and(|listing| listing.removed_at.is_some())
-    );
-
-    // A retired address can never be listed again, not even by governance.
-    for refused in [h.add_node(&a), h.replace_node(b.address, c.address)] {
-        assert!(
-            refused
-                .expect_err("retired")
-                .contains("already in the registry")
-        );
-    }
-
-    // Publication is on demand: a quiet day signs nothing. Freshness comes from
-    // the certificate, which the subnet renews with its state.
-    let before = h.registry();
-    h.pass_time(86_400);
-    let after = h.registry();
-    assert_eq!(after, before, "nothing re-signs on a timer");
-    let response = h.get_json(REGISTRY);
-    let now_ns = h.pic.get_time().as_nanos_since_unix_epoch();
-    let body = h
-        .sdk_check(REGISTRY, &response, now_ns)
-        .expect("the unchanged document is certified as current");
-    assert_eq!(
-        serde_json::from_slice::<Registry>(&body).expect("parses"),
-        after
-    );
-    let replayed_later = now_ns + 6 * 60 * 1_000_000_000;
-    assert!(
-        matches!(
-            h.sdk_check(REGISTRY, &response, replayed_later),
-            Err(FetchError::Uncertified(_))
-        ),
-        "a replayed response goes stale with its certificate"
-    );
-
-    // The certification tree is not in stable memory. `post_upgrade` rebuilds it.
-    h.pic
-        .upgrade_canister(
-            h.canister,
-            WASM.clone(),
-            Encode!().expect("encodes"),
-            Some(h.governance),
-        )
-        .expect("upgrades");
-    let response = h.get_json(REGISTRY);
-    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
-    assert_eq!(served, after);
-    h.verify_http(REGISTRY, response)
-        .expect("certified after an upgrade");
-}
-
-#[test]
-fn the_canister_publishes_a_certified_client_list() {
-    let h = Harness::new(1, "dfx_test_key", None);
-    let empty = h.get_json(CLIENTS);
-    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    h.verify_http(CLIENTS, empty)
-        .expect("the empty state is certified at init");
-
-    let client = key(0x42).address();
-    let expires_at = h.now() + 86_400;
-    let args = Encode!(&client.to_checksummed(), &expires_at).expect("encodes");
-    let stranger = Principal::self_authenticating(b"stranger");
-    assert!(
-        h.pic
-            .update_call(h.canister, stranger, "add_client", args.clone())
-            .is_err(),
-        "only governance may add a client"
-    );
-    let bad = Encode!(&"0x1234", &expires_at).expect("encodes");
-    let refused: Result<u64, String> = h.update(h.governance, "add_client", bad);
-    assert!(refused.expect_err("bad address").contains("address"));
-    let version: Result<u64, String> = h.update(h.governance, "add_client", args);
-    assert_eq!(version, Ok(1));
-
-    let governance = h.governance_address();
-    let response = h.get_json(CLIENTS);
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let served: ClientList = serde_json::from_slice(response.body()).expect("parses");
-    h.verify_http(CLIENTS, response).expect("certified");
-    let verified = served.verify(governance, 0).expect("governance signed it");
-    assert_eq!(verified.get(client).map(|c| c.expires_at), Some(expires_at));
-    assert_eq!(verified.epoch_secs(), 60);
-    // The other document stays certified in the same tree.
-    h.verify_http(REGISTRY, h.get_json(REGISTRY))
-        .expect("the registry path is still certified");
-
-    let version: Result<u64, String> = h.update(
-        h.governance,
-        "set_client_expiry",
-        Encode!(&client.to_string(), &(expires_at + 60)).expect("encodes"),
-    );
-    assert_eq!(version, Ok(2));
-    let version: Result<u64, String> = h.update(
-        h.governance,
-        "remove_client",
-        Encode!(&client.to_string()).expect("encodes"),
-    );
-    assert_eq!(version, Ok(3));
-    assert!(
-        h.add_client(client, expires_at)
-            .expect_err("revoked for good")
-            .contains("already in the registry")
-    );
-    let removed: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
-    assert!(
-        removed
-            .verify(governance, 2)
-            .expect("verifies")
-            .clients()
-            .is_empty()
-    );
-
-    // Nothing re-signs on a timer; governance can re-sign on demand.
-    h.pass_time(3_600);
-    let quiet: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
-    assert_eq!(quiet, removed);
-    let version: Result<u64, String> = h.update(
-        h.governance,
-        "republish_clients",
-        Encode!().expect("encodes"),
-    );
-    assert_eq!(version, Ok(4));
-    let beat: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
-    assert_eq!(beat.clients, removed.clients);
-
-    h.pic
-        .upgrade_canister(
-            h.canister,
-            WASM.clone(),
-            Encode!().expect("encodes"),
-            Some(h.governance),
-        )
-        .expect("upgrades");
-    for path in [CLIENTS, REGISTRY] {
-        h.verify_http(path, h.get_json(path))
-            .expect("certified after an upgrade");
-    }
-    let after: ClientList = serde_json::from_slice(h.get_json(CLIENTS).body()).expect("parses");
-    assert_eq!(after, beat);
+    Signer::from_secret(&Zeroizing::new([seed; 32])).expect("valid key")
 }
 
 /// Two feeds: the peg, and a feed priced through it, with a decimal in a
@@ -390,47 +146,339 @@ fn feed_content(push_heartbeat: u64, with_usdc: bool) -> String {
     .to_string()
 }
 
-#[test]
-fn the_canister_publishes_a_certified_feed_set() {
-    let h = Harness::new(1, "dfx_test_key", None);
-    let empty = h.get_json(FEEDS);
-    assert_eq!(empty.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    h.verify_http(FEEDS, empty)
-        .expect("the empty state is certified at init");
+/// Every other path gets a 404 that is certified too, or a gateway would
+/// answer with a verification error instead.
+fn assert_other_paths_get_a_certified_404(h: &Harness) {
+    for other in ["/other", "/", "/registry.json/x"] {
+        let missing = h.get_json(other);
+        assert_eq!(missing.status_code(), StatusCode::NOT_FOUND, "{other}");
+        h.verify_http(other, missing)
+            .unwrap_or_else(|error| panic!("{other}: the 404 is certified: {error}"));
+    }
+}
 
-    let content = feed_content(30, true);
-    let stranger = Principal::self_authenticating(b"stranger");
+fn assert_every_answer_is_certified(h: &Harness) {
+    for path in DOCUMENTS {
+        let empty = h.get_json(path);
+        assert_eq!(
+            empty.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}"
+        );
+        h.verify_http(path, empty)
+            .unwrap_or_else(|error| panic!("{path}: the empty state is certified: {error}"));
+    }
+    assert_other_paths_get_a_certified_404(h);
+}
+
+/// A gateway answers an uncertified response with a verification error, so
+/// every answer is certified at init and again after an upgrade.
+#[test]
+fn every_path_is_certified_before_the_first_publish() {
+    let s = Scenario::builder().build();
+    assert_every_answer_is_certified(&s);
+    // Governance fetches the key first, as `make governance` does. Its rounds
+    // also lift PocketIC's limit on an upgrade right after the install.
+    let _ = s.refresh_governance_key();
+    s.upgrade();
+    assert_every_answer_is_certified(&s);
+}
+
+/// Ingress from anyone but governance is dropped before it executes.
+#[test]
+fn only_governance_calls_the_update_methods() {
+    let s = Scenario::builder().nodes(1).build();
+    let listed = s.node(0).address().to_string();
+    let rotated = key(ROTATED_SEED).address().to_string();
+    let client = key(CLIENT_SEED).address().to_checksummed();
+    for (method, args) in [
+        ("add_node", Harness::add_args(&s.stranger().entry())),
+        ("refresh_governance_key", Encode!().expect("encodes")),
+        ("replace_node", Encode!(&listed, &rotated).expect("encodes")),
+        (
+            "add_client",
+            Encode!(&client, &(s.now() + DAY_SECS)).expect("encodes"),
+        ),
+        (
+            "set_feed_set",
+            Encode!(&feed_content(HEARTBEAT_SECS, true)).expect("encodes"),
+        ),
+    ] {
+        assert!(
+            s.update_as(outsider(), method, args).is_err(),
+            "{method} must refuse a non-controller"
+        );
+    }
+    assert_eq!(s.version(), 1, "nothing was published");
+}
+
+/// The crux: the threshold signature verifies through the unchanged path.
+#[test]
+fn the_published_registry_verifies_with_oracle_wire() {
+    let s = Scenario::builder().nodes(3).min_nodes(3).build();
+    let governance = s.governance_address();
+    let registry = s.registry();
+    assert_eq!(registry.version, 3);
+    let verified = registry
+        .verify(governance, 0)
+        .expect("the threshold signature verifies");
+    assert_eq!(verified.nodes().len(), 3);
+    assert!(matches!(
+        registry.verify(governance, 3),
+        Err(VerifyError::StaleRegistry { .. })
+    ));
     assert!(
-        h.pic
-            .update_call(
-                h.canister,
-                stranger,
-                "set_feed_set",
-                Encode!(&content).expect("encodes")
-            )
-            .is_err(),
-        "only governance may set the feed set"
+        s.add_node(&s.node(0).entry())
+            .expect_err("listed once")
+            .contains("already in the registry")
+    );
+}
+
+/// A plain query, certified the way an HTTP gateway checks it.
+#[test]
+fn a_gateway_accepts_the_registry_and_refuses_a_changed_body() {
+    let s = Scenario::builder().nodes(1).build();
+    let response = s.get_json(REGISTRY);
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.upgrade(), None);
+    let served: Registry = serde_json::from_slice(response.body()).expect("parses");
+    assert_eq!(served, s.registry());
+    let tampered = HttpResponse::builder()
+        .with_status_code(StatusCode::OK)
+        .with_headers(response.headers().to_vec())
+        .with_body(b"{}".to_vec())
+        .build();
+    let checked = s
+        .verify_http(REGISTRY, response)
+        .expect("the gateway accepts it");
+    assert_eq!(checked.verification_version, u16::from(CERTIFICATE_VERSION));
+    assert!(
+        s.verify_http(REGISTRY, tampered).is_err(),
+        "a changed body must fail"
+    );
+    assert_other_paths_get_a_certified_404(&s);
+}
+
+/// One call puts a new address in place of the old one, and the publish
+/// certifies the new version. The old address is retired for good.
+#[test]
+fn a_rotation_puts_the_new_address_in_place_of_the_old_one() {
+    let s = Scenario::builder().nodes(3).min_nodes(3).build();
+    let old = s.node(0).entry();
+    let new = key(ROTATED_SEED).address();
+    assert_eq!(s.replace_node(old.address, new), Ok(4));
+
+    let registry = s.registry();
+    registry
+        .verify(s.governance_address(), 3)
+        .expect("v4 verifies");
+    assert_eq!(s.certified::<Registry>(REGISTRY), registry);
+    assert_eq!(registry.nodes.len(), 3);
+    let listed = registry
+        .nodes
+        .iter()
+        .find(|node| node.address == new)
+        .expect("the new address is listed");
+    assert_eq!(listed.endpoints, old.endpoints);
+    assert!(
+        registry
+            .nodes
+            .iter()
+            .all(|node| node.address != old.address)
+    );
+    let retired = s.listing(old.address).expect("the old address is known");
+    assert!(retired.removed_at.is_some());
+    assert_eq!(s.listing(new).map(|listing| listing.removed_at), Some(None));
+    assert!(
+        s.add_node(&old)
+            .expect_err("retired, even for governance")
+            .contains("already in the registry")
+    );
+}
+
+/// The canister prices with `recommended`, so a removal never goes below it.
+/// The listing survives the removal, and the address is retired for good.
+#[test]
+fn a_removal_never_goes_below_the_price_quorum() {
+    let s = Scenario::builder().nodes(3).min_nodes(3).build();
+    let removed = s.node(2).address();
+    assert!(
+        s.remove_node(removed)
+            .expect_err("3 of 3")
+            .contains("below")
+    );
+    assert_eq!(s.set_quorum(2, 3), Ok(4));
+    assert!(
+        s.remove_node(removed)
+            .expect_err("min_nodes alone does not decide")
+            .contains("set_quorum")
+    );
+    assert_eq!(s.set_quorum(2, 2), Ok(5));
+    assert_eq!(s.remove_node(removed), Ok(6));
+    let registry = s.registry();
+    assert_eq!(registry.nodes.len(), 2);
+    registry
+        .verify(s.governance_address(), 5)
+        .expect("v6 verifies");
+    assert!(
+        s.listing(removed)
+            .is_some_and(|listing| listing.removed_at.is_some())
     );
     assert!(
-        h.set_feed_set("{")
+        s.replace_node(s.node(0).address(), removed)
+            .expect_err("retired, even for governance")
+            .contains("already in the registry")
+    );
+    assert!(
+        s.set_quorum(2, 3)
+            .expect_err("above the two listed nodes")
+            .contains("halts every priced feed")
+    );
+}
+
+/// The certification tree is not in stable memory. `post_upgrade` rebuilds it.
+#[test]
+fn an_upgrade_keeps_every_document_and_its_certificate() {
+    let s = Scenario::builder().nodes(1).build();
+    s.add_client(key(CLIENT_SEED).address(), s.now() + DAY_SECS)
+        .expect("listed");
+    s.set_feed_set(&feed_content(HEARTBEAT_SECS, true))
+        .expect("published");
+    let registry: Registry = s.certified(REGISTRY);
+    let clients: ClientList = s.certified(CLIENTS);
+    let feeds: FeedSet = s.certified(FEEDS);
+
+    s.upgrade();
+    assert_eq!(s.certified::<Registry>(REGISTRY), registry);
+    assert_eq!(s.certified::<ClientList>(CLIENTS), clients);
+    assert_eq!(s.certified::<FeedSet>(FEEDS), feeds);
+}
+
+#[test]
+fn the_canister_publishes_a_certified_client_list() {
+    let s = Scenario::builder().build();
+    let client = key(CLIENT_SEED).address();
+    let expires_at = s.now() + DAY_SECS;
+    let bad = Encode!(&"0x1234", &expires_at).expect("encodes");
+    let refused: Result<u64, String> = s.update(s.governance, "add_client", bad);
+    assert!(refused.expect_err("bad address").contains("address"));
+    assert_eq!(s.add_client(client, expires_at), Ok(1));
+
+    let served: ClientList = s.certified(CLIENTS);
+    let verified = served
+        .verify(s.governance_address(), 0)
+        .expect("governance signed it");
+    assert_eq!(verified.get(client).map(|c| c.expires_at), Some(expires_at));
+    assert_eq!(verified.epoch_secs(), DEFAULT_EPOCH_SECS);
+    s.verify_http(REGISTRY, s.get_json(REGISTRY))
+        .expect("the other document stays certified in the same tree");
+}
+
+/// A removed client's address is retired, as a node's is.
+#[test]
+fn a_removed_client_is_revoked_for_good() {
+    let s = Scenario::builder().build();
+    let client = key(CLIENT_SEED).address();
+    let expires_at = s.now() + DAY_SECS;
+    assert_eq!(s.add_client(client, expires_at), Ok(1));
+    // Lowercase, as `Address` displays: the canister takes either case.
+    let lowercase = client.to_string();
+    let moved: Result<u64, String> = s.update(
+        s.governance,
+        "set_client_expiry",
+        Encode!(&lowercase, &(expires_at + 60)).expect("encodes"),
+    );
+    assert_eq!(moved, Ok(2));
+    let removed: Result<u64, String> = s.update(
+        s.governance,
+        "remove_client",
+        Encode!(&lowercase).expect("encodes"),
+    );
+    assert_eq!(removed, Ok(3));
+
+    assert!(
+        s.add_client(client, expires_at)
+            .expect_err("revoked for good")
+            .contains("already in the registry")
+    );
+    let list: ClientList = s.certified(CLIENTS);
+    assert!(
+        list.verify(s.governance_address(), 2)
+            .expect("verifies")
+            .clients()
+            .is_empty()
+    );
+}
+
+/// Publication is on demand: a quiet day signs nothing, and governance
+/// re-signs on request. Freshness comes from the certificate, which the subnet
+/// renews with its state.
+#[test]
+fn nothing_re_signs_on_a_timer() {
+    let s = Scenario::builder().nodes(1).build();
+    assert_eq!(
+        s.add_client(key(CLIENT_SEED).address(), s.now() + DAY_SECS),
+        Ok(1)
+    );
+    assert_eq!(s.set_feed_set(&feed_content(HEARTBEAT_SECS, true)), Ok(1));
+    let registry = s.registry();
+    let clients: ClientList = s.certified(CLIENTS);
+    let feeds: FeedSet = s.certified(FEEDS);
+
+    s.pass_time(DAY_SECS);
+    assert_eq!(s.registry(), registry);
+    assert_eq!(s.certified::<ClientList>(CLIENTS), clients);
+    assert_eq!(s.certified::<FeedSet>(FEEDS), feeds);
+
+    let response = s.get_json(REGISTRY);
+    let now_ns = s.now_ns();
+    let body = s
+        .sdk_check(REGISTRY, &response, now_ns)
+        .expect("the unchanged document is certified as current");
+    assert_eq!(
+        serde_json::from_slice::<Registry>(&body).expect("parses"),
+        registry
+    );
+    assert!(
+        matches!(
+            s.sdk_check(REGISTRY, &response, now_ns + REPLAY_DELAY_NS),
+            Err(FetchError::Uncertified(_))
+        ),
+        "a replayed response goes stale with its certificate"
+    );
+
+    assert_eq!(s.republish_clients(), Ok(2));
+    assert_eq!(s.certified::<ClientList>(CLIENTS).clients, clients.clients);
+    assert_eq!(s.republish_feeds(), Ok(2));
+    let again: FeedSet = s.certified(FEEDS);
+    assert_eq!(again.feeds, feeds.feeds);
+    again
+        .verify(s.governance_address(), 1)
+        .expect("the next version verifies");
+}
+
+#[test]
+fn the_canister_publishes_a_certified_feed_set() {
+    let s = Scenario::builder().build();
+    let content = feed_content(HEARTBEAT_SECS, true);
+    assert!(
+        s.set_feed_set("{")
             .expect_err("not JSON")
             .contains("not valid JSON")
     );
     let unpegged = content.replace("\"peg\":\"CRYPTO.USDT/USD\",", "");
     assert_ne!(unpegged, content, "the peg is gone");
     assert!(
-        h.set_feed_set(&unpegged)
+        s.set_feed_set(&unpegged)
             .expect_err("a converted source without a peg")
             .contains("invalid feed set")
     );
-    assert_eq!(h.set_feed_set(&content), Ok(1));
+    assert_eq!(s.set_feed_set(&content), Ok(1));
 
-    let governance = h.governance_address();
-    let response = h.get_json(FEEDS);
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let served: FeedSet = serde_json::from_slice(response.body()).expect("parses");
-    h.verify_http(FEEDS, response).expect("certified");
-    let verified = served.verify(governance, 0).expect("governance signed it");
+    let served: FeedSet = s.certified(FEEDS);
+    let verified = served
+        .verify(s.governance_address(), 0)
+        .expect("governance signed it");
     assert_eq!(verified.feeds().len(), 2);
     assert_eq!(
         verified
@@ -440,109 +488,151 @@ fn the_canister_publishes_a_certified_feed_set() {
         Some("0.1"),
         "stored and signed in canonical form"
     );
-    assert_eq!(h.feed_set(), Some(served.clone()));
+    assert_eq!(s.feed_set(), Some(served));
     for path in [REGISTRY, CLIENTS] {
-        h.verify_http(path, h.get_json(path))
+        s.verify_http(path, s.get_json(path))
             .expect("the other documents stay certified in the same tree");
     }
+}
 
-    // The priced subset and the price window must fit the set.
+#[test]
+fn the_priced_feeds_and_the_window_must_fit_the_feed_set() {
+    let s = Scenario::builder().build();
+    assert_eq!(s.set_feed_set(&feed_content(HEARTBEAT_SECS, true)), Ok(1));
     assert!(
-        h.set_feeds(&["CRYPTO.BTC/USD"])
+        s.set_feeds(&["CRYPTO.BTC/USD"])
             .expect_err("not in the set")
             .contains("not in the feed set")
     );
-    h.set_feeds(&["CRYPTO.USDC/USD"]).expect("in the set");
+    s.set_feeds(&["CRYPTO.USDC/USD"]).expect("in the set");
     assert!(
-        h.set_feed_set(&feed_content(30, false))
+        s.set_feed_set(&feed_content(HEARTBEAT_SECS, false))
             .expect_err("drops a priced feed")
             .contains("priced on-chain")
     );
     assert!(
-        h.set_price_window(40)
+        s.set_price_window(SHORT_WINDOW_SECS)
             .expect_err("below twice the heartbeat")
             .contains("drops quiet feeds")
     );
+    assert_eq!(s.set_price_window(NARROW_WINDOW_SECS), Ok(()));
     assert!(
-        h.set_feed_set(&feed_content(60, true))
+        s.set_feed_set(&feed_content(SLOW_HEARTBEAT_SECS, true))
             .expect_err("more than half the window")
             .contains("half the price window")
     );
+}
 
-    let version: Result<u64, String> =
-        h.update(h.governance, "republish_feeds", Encode!().expect("encodes"));
-    assert_eq!(version, Ok(2));
-    let again: FeedSet = serde_json::from_slice(h.get_json(FEEDS).body()).expect("parses");
-    assert_eq!(again.feeds, served.feeds);
-    again
-        .verify(governance, 1)
-        .expect("the next version verifies");
+/// The test feed set without its push pace.
+fn set_unpaced_feed_set(s: &Harness) -> Result<u64, String> {
+    let mut content: serde_json::Value =
+        serde_json::from_str(&feed_content(HEARTBEAT_SECS, true)).expect("JSON");
+    content
+        .as_object_mut()
+        .expect("an object")
+        .remove("push")
+        .expect("the pace");
+    s.set_feed_set(&content.to_string())
+}
 
-    h.pic
-        .upgrade_canister(
-            h.canister,
-            WASM.clone(),
-            Encode!().expect("encodes"),
-            Some(h.governance),
-        )
-        .expect("upgrades");
-    let response = h.get_json(FEEDS);
-    let after: FeedSet = serde_json::from_slice(response.body()).expect("parses");
-    h.verify_http(FEEDS, response)
-        .expect("certified after an upgrade");
-    assert_eq!(after, again);
+/// SPEC §3.7 P11: before the first feed set no pace exists, so the canister
+/// prices no feed, from `set_feeds` or from the install arguments.
+#[test]
+fn the_canister_prices_no_feed_before_a_feed_set_with_a_pace() {
+    let s = Scenario::builder().build();
+    assert!(
+        s.set_feeds(&["CRYPTO.USDC/USD"])
+            .expect_err("no feed set yet")
+            .contains("push")
+    );
+    assert_eq!(s.set_feeds(&[]), Ok(()), "pricing nothing needs no pace");
+    let priced = Encode!(&InitArgs {
+        key_name: "dfx_test_key".to_owned(),
+        min_nodes: 1,
+        recommended: 1,
+        epoch_secs: None,
+        feeds: Some(vec!["CRYPTO.BTC/USD".to_owned()]),
+    })
+    .expect("encodes");
+    let refused = s
+        .pic
+        .reinstall_canister(s.canister, WASM.clone(), priced, Some(s.governance))
+        .expect_err("an install that prices feeds without a feed set");
+    assert!(refused.reject_message.contains("push"), "{refused:?}");
+}
+
+/// SPEC §3.7 P11: without a pace in the feed set, each node pushes at its own
+/// pace, and the canister pays for each push.
+#[test]
+fn a_feed_set_without_a_pace_is_refused_while_the_canister_prices_feeds() {
+    let s = Scenario::builder().build();
+    assert_eq!(set_unpaced_feed_set(&s), Ok(1), "nothing is priced yet");
+    assert!(
+        s.set_feeds(&["CRYPTO.USDC/USD"])
+            .expect_err("the set has no pace")
+            .contains("push")
+    );
+    assert_eq!(s.set_feed_set(&feed_content(HEARTBEAT_SECS, true)), Ok(2));
+    s.set_feeds(&["CRYPTO.USDC/USD"])
+        .expect("the set has a pace");
+    assert!(
+        set_unpaced_feed_set(&s)
+            .expect_err("feeds are priced")
+            .contains("PUSH")
+    );
 }
 
 /// While a feed set is being signed, `set_feeds` and `set_price_window` would
 /// check against the set that the round replaces, so they wait for it.
 #[test]
 fn the_priced_feeds_and_the_window_wait_for_a_signing_round() {
-    let h = Harness::new(1, "dfx_test_key", None);
-    let content = feed_content(30, true);
-    let round = h
+    let s = Scenario::builder().build();
+    let content = feed_content(HEARTBEAT_SECS, true);
+    let round = s
         .pic
         .submit_call(
-            h.canister,
-            h.governance,
+            s.canister,
+            s.governance,
             "set_feed_set",
             Encode!(&content).expect("encodes"),
         )
         .expect("submits");
     // One round starts it; the threshold signature takes several more.
-    h.pic.tick();
-    let during = h.set_feeds(&["CRYPTO.USDC/USD"]);
+    s.pic.tick();
+    let during = s.set_feeds(&["CRYPTO.USDC/USD"]);
     assert!(
         during
             .as_ref()
             .is_err_and(|error| error.contains("in flight")),
         "{during:?}"
     );
-    let window = h.set_price_window(20);
+    let window = s.set_price_window(20);
     assert!(
         window
             .as_ref()
             .is_err_and(|error| error.contains("in flight")),
         "{window:?}"
     );
-    let reply = h.pic.await_call(round).expect("the round ends");
+    let reply = s.pic.await_call(round).expect("the round ends");
     let version: Result<u64, String> = candid::decode_one(&reply).expect("decodes");
     assert_eq!(version, Ok(1));
-    h.set_feeds(&["CRYPTO.USDC/USD"]).expect("after the round");
+    s.set_feeds(&["CRYPTO.USDC/USD"]).expect("after the round");
 }
 
 /// A round works on a copy, so a signature that fails leaves no trace and
 /// governance retries the same call.
 #[test]
 fn a_failed_signing_round_changes_nothing() {
-    let h = Harness::new(1, "no_such_key", None);
-    let a = node(1);
-    let refused = h.add_node(&a).expect_err("the key does not exist");
+    let s = Scenario::builder().key_name("no_such_key").build();
+    let node = s.stranger().entry();
+    let refused = s.add_node(&node).expect_err("the key does not exist");
     assert!(refused.contains("ecdsa_public_key"), "{refused}");
-    let version: u64 = h.query("get_version", Encode!().expect("encodes"));
-    assert_eq!(version, 0);
-    assert_eq!(h.listing(a.address), None, "the node was not listed");
+    assert_eq!(s.version(), 0);
+    assert_eq!(s.listing(node.address), None, "the node was not listed");
     assert!(
-        h.add_node(&a).expect_err("still no key").contains("ecdsa"),
+        s.add_node(&node)
+            .expect_err("still no key")
+            .contains("ecdsa"),
         "a retry runs the whole round again, not `already in the registry`"
     );
 }
@@ -551,45 +641,49 @@ fn a_failed_signing_round_changes_nothing() {
 /// certificate themselves.
 #[test]
 fn the_sdk_checks_the_certificate_through_the_http_gateway() {
-    let mut h = Harness::new(1, "dfx_test_key", None);
-    assert_eq!(h.add_node(&node(1)), Ok(1));
-    assert_eq!(h.add_client(key(0x42).address(), h.now() + 86_400), Ok(1));
-    let registry = h.registry();
-    let certification = h.certification();
-    h.make_live();
-    let url = |path: &str| h.url(path);
+    let mut s = Scenario::builder().nodes(1).build();
+    assert_eq!(
+        s.add_client(key(CLIENT_SEED).address(), s.now() + DAY_SECS),
+        Ok(1)
+    );
+    let registry = s.registry();
+    let certification = s.certification();
+    s.make_live();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
-    let fetched = runtime
-        .block_on(
-            HttpRegistrySource::new(&url(REGISTRY), certification.clone())
+    let fetch_registry = |certification: Certification| {
+        runtime.block_on(
+            HttpRegistrySource::new(&s.url(REGISTRY), certification)
                 .expect("builds")
                 .fetch(),
         )
-        .expect("certified registry");
-    assert_eq!(fetched, registry);
-    let clients: ClientList = runtime
-        .block_on(
-            HttpDocumentSource::new(&url(CLIENTS), certification)
+    };
+    let fetch = |path: &str| {
+        runtime.block_on(
+            HttpDocumentSource::new(&s.url(path), s.certification())
                 .expect("builds")
-                .fetch(),
+                .fetch::<serde_json::Value>(),
         )
-        .expect("certified client list");
-    assert_eq!(clients.version, 1);
-    let missing = runtime.block_on(
-        HttpDocumentSource::new(&url("/other"), h.certification())
-            .expect("builds")
-            .fetch::<serde_json::Value>(),
+    };
+
+    assert_eq!(
+        fetch_registry(certification).expect("certified registry"),
+        registry
     );
+    let clients: ClientList =
+        serde_json::from_value(fetch(CLIENTS).expect("certified client list"))
+            .expect("a client list");
+    assert_eq!(clients.version, 1);
+    let missing = fetch("/other");
     assert!(
         matches!(&missing, Err(FetchError::Transport(error)) if error.contains("404")),
         "the gateway passes a certified 404 through: {missing:?}"
     );
 
-    let root_key = h.root_key();
+    let root_key = s.root_key();
     for (label, wrong) in [
         (
             "another canister",
@@ -597,14 +691,10 @@ fn the_sdk_checks_the_certificate_through_the_http_gateway() {
         ),
         (
             "another network",
-            Certification::mainnet(&h.canister.to_text()).expect("valid"),
+            Certification::mainnet(&s.canister.to_text()).expect("valid"),
         ),
     ] {
-        let result = runtime.block_on(
-            HttpRegistrySource::new(&url(REGISTRY), wrong)
-                .expect("builds")
-                .fetch(),
-        );
+        let result = fetch_registry(wrong);
         assert!(
             matches!(result, Err(FetchError::Uncertified(_))),
             "{label}: {result:?}"

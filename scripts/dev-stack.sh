@@ -8,6 +8,7 @@
 #   NODES=1 scripts/dev-stack.sh    # one node
 #   KEEP=1 scripts/dev-stack.sh     # leave the local network running on exit
 #   ASSETS=1 scripts/dev-stack.sh   # also the feeds of node/assets.toml (scripts/asset-feeds.py)
+#   PUSH=2,10,1 scripts/dev-stack.sh  # another push pace; the default is the production 60,2,60
 #
 # Node N listens on 880N and serves every feed in node/all-feeds.toml. One
 # client key is listed, for a local SDK client. When the nodes serve, the
@@ -78,6 +79,25 @@ EXTRA_FEEDS=()
 SYMBOLS=()
 while IFS= read -r symbol; do SYMBOLS+=("$symbol"); done \
   < <(sed -n 's/^symbol = "\(.*\)"$/\1/p' node/all-feeds.toml ${EXTRA_FEEDS[@]+"${EXTRA_FEEDS[@]}"})
+
+say "a paced feed set, then the priced feeds"
+# The canister prices feeds only under a feed set with a push pace (SPEC §3.7
+# P11). The set holds the feeds that the nodes serve, so a node keeps them.
+IFS=, read -r heartbeat deviation interval <<<"${PUSH:-60,2,60}"
+"$BIN/oracle-node" export-feeds node/all-feeds.toml ${EXTRA_FEEDS[@]+"${EXTRA_FEEDS[@]}"} \
+  --candid "$DIR/feed-set.bin" --push-heartbeat-secs "$heartbeat" \
+  --push-deviation-bps "$deviation" --push-min-interval-secs "$interval" >/dev/null
+icp canister call oracle_registry set_feed_set --args-file "$DIR/feed-set.bin" --args-format bin \
+  --identity "$IDENTITY" | grep -q "Ok = " || die "set_feed_set failed"
+# The 14 feeds that mainnet prices, as in the README.
+PRICED='(vec { "CRYPTO.USDT/USD"; "CRYPTO.BTC/USD"; "CRYPTO.ETH/USD"; "CRYPTO.SOL/USD";
+  "CRYPTO.BTC/USDT"; "CRYPTO.BTC/USD.PERP_MARK"; "CRYPTO.ETH/USD.PERP_MARK";
+  "CRYPTO.BTC/USD.PERP_INDEX"; "CRYPTO.BTC/USDT.PERP_MARK"; "CRYPTO.ETH/USDT.PERP_MARK";
+  "CRYPTO.BTC/USDT.PERP_MID"; "CRYPTO.ETH/USDT.PERP_MID"; "CRYPTO.BTC/USD.FUNDING_8H";
+  "CRYPTO.ETH/USD.FUNDING_8H" })'
+icp canister call oracle_registry set_feeds "$PRICED" --identity "$IDENTITY" \
+  | grep -q "Ok" || die "set_feeds failed"
+echo "feed set v1 at PUSH=${PUSH:-60,2,60}, 14 feeds priced"
 
 say "$NODES nodes"
 for i in $(seq 1 "$NODES"); do

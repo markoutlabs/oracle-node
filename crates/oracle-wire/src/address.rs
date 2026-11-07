@@ -220,7 +220,7 @@ mod tests {
         if let Some(last) = secret.last_mut() {
             *last = 1;
         }
-        let signer = Signer::from_secret_bytes(secret).expect("valid key");
+        let signer = Signer::from_secret(&secret.into()).expect("valid key");
         assert_eq!(
             signer.address().to_string(),
             "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn compressed_key_round_trips_through_the_curve() {
-        let signer = Signer::from_secret_bytes([7_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[7_u8; 32].into()).expect("valid key");
         let compressed = signer.public_key();
         let uncompressed = compressed.decompress().expect("valid point");
         assert_eq!(uncompressed.first(), Some(&0x04));

@@ -18,11 +18,11 @@
 
 use std::time::Duration;
 
-use oracle_types::{Fixed, ObsKind, Observation};
+use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::clock::millis_to_nanos;
 use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
@@ -212,31 +212,8 @@ fn entry<'a>(map: &'a InstrumentMap, symbol: &str) -> Result<&'a InstrumentEntry
         .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))
 }
 
-/// Replaces the book with a whole snapshot, and emits it.
-fn whole_book(
-    symbol: &str,
-    entry: &InstrumentEntry,
-    levels: [(Side, Vec<(Fixed, Fixed)>); 2],
-    time_ms: Option<u64>,
-    books: &mut Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let book = books.book(symbol);
-    book.clear();
-    for (side, levels) in levels {
-        for (price, size) in levels {
-            book.set(side, price, size);
-        }
-    }
-    books.emit(
-        symbol,
-        entry.instrument.clone(),
-        time_ms.map(millis_to_nanos),
-        local_recv_ns,
-        out,
-    )
-}
+/// Each book message is a whole book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::WholeBook);
 
 /// Decodes one payload of either socket.
 ///
@@ -269,61 +246,51 @@ pub fn decode(
             let size = |raw| {
                 decimal_literal("size", raw).map(|size| base_units(size, entry.contract_size))
             };
-            out.push(book_top(
-                entry,
-                (
-                    decimal_literal("b", quote.b)?,
-                    decimal_literal("a", quote.a)?,
-                ),
-                (size(quote.bid_size)?, size(quote.ask_size)?),
-                quote.t.map(millis_to_nanos),
-                local_recv_ns,
-            )?);
+            let top = || {
+                // An empty side comes as an empty string.
+                if [quote.b, quote.a].iter().any(|raw| raw.get() == r#""""#) {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    (
+                        decimal_literal("b", quote.b)?,
+                        decimal_literal("a", quote.a)?,
+                    ),
+                    (size(quote.bid_size)?, size(quote.ask_size)?),
+                )))
+            };
+            let time = quote.t.map(millis_to_nanos);
+            out.push(book_top(entry, top, time, local_recv_ns)?);
             Ok(())
         }
         "spot.order_book" => {
             let book: SpotBook<'_> = parse(result)?;
             let entry = entry(map, book.s)?;
-            let side = |levels: &[(&str, &str)]| {
-                levels
-                    .iter()
-                    .map(|(price, size)| Ok((decimal("price", price)?, decimal("size", size)?)))
-                    .collect::<Result<Vec<_>, DecodeError>>()
-            };
-            let levels = [
-                (Side::Bid, side(&book.bids)?),
-                (Side::Ask, side(&book.asks)?),
-            ];
-            whole_book(book.s, entry, levels, book.t, books, local_recv_ns, out)
+            let parsed = BookMsg::whole(&book.bids, &book.asks, |(price, size)| {
+                Ok(Change::new(
+                    decimal("price", price)?,
+                    decimal("size", size)?,
+                ))
+            });
+            let parsed = parsed.map(|whole| whole.at(book.t.map(millis_to_nanos)));
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "futures.order_book" => {
             let book: FuturesBook<'_> = parse(result)?;
             let entry = entry(map, book.contract)?;
-            let side = |levels: &[Level<'_>]| {
-                levels
-                    .iter()
-                    .map(|level| {
-                        let size = decimal_literal("s", level.s)?;
-                        Ok((
-                            decimal("p", level.p)?,
-                            base_units(size, entry.contract_size),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, DecodeError>>()
-            };
-            let levels = [
-                (Side::Bid, side(&book.bids)?),
-                (Side::Ask, side(&book.asks)?),
-            ];
-            whole_book(
-                book.contract,
-                entry,
-                levels,
-                book.t,
-                books,
-                local_recv_ns,
-                out,
-            )
+            let parsed = BookMsg::whole(&book.bids, &book.asks, |level| {
+                let size = decimal_literal("s", level.s)?;
+                Ok(Change::new(
+                    decimal("p", level.p)?,
+                    base_units(size, entry.contract_size),
+                ))
+            });
+            let parsed = parsed.map(|whole| whole.at(book.t.map(millis_to_nanos)));
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "spot.trades" => {
             let trade: SpotTrade<'_> = parse(result)?;
@@ -385,7 +352,7 @@ pub fn decode(
                 let next_ns = ticker
                     .funding_next_apply
                     .and_then(|secs| secs.checked_mul(1_000_000_000));
-                let state = books.funding(ticker.contract);
+                let state = books.funding(&entry.instrument);
                 let moved =
                     state.interval_ns != interval_ns || state.next_funding_time_ns != next_ns;
                 state.interval_ns = interval_ns;
@@ -409,10 +376,13 @@ pub fn decode(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::book::DEPTH_LEVELS;
+    use crate::testing::{Feed, Replayed, contracts_of, fixed, instrument, of};
     use oracle_types::{MarketKind, OpenInterestUnit, Venue};
 
-    const RECV: u64 = 1_793_214_170_000_000_000;
+    /// 2026-10-26, before every recording: a time read in seconds would be far below it.
+    const IN_2026_NS: u64 = 1_793_000_000_000_000_000;
+
     /// Recorded from Gate on 2026-10-28: the BTC and ETH quotes, ETH's whole
     /// book, BTC's trades and a pong.
     const SPOT: &str = include_str!("../../tests/fixtures/gate-spot.jsonl");
@@ -420,51 +390,32 @@ mod tests {
     /// book, the tickers of both, and a pong.
     const FUTURES: &str = include_str!("../../tests/fixtures/gate-futures.jsonl");
 
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
+    /// Contracts of the futures recording, in coins.
+    const BTC_CONTRACT: &str = "0.0001";
+    const ETH_CONTRACT: &str = "0.01";
+
+    fn spot() -> Feed {
+        let pairs = [
+            instrument("BTC_USDT", MarketKind::Spot),
+            instrument("ETH_USDT", MarketKind::Spot).with_depth(),
+        ];
+        Feed::venue(decode, Venue::Gate, MarketKind::Spot, &pairs)
     }
 
-    fn map(market: MarketKind, symbols: &[(&str, bool, Option<&str>)]) -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = symbols
-            .iter()
-            .map(|(symbol, depth, size)| {
-                let spec = InstrumentSpec {
-                    contract_size: size.map(fixed),
-                    ..InstrumentSpec::new(*symbol, market, "CRYPTO.X/USD").expect("valid")
-                };
-                if *depth { spec.with_depth() } else { spec }
-            })
-            .collect();
-        InstrumentMap::new(Venue::Gate, market, &specs).expect("valid")
-    }
-
-    fn replay(session: &str, map: &InstrumentMap) -> (Vec<Observation>, Vec<String>) {
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for line in session.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
-    }
-
-    fn of<'a>(all: &'a [Observation], symbol: &str, kind: ObsKind) -> Vec<&'a Observation> {
-        all.iter()
-            .filter(|o| &*o.instrument.symbol == symbol && o.kind == kind)
-            .collect()
+    fn futures() -> Feed {
+        let perps = [
+            contracts_of(instrument("BTC_USDT", MarketKind::LinearPerp), BTC_CONTRACT),
+            contracts_of(instrument("ETH_USDT", MarketKind::LinearPerp), ETH_CONTRACT).with_depth(),
+        ];
+        Feed::venue(decode, Venue::Gate, MarketKind::LinearPerp, &perps)
     }
 
     #[test]
     fn a_spot_session_gives_quotes_a_whole_book_and_trades() {
-        let map = map(
-            MarketKind::Spot,
-            &[("BTC_USDT", false, None), ("ETH_USDT", true, None)],
-        );
-        let (all, errors) = replay(SPOT, &map);
+        let Replayed {
+            observations: all,
+            errors,
+        } = spot().replay_all(SPOT.lines());
         assert!(errors.is_empty(), "{errors:?}");
         let tops = of(&all, "BTC_USDT", ObsKind::BookTop);
         assert_eq!(tops.len(), 3);
@@ -474,27 +425,26 @@ mod tests {
         );
         let depth = of(&all, "ETH_USDT", ObsKind::Depth);
         assert_eq!(depth.len(), 2);
-        let book = depth[1].book.as_deref().expect("levels");
-        assert_eq!(book.bids.len(), 50);
-        assert!(book.bids[0].price < book.asks[0].price);
+        assert_eq!(
+            depth[1].book.as_deref().map(|book| book.bids.len()),
+            Some(DEPTH_LEVELS)
+        );
         let trades = of(&all, "BTC_USDT", ObsKind::Trade);
         assert_eq!(trades.len(), 3);
-        assert!(trades.iter().all(|o| {
-            o.exchange_time_ns
-                .is_some_and(|ns| ns > 1_793_000_000_000_000_000)
-        }));
+        // A time in 2026: the milliseconds were read, not the seconds.
+        assert!(
+            trades
+                .iter()
+                .all(|o| { o.exchange_time_ns.is_some_and(|ns| ns > IN_2026_NS) })
+        );
     }
 
     #[test]
     fn a_futures_session_sizes_in_coins_and_carries_funding() {
-        let map = map(
-            MarketKind::LinearPerp,
-            &[
-                ("BTC_USDT", false, Some("0.0001")),
-                ("ETH_USDT", true, Some("0.01")),
-            ],
-        );
-        let (all, errors) = replay(FUTURES, &map);
+        let Replayed {
+            observations: all,
+            errors,
+        } = futures().replay_all(FUTURES.lines());
         assert!(errors.is_empty(), "{errors:?}");
 
         let top = of(&all, "BTC_USDT", ObsKind::BookTop)[0];
@@ -502,16 +452,13 @@ mod tests {
             .lines()
             .find(|l| l.contains("futures.book_ticker\",\"event\":\"update"))
             .expect("a quote");
-        let contracts: serde_json::Value = serde_json::from_str(line).expect("JSON");
-        let bid_contracts = contracts["result"]["B"].as_u64().expect("contracts");
-        assert_eq!(
-            top.bid_qty,
-            Some(
-                fixed(&bid_contracts.to_string())
-                    .checked_mul(fixed("0.0001"))
-                    .expect("fits")
-            )
-        );
+        let quote: serde_json::Value = serde_json::from_str(line).expect("JSON");
+        let bid_contracts = quote["result"]["B"]
+            .as_u64()
+            .expect("contracts")
+            .to_string();
+        let bid_coins = fixed(&bid_contracts).checked_mul(fixed(BTC_CONTRACT));
+        assert_eq!(top.bid_qty, Some(bid_coins.expect("fits")));
 
         assert_eq!(of(&all, "ETH_USDT", ObsKind::Depth).len(), 2);
         assert_eq!(of(&all, "BTC_USDT", ObsKind::MarkPrice).len(), 2);
@@ -520,30 +467,28 @@ mod tests {
         let info = funding[0].funding.as_deref().expect("funding");
         assert_eq!(info.interval_ns, Some(8 * 3_600_000_000_000));
         assert_eq!(info.next_funding_time_ns, Some(1_793_232_000_000_000_000));
-        let (coins, unit) = info.open_interest.expect("open interest");
-        assert_eq!(unit, OpenInterestUnit::Base);
-        assert_eq!(coins, fixed("719893.514"));
+        assert_eq!(
+            info.open_interest,
+            Some((fixed("719893.514"), OpenInterestUnit::Base))
+        );
         assert_eq!(of(&all, "BTC_USDT", ObsKind::Trade).len(), 3);
     }
 
     #[test]
     fn pongs_and_acks_are_benign_and_a_refusal_is_not() {
-        let map = map(MarketKind::Spot, &[("BTC_USDT", false, None)]);
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let mut decode_one =
-            |payload: &str| decode(payload.as_bytes(), &map, &mut books, RECV, &mut out);
+        let mut spot = spot();
         assert!(
-            decode_one(r#"{"time":1,"channel":"spot.pong","event":"","result":null}"#)
-                .is_err_and(|e| e.is_benign())
+            spot.refused(r#"{"time":1,"channel":"spot.pong","event":"","result":null}"#)
+                .is_benign()
         );
         assert!(
-            decode_one(r#"{"time":1,"channel":"spot.trades","event":"subscribe","result":{"status":"success"}}"#)
-                .is_err_and(|e| e.is_benign())
+            spot.refused(r#"{"time":1,"channel":"spot.trades","event":"subscribe","result":{"status":"success"}}"#)
+                .is_benign()
         );
         assert!(
-            decode_one(r#"{"time":1,"channel":"spot.trades","event":"subscribe","error":{"code":2,"message":"bad"},"result":{"status":"fail"}}"#)
-                .is_err_and(|e| !e.is_benign())
+            !spot
+                .refused(r#"{"time":1,"channel":"spot.trades","event":"subscribe","error":{"code":2,"message":"bad"},"result":{"status":"fail"}}"#)
+                .is_benign()
         );
     }
 

@@ -827,7 +827,7 @@ mod tests {
     }
 
     fn signed(symbol: &Symbol, seq: u64) -> SignedUpdate {
-        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[5; 32].into()).expect("valid key");
         signer.sign_update(&PriceUpdate {
             feed_id: feed_id(symbol),
             flags: Flags::NONE,
@@ -890,7 +890,7 @@ mod tests {
     }
 
     fn venues(symbol: &Symbol, seq: u64) -> SignedVenueReport {
-        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[5; 32].into()).expect("valid key");
         signer
             .sign_venue_report(&oracle_types::VenueReport {
                 feed_id: feed_id(symbol),
@@ -934,7 +934,7 @@ mod tests {
     }
 
     fn book(seq: u64, snapshot: bool) -> SignedBookUpdate {
-        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[5; 32].into()).expect("valid key");
         signer
             .sign_book_update(&oracle_types::BookUpdate {
                 venue: Venue::Binance,
@@ -966,7 +966,7 @@ mod tests {
     }
 
     fn funding(symbol: &str, seq: u64) -> SignedFundingUpdate {
-        let signer = Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[5; 32].into()).expect("valid key");
         signer
             .sign_funding_update(&oracle_types::FundingUpdate {
                 venue: oracle_types::Venue::Bybit,

@@ -19,7 +19,7 @@ use oracle_types::{ObsKind, Observation};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::{DecodeError, InstrumentMap};
 
 use super::{decimal, integer, observation, parse};
@@ -39,6 +39,9 @@ pub const MARKETS_PER_CONNECTION: usize = 20;
 const _: () = assert!(MARKETS_PER_CONNECTION * 2 <= 40);
 
 const BOOK: &str = "order_book_";
+
+/// Each book message is a whole book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::WholeBook);
 const TRADES: &str = "live_trades_";
 
 fn subscribe(channel: &str) -> String {
@@ -117,27 +120,18 @@ pub fn decode(
             let entry = map
                 .lookup(symbol)
                 .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))?;
-            let snapshot: Book<'_> = parse(data()?)?;
-            let book = books.book(symbol);
-            book.clear();
-            for (side, levels) in [(Side::Bid, &snapshot.bids), (Side::Ask, &snapshot.asks)] {
-                for (price, size) in levels {
-                    book.set(side, decimal("price", price)?, decimal("amount", size)?);
-                }
-            }
-            let emit = if entry.depth {
-                Books::emit
-            } else {
-                Books::emit_top
-            };
-            emit(
-                books,
-                symbol,
-                entry.instrument.clone(),
-                micros(snapshot.microtimestamp)?,
-                local_recv_ns,
-                out,
-            )
+            let parsed = parse::<Book<'_>>(data()?).and_then(|snapshot| {
+                let whole = BookMsg::whole(&snapshot.bids, &snapshot.asks, |(price, size)| {
+                    Ok(Change::new(
+                        decimal("price", price)?,
+                        decimal("amount", size)?,
+                    ))
+                })?;
+                Ok(whole.at(micros(snapshot.microtimestamp)?))
+            });
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "trade" => {
             let symbol = envelope
@@ -177,108 +171,77 @@ pub fn decode(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
-    use oracle_types::{Fixed, MarketKind, Venue};
+    use crate::book::DEPTH_LEVELS;
+    use crate::testing::{Feed, Replayed, fixed, instrument, of};
+    use oracle_types::{MarketKind, Venue};
 
-    const RECV: u64 = 1_793_212_030_000_000_000;
+    /// 2026-10-26, before every recording: a time read in seconds would be far below it.
+    const IN_2026_NS: u64 = 1_793_000_000_000_000_000;
+
     /// Recorded from Bitstamp on 2026-10-28: the acks, a refused channel, the
     /// BTC and USDT books, BTC's trades and a heartbeat.
     const SPOT: &str = include_str!("../../tests/fixtures/bitstamp-spot.jsonl");
 
-    fn map(depth: bool) -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = [("btcusd", depth), ("usdtusd", false)]
-            .into_iter()
-            .map(|(symbol, depth)| {
-                let spec =
-                    InstrumentSpec::new(symbol, MarketKind::Spot, "CRYPTO.X/USD").expect("valid");
-                if depth { spec.with_depth() } else { spec }
-            })
-            .collect();
-        InstrumentMap::new(Venue::Bitstamp, MarketKind::Spot, &specs).expect("valid")
-    }
-
-    fn replay(map: &InstrumentMap) -> (Vec<Observation>, Vec<String>) {
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for line in SPOT.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
+    /// BTC with or without its book, and the USDT peg's top.
+    fn bitstamp(depth: bool) -> Feed {
+        let btc = instrument("btcusd", MarketKind::Spot);
+        let pairs = [
+            if depth { btc.with_depth() } else { btc },
+            instrument("usdtusd", MarketKind::Spot),
+        ];
+        Feed::venue(decode, Venue::Bitstamp, MarketKind::Spot, &pairs)
     }
 
     #[test]
     fn a_session_gives_books_and_trades() {
-        let (all, errors) = replay(&map(true));
-        // Only the refused channel is an error.
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("Invalid channel"), "{errors:?}");
+        let Replayed {
+            observations: all,
+            errors,
+        } = bitstamp(true).replay_all(SPOT.lines());
+        let [refused] = errors.as_slice() else {
+            panic!("only the refused channel is an error: {errors:?}");
+        };
+        assert!(refused.to_string().contains("Invalid channel"), "{refused}");
 
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
-        assert_eq!(&*depth.instrument.symbol, "btcusd");
+        let depth = *of(&all, "btcusd", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
-        assert_eq!(book.bids.len(), 50);
-        assert!(book.bids[0].price < book.asks[0].price);
+        assert_eq!(book.bids.len(), DEPTH_LEVELS);
         assert_eq!(depth.bid, Some(book.bids[0].price));
-        assert!(
-            depth
-                .exchange_time_ns
-                .is_some_and(|ns| ns > 1_793_000_000_000_000_000)
-        );
+        // A time in 2026: the microseconds were read, not the seconds.
+        assert!(depth.exchange_time_ns.is_some_and(|ns| ns > IN_2026_NS));
 
         // The USDT book wants no depth, so it gives only its top.
-        let peg = all
-            .iter()
-            .find(|o| &*o.instrument.symbol == "usdtusd")
-            .expect("a quote");
-        assert_eq!(peg.kind, ObsKind::BookTop);
-        assert!(peg.bid < peg.ask);
-        assert!(peg.price > "0.99".parse::<Fixed>().expect("valid"));
+        let peg = of(&all, "usdtusd", ObsKind::BookTop);
+        assert!(of(&all, "usdtusd", ObsKind::Depth).is_empty());
+        assert!(peg[0].bid < peg[0].ask);
+        assert!(peg[0].price > fixed("0.99"));
 
-        let trades: Vec<_> = all.iter().filter(|o| o.kind == ObsKind::Trade).collect();
+        let trades = of(&all, "btcusd", ObsKind::Trade);
         assert_eq!(trades.len(), 3);
         assert!(trades.iter().all(|o| o.exchange_time_ns.is_some()));
     }
 
     #[test]
     fn a_market_without_depth_gives_its_top() {
-        let (all, _) = replay(&map(false));
+        let all = bitstamp(false).replay_all(SPOT.lines()).observations;
         assert!(all.iter().all(|o| o.kind != ObsKind::Depth));
-        assert!(
-            all.iter()
-                .any(|o| o.kind == ObsKind::BookTop && &*o.instrument.symbol == "btcusd")
-        );
+        assert!(!of(&all, "btcusd", ObsKind::BookTop).is_empty());
     }
 
     #[test]
     fn control_events_are_benign_and_a_reconnect_ends_the_connection() {
-        let map = map(true);
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let mut decode_one =
-            |payload: &str| decode(payload.as_bytes(), &map, &mut books, RECV, &mut out);
+        let mut feed = bitstamp(true);
         assert!(
-            decode_one(r#"{"event":"bts:heartbeat","channel":"","data":{"status":"success"}}"#)
-                .is_err_and(|error| error.is_benign())
+            feed.refused(r#"{"event":"bts:heartbeat","channel":"","data":{"status":"success"}}"#)
+                .is_benign()
         );
         assert!(matches!(
-            decode_one(r#"{"event":"bts:request_reconnect","channel":"","data":""}"#),
-            Err(DecodeError::Resync(_))
+            feed.refused(r#"{"event":"bts:request_reconnect","channel":"","data":""}"#),
+            DecodeError::Resync(_)
         ));
-        assert!(
-            decode_one(
-                r#"{"event":"data","channel":"order_book_ethusd","data":{"bids":[],"asks":[]}}"#
-            )
-            .is_err_and(|error| error.is_benign())
-        );
+        let untracked =
+            r#"{"event":"data","channel":"order_book_ethusd","data":{"bids":[],"asks":[]}}"#;
+        assert!(feed.refused(untracked).is_benign());
     }
 
     #[test]

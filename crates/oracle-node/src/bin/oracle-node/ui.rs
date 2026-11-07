@@ -10,9 +10,12 @@ use oracle_node::{Endpoint, NodeSetup, RegistrySource, Written};
 /// `true` when a person can answer prompts. cliclack draws on stderr, and a
 /// redirected stdout means a script is reading.
 pub(crate) fn interactive() -> bool {
-    std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal()
+    std::io::stdin().is_terminal() && stdout_is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// `false` for a pipe or a file, which a log or a script may keep.
+pub(crate) fn stdout_is_terminal() -> bool {
+    std::io::stdout().is_terminal()
 }
 
 pub(crate) fn heading<D: Display>(text: D) -> StyledObject<D> {

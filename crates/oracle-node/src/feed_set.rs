@@ -9,7 +9,7 @@ use oracle_ingest::InstrumentSpec;
 use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_types::Venue;
-use oracle_wire::{Address, FeedSet, FeedSettings, VerifiedFeedSet};
+use oracle_wire::{Address, FeedSet, FeedSettings, NodeEntry, VerifiedFeedSet};
 
 use crate::config::{
     ConfigError, DEFAULT_TICK_MS, EndpointSettings, NodeConfig, ResolvedConfig, resolve_feeds,
@@ -121,6 +121,33 @@ pub fn changed_venues(old: &Subscriptions, new: &Subscriptions) -> Vec<Venue> {
         .filter(|venue| old.get(*venue) != new.get(*venue))
         .copied()
         .collect()
+}
+
+/// A node's change slot: its place in the registry, and the node count (SPEC §3.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    /// The node's place in the address order, from 0.
+    pub index: usize,
+    /// The nodes that the registry lists.
+    pub nodes: usize,
+}
+
+/// The place of `address` among `nodes`, in the address order that the registry signature covers.
+///
+/// The JSON order of the list is not signed, so it does not count. An unlisted
+/// node goes after every listed one: its frames count for no quorum.
+#[must_use]
+pub fn place(nodes: &[NodeEntry], address: Address) -> Place {
+    let listed = nodes.iter().any(|node| node.address == address);
+    let index = if listed {
+        nodes.iter().filter(|node| node.address < address).count()
+    } else {
+        nodes.len()
+    };
+    Place {
+        index,
+        nodes: nodes.len(),
+    }
 }
 
 /// The cached feed set sits next to the node's config.
@@ -312,6 +339,49 @@ mod tests {
         assert!(again.dropped_endpoints.is_empty());
     }
 
+    fn listed(addresses: &[Address]) -> Vec<NodeEntry> {
+        addresses
+            .iter()
+            .map(|&address| NodeEntry {
+                address,
+                endpoints: vec!["wss://node.example/v2/ws".to_owned()],
+                weight: 1,
+            })
+            .collect()
+    }
+
+    /// A rotation moves a node in the address order. Node A rotates to A',
+    /// which sorts after C, so the slot must come from the registry read when the set arrives.
+    #[test]
+    fn two_nodes_never_change_in_one_slot_after_a_rotation() {
+        let [a, b, c, rotated] =
+            [0x10, 0x20, 0x30, 0x40].map(|byte| Address::from_bytes([byte; 20]));
+        let before = listed(&[a, b, c]);
+        let after = listed(&[rotated, b, c]);
+        // C kept its place from its own start, and A' restarts in that place.
+        assert_eq!(place(&before, c), place(&after, rotated));
+
+        let issued = 1_000;
+        let slots = oracle_wire::Slots::default();
+        let changes: BTreeSet<u64> = [rotated, b, c]
+            .into_iter()
+            .map(|node| {
+                let Place { index, nodes } = place(&after, node);
+                slots.apply_at(issued, index, nodes, issued)
+            })
+            .collect();
+        assert_eq!(changes.len(), 3, "{changes:?}");
+    }
+
+    #[test]
+    fn the_place_follows_the_address_order_and_an_unlisted_node_goes_last() {
+        let [low, high, absent] = [0x10, 0x20, 0x15].map(|byte| Address::from_bytes([byte; 20]));
+        let nodes = listed(&[high, low]);
+        assert_eq!(place(&nodes, low), Place { index: 0, nodes: 2 });
+        assert_eq!(place(&nodes, high), Place { index: 1, nodes: 2 });
+        assert_eq!(place(&nodes, absent), Place { index: 2, nodes: 2 });
+    }
+
     #[test]
     fn the_cache_round_trips_and_a_bad_file_reads_as_none() {
         let dir = std::env::temp_dir().join(format!("network-feeds-{}", std::process::id()));
@@ -322,7 +392,7 @@ mod tests {
             Some("network-feeds.json")
         );
         assert!(read_cache(&path).is_none());
-        let governance = oracle_wire::Signer::from_secret_bytes([0x33; 32]).expect("a key");
+        let governance = oracle_wire::Signer::from_secret(&[0x33; 32].into()).expect("a key");
         let set = FeedSet::sign(
             &governance,
             3,

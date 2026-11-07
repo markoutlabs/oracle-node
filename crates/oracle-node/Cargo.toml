@@ -7,10 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Reads `signing.key_env`, for local playgrounds only: the environment keeps the key.
+dev-key-env = []
+
 [dependencies]
 oracle-agg.workspace = true
 oracle-client = { workspace = true, features = ["libsecp"] }
 oracle-ingest.workspace = true
+oracle-registry-api.workspace = true
 oracle-server.workspace = true
 oracle-types.workspace = true
 oracle-wire = { workspace = true, features = ["libsecp"] }

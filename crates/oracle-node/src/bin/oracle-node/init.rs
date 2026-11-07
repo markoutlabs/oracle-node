@@ -3,8 +3,9 @@
 //! As root without `--out`, init installs the node as a system service: see
 //! `system`. At a terminal without `--out`, the wizard asks for each value.
 //! Otherwise the flags give them, and the output is plain text a script can
-//! read. The node always fetches from the registry canister: the mainnet one
-//! unless `--canister` and `--governance` name another.
+//! read. Without `--out`, the seed goes to a pipe or a file only with
+//! `--print-secret`. The node always fetches from the registry canister: the
+//! mainnet one unless `--canister` and `--governance` name another.
 
 use std::path::PathBuf;
 
@@ -55,6 +56,10 @@ pub(crate) struct InitArgs {
     /// turns one on, and does not open the port.
     #[arg(long, conflicts_with = "out")]
     pub(crate) no_firewall: bool,
+    /// Print the secret seed when stdout is not a terminal, such as a pipe or
+    /// a file. Without it, init refuses: the seed would land in a log.
+    #[arg(long, conflicts_with = "out")]
+    pub(crate) print_secret: bool,
 }
 
 impl InitArgs {
@@ -76,6 +81,12 @@ pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
     }
     if args.out.is_none() && ui::interactive() {
         return wizard::run(&args);
+    }
+    if args.out.is_none() && !args.print_secret && !ui::stdout_is_terminal() {
+        anyhow::bail!(
+            "stdout is not a terminal, so the secret seed would land in a pipe or a file. \
+             Use `--out DIR` to write it to a 0600 file, or `--print-secret` to print it anyway"
+        );
     }
     let key = NodeKey::generate()?;
     let entry = key.entry(&args.endpoint());
@@ -117,8 +128,8 @@ pub(crate) fn run(args: InitArgs) -> anyhow::Result<()> {
             &*key.secret_text()
         );
         println!(
-            "\n  This is now in your terminal scrollback and shell history. Re-run\n  \
-             with `--out DIR` to write it to a 0600 file instead."
+            "\n  This is now in your terminal scrollback, and in every file or pipe that\n  \
+             reads this output. Re-run with `--out DIR` to write it to a 0600 file instead."
         );
         let entry = serde_json::to_string_pretty(&entry)?;
         println!("\n{}\n\n{entry}", ui::heading("Send to governance"));

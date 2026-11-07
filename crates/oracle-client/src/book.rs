@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use oracle_types::{BOOK_EXPO, BookLevel, BookUpdate, Fixed, FixedError, InstrumentId};
+use oracle_types::{
+    BOOK_EXPO, BookLevel, BookUpdate, Fixed, FixedError, InstrumentId, MAX_BOOK_LEVELS,
+};
 use oracle_wire::Address;
 
 /// A venue book as one node sent it.
@@ -76,7 +78,14 @@ impl Book {
                 }
             }
         }
-        true
+        // A node's book never holds more levels than one snapshot carries, so a
+        // longer side is a wrong book, and its levels need not stay in memory.
+        if self.bids.len().max(self.asks.len()) > MAX_BOOK_LEVELS {
+            self.bids.clear();
+            self.asks.clear();
+            self.valid = false;
+        }
+        self.valid
     }
 
     /// Returns `true` once a snapshot arrived and no frame was missed after it.
@@ -185,6 +194,22 @@ mod tests {
         assert_eq!(bids, vec![99, 98]);
         assert_eq!(book.best_ask().map(|level| level.price), Some(101));
         assert_eq!(book.asks().count(), 2);
+    }
+
+    #[test]
+    fn deltas_that_grow_a_side_past_one_snapshot_invalidate_the_book() {
+        let mut book = book();
+        assert!(book.apply(&update(1, true, &[(1_000, 1)], &[(2_000, 1)])));
+        let mut seq = 1;
+        let mut price = 1_000;
+        while book.bids().count() < MAX_BOOK_LEVELS {
+            seq += 1;
+            price -= 1;
+            assert!(book.apply(&update(seq, false, &[(price, 1)], &[])));
+        }
+        assert!(!book.apply(&update(seq + 1, false, &[(price - 1, 1)], &[])));
+        assert_eq!(book.bids().count(), 0, "a wrong book keeps no levels");
+        assert!(book.apply(&update(seq + 2, true, &[(1_000, 1)], &[(2_000, 1)])));
     }
 
     #[test]

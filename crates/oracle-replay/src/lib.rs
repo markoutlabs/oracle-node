@@ -157,9 +157,10 @@ impl Transport for ReplayConn {
             .take(|record| record.url() == self.url && !matches!(record, Record::Connect { .. }))
             .await;
         Ok(match record {
-            Some(Record::Text { text, .. }) => Some(Frame::Text(text)),
+            // The socket's own frame types, so a replay takes the live decode path.
+            Some(Record::Text { text, .. }) => Some(Frame::Utf8(text.into())),
             Some(Record::Rest { text, .. }) => Some(Frame::Rest(text)),
-            Some(Record::Binary { bytes, .. }) => Some(Frame::Binary(bytes)),
+            Some(Record::Binary { bytes, .. }) => Some(Frame::Bytes(bytes.into())),
             Some(Record::Control { .. }) => Some(Frame::Pong),
             Some(Record::Close { .. } | Record::Connect { .. }) | None => None,
         })

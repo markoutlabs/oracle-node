@@ -6,8 +6,8 @@ use std::time::Duration;
 use futures_util::{SinkExt as _, StreamExt as _};
 use oracle_client::testing::{TestNode, TestSource, governance, signed_registry};
 use oracle_client::{OracleClient, Subscription};
-use oracle_transport::{NodeHandshake, os_rng};
-use oracle_wire::{Address, NodeEntry, Registry};
+use oracle_transport::{HandshakeMessage, NodeHandshake, os_rng};
+use oracle_wire::{Address, ClientEntry, ClientList, NodeEntry, Registry, Signer};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -57,7 +57,7 @@ fn client_for(registry: &Registry, source: Arc<TestSource>) -> OracleClient {
         .quorum(3)
         .registry_source(source)
         .registry_poll_interval(POLL)
-        .client_key(oracle_wire::Signer::from_secret_bytes([0x51; 32]).expect("valid key"))
+        .client_key(oracle_wire::Signer::from_secret(&[0x51; 32].into()).expect("valid key"))
         .build()
         .expect("builds")
 }
@@ -276,7 +276,7 @@ async fn a_challenge_from_a_new_address_fetches_the_registry_once() {
         .quorum(1)
         .i_understand_this_provides_no_protection_against_a_bad_node()
         .registry_source(source.clone())
-        .client_key(oracle_wire::Signer::from_secret_bytes([0x51; 32]).expect("valid key"))
+        .client_key(oracle_wire::Signer::from_secret(&[0x51; 32].into()).expect("valid key"))
         .build()
         .expect("builds");
     client.subscribe(&[SYMBOL]).await.expect("subscribes");
@@ -347,4 +347,133 @@ async fn one_subscription_connects_each_node_once() {
         .expect("subscribes");
     let seen = collect(&mut client, &mut events, &labels.map(Connected)).await;
     assert_eq!(seen, sorted(labels.map(Connected).to_vec()));
+}
+
+/// One endpoint that is down must not keep its node out of the quorum.
+#[tokio::test]
+async fn a_node_whose_first_endpoint_is_down_connects_to_the_next() {
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let refused = format!("ws://{}/v2/ws", listener.local_addr().expect("bound"));
+    drop(listener);
+    let nodes: Vec<TestNode> = (1..=3_u8).map(TestNode::new).collect();
+    let mut entries = Vec::new();
+    for (node, label) in nodes.iter().zip(["a", "b", "c"]) {
+        let mut entry = entry_at(node, &refused);
+        entry.endpoints.push(fake_node(label, tx.clone()).await);
+        entries.push(entry);
+    }
+    let registry = signed_registry(1, entries);
+    let mut client = client_for(&registry, TestSource::serving(registry.clone()));
+    client.subscribe(&[SYMBOL]).await.expect("subscribes");
+
+    let want = [Connected("a"), Connected("b"), Connected("c")];
+    assert_eq!(
+        collect(&mut client, &mut events, &want).await,
+        sorted(want.to_vec())
+    );
+}
+
+/// Plays `node` for the client key `0x51`: the handshake, one subscription,
+/// then a close. Each served session sends `label`.
+async fn serving_node(
+    node: Arc<TestNode>,
+    label: &'static str,
+    events: mpsc::UnboundedSender<&'static str>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let url = format!("ws://{}/v2/ws", listener.local_addr().expect("bound"));
+    let now = oracle_client::now_unix_nanos() / 1_000_000_000;
+    let client = Signer::from_secret(&[0x51; 32].into())
+        .expect("valid key")
+        .address();
+    let clients = ClientList::sign(
+        &governance(),
+        1,
+        now,
+        60,
+        vec![ClientEntry {
+            address: client,
+            expires_at: now + 3_600,
+        }],
+    )
+    .expect("signs")
+    .verify(governance().address(), 0)
+    .expect("verifies");
+    let clients = Arc::new(clients);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (node, clients, events) = (Arc::clone(&node), Arc::clone(&clients), events.clone());
+            tokio::spawn(async move {
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (handshake, challenge) =
+                    NodeHandshake::start(node.signing_address(), &mut os_rng());
+                let text = serde_json::to_string(&challenge).expect("serialises");
+                let _ = socket.send(Message::Text(text.into())).await;
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    return;
+                };
+                let auth: HandshakeMessage = serde_json::from_str(&text).expect("an auth message");
+                let admitted = handshake
+                    .verify(&auth, &clients, now)
+                    .expect("a listed client");
+                let (ok, _session) = admitted
+                    .accept(node.signer(), &[], &mut os_rng())
+                    .expect("accepts");
+                let text = serde_json::to_string(&ok).expect("serialises");
+                let _ = socket.send(Message::Text(text.into())).await;
+                let _ = socket.next().await;
+                let _ = events.send(label);
+                let _ = socket.close(None).await;
+            });
+        }
+    });
+    url
+}
+
+/// After a session ends, the next round dials the endpoint that served it
+/// first, not the first one in the list.
+#[tokio::test]
+async fn a_round_starts_at_the_endpoint_that_served_last() {
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let refusing = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let first = format!("ws://{}/v2/ws", refusing.local_addr().expect("bound"));
+    let dialled = tx.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = refusing.accept().await {
+            let _ = dialled.send("first");
+            drop(stream);
+        }
+    });
+    let node = Arc::new(TestNode::new(1));
+    let second = serving_node(Arc::clone(&node), "second", tx).await;
+    let mut entry = entry_at(&node, &first);
+    entry.endpoints.push(second);
+    let registry = signed_registry(1, vec![entry]);
+    let verified = registry
+        .verify(governance().address(), 0)
+        .expect("verifies");
+    let mut client = OracleClient::builder(verified)
+        .quorum(1)
+        .i_understand_this_provides_no_protection_against_a_bad_node()
+        .client_key(Signer::from_secret(&[0x51; 32].into()).expect("valid key"))
+        .build()
+        .expect("builds");
+    client.subscribe(&[SYMBOL]).await.expect("subscribes");
+
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.iter().filter(|label| **label == "second").count() < 3 {
+        tokio::select! {
+            Some(label) = events.recv() => seen.push(label),
+            () = tokio::time::sleep_until(deadline) => panic!("three sessions in time; saw {seen:?}"),
+        }
+    }
+    assert_eq!(
+        seen.iter().filter(|label| **label == "first").count(),
+        1,
+        "{seen:?}"
+    );
 }

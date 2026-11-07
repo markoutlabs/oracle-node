@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn a_new_feed_set_serves_its_feeds_and_drops_the_others() {
         let state = state();
-        let signer = oracle_wire::Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = oracle_wire::Signer::from_secret(&[5; 32].into()).expect("valid key");
         let btc = feed_id(&"CRYPTO.BTC/USD".parse::<Symbol>().expect("valid"));
         let sol: Symbol = "CRYPTO.SOL/USD".parse().expect("valid");
         let update = |id| signer.sign_update(&crate::testing::sample_update(id));
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn updates_for_uncatalogued_feeds_are_not_published() {
         let state = state();
-        let signer = oracle_wire::Signer::from_secret_bytes([5; 32]).expect("valid key");
+        let signer = oracle_wire::Signer::from_secret(&[5; 32].into()).expect("valid key");
         let mut update = crate::testing::sample_update(feed_id(
             &"CRYPTO.BTC/USD".parse::<Symbol>().expect("valid"),
         ));

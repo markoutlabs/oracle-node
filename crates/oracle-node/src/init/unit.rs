@@ -1,6 +1,7 @@
 //! The systemd unit `init` writes beside the config.
 //!
-//! `Type=notify`: the node tells systemd when it serves and what it is doing.
+//! `Type=notify`: the node tells systemd when it serves and what it is doing,
+//! and its pipeline pings the watchdog.
 //! The sandboxing leaves the node what it uses: reading its directory,
 //! binding its port, and outbound TCP to the venues and the canister.
 
@@ -51,6 +52,8 @@ User={user}
 ExecStart={exe} start {config}
 Restart=on-failure
 RestartSec=10s
+# The pipeline pings each 15 s; a hung one stops, and systemd restarts the node.
+WatchdogSec=30s
 # Exit 78 is a config error: only an edit fixes it.
 RestartPreventExitStatus=78
 TimeoutStopSec=20s
@@ -137,6 +140,7 @@ mod tests {
             "User=oracle",
             r#"ExecStart="/usr/local/bin/oracle-node" start "/home/oracle/node 1/config.toml""#,
             "RestartPreventExitStatus=78",
+            "WatchdogSec=30s",
             "LimitNOFILE=65536",
             "LimitCORE=0",
             "MemorySwapMax=0",

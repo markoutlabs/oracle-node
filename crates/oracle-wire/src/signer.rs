@@ -23,13 +23,13 @@ pub struct Signer {
 }
 
 impl Signer {
-    /// Loads a signing key from 32 raw bytes.
+    /// Loads a signing key from 32 raw bytes that the caller keeps wiped, with no copy of its own.
     ///
     /// # Errors
     ///
     /// Returns [`WireError::InvalidSecretKey`] if the bytes are not a valid
     /// scalar for the curve (zero, or at or above the group order).
-    pub fn from_secret_bytes(bytes: [u8; 32]) -> Result<Self, WireError> {
+    pub fn from_secret(bytes: &Zeroizing<[u8; 32]>) -> Result<Self, WireError> {
         let secret = SecretKey::from_bytes(bytes)?;
         let public = CompressedPublicKey::from_bytes(secret.public_compressed());
         let address = public.address()?;
@@ -38,6 +38,19 @@ impl Signer {
             public,
             address,
         })
+    }
+
+    /// Loads a signing key from 32 raw bytes, taken by value.
+    ///
+    /// Deprecated for a real key, because nothing wipes the caller's array: use
+    /// [`Signer::from_secret`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Signer::from_secret`].
+    #[deprecated(note = "the caller's array is not wiped: use `Signer::from_secret`")]
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Result<Self, WireError> {
+        Self::from_secret(&Zeroizing::new(bytes))
     }
 
     /// Generates a key from the operating system's CSPRNG.
@@ -66,7 +79,7 @@ impl Signer {
             let mut bytes = Zeroizing::new([0_u8; 32]);
             getrandom::fill(&mut *bytes)
                 .map_err(|e| WireError::EntropyUnavailable(e.to_string()))?;
-            if let Ok(signer) = Self::from_secret_bytes(*bytes) {
+            if let Ok(signer) = Self::from_secret(&bytes) {
                 return Ok(signer);
             }
         }
@@ -100,7 +113,7 @@ impl Signer {
             field: "secret_key",
             expected: 32,
         })?;
-        Self::from_secret_bytes(*bytes)
+        Self::from_secret(&bytes)
     }
 
     /// Returns the address this key signs under.
@@ -197,8 +210,21 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
+    fn a_wiped_secret_loads_the_same_key_as_the_array() {
+        let secret = Zeroizing::new([42_u8; 32]);
+        let wiped = Signer::from_secret(&secret).expect("valid key");
+        let copied = Signer::from_secret_bytes([42_u8; 32]).expect("valid key");
+        assert_eq!(wiped.address(), copied.address());
+        assert!(matches!(
+            Signer::from_secret(&Zeroizing::new([0_u8; 32])),
+            Err(WireError::InvalidSecretKey)
+        ));
+    }
+
+    #[test]
     fn sign_and_recover_round_trip() {
-        let signer = Signer::from_secret_bytes([42_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[42_u8; 32].into()).expect("valid key");
         let payload = b"canonical payload bytes";
         let signature = signer.sign_payload(payload);
         assert_eq!(
@@ -209,7 +235,7 @@ mod tests {
 
     #[test]
     fn a_different_payload_recovers_a_different_address() {
-        let signer = Signer::from_secret_bytes([42_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[42_u8; 32].into()).expect("valid key");
         let signature = signer.sign_payload(b"original");
         let recovered = recover_payload_signer(b"tampered", &signature).expect("recovers");
         // Recovery still succeeds — it just yields someone else. This is exactly
@@ -220,7 +246,7 @@ mod tests {
     #[test]
     fn signing_is_deterministic() {
         // RFC 6979 nonces: the same key and digest always give the same bytes.
-        let signer = Signer::from_secret_bytes([7_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[7_u8; 32].into()).expect("valid key");
         assert_eq!(signer.sign_payload(b"x"), signer.sign_payload(b"x"));
     }
 
@@ -228,12 +254,12 @@ mod tests {
     fn rejects_invalid_secret_keys() {
         // Zero is not a valid scalar.
         assert_eq!(
-            Signer::from_secret_bytes([0_u8; 32]).err(),
+            Signer::from_secret(&[0_u8; 32].into()).err(),
             Some(WireError::InvalidSecretKey)
         );
         // Neither is anything at or above the group order.
         assert_eq!(
-            Signer::from_secret_bytes([0xFF_u8; 32]).err(),
+            Signer::from_secret(&[0xFF_u8; 32].into()).err(),
             Some(WireError::InvalidSecretKey)
         );
         assert!(Signer::from_hex("not hex").is_err());
@@ -243,7 +269,7 @@ mod tests {
     #[test]
     fn hex_loading_matches_byte_loading() {
         let bytes = [9_u8; 32];
-        let from_bytes = Signer::from_secret_bytes(bytes).expect("valid key");
+        let from_bytes = Signer::from_secret(&bytes.into()).expect("valid key");
         let from_hex = Signer::from_hex(&format!("0x{}", hex::encode(bytes))).expect("valid key");
         assert_eq!(from_bytes.address(), from_hex.address());
     }
@@ -284,7 +310,7 @@ mod tests {
     #[test]
     fn debug_output_never_contains_the_secret() {
         let secret = [0xAB_u8; 32];
-        let signer = Signer::from_secret_bytes(secret).expect("valid key");
+        let signer = Signer::from_secret(&secret.into()).expect("valid key");
         let rendered = format!("{signer:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains(&hex::encode(secret)));

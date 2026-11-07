@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use oracle_types::{MarketKind, Observation, Venue};
+use oracle_types::{InstrumentId, MarketKind, ObsKind, Observation, Venue};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -17,7 +17,7 @@ use crate::clock::MonotonicClock;
 use crate::session::{MessageHandler, Session, SessionConfig, SessionStats};
 use crate::{
     Connector, DecodeError, ExchangeAdapter, IngestError, IngestEvent, InstrumentMap,
-    InstrumentSpec, StreamId,
+    InstrumentSpec, StreamId, VenueHealth,
 };
 
 /// How one venue's connection is built and decoded.
@@ -86,11 +86,23 @@ impl MessageHandler for VenueHandler {
     fn on_connect(&mut self) {
         self.books.clear();
     }
+
+    /// The node gives each connection only the instruments it subscribes to.
+    fn subscribed(&self) -> Vec<(InstrumentId, Option<ObsKind>)> {
+        self.map
+            .entries()
+            .flat_map(|entry| {
+                super::moving_kinds(self.map.venue(), entry)
+                    .into_iter()
+                    .map(|kind| (entry.instrument.clone(), Some(kind)))
+            })
+            .collect()
+    }
 }
 
 /// A venue adapter built from a [`VenueSpec`] and a decode function.
 pub struct VenueAdapter<C> {
-    specs: Vec<(VenueSpec, InstrumentMap)>,
+    specs: Vec<(VenueSpec, InstrumentMap, VenueHealth)>,
     connector: C,
     label: String,
     venue: Venue,
@@ -122,7 +134,8 @@ impl<C: Connector + Clone + 'static> VenueAdapter<C> {
             // Validated here so a typo fails at startup rather than silently
             // dropping a feed at runtime.
             let map = InstrumentMap::new(venue, spec.market, &instruments)?;
-            specs.push((spec, map));
+            let health = VenueHealth::new(StreamId::new(venue, spec.market), spec.url.clone());
+            specs.push((spec, map, health));
         }
         Ok(Self {
             clock: MonotonicClock::new(),
@@ -147,7 +160,7 @@ impl<C: Connector + Clone + 'static> VenueAdapter<C> {
     pub fn plan(&self) -> Vec<SessionConfig> {
         self.specs
             .iter()
-            .map(|(spec, _)| session_config(spec, self.venue))
+            .map(|(spec, _, _)| session_config(spec, self.venue))
             .collect()
     }
 }
@@ -172,19 +185,27 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for VenueAdapter<C> {
         &self.label
     }
 
+    fn health(&self) -> Vec<VenueHealth> {
+        self.specs
+            .iter()
+            .map(|(_, _, health)| health.clone())
+            .collect()
+    }
+
     async fn run(
         self: Box<Self>,
         out: mpsc::Sender<IngestEvent>,
         shutdown: CancellationToken,
     ) -> Result<(), IngestError> {
         let mut sessions = Vec::with_capacity(self.specs.len());
-        for (spec, map) in &self.specs {
+        for (spec, map, health) in &self.specs {
             let session = Session::new(
                 session_config(spec, self.venue),
                 self.connector.clone(),
                 VenueHandler::new(map.clone(), spec.decode),
                 self.clock.clone(),
-            );
+            )
+            .with_health(health.clone());
             sessions.push(session.run(out.clone(), shutdown.clone()));
         }
         let results: Vec<Result<SessionStats, IngestError>> =
@@ -199,35 +220,11 @@ impl<C: Connector + Clone + 'static> ExchangeAdapter for VenueAdapter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{Frame, Transport, TransportError};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::testing::{Script, ScriptedConnector, instrument, run_adapter_until_connected};
 
-    #[derive(Clone)]
-    struct NullConnector {
-        opens: Arc<AtomicUsize>,
-    }
-
-    struct NullConn;
-
-    impl Transport for NullConn {
-        async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
-            Ok(None)
-        }
-        async fn send_text(&mut self, _text: String) -> Result<(), TransportError> {
-            Ok(())
-        }
-        async fn send_ping(&mut self) -> Result<(), TransportError> {
-            Ok(())
-        }
-    }
-
-    impl Connector for NullConnector {
-        type Conn = NullConn;
-        async fn connect(&self, _url: &str) -> Result<Self::Conn, TransportError> {
-            self.opens.fetch_add(1, Ordering::SeqCst);
-            Ok(NullConn)
-        }
+    /// Each connection closes at once, so the adapter reconnects at its backoff.
+    fn closing() -> ScriptedConnector {
+        ScriptedConnector::repeating(Script::new().close())
     }
 
     fn spec(market: MarketKind, url: &str) -> VenueSpec {
@@ -244,8 +241,8 @@ mod tests {
         }
     }
 
-    fn instruments(market: MarketKind) -> Vec<InstrumentSpec> {
-        vec![InstrumentSpec::new("BTCUSDT", market, "CRYPTO.BTC/USDT").expect("valid")]
+    fn btc(market: MarketKind) -> Vec<InstrumentSpec> {
+        vec![instrument("BTCUSDT", market)]
     }
 
     fn decode(
@@ -258,39 +255,35 @@ mod tests {
         Err(DecodeError::Control)
     }
 
+    /// A spot and a linear connection, each with BTCUSDT.
+    fn two_markets(connector: ScriptedConnector) -> VenueAdapter<ScriptedConnector> {
+        VenueAdapter::new(
+            Venue::Bybit,
+            vec![
+                (spec(MarketKind::Spot, "wss://spot"), btc(MarketKind::Spot)),
+                (
+                    spec(MarketKind::LinearPerp, "wss://linear"),
+                    btc(MarketKind::LinearPerp),
+                ),
+            ],
+            connector,
+        )
+        .expect("valid")
+    }
+
     #[test]
     fn an_empty_configuration_is_refused() {
         let result = VenueAdapter::new(
             Venue::Bybit,
             vec![(spec(MarketKind::Spot, "wss://x"), vec![])],
-            NullConnector {
-                opens: Arc::new(AtomicUsize::new(0)),
-            },
+            closing(),
         );
         assert!(matches!(result, Err(IngestError::NoInstruments { .. })));
     }
 
     #[test]
     fn each_market_becomes_its_own_connection() {
-        let adapter = VenueAdapter::new(
-            Venue::Bybit,
-            vec![
-                (
-                    spec(MarketKind::Spot, "wss://spot"),
-                    instruments(MarketKind::Spot),
-                ),
-                (
-                    spec(MarketKind::LinearPerp, "wss://linear"),
-                    instruments(MarketKind::LinearPerp),
-                ),
-            ],
-            NullConnector {
-                opens: Arc::new(AtomicUsize::new(0)),
-            },
-        )
-        .expect("valid");
-
-        let plan = adapter.plan();
+        let plan = two_markets(closing()).plan();
         let urls: Vec<&str> = plan.iter().map(|config| config.url.as_str()).collect();
         assert_eq!(urls, ["wss://spot", "wss://linear"]);
         assert!(
@@ -305,15 +298,10 @@ mod tests {
         let adapter = VenueAdapter::new(
             Venue::Bybit,
             vec![
-                (
-                    spec(MarketKind::Spot, "wss://spot"),
-                    instruments(MarketKind::Spot),
-                ),
+                (spec(MarketKind::Spot, "wss://spot"), btc(MarketKind::Spot)),
                 (spec(MarketKind::LinearPerp, "wss://linear"), vec![]),
             ],
-            NullConnector {
-                opens: Arc::new(AtomicUsize::new(0)),
-            },
+            closing(),
         )
         .expect("valid");
         assert_eq!(adapter.plan().len(), 1);
@@ -321,42 +309,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn run_opens_every_configured_connection() {
-        let opens = Arc::new(AtomicUsize::new(0));
-        let adapter = Box::new(
-            VenueAdapter::new(
-                Venue::Bybit,
-                vec![
-                    (
-                        spec(MarketKind::Spot, "wss://spot"),
-                        instruments(MarketKind::Spot),
-                    ),
-                    (
-                        spec(MarketKind::LinearPerp, "wss://linear"),
-                        instruments(MarketKind::LinearPerp),
-                    ),
-                ],
-                NullConnector {
-                    opens: Arc::clone(&opens),
-                },
-            )
-            .expect("valid"),
-        );
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let shutdown = CancellationToken::new();
-        let handle = tokio::spawn(adapter.run(tx, shutdown.clone()));
-
-        let mut connected = 0;
-        while connected < 2 {
-            match rx.recv().await {
-                Some(IngestEvent::Connected { .. }) => connected += 1,
-                Some(_) => {}
-                None => break,
-            }
-        }
-        shutdown.cancel();
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        handle.await.expect("joins").expect("runs");
-        assert!(opens.load(Ordering::SeqCst) >= 2);
+        let connector = closing();
+        run_adapter_until_connected(Box::new(two_markets(connector.clone())), 2).await;
+        assert!(connector.urls().iter().any(|url| url == "wss://spot"));
+        assert!(connector.urls().iter().any(|url| url == "wss://linear"));
     }
 }

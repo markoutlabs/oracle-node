@@ -8,17 +8,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use oracle_types::{
-    Fixed, FundingBasis, FundingInfo, Level, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
+    Fixed, FundingBasis, FundingInfo, MarketKind, NANOS_PER_SEC, ObsKind, Observation,
     OpenInterestUnit,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::book::{BookMsg, BookRule, Change, Continuity};
 use crate::clock::millis_to_nanos;
+use crate::instrument::InstrumentEntry;
+use crate::venues::{mid, observation};
 use crate::{DecodeError, InstrumentMap};
 
 use super::book::{Applied, BinanceBooks, Diff};
 use super::streams::StreamKind;
+
+/// Each diff follows the last by its ids; [`BinanceBooks`] checks them, and a
+/// diff that does not parse is lost, so the book resyncs.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::UpdateId);
 
 /// The combined-stream envelope: `{"stream":"btcusdt@bookTicker","data":{…}}`.
 /// A REST frame that could not be fetched carries `error` instead of `data`.
@@ -94,14 +101,15 @@ struct OpenInterestReply<'a> {
 }
 
 impl FundingIntervals {
-    fn open_interest(&self, symbol: &str) -> Option<Fixed> {
-        self.open_interest
-            .get(symbol)
-            .or_else(|| self.open_interest.get(&symbol.to_ascii_uppercase()))
-            .copied()
+    fn open_interest(&self, entry: &InstrumentEntry) -> Option<Fixed> {
+        self.open_interest.get(&*entry.instrument.symbol).copied()
     }
 
-    fn apply_open_interest(&mut self, envelope: &Envelope<'_>) -> Result<(), DecodeError> {
+    fn apply_open_interest(
+        &mut self,
+        envelope: &Envelope<'_>,
+        map: &InstrumentMap,
+    ) -> Result<(), DecodeError> {
         if let Some(error) = envelope.error {
             return Err(DecodeError::Malformed(format!(
                 "{}: fetch failed: {error}",
@@ -112,18 +120,20 @@ impl FundingIntervals {
         let reply: OpenInterestReply<'_> = serde_json::from_slice(data.get().as_bytes())
             .map_err(|e| DecodeError::Malformed(e.to_string()))?;
         let open_interest = decimal("openInterest", reply.open_interest)?;
+        let entry = map
+            .lookup(reply.symbol)
+            .ok_or_else(|| DecodeError::UnknownInstrument(reply.symbol.to_owned()))?;
         self.open_interest
-            .insert(reply.symbol.to_ascii_uppercase(), open_interest);
+            .insert(entry.instrument.symbol.to_string(), open_interest);
         // The value reaches the next mark price; this frame alone is no observation.
         Err(DecodeError::Control)
     }
 
-    fn interval_ns(&self, symbol: &str) -> Option<u64> {
+    fn interval_ns(&self, entry: &InstrumentEntry) -> Option<u64> {
         let by_symbol = self.by_symbol.as_ref()?;
-        // Uppercase only on a miss, as `InstrumentMap::lookup` does.
         let listed = by_symbol
-            .get(symbol)
-            .or_else(|| by_symbol.get(&symbol.to_ascii_uppercase()));
+            .get(&*entry.instrument.symbol)
+            .or_else(|| by_symbol.get(&entry.instrument.symbol.to_ascii_uppercase()));
         Some(listed.copied().unwrap_or(DEFAULT_INTERVAL_NS))
     }
 
@@ -153,21 +163,17 @@ impl FundingIntervals {
     }
 }
 
-fn levels(raw: &[[&str; 2]]) -> Result<Vec<Level>, DecodeError> {
-    raw.iter()
-        .map(|[price, qty]| crate::depth::level(price, qty))
-        .collect()
+fn change(&[price, qty]: &[&str; 2]) -> Result<Change<'static>, DecodeError> {
+    Ok(Change::from(crate::depth::level(price, qty)?))
 }
 
-/// The session's entry point: depth streams are kept in `books`, and mark
-/// prices get their interval from `intervals`. Every other stream goes to
-/// [`decode_payload`].
+/// Decodes one combined-stream payload of the market that `map` serves. The map
+/// is what tells `BTCUSDT` the perpetual from `BTCUSDT` the spot pair.
 ///
 /// # Errors
 ///
-/// As [`decode_payload`], and [`DecodeError::Resync`] when a diff does not
-/// follow the book, or its snapshot could not be fetched.
-/// [`DecodeError::Malformed`] when the funding intervals could not be fetched.
+/// Returns [`DecodeError`]; acknowledgements and untracked streams are benign.
+/// A diff that does not follow its book, or a failed snapshot, is [`DecodeError::Resync`].
 pub(crate) fn decode(
     payload: &[u8],
     map: &InstrumentMap,
@@ -176,77 +182,81 @@ pub(crate) fn decode(
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(payload) else {
-        return decode_payload(payload, map, local_recv_ns, out);
-    };
-    let kind = StreamKind::from_stream_name(envelope.stream);
-    match kind {
-        Some(StreamKind::FundingInfo) => return intervals.apply(&envelope),
-        Some(StreamKind::OpenInterest) => return intervals.apply_open_interest(&envelope),
-        Some(StreamKind::MarkPrice) => {
-            let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
-            return decode_mark_price(data.get().as_bytes(), map, intervals, local_recv_ns, out);
+    let envelope: Envelope<'_> = serde_json::from_slice(payload).map_err(|e| {
+        // Subscription replies (`{"result":null,"id":1}`) and error objects share
+        // this endpoint and have no `stream` field.
+        if looks_like_control(payload) {
+            DecodeError::Control
+        } else {
+            DecodeError::Malformed(e.to_string())
         }
-        Some(StreamKind::Depth | StreamKind::DepthSnapshot) => {}
-        _ => return decode_payload(payload, map, local_recv_ns, out),
+    })?;
+    let kind = StreamKind::from_stream_name(envelope.stream)
+        .ok_or_else(|| DecodeError::UnhandledStream(envelope.stream.to_owned()))?;
+    let data = || envelope.data.ok_or(DecodeError::MissingField("data"));
+    match kind {
+        StreamKind::BookTicker => decode_book_ticker(data()?, map, local_recv_ns, out),
+        StreamKind::AggTrade => decode_agg_trade(data()?, map, local_recv_ns, out),
+        StreamKind::MarkPrice => decode_mark_price(data()?, map, intervals, local_recv_ns, out),
+        StreamKind::FundingInfo => intervals.apply(&envelope),
+        StreamKind::OpenInterest => intervals.apply_open_interest(&envelope, map),
+        StreamKind::Depth | StreamKind::DepthSnapshot => {
+            decode_depth(&envelope, kind, map, books, local_recv_ns, out)
+        }
     }
+}
+
+/// A diff, or the REST snapshot it applies to.
+fn decode_depth(
+    envelope: &Envelope<'_>,
+    kind: StreamKind,
+    map: &InstrumentMap,
+    books: &mut BinanceBooks,
+    local_recv_ns: u64,
+    out: &mut Vec<Observation>,
+) -> Result<(), DecodeError> {
     if let Some(error) = envelope.error {
         return Err(DecodeError::Resync(format!(
             "{}: snapshot failed: {error}",
             envelope.stream
         )));
     }
-    let data = envelope
-        .data
-        .ok_or(DecodeError::MissingField("data"))?
-        .get()
-        .as_bytes();
+    let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
     let futures = map.market() != MarketKind::Spot;
-    let (symbol, exchange_time_ns, applied) = if kind == Some(StreamKind::Depth) {
-        let diff: DepthDiff<'_> =
-            serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        let symbol = diff.symbol.to_ascii_uppercase();
-        let applied = books.on_diff(
-            &symbol,
-            futures,
-            Diff {
-                first: diff.first,
-                last: diff.last,
-                previous: diff.previous,
-                bids: levels(&diff.bids)?,
-                asks: levels(&diff.asks)?,
+    let lost = |error| BOOK_RULE.unparsed(error);
+    let (entry, exchange_time_ns, applied) = if kind == StreamKind::Depth {
+        let diff: DepthDiff<'_> = serde_json::from_str(data.get())
+            .map_err(|e| lost(DecodeError::Malformed(e.to_string())))?;
+        let entry = map
+            .lookup(diff.symbol)
+            .ok_or_else(|| DecodeError::UnknownInstrument(diff.symbol.to_owned()))?;
+        let changes = BookMsg::changes(&diff.bids, &diff.asks, change).map_err(lost)?;
+        let parsed = Diff {
+            first: diff.first,
+            changes: BookMsg {
+                prev_id: diff.previous,
+                next_id: Some(diff.last),
+                ..changes
             },
-        )?;
-        (symbol, diff.event_time_ms.map(millis_to_nanos), applied)
+        };
+        let applied = books.on_diff(&entry.instrument.symbol, futures, parsed)?;
+        (entry, diff.event_time_ms.map(millis_to_nanos), applied)
     } else {
-        let snapshot: DepthSnapshot<'_> =
-            serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        let symbol = envelope
-            .stream
-            .split('@')
-            .next()
-            .unwrap_or(envelope.stream)
-            .to_ascii_uppercase();
-        let applied = books.on_snapshot(
-            &symbol,
-            futures,
-            snapshot.last_update_id,
-            levels(&snapshot.bids)?,
-            levels(&snapshot.asks)?,
-        )?;
-        (symbol, None, applied)
+        let snapshot: DepthSnapshot<'_> = serde_json::from_str(data.get())
+            .map_err(|e| lost(DecodeError::Malformed(e.to_string())))?;
+        let symbol = envelope.stream.split('@').next().unwrap_or(envelope.stream);
+        let entry = map
+            .lookup(symbol)
+            .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))?;
+        let whole = BookMsg::whole(&snapshot.bids, &snapshot.asks, change).map_err(lost)?;
+        let id = snapshot.last_update_id;
+        let applied = books.on_snapshot(&entry.instrument.symbol, futures, id, &whole)?;
+        (entry, None, applied)
     };
-    let entry = map
-        .lookup(&symbol)
-        .ok_or_else(|| DecodeError::UnknownInstrument(symbol.clone()))?;
     if applied == Applied::Changed {
-        books.books.emit(
-            &symbol,
-            entry.instrument.clone(),
-            exchange_time_ns,
-            local_recv_ns,
-            out,
-        )?;
+        books
+            .keeper
+            .emit(BOOK_RULE, entry, exchange_time_ns, local_recv_ns, out)?;
     }
     Ok(())
 }
@@ -309,57 +319,6 @@ fn decimal(field: &'static str, value: &str) -> Result<Fixed, DecodeError> {
     })
 }
 
-/// Decodes one combined-stream payload. Funding observations get no interval
-/// here: it comes from the list that only a session has.
-///
-/// The `map` carries the market it serves, which is what disambiguates symbols
-/// listed on both spot and perpetuals — every major pair is. A session must
-/// therefore be built with the map for the market its connection subscribes to.
-///
-/// # Errors
-///
-/// Returns [`DecodeError`]. Check [`DecodeError::is_benign`] before treating one
-/// as a fault: subscription acknowledgements and untracked streams arrive in
-/// normal operation.
-pub fn decode_payload(
-    payload: &[u8],
-    map: &InstrumentMap,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let envelope: Envelope<'_> = serde_json::from_slice(payload).map_err(|e| {
-        // Subscription replies (`{"result":null,"id":1}`) and error objects share
-        // this endpoint and have no `stream` field.
-        if looks_like_control(payload) {
-            DecodeError::Control
-        } else {
-            DecodeError::Malformed(e.to_string())
-        }
-    })?;
-
-    let kind = StreamKind::from_stream_name(envelope.stream)
-        .ok_or_else(|| DecodeError::UnhandledStream(envelope.stream.to_owned()))?;
-    // Only a REST frame carries `error`, and `decode` handles those.
-    let data = envelope
-        .data
-        .ok_or(DecodeError::MissingField("data"))?
-        .get()
-        .as_bytes();
-
-    match kind {
-        StreamKind::BookTicker => decode_book_ticker(data, map, local_recv_ns, out),
-        StreamKind::AggTrade => decode_agg_trade(data, map, local_recv_ns, out),
-        StreamKind::MarkPrice => {
-            decode_mark_price(data, map, &FundingIntervals::default(), local_recv_ns, out)
-        }
-        // These need the session's state; see `decode`.
-        StreamKind::Depth
-        | StreamKind::DepthSnapshot
-        | StreamKind::FundingInfo
-        | StreamKind::OpenInterest => Err(DecodeError::UnhandledStream(envelope.stream.to_owned())),
-    }
-}
-
 /// Returns `true` if the payload is a control response rather than market data.
 fn looks_like_control(payload: &[u8]) -> bool {
     #[derive(Deserialize)]
@@ -373,90 +332,75 @@ fn looks_like_control(payload: &[u8]) -> bool {
 }
 
 fn decode_book_ticker(
-    data: &[u8],
+    data: &RawValue,
     map: &InstrumentMap,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let ticker: BookTicker<'_> =
-        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let ticker: BookTicker<'_> = serde_json::from_str(data.get())?;
     let entry = map
         .lookup(ticker.symbol)
         .ok_or_else(|| DecodeError::UnknownInstrument(ticker.symbol.to_owned()))?;
 
-    let bid = decimal("b", ticker.bid)?;
-    let ask = decimal("a", ticker.ask)?;
-    let bid_qty = decimal("B", ticker.bid_qty)?;
-    let ask_qty = decimal("A", ticker.ask_qty)?;
+    let parse = || {
+        Ok::<_, DecodeError>((
+            decimal("b", ticker.bid)?,
+            decimal("a", ticker.ask)?,
+            decimal("B", ticker.bid_qty)?,
+            decimal("A", ticker.ask_qty)?,
+        ))
+    };
+    let (bid, ask, bid_qty, ask_qty) =
+        parse().map_err(|error| DecodeError::lost(&entry.instrument, error))?;
 
-    // The primary value for a two-sided quote is the mid. Consumers that want the
-    // pressure-weighted view call `microprice()`; the sizes are carried for them.
-    let price = bid
-        .checked_add(ask)
-        .and_then(|sum| sum.checked_div(Fixed::from_int(2).ok()?))
-        .unwrap_or(bid);
-
+    // A zero side is not refused here: the aggregator marks the quote invalid,
+    // which is the safer result.
     out.push(Observation {
-        instrument: entry.instrument.clone(),
-        kind: ObsKind::BookTop,
-        price,
         bid: Some(bid),
         ask: Some(ask),
         bid_qty: Some(bid_qty),
         ask_qty: Some(ask_qty),
-        // `bookTicker` is top-of-book only. Depth-derived weighting needs a depth
-        // stream, which M2 will have to add before `w_depth` means anything.
-        depth_notional_1bp: None,
         exchange_time_ns: ticker.event_time_ms.map(millis_to_nanos),
-        local_recv_ns,
         seq: Some(ticker.update_id),
-        book: None,
-        funding: None,
+        ..observation(entry, ObsKind::BookTop, mid(bid, ask), local_recv_ns)
     });
     Ok(())
 }
 
 fn decode_agg_trade(
-    data: &[u8],
+    data: &RawValue,
     map: &InstrumentMap,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let trade: AggTrade<'_> =
-        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let trade: AggTrade<'_> = serde_json::from_str(data.get())?;
     let entry = map
         .lookup(trade.symbol)
         .ok_or_else(|| DecodeError::UnknownInstrument(trade.symbol.to_owned()))?;
 
     out.push(Observation {
-        instrument: entry.instrument.clone(),
-        kind: ObsKind::Trade,
-        price: decimal("p", trade.price)?,
-        bid: None,
-        ask: None,
-        bid_qty: None,
-        ask_qty: None,
-        depth_notional_1bp: None,
         // The trade time, not the event time: when it happened beats when it was
         // relayed.
         exchange_time_ns: Some(millis_to_nanos(trade.trade_time_ms)),
-        local_recv_ns,
         seq: Some(trade.agg_id),
-        book: None,
-        funding: None,
+        ..observation(
+            entry,
+            ObsKind::Trade,
+            decimal("p", trade.price)?,
+            local_recv_ns,
+        )
     });
     Ok(())
 }
 
 fn decode_mark_price(
-    data: &[u8],
+    data: &RawValue,
     map: &InstrumentMap,
     intervals: &FundingIntervals,
     local_recv_ns: u64,
     out: &mut Vec<Observation>,
 ) -> Result<(), DecodeError> {
-    let update: MarkPrice<'_> =
-        serde_json::from_slice(data).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let update: MarkPrice<'_> = serde_json::from_str(data.get())?;
     let entry = map
         .lookup(update.symbol)
         .ok_or_else(|| DecodeError::UnknownInstrument(update.symbol.to_owned()))?;
@@ -464,19 +408,9 @@ fn decode_mark_price(
     let exchange_time_ns = Some(millis_to_nanos(update.event_time_ms));
     let mut push = |kind: ObsKind, price: Fixed, funding: Option<Arc<FundingInfo>>| {
         out.push(Observation {
-            instrument: entry.instrument.clone(),
-            kind,
-            price,
-            bid: None,
-            ask: None,
-            bid_qty: None,
-            ask_qty: None,
-            depth_notional_1bp: None,
             exchange_time_ns,
-            local_recv_ns,
-            seq: None,
-            book: None,
             funding,
+            ..observation(entry, kind, price, local_recv_ns)
         });
     };
 
@@ -486,13 +420,13 @@ fn decode_mark_price(
     }
     if let Some(rate) = update.funding_rate {
         let info = FundingInfo {
-            interval_ns: intervals.interval_ns(update.symbol),
+            interval_ns: intervals.interval_ns(entry),
             next_funding_time_ns: update
                 .next_funding_time_ms
                 .filter(|ms| *ms > 0)
                 .map(millis_to_nanos),
             open_interest: intervals
-                .open_interest(update.symbol)
+                .open_interest(entry)
                 .map(|oi| (oi, OpenInterestUnit::Base)),
             ..FundingInfo::new(FundingBasis::Interval)
         };
@@ -504,34 +438,22 @@ fn decode_mark_price(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::binance::BinanceHandler;
+    use crate::testing::{Feed, RECV_NS, fixed, instrument, kinds};
     use oracle_types::{MarketKind, Venue};
 
-    const RECV_NS: u64 = 1_754_582_400_500_000_000;
-
-    fn spot_map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new("BTCUSDT", MarketKind::Spot, "CRYPTO.BTC/USDT").expect("valid"),
-        ];
-        InstrumentMap::new(Venue::Binance, MarketKind::Spot, &specs).expect("valid")
+    fn binance(market: MarketKind) -> Feed {
+        let map = InstrumentMap::new(Venue::Binance, market, &[instrument("BTCUSDT", market)])
+            .expect("valid");
+        Feed::new(BinanceHandler::new(map))
     }
 
-    fn perp_map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new(
-                "BTCUSDT",
-                MarketKind::LinearPerp,
-                "CRYPTO.BTC/USDT.PERP_MARK",
-            )
-            .expect("valid"),
-        ];
-        InstrumentMap::new(Venue::Binance, MarketKind::LinearPerp, &specs).expect("valid")
+    fn spot() -> Feed {
+        binance(MarketKind::Spot)
     }
 
-    fn decode(payload: &str, map: &InstrumentMap) -> Vec<Observation> {
-        let mut out = Vec::new();
-        decode_payload(payload.as_bytes(), map, RECV_NS, &mut out).expect("decodes");
-        out
+    fn perp() -> Feed {
+        binance(MarketKind::LinearPerp)
     }
 
     /// Captured shape of a spot `bookTicker`: no `e`, no `E`, no `T`.
@@ -545,61 +467,6 @@ mod tests {
         "e":"bookTicker","u":400900217,"E":1754582400123,"T":1754582400120,
         "s":"BTCUSDT","b":"64311.50","B":"3.0","a":"64312.50","A":"1.0"}}"#;
 
-    /// Recorded from Binance spot on 2026-10-06, in the order the snapshot
-    /// connector delivers it: five diffs, the REST snapshot, then 25 more.
-    const RECORDED_DEPTH: &str = include_str!("../../tests/fixtures/binance-depth.jsonl");
-
-    fn depth_map() -> InstrumentMap {
-        let specs = vec![
-            InstrumentSpec::new("BTCUSDT", MarketKind::Spot, "CRYPTO.BTC/USDT")
-                .expect("valid")
-                .with_depth(),
-        ];
-        InstrumentMap::new(Venue::Binance, MarketKind::Spot, &specs).expect("valid")
-    }
-
-    /// The diffs before the snapshot wait for it, and every one after it
-    /// follows the last.
-    #[test]
-    fn a_recorded_book_joins_snapshot_and_diffs() {
-        let map = depth_map();
-        let mut books = BinanceBooks::default();
-        let mut depths = Vec::new();
-        for line in RECORDED_DEPTH.lines() {
-            let mut out = Vec::new();
-            super::decode(
-                line.as_bytes(),
-                &map,
-                &mut books,
-                &mut FundingIntervals::default(),
-                RECV_NS,
-                &mut out,
-            )
-            .unwrap_or_else(|error| panic!("{error}: {line}"));
-            depths.extend(out);
-        }
-        assert!(depths.len() >= 25, "{}", depths.len());
-        assert!(depths.iter().all(|o| o.kind == ObsKind::Depth));
-        let last = depths.last().expect("a depth observation");
-        assert!(last.bid < last.ask);
-    }
-
-    #[test]
-    fn a_failed_snapshot_asks_for_a_resync() {
-        let failed = r#"{"stream":"btcusdt@depthSnapshot","error":"HTTP status 429"}"#;
-        assert!(matches!(
-            super::decode(
-                failed.as_bytes(),
-                &depth_map(),
-                &mut BinanceBooks::default(),
-                &mut FundingIntervals::default(),
-                RECV_NS,
-                &mut Vec::new()
-            ),
-            Err(DecodeError::Resync(_))
-        ));
-    }
-
     const AGG_TRADE: &str = r#"{"stream":"btcusdt@aggTrade","data":{
         "e":"aggTrade","E":1754582400123,"s":"BTCUSDT","a":12345,
         "p":"64312.10","q":"0.05","f":100,"l":105,"T":1754582400100,"m":true,"M":true}}"#;
@@ -610,119 +477,91 @@ mod tests {
         "r":"0.00010000","T":1754596800000}}"#;
 
     #[test]
+    fn a_failed_snapshot_asks_for_a_resync() {
+        let failed = r#"{"stream":"btcusdt@depthSnapshot","error":"HTTP status 429"}"#;
+        assert!(matches!(spot().refused(failed), DecodeError::Resync(_)));
+    }
+
+    #[test]
     fn spot_book_ticker_has_no_exchange_timestamp() {
-        let observations = decode(SPOT_BOOK_TICKER, &spot_map());
-        assert_eq!(observations.len(), 1);
-        let obs = observations.first().expect("one observation");
-        assert_eq!(obs.kind, ObsKind::BookTop);
-        assert_eq!(obs.bid, Some("64312".parse().expect("valid")));
-        assert_eq!(obs.ask, Some("64313".parse().expect("valid")));
-        assert_eq!(obs.bid_qty, Some("1.25".parse().expect("valid")));
-        assert_eq!(obs.price, "64312.5".parse().expect("valid"));
-        assert_eq!(obs.seq, Some(400_900_217));
+        let observations = spot().decoded(SPOT_BOOK_TICKER);
+        let [quote] = observations.as_slice() else {
+            panic!("one observation: {observations:?}");
+        };
+        assert_eq!(quote.kind, ObsKind::BookTop);
+        assert_eq!(quote.bid, Some(fixed("64312")));
+        assert_eq!(quote.ask, Some(fixed("64313")));
+        assert_eq!(quote.bid_qty, Some(fixed("1.25")));
+        assert_eq!(quote.price, fixed("64312.5"));
+        assert_eq!(quote.seq, Some(400_900_217));
         // The whole reason the field is optional.
-        assert_eq!(obs.exchange_time_ns, None);
-        assert_eq!(obs.venue_lag_ns(), None);
-        assert_eq!(obs.local_recv_ns, RECV_NS);
+        assert_eq!(quote.exchange_time_ns, None);
+        assert_eq!(quote.venue_lag_ns(), None);
+        assert_eq!(quote.local_recv_ns, RECV_NS);
     }
 
     #[test]
     fn futures_book_ticker_carries_an_exchange_timestamp() {
-        let observations = decode(PERP_BOOK_TICKER, &perp_map());
-        let obs = observations.first().expect("one observation");
-        assert_eq!(obs.exchange_time_ns, Some(1_754_582_400_123_000_000));
-        assert_eq!(obs.venue_lag_ns(), Some(377_000_000));
-        assert_eq!(obs.instrument.market, MarketKind::LinearPerp);
+        let quote = perp().decoded(PERP_BOOK_TICKER).remove(0);
+        assert_eq!(
+            quote.exchange_time_ns,
+            Some(millis_to_nanos(1_754_582_400_123))
+        );
+        // `E` is 377 ms before the receipt.
+        assert_eq!(quote.venue_lag_ns(), Some(377_000_000));
+        assert_eq!(quote.instrument.market, MarketKind::LinearPerp);
     }
 
     #[test]
     fn agg_trade_uses_the_trade_time_not_the_event_time() {
-        let observations = decode(AGG_TRADE, &spot_map());
-        let obs = observations.first().expect("one observation");
-        assert_eq!(obs.kind, ObsKind::Trade);
-        assert_eq!(obs.price, "64312.1".parse().expect("valid"));
+        let trade = spot().decoded(AGG_TRADE).remove(0);
+        assert_eq!(trade.kind, ObsKind::Trade);
+        assert_eq!(trade.price, fixed("64312.1"));
         // T = 1754582400100, not E = 1754582400123.
-        assert_eq!(obs.exchange_time_ns, Some(1_754_582_400_100_000_000));
-        assert_eq!(obs.seq, Some(12_345));
-        assert!(obs.bid.is_none(), "a trade print carries no book");
+        assert_eq!(
+            trade.exchange_time_ns,
+            Some(millis_to_nanos(1_754_582_400_100))
+        );
+        assert_eq!(trade.seq, Some(12_345));
+        assert!(trade.bid.is_none(), "a trade print carries no book");
     }
 
     #[test]
     fn mark_price_yields_three_observations() {
-        let observations = decode(MARK_PRICE, &perp_map());
-        assert_eq!(observations.len(), 3);
-        let kinds: Vec<_> = observations.iter().map(|o| o.kind).collect();
+        let observations = perp().decoded(MARK_PRICE);
         assert_eq!(
-            kinds,
+            kinds(&observations),
             [ObsKind::MarkPrice, ObsKind::IndexPrice, ObsKind::Funding]
         );
         let prices: Vec<_> = observations.iter().map(|o| o.price).collect();
-        assert_eq!(
-            prices,
-            [
-                "64315".parse().expect("valid"),
-                "64310".parse().expect("valid"),
-                "0.0001".parse().expect("valid"),
-            ]
-        );
+        assert_eq!(prices, [fixed("64315"), fixed("64310"), fixed("0.0001")]);
     }
 
     /// Binance has no open-interest stream, so a REST frame holds the value
     /// until the next mark price carries it.
     #[test]
     fn the_open_interest_frame_reaches_the_next_funding_update() {
-        let map = perp_map();
-        let mut books = BinanceBooks::default();
-        let mut intervals = FundingIntervals::default();
-        let mut out = Vec::new();
+        let mut perp = perp();
         let frame = r#"{"stream":"btcusdt@openInterest","data":{"symbol":"BTCUSDT","openInterest":"93697.961","time":1754582400000}}"#;
-        let error = super::decode(
-            frame.as_bytes(),
-            &map,
-            &mut books,
-            &mut intervals,
-            RECV_NS,
-            &mut out,
-        )
-        .expect_err("no observation of its own");
-        assert!(error.is_benign());
-        assert!(out.is_empty());
-
-        super::decode(
-            MARK_PRICE.as_bytes(),
-            &map,
-            &mut books,
-            &mut intervals,
-            RECV_NS,
-            &mut out,
-        )
-        .expect("decodes");
-        let funding = out
-            .iter()
-            .find(|o| o.kind == ObsKind::Funding)
-            .expect("funding");
-        let info = funding.funding.as_deref().expect("funding info");
-        assert_eq!(
-            info.open_interest,
-            Some(("93697.961".parse().expect("valid"), OpenInterestUnit::Base))
-        );
+        assert!(perp.refused(frame).is_benign(), "no observation of its own");
+        let open_interest = |perp: &mut Feed| {
+            let out = perp.decoded(MARK_PRICE);
+            let funding = out
+                .iter()
+                .find(|o| o.kind == ObsKind::Funding)
+                .expect("funding");
+            funding
+                .funding
+                .as_deref()
+                .and_then(|info| info.open_interest)
+        };
+        let expected = Some((fixed("93697.961"), OpenInterestUnit::Base));
+        assert_eq!(open_interest(&mut perp), expected);
 
         // A failed fetch is counted, and the last value stays.
         let failed = r#"{"stream":"btcusdt@openInterest","error":"HTTP status 429"}"#;
-        let error = super::decode(
-            failed.as_bytes(),
-            &map,
-            &mut books,
-            &mut intervals,
-            RECV_NS,
-            &mut Vec::new(),
-        )
-        .expect_err("a failed fetch");
-        assert!(!error.is_benign());
-        assert_eq!(
-            intervals.open_interest("BTCUSDT"),
-            Some("93697.961".parse().expect("valid"))
-        );
+        assert!(!perp.refused(failed).is_benign());
+        assert_eq!(open_interest(&mut perp), expected);
     }
 
     #[test]
@@ -730,12 +569,7 @@ mod tests {
         let payload = r#"{"stream":"btcusdt@markPrice@1s","data":{
             "e":"markPriceUpdate","E":1754582400000,"s":"BTCUSDT",
             "p":"64315.0","T":1754596800000}}"#;
-        let observations = decode(payload, &perp_map());
-        assert_eq!(observations.len(), 1);
-        assert_eq!(
-            observations.first().map(|o| o.kind),
-            Some(ObsKind::MarkPrice)
-        );
+        assert_eq!(kinds(&perp().decoded(payload)), [ObsKind::MarkPrice]);
     }
 
     #[test]
@@ -743,84 +577,65 @@ mod tests {
         let payload = r#"{"stream":"btcusdt@markPrice@1s","data":{
             "e":"markPriceUpdate","E":1754582400000,"s":"BTCUSDT",
             "p":"64315.0","r":"-0.00012500","T":1754596800000}}"#;
-        let observations = decode(payload, &perp_map());
+        let observations = perp().decoded(payload);
         let funding = observations
             .iter()
             .find(|o| o.kind == ObsKind::Funding)
             .expect("funding");
-        assert_eq!(funding.price, "-0.000125".parse().expect("valid"));
+        assert_eq!(funding.price, fixed("-0.000125"));
     }
 
     #[test]
     fn subscription_acknowledgements_are_benign() {
-        let mut out = Vec::new();
-        let err = decode_payload(br#"{"result":null,"id":1}"#, &spot_map(), RECV_NS, &mut out)
-            .expect_err("not market data");
-        assert_eq!(err, DecodeError::Control);
-        assert!(err.is_benign());
-        assert!(out.is_empty());
+        assert_eq!(
+            spot().refused(r#"{"result":null,"id":1}"#),
+            DecodeError::Control
+        );
     }
 
     #[test]
     fn error_objects_are_benign() {
-        let mut out = Vec::new();
-        let err = decode_payload(
-            br#"{"code":-1121,"msg":"Invalid symbol."}"#,
-            &spot_map(),
-            RECV_NS,
-            &mut out,
-        )
-        .expect_err("not market data");
-        assert!(err.is_benign(), "got {err:?}");
+        let error = spot().refused(r#"{"code":-1121,"msg":"Invalid symbol."}"#);
+        assert!(error.is_benign(), "got {error:?}");
     }
 
     #[test]
     fn untracked_symbols_and_streams_are_benign() {
-        let mut out = Vec::new();
-
         let unknown_symbol = r#"{"stream":"ethusdt@bookTicker","data":{
             "u":1,"s":"ETHUSDT","b":"1","B":"1","a":"2","A":"1"}}"#;
-        let err = decode_payload(unknown_symbol.as_bytes(), &spot_map(), RECV_NS, &mut out)
-            .expect_err("untracked");
-        assert!(matches!(err, DecodeError::UnknownInstrument(_)));
-        assert!(err.is_benign());
+        let error = spot().refused(unknown_symbol);
+        assert!(matches!(error, DecodeError::UnknownInstrument(_)) && error.is_benign());
 
         let unknown_stream = r#"{"stream":"btcusdt@kline_1m","data":{}}"#;
-        let err = decode_payload(unknown_stream.as_bytes(), &spot_map(), RECV_NS, &mut out)
-            .expect_err("unhandled");
-        assert!(matches!(err, DecodeError::UnhandledStream(_)));
-        assert!(err.is_benign());
-
-        assert!(out.is_empty());
+        let error = spot().refused(unknown_stream);
+        assert!(matches!(error, DecodeError::UnhandledStream(_)) && error.is_benign());
     }
 
     #[test]
     fn malformed_payloads_are_not_benign() {
-        let mut out = Vec::new();
         for payload in [
-            &b"not json"[..],
-            b"{}",
-            br#"{"stream":"btcusdt@bookTicker","data":{"u":1,"s":"BTCUSDT"}}"#,
+            "not json",
+            "{}",
+            r#"{"stream":"btcusdt@bookTicker","data":{"u":1,"s":"BTCUSDT"}}"#,
         ] {
-            let err =
-                decode_payload(payload, &spot_map(), RECV_NS, &mut out).expect_err("should fail");
+            let error = spot().refused(payload);
             assert!(
-                !err.is_benign(),
-                "{payload:?} produced a benign error: {err:?}"
+                !error.is_benign(),
+                "{payload:?} produced a benign error: {error:?}"
             );
         }
-        assert!(out.is_empty());
     }
 
     #[test]
     fn non_numeric_prices_are_reported_with_the_offending_value() {
         let payload = r#"{"stream":"btcusdt@bookTicker","data":{
             "u":1,"s":"BTCUSDT","b":"not-a-price","B":"1","a":"2","A":"1"}}"#;
-        let mut out = Vec::new();
-        let err = decode_payload(payload.as_bytes(), &spot_map(), RECV_NS, &mut out)
-            .expect_err("should fail");
+        let DecodeError::Lost { instrument, error } = spot().refused(payload) else {
+            panic!("a lost quote");
+        };
+        assert_eq!(&*instrument.symbol, "BTCUSDT");
         assert_eq!(
-            err,
+            *error,
             DecodeError::BadDecimal {
                 field: "b",
                 value: "not-a-price".to_owned()
@@ -834,18 +649,17 @@ mod tests {
         let payload = r#"{"stream":"btcusdt@bookTicker","data":{
             "u":1,"s":"BTCUSDT","b":"0.00000001","B":"12345.67891234",
             "a":"0.00000002","A":"0.00000001"}}"#;
-        let observations = decode(payload, &spot_map());
-        let obs = observations.first().expect("one observation");
-        assert_eq!(obs.bid, Some("0.00000001".parse().expect("valid")));
-        assert_eq!(obs.bid_qty, Some("12345.67891234".parse().expect("valid")));
-        assert_eq!(obs.price, "0.000000015".parse().expect("valid"));
+        let quote = spot().decoded(payload).remove(0);
+        assert_eq!(quote.bid, Some(fixed("0.00000001")));
+        assert_eq!(quote.bid_qty, Some(fixed("12345.67891234")));
+        assert_eq!(quote.price, fixed("0.000000015"));
     }
 
     #[test]
     fn lowercase_symbols_in_payloads_still_map() {
         let payload = r#"{"stream":"btcusdt@bookTicker","data":{
             "u":1,"s":"btcusdt","b":"1","B":"1","a":"2","A":"1"}}"#;
-        assert_eq!(decode(payload, &spot_map()).len(), 1);
+        assert_eq!(spot().decoded(payload).len(), 1);
     }
 
     #[test]
@@ -853,7 +667,11 @@ mod tests {
         // Dropping it is the aggregator's call; the decoder must not silently fix it.
         let payload = r#"{"stream":"btcusdt@bookTicker","data":{
             "u":1,"s":"BTCUSDT","b":"64313","B":"1","a":"64312","A":"1"}}"#;
-        let observations = decode(payload, &spot_map());
-        assert!(observations.first().is_some_and(Observation::is_crossed));
+        assert!(
+            spot()
+                .decoded(payload)
+                .first()
+                .is_some_and(Observation::is_crossed)
+        );
     }
 }

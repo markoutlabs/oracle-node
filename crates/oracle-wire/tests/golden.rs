@@ -39,11 +39,13 @@ use oracle_types::{
     VenueEntry, VenueReport,
 };
 use oracle_wire::{
-    FeedSet, FeedSettings, NodeEntry, PushPolicy, Quorum, Registry, Signer, SourceSettings,
-    UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame, UnverifiedPriceBatch,
-    UnverifiedVenueFrame, decode_book_update, decode_funding_update, decode_price_batch,
-    decode_venue_report, domain, encode_book_update, encode_funding_update, encode_price_batch,
-    encode_price_update, encode_venue_report, feed_id,
+    Address, ClientEntry, ClientList, FeedSet, FeedSettings, NodeEntry, PushPolicy, Quorum,
+    Registry, Signer, SourceSettings, UnverifiedBookFrame, UnverifiedFrame, UnverifiedFundingFrame,
+    UnverifiedPriceBatch, UnverifiedVenueFrame, auth_ok_payload, auth_ok_transcript,
+    client_auth_payload, client_auth_transcript, decode_book_update, decode_funding_update,
+    decode_price_batch, decode_venue_report, domain, encode_book_update, encode_funding_update,
+    encode_price_batch, encode_price_update, encode_venue_report, feed_id, initial_keys_digest,
+    recover_payload_signer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +73,50 @@ struct GoldenFile {
     funding_updates: Vec<FundingUpdateVector>,
     price_batches: Vec<PriceBatchVector>,
     feed_set: FeedSetVector,
+    client_list: ClientListVector,
+    client_auth: ClientAuthVector,
+    auth_ok: AuthOkVector,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct ClientListVector {
+    governance_secret_key: String,
+    governance_address: String,
+    client_list: ClientList,
+    signing_bytes: String,
+    digest: String,
+}
+
+/// What a client's API key signs in the handshake (SPEC §6.1, kind `0x83`).
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct ClientAuthVector {
+    secret_key: String,
+    signer: String,
+    node: String,
+    challenge: String,
+    client_nonce: String,
+    client_pubkey: String,
+    eph_public: String,
+    transcript: String,
+    payload: String,
+    digest: String,
+    signature: String,
+}
+
+/// What a node's key signs to accept that client (SPEC §6.1, kind `0x84`).
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct AuthOkVector {
+    secret_key: String,
+    signer: String,
+    client_auth: String,
+    enc: String,
+    session_deadline: u64,
+    initial: Vec<String>,
+    initial_digest: String,
+    transcript: String,
+    payload: String,
+    digest: String,
+    signature: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -172,7 +218,7 @@ fn signer_from(seed: u8) -> ([u8; 32], Signer) {
     let secret = [seed; 32];
     (
         secret,
-        Signer::from_secret_bytes(secret).expect("valid secret key"),
+        Signer::from_secret(&secret.into()).expect("valid secret key"),
     )
 }
 
@@ -620,6 +666,77 @@ fn sample_feed_set(governance: &Signer) -> FeedSet {
     .expect("signs")
 }
 
+/// Three clients out of address order, so the vector shows that the encoding sorts them.
+fn sample_client_list(governance: &Signer) -> ClientList {
+    let clients = [0x52_u8, 0x51, 0x53]
+        .into_iter()
+        .zip([1_757_174_400, 1_788_710_400, 1_760_000_000])
+        .map(|(seed, expires_at)| ClientEntry {
+            address: signer_from(seed).1.address(),
+            expires_at,
+        })
+        .collect();
+    ClientList::sign(governance, 4, BASE_TIME_NS / NANOS_PER_SEC, 60, clients).expect("signs")
+}
+
+/// The handshake of client `0x51` with the node `0x11`. Each 32-byte field is a
+/// distinct fill, so a swapped field shows in the transcript.
+fn sample_handshake() -> (ClientAuthVector, AuthOkVector) {
+    let (client_secret, client) = signer_from(0x51);
+    let (node_secret, node) = signer_from(0x11);
+    let (challenge, nonce, eph, enc) = ([0xA1; 32], [0xB2; 32], [0xC3; 32], [0xD4; 32]);
+    // Two sealed key updates of different lengths, so that each length prefix shows.
+    let sealed = |counter: u8, fill: u8, len: usize| {
+        let mut message = vec![0x02, 0x11, 0, 0, 0, 0, 0, 0, 0, counter];
+        message.resize(len, fill);
+        message
+    };
+    let initial_keys = [sealed(0, 0xE5, 90), sealed(1, 0x5E, 97)];
+    let initial = initial_keys_digest(&initial_keys);
+    let deadline = BASE_TIME_NS / NANOS_PER_SEC + 3_600;
+
+    let client_transcript = client_auth_transcript(
+        node.address(),
+        &challenge,
+        &nonce,
+        &client.public_key(),
+        &eph,
+    )
+    .expect("encodes");
+    let client_payload = client_auth_payload(&client_transcript);
+    let ok_transcript =
+        auth_ok_transcript(&client_transcript, &enc, deadline, &initial).expect("encodes");
+    let ok_payload = auth_ok_payload(&ok_transcript);
+    (
+        ClientAuthVector {
+            secret_key: hex0x(&client_secret),
+            signer: client.address().to_string(),
+            node: node.address().to_string(),
+            challenge: hex0x(&challenge),
+            client_nonce: hex0x(&nonce),
+            client_pubkey: client.public_key().to_string(),
+            eph_public: hex0x(&eph),
+            transcript: hex0x(&client_transcript),
+            payload: hex0x(&client_payload),
+            digest: hex0x(&domain::digest(&client_payload)),
+            signature: client.sign_payload(&client_payload).to_string(),
+        },
+        AuthOkVector {
+            secret_key: hex0x(&node_secret),
+            signer: node.address().to_string(),
+            client_auth: hex0x(&client_transcript),
+            enc: hex0x(&enc),
+            session_deadline: deadline,
+            initial: initial_keys.iter().map(|key| hex0x(key)).collect(),
+            initial_digest: hex0x(&initial),
+            transcript: hex0x(&ok_transcript),
+            payload: hex0x(&ok_payload),
+            digest: hex0x(&domain::digest(&ok_payload)),
+            signature: node.sign_payload(&ok_payload).to_string(),
+        },
+    )
+}
+
 fn build() -> GoldenFile {
     let feed_ids = [
         "CRYPTO.BTC/USD",
@@ -682,6 +799,9 @@ fn build() -> GoldenFile {
     let registry_bytes = registry.to_signing_bytes().expect("encodes");
     let feed_set = sample_feed_set(&governance);
     let feed_set_bytes = feed_set.to_signing_bytes().expect("encodes");
+    let client_list = sample_client_list(&governance);
+    let client_list_bytes = client_list.to_signing_bytes().expect("encodes");
+    let (client_auth, auth_ok) = sample_handshake();
 
     // The registry's node signs these too, so stored frames verify against it.
     let (node_secret, node) = signer_from(0x11);
@@ -795,6 +915,15 @@ fn build() -> GoldenFile {
             digest: hex0x(&domain::digest(&feed_set_bytes)),
             feed_set,
         },
+        client_list: ClientListVector {
+            governance_secret_key: hex0x(&governance_secret),
+            governance_address: governance.address().to_string(),
+            signing_bytes: hex0x(&client_list_bytes),
+            digest: hex0x(&domain::digest(&client_list_bytes)),
+            client_list,
+        },
+        client_auth,
+        auth_ok,
     }
 }
 
@@ -905,6 +1034,68 @@ fn golden_vectors_are_unchanged() {
         generated.feed_set, expected.feed_set,
         "feed set encoding changed"
     );
+    assert_eq!(
+        generated.client_list, expected.client_list,
+        "client list encoding changed"
+    );
+    assert_eq!(
+        generated.client_auth, expected.client_auth,
+        "client auth transcript changed"
+    );
+    assert_eq!(
+        generated.auth_ok, expected.auth_ok,
+        "auth_ok transcript changed"
+    );
+}
+
+/// The stored client list verifies, and each stored handshake signature
+/// recovers to its signer under its own kind only.
+#[test]
+fn the_stored_client_list_and_handshake_signatures_verify() {
+    let file = load();
+    let governance: Address = file
+        .client_list
+        .governance_address
+        .parse()
+        .expect("an address");
+    let verified = file
+        .client_list
+        .client_list
+        .verify(governance, 0)
+        .expect("verifies");
+    assert_eq!(verified.version(), 4);
+
+    let unhex = |text: &str| hex::decode(text.trim_start_matches("0x")).expect("valid hex");
+    let signed = [
+        (
+            &file.client_auth.payload,
+            &file.client_auth.signature,
+            &file.client_auth.signer,
+        ),
+        (
+            &file.auth_ok.payload,
+            &file.auth_ok.signature,
+            &file.auth_ok.signer,
+        ),
+    ];
+    for (payload, signature, signer) in signed {
+        let signature = signature.parse().expect("a signature");
+        let recovered = recover_payload_signer(&unhex(payload), &signature).expect("recovers");
+        assert_eq!(&recovered.to_string(), signer);
+    }
+    // The same transcript under the other kind recovers to someone else.
+    let mut swapped = unhex(&file.client_auth.payload);
+    if let Some(kind) = swapped.get_mut(1) {
+        *kind = oracle_wire::KIND_NODE_AUTH_OK;
+    }
+    let signature = file.client_auth.signature.parse().expect("a signature");
+    assert_ne!(
+        recover_payload_signer(&swapped, &signature)
+            .map(|address| address.to_string())
+            .ok()
+            .as_ref(),
+        Some(&file.client_auth.signer)
+    );
 }
 
 /// The stored feed set must verify against its own governance address.
@@ -914,6 +1105,7 @@ fn the_stored_feed_set_verifies() {
     let governance: oracle_wire::Address = stored.governance_address.parse().expect("an address");
     let verified = stored.feed_set.verify(governance, 0).expect("verifies");
     assert_eq!(verified.feeds().len(), 3);
+    assert_eq!(verified.governance(), governance);
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.
@@ -1062,6 +1254,7 @@ fn signature_matches_foundry() {
     };
 
     let file = load();
+    let (client_auth_name, auth_ok_name) = ("client_auth".to_owned(), "auth_ok".to_owned());
     let signed = file
         .price_updates
         .iter()
@@ -1080,7 +1273,21 @@ fn signature_matches_foundry() {
             file.funding_updates
                 .iter()
                 .map(|v| (&v.name, &v.digest, &v.secret_key, &v.signature)),
-        );
+        )
+        .chain([
+            (
+                &client_auth_name,
+                &file.client_auth.digest,
+                &file.client_auth.secret_key,
+                &file.client_auth.signature,
+            ),
+            (
+                &auth_ok_name,
+                &file.auth_ok.digest,
+                &file.auth_ok.secret_key,
+                &file.auth_ok.signature,
+            ),
+        ]);
     for (name, digest, secret_key, signature) in signed {
         let output = std::process::Command::new(&cast)
             .args([

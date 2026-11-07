@@ -9,8 +9,8 @@ use crate::WireError;
 pub(crate) struct SecretKey(SigningKey);
 
 impl SecretKey {
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, WireError> {
-        SigningKey::from_bytes((&bytes).into())
+    pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Result<Self, WireError> {
+        SigningKey::from_bytes(bytes.into())
             .map(Self)
             .map_err(|_| WireError::InvalidSecretKey)
     }

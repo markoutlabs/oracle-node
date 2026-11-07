@@ -1,0 +1,31 @@
+{
+  "prices": [
+    {
+      "concerns": [],
+      "conf": "12.5",
+      "feed_id": "0x0523e79c7ed211911a19afaa4def68c896bc72d674bf33c5c64d4d7089e320e2",
+      "halted_nodes": 0,
+      "nodes": 3,
+      "price": "64010",
+      "publish_time_ns": "1754583000000000000",
+      "spread_bps": "3.90563974",
+      "status": "ok",
+      "symbol": "CRYPTO.BTC/USD"
+    },
+    {
+      "concerns": [
+        "insufficient_nodes"
+      ],
+      "conf": null,
+      "feed_id": "0x2473e24bc41464f61b79547860ce69c012a19808f3057492fb5f95e22a5e40e4",
+      "halted_nodes": 0,
+      "nodes": 1,
+      "price": null,
+      "publish_time_ns": "0",
+      "spread_bps": null,
+      "status": "halted",
+      "symbol": "CRYPTO.ETH/USD"
+    }
+  ],
+  "resolved_at_ns": "1754583002000000000"
+}

@@ -26,7 +26,7 @@ use prost::Message as _;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::clock::millis_to_nanos;
 use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
@@ -171,44 +171,21 @@ pub fn futures_frames<'a>(instruments: impl Iterator<Item = (&'a str, bool)>) ->
     frames
 }
 
-fn lookup(map: &InstrumentMap, symbol: &str) -> Result<InstrumentEntry, DecodeError> {
+fn lookup<'m>(map: &'m InstrumentMap, symbol: &str) -> Result<&'m InstrumentEntry, DecodeError> {
     map.lookup(symbol)
-        .cloned()
         .ok_or_else(|| DecodeError::UnknownInstrument(symbol.to_owned()))
 }
 
-/// Replaces the book with a whole snapshot, and emits all of it where the
-/// market wants depth, or only its top.
-fn snapshot<P, Q>(
-    levels: [(Side, &[(P, Q)]); 2],
-    parse_level: impl Fn(&P, &Q) -> Result<(Fixed, Fixed), DecodeError>,
-    symbol: &str,
+/// Each depth message is a whole book.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::WholeBook);
+
+/// A level of `price` and `size`, the size in coins.
+fn change(
     entry: &InstrumentEntry,
-    books: &mut Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let book = books.book(symbol);
-    book.clear();
-    for (side, levels) in levels {
-        for (price, size) in levels {
-            let (price, size) = parse_level(price, size)?;
-            book.set(side, price, base_units(size, entry.contract_size));
-        }
-    }
-    let emit = if entry.depth {
-        Books::emit
-    } else {
-        Books::emit_top
-    };
-    emit(
-        books,
-        symbol,
-        entry.instrument.clone(),
-        None,
-        local_recv_ns,
-        out,
-    )
+    price: Result<Fixed, DecodeError>,
+    size: Result<Fixed, DecodeError>,
+) -> Result<Change<'static>, DecodeError> {
+    Ok(Change::new(price?, base_units(size?, entry.contract_size)))
 }
 
 #[derive(Deserialize)]
@@ -256,15 +233,23 @@ pub fn decode_spot(
         .map(millis_to_nanos);
     match push.body {
         Some(pb::Body::AggreBookTicker(ticker)) => {
-            let prices = (
-                decimal("bidPrice", &ticker.bid_price)?,
-                decimal("askPrice", &ticker.ask_price)?,
-            );
-            let sizes = (
-                decimal("bidQuantity", &ticker.bid_quantity)?,
-                decimal("askQuantity", &ticker.ask_quantity)?,
-            );
-            out.push(book_top(&entry, prices, sizes, time, local_recv_ns)?);
+            // Protobuf sends an unset string as empty: that side is absent.
+            let top = || {
+                if ticker.bid_price.is_empty() || ticker.ask_price.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    (
+                        decimal("bidPrice", &ticker.bid_price)?,
+                        decimal("askPrice", &ticker.ask_price)?,
+                    ),
+                    (
+                        decimal("bidQuantity", &ticker.bid_quantity)?,
+                        decimal("askQuantity", &ticker.ask_quantity)?,
+                    ),
+                )))
+            };
+            out.push(book_top(entry, top, time, local_recv_ns)?);
             Ok(())
         }
         Some(pb::Body::AggreDeals(deals)) => {
@@ -272,7 +257,7 @@ pub fn decode_spot(
                 out.push(Observation {
                     exchange_time_ns: u64::try_from(deal.time).ok().map(millis_to_nanos),
                     ..observation(
-                        &entry,
+                        entry,
                         ObsKind::Trade,
                         decimal("price", &deal.price)?,
                         local_recv_ns,
@@ -282,22 +267,13 @@ pub fn decode_spot(
             Ok(())
         }
         Some(pb::Body::LimitDepths(depth)) => {
-            let side = |items: &[pb::PublicLimitDepthV3ApiItem]| -> Vec<(String, String)> {
-                items
-                    .iter()
-                    .map(|item| (item.price.clone(), item.quantity.clone()))
-                    .collect()
-            };
-            let (asks, bids) = (side(&depth.asks), side(&depth.bids));
-            snapshot(
-                [(Side::Ask, &asks), (Side::Bid, &bids)],
-                |price, size| Ok((decimal("depth price", price)?, decimal("depth size", size)?)),
-                symbol,
-                &entry,
-                books,
-                local_recv_ns,
-                out,
-            )
+            let parsed = BookMsg::whole(&depth.bids, &depth.asks, |item| {
+                let price = decimal("depth price", &item.price);
+                change(entry, price, decimal("depth size", &item.quantity))
+            });
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         None => Err(DecodeError::UnhandledStream(push.channel)),
     }
@@ -329,19 +305,6 @@ struct FuturesDepth<'a> {
     asks: Vec<Vec<&'a RawValue>>,
     #[serde(borrow)]
     bids: Vec<Vec<&'a RawValue>>,
-}
-
-/// The price and the contracts of each level.
-fn pairs<'a>(
-    levels: &[Vec<&'a RawValue>],
-) -> Result<Vec<(&'a RawValue, &'a RawValue)>, DecodeError> {
-    levels
-        .iter()
-        .map(|level| match level.as_slice() {
-            [price, size, ..] => Ok((*price, *size)),
-            _ => Err(DecodeError::MissingField("depth level")),
-        })
-        .collect()
 }
 
 /// One trade of `push.deal`: price, volume, side, time.
@@ -446,22 +409,19 @@ pub fn decode_futures(
     let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
     match channel {
         "push.depth.full" => {
-            let depth: FuturesDepth<'_> = parse(data)?;
-            let (asks, bids) = (pairs(&depth.asks)?, pairs(&depth.bids)?);
-            snapshot(
-                [(Side::Ask, &asks), (Side::Bid, &bids)],
-                |price, size| {
-                    Ok((
-                        decimal_literal("depth price", price)?,
-                        decimal_literal("depth size", size)?,
-                    ))
-                },
-                symbol,
-                &entry,
-                books,
-                local_recv_ns,
-                out,
-            )
+            let parsed = parse::<FuturesDepth<'_>>(data).and_then(|depth| {
+                BookMsg::whole(&depth.bids, &depth.asks, |level| match level.as_slice() {
+                    [price, size, ..] => change(
+                        entry,
+                        decimal_literal("depth price", price),
+                        decimal_literal("depth size", size),
+                    ),
+                    _ => Err(DecodeError::MissingField("depth level")),
+                })
+            });
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "push.deal" => {
             let deals: Vec<Deal<'_>> = parse(data)?;
@@ -469,7 +429,7 @@ pub fn decode_futures(
                 out.push(Observation {
                     exchange_time_ns: deal.t.map(millis_to_nanos),
                     ..observation(
-                        &entry,
+                        entry,
                         ObsKind::Trade,
                         decimal_literal("p", deal.p)?,
                         local_recv_ns,
@@ -486,7 +446,7 @@ pub fn decode_futures(
             };
             let price: Price<'_> = parse(data)?;
             out.push(observation(
-                &entry,
+                entry,
                 kind,
                 decimal_literal("price", price.price)?,
                 local_recv_ns,
@@ -495,7 +455,7 @@ pub fn decode_futures(
         }
         "push.ticker" => {
             let ticker: Ticker<'_> = parse(data)?;
-            let state = books.funding(symbol);
+            let state = books.funding(&entry.instrument);
             if let Some(rate) = ticker.funding_rate {
                 state.rate = Some(decimal_literal("fundingRate", rate)?);
             }
@@ -503,17 +463,17 @@ pub fn decode_futures(
                 let contracts = decimal_literal("holdVol", contracts)?;
                 state.open_interest = Some(base_units(contracts, entry.contract_size));
             }
-            out.extend(interval_funding(&entry, state, local_recv_ns));
+            out.extend(interval_funding(entry, state, local_recv_ns));
             Ok(())
         }
         "push.funding.rate" => {
             let funding: FundingPush<'_> = parse(data)?;
-            let state = books.funding(symbol);
+            let state = books.funding(&entry.instrument);
             state.rate = Some(decimal_literal("rate", funding.rate)?);
             if let Some(next) = funding.next_settle_time {
                 state.next_funding_time_ns = Some(millis_to_nanos(next));
             }
-            out.extend(interval_funding(&entry, state, local_recv_ns));
+            out.extend(interval_funding(entry, state, local_recv_ns));
             Ok(())
         }
         other => Err(DecodeError::UnhandledStream(other.to_owned())),
@@ -540,7 +500,7 @@ fn rest(
         )));
     }
     let data = envelope.data.ok_or(DecodeError::MissingField("data"))?;
-    let state = books.funding(symbol);
+    let state = books.funding(&entry.instrument);
     match envelope.subject.unwrap_or_default() {
         "funding.current" => {
             let current: FundingCurrent<'_> = parse(data)?;
@@ -562,7 +522,7 @@ fn rest(
         }
         other => return Err(DecodeError::UnhandledStream(other.to_owned())),
     }
-    out.extend(interval_funding(&entry, state, local_recv_ns));
+    out.extend(interval_funding(entry, state, local_recv_ns));
     Ok(())
 }
 
@@ -573,10 +533,9 @@ fn rest(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, Replayed, contracts_of, fixed, instrument, of};
     use oracle_types::{MarketKind, OpenInterestUnit, Venue};
 
-    const RECV: u64 = 1_792_940_600_000_000_000;
     /// Recorded from MEXC on 2026-10-25: the subscription reply and a pong as
     /// text (`T`), then pushes of BTC's and ETH's quotes, BTC's trades and BTC's
     /// book as protobuf, in hex (`B`).
@@ -586,55 +545,29 @@ mod tests {
     /// two REST records as the connector frames them, and a failed read.
     const FUTURES: &str = include_str!("../../tests/fixtures/mexc-futures.jsonl");
 
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
-    }
+    /// The levels of MEXC's spot book: `limit.depth` at 20.
+    const SPOT_BOOK_LEVELS: usize = 20;
 
-    fn spec(symbol: &str, market: MarketKind, depth: bool, size: Option<&str>) -> InstrumentSpec {
-        let spec = InstrumentSpec {
-            contract_size: size.map(fixed),
-            ..InstrumentSpec::new(symbol, market, "CRYPTO.X/USDT").expect("valid")
-        };
-        if depth { spec.with_depth() } else { spec }
-    }
-
-    fn spot_map(depth: bool) -> InstrumentMap {
-        let specs = [
-            spec("BTCUSDT", MarketKind::Spot, depth, None),
-            spec("ETHUSDT", MarketKind::Spot, false, None),
+    fn spot(depth: bool) -> Feed {
+        let btc = instrument("BTCUSDT", MarketKind::Spot);
+        let pairs = [
+            if depth { btc.with_depth() } else { btc },
+            instrument("ETHUSDT", MarketKind::Spot),
         ];
-        InstrumentMap::new(Venue::Mexc, MarketKind::Spot, &specs).expect("valid")
+        Feed::venue(decode_spot, Venue::Mexc, MarketKind::Spot, &pairs)
     }
 
-    fn futures_map(depth: bool) -> InstrumentMap {
-        let specs = [
-            spec("BTC_USDT", MarketKind::LinearPerp, depth, Some("0.0001")),
-            spec("ETH_USDT", MarketKind::LinearPerp, false, Some("0.01")),
+    fn futures(depth: bool) -> Feed {
+        let btc = contracts_of(instrument("BTC_USDT", MarketKind::LinearPerp), "0.0001");
+        let perps = [
+            if depth { btc.with_depth() } else { btc },
+            contracts_of(instrument("ETH_USDT", MarketKind::LinearPerp), "0.01"),
         ];
-        InstrumentMap::new(Venue::Mexc, MarketKind::LinearPerp, &specs).expect("valid")
+        Feed::venue(decode_futures, Venue::Mexc, MarketKind::LinearPerp, &perps)
     }
 
-    /// Runs a session through one map; returns the observations and the errors
-    /// that are not benign.
-    fn replay(
-        lines: impl Iterator<Item = Vec<u8>>,
-        map: &InstrumentMap,
-        decode: super::super::DecodeFn,
-    ) -> (Vec<Observation>, Vec<String>) {
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for payload in lines {
-            let mut out = Vec::new();
-            match decode(&payload, map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
-    }
-
-    fn spot_lines() -> impl Iterator<Item = Vec<u8>> {
+    /// The spot recording's payloads: text as it is, protobuf from its hex.
+    fn spot_payloads() -> impl Iterator<Item = Vec<u8>> {
         SPOT.lines().map(|line| match line.split_once(' ') {
             Some(("B", body)) => hex::decode(body).expect("hex"),
             Some((_, body)) => body.as_bytes().to_vec(),
@@ -644,14 +577,15 @@ mod tests {
 
     #[test]
     fn a_spot_session_gives_quotes_trades_and_a_book_from_protobuf() {
-        let (all, errors) = replay(spot_lines(), &spot_map(true), decode_spot);
+        let Replayed {
+            observations: all,
+            errors,
+        } = spot(true).replay_all(spot_payloads());
         assert!(errors.is_empty(), "{errors:?}");
-        let top = all
-            .iter()
-            .find(|o| o.kind == ObsKind::BookTop && &*o.instrument.symbol == "ETHUSDT")
-            .expect("a quote");
+        let top = of(&all, "ETHUSDT", ObsKind::BookTop)[0];
         assert!(top.bid < top.ask);
         assert!(top.bid_qty.is_some_and(Fixed::is_positive));
+        // A time after 2023: the milliseconds were read, not the seconds.
         assert!(
             top.exchange_time_ns
                 .is_some_and(|ns| ns > 1_700_000_000_000_000_000)
@@ -661,55 +595,43 @@ mod tests {
             .find(|o| o.kind == ObsKind::Trade)
             .expect("a trade");
         assert!(trade.price > fixed("10000"));
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
+        let depth = *of(&all, "BTCUSDT", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
-        assert_eq!(book.bids.len().min(book.asks.len()), 20);
+        assert_eq!(book.bids.len().min(book.asks.len()), SPOT_BOOK_LEVELS);
         assert!(book.bids[0].price < book.asks[0].price);
     }
 
     #[test]
     fn a_spot_book_without_depth_gives_only_its_top() {
-        let (all, _) = replay(spot_lines(), &spot_map(false), decode_spot);
+        let all = spot(false).replay_all(spot_payloads()).observations;
         assert!(all.iter().all(|o| o.kind != ObsKind::Depth));
     }
 
     #[test]
     fn a_futures_session_sizes_in_coins_and_carries_the_rest_funding() {
-        let lines = FUTURES.lines().map(|line| line.as_bytes().to_vec());
-        let (all, errors) = replay(lines, &futures_map(true), decode_futures);
-        // Only the failed REST read is an error.
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("ETH_USDT"), "{errors:?}");
+        let Replayed {
+            observations: all,
+            errors,
+        } = futures(true).replay_all(FUTURES.lines());
+        let [failed] = errors.as_slice() else {
+            panic!("only the failed REST read is an error: {errors:?}");
+        };
+        assert!(failed.to_string().contains("ETH_USDT"), "{failed}");
 
-        let depth = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Depth)
-            .expect("a book");
+        let depth = *of(&all, "BTC_USDT", ObsKind::Depth).last().expect("a book");
         let book = depth.book.as_deref().expect("levels");
-        assert!(book.bids[0].price < book.asks[0].price);
         assert_eq!(depth.bid, Some(book.bids[0].price));
         assert!(
             book.bids[0].qty < fixed("1000"),
             "contracts of 0.0001 BTC become coins"
         );
 
-        assert!(all.iter().any(|o| o.kind == ObsKind::Trade));
-        let mark = all
-            .iter()
-            .find(|o| o.kind == ObsKind::MarkPrice)
-            .expect("a mark");
-        assert!(mark.price > fixed("10000"));
-        assert!(all.iter().any(|o| o.kind == ObsKind::IndexPrice));
+        assert!(!of(&all, "BTC_USDT", ObsKind::Trade).is_empty());
+        assert!(of(&all, "BTC_USDT", ObsKind::MarkPrice)[0].price > fixed("10000"));
+        assert!(!of(&all, "BTC_USDT", ObsKind::IndexPrice).is_empty());
 
-        let funding = all
-            .iter()
-            .rev()
-            .find(|o| o.kind == ObsKind::Funding && &*o.instrument.symbol == "BTC_USDT")
+        let funding = *of(&all, "BTC_USDT", ObsKind::Funding)
+            .last()
             .expect("funding");
         let info = funding.funding.as_deref().expect("info");
         assert_eq!(info.interval_ns, Some(8 * HOUR_NS));
@@ -728,44 +650,22 @@ mod tests {
 
     #[test]
     fn replies_are_benign_and_a_refusal_is_not() {
-        let (spot, futures) = (spot_map(false), futures_map(false));
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let replies: [(super::super::DecodeFn, &str, &InstrumentMap); 3] = [
-            (decode_spot, r#"{"id":0,"code":0,"msg":"PONG"}"#, &spot),
-            (
-                decode_futures,
-                r#"{"channel":"pong","data":1792940539872,"ts":1792940539872}"#,
-                &futures,
-            ),
-            (
-                decode_futures,
-                r#"{"channel":"rs.sub.deal","data":"success","ts":1}"#,
-                &futures,
-            ),
-        ];
-        for (decode, reply, map) in replies {
-            let error =
-                decode(reply.as_bytes(), map, &mut books, RECV, &mut out).expect_err("a reply");
+        let (mut spot, mut futures) = (spot(false), futures(false));
+        assert!(
+            spot.refused(r#"{"id":0,"code":0,"msg":"PONG"}"#)
+                .is_benign()
+        );
+        for reply in [
+            r#"{"channel":"pong","data":1792940539872,"ts":1792940539872}"#,
+            r#"{"channel":"rs.sub.deal","data":"success","ts":1}"#,
+        ] {
+            let error = futures.refused(reply);
             assert!(error.is_benign(), "{error:?} for {reply}");
         }
-        let refusals: [(super::super::DecodeFn, &str, &InstrumentMap); 2] = [
-            (
-                decode_spot,
-                r#"{"id":0,"code":0,"msg":"Not Subscribed successfully! [spot@x].  Reason： Blocked! "}"#,
-                &spot,
-            ),
-            (
-                decode_futures,
-                r#"{"channel":"rs.sub.deal","data":"symbol not exist","ts":1}"#,
-                &futures,
-            ),
-        ];
-        for (decode, refusal, map) in refusals {
-            let error =
-                decode(refusal.as_bytes(), map, &mut books, RECV, &mut out).expect_err("a refusal");
-            assert!(!error.is_benign(), "{error:?} for {refusal}");
-        }
+        let blocked = r#"{"id":0,"code":0,"msg":"Not Subscribed successfully! [spot@x].  Reason： Blocked! "}"#;
+        assert!(!spot.refused(blocked).is_benign());
+        let unknown = r#"{"channel":"rs.sub.deal","data":"symbol not exist","ts":1}"#;
+        assert!(!futures.refused(unknown).is_benign());
     }
 
     #[test]

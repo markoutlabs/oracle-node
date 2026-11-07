@@ -345,7 +345,10 @@ impl FeedSet {
         )?;
         content::check(&self.min_node_version, self.push, &self.feeds)
             .map_err(VerifyError::MalformedFeedSet)?;
-        Ok(VerifiedFeedSet { set: self.clone() })
+        Ok(VerifiedFeedSet {
+            set: self.clone(),
+            governance,
+        })
     }
 }
 
@@ -353,9 +356,16 @@ impl FeedSet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedFeedSet {
     set: FeedSet,
+    governance: Address,
 }
 
 impl VerifiedFeedSet {
+    /// Returns the governance address this set was verified against.
+    #[must_use]
+    pub const fn governance(&self) -> Address {
+        self.governance
+    }
+
     /// Returns the version.
     #[must_use]
     pub const fn version(&self) -> u64 {
@@ -415,7 +425,7 @@ mod tests {
     const NOW: u64 = 1_754_582_400;
 
     fn governance() -> Signer {
-        Signer::from_secret_bytes([0xC0; 32]).expect("valid key")
+        Signer::from_secret(&[0xC0; 32].into()).expect("valid key")
     }
 
     fn source(venue: &str, symbol: &str) -> SourceSettings {
@@ -563,7 +573,7 @@ mod tests {
                 minimum: 3
             })
         ));
-        let impostor = Signer::from_secret_bytes([0xF0; 32]).expect("valid key");
+        let impostor = Signer::from_secret(&[0xF0; 32].into()).expect("valid key");
         let forged = FeedSet::sign(
             &impostor,
             4,

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 oracle-types.workspace = true
 
+arc-swap.workspace = true
 async-trait.workspace = true
 backon.workspace = true
 crc32fast.workspace = true
@@ -26,8 +27,14 @@ tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpk
 tokio-util.workspace = true
 tracing.workspace = true
 
+[features]
+# The test harness, `oracle_ingest::testing`. Off in production builds.
+testing = []
+
 [dev-dependencies]
 hex.workspace = true
+# The crate itself with the harness on, for its own tests.
+oracle-ingest = { path = ".", features = ["testing"] }
 oracle-types = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",

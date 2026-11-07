@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn encrypted_keys_round_trip_and_refuse_the_wrong_passphrase() {
-        let signer = Signer::from_secret_bytes([5_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[5_u8; 32].into()).expect("valid key");
         let armored =
             encrypt(&signer.to_secret_hex(), &passphrase("correct horse")).expect("encrypts");
         assert!(is_encrypted(&armored));
@@ -313,7 +313,7 @@ mod tests {
     /// factor is fixed, and a file over the limit says so.
     #[test]
     fn keys_use_a_fixed_work_factor_and_too_much_work_is_named() {
-        let signer = Signer::from_secret_bytes([7_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[7_u8; 32].into()).expect("valid key");
         let armored = encrypt(&signer.to_secret_hex(), &passphrase("pw")).expect("encrypts");
         let mut bytes = Vec::new();
         ArmoredReader::new(armored.as_bytes())
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn load_signer_handles_plaintext_and_encrypted_files() {
         let dir = scratch("load");
-        let signer = Signer::from_secret_bytes([6_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[6_u8; 32].into()).expect("valid key");
 
         let plain = dir.join("plain.key");
         std::fs::write(&plain, format!("{}\n", &*signer.to_secret_hex())).expect("writes");

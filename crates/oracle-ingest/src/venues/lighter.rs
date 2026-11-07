@@ -24,9 +24,8 @@ use oracle_types::{Fixed, FundingBasis, FundingInfo, ObsKind, Observation, OpenI
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use crate::book::{Books, Side};
+use crate::book::{BookMsg, BookRule, Books, Change, Continuity};
 use crate::clock::millis_to_nanos;
-use crate::instrument::InstrumentEntry;
 use crate::{DecodeError, InstrumentMap};
 
 use super::{book_top, decimal, observation, parse};
@@ -50,6 +49,9 @@ const FUNDING_INTERVAL_NS: u64 = 3_600_000_000_000;
 
 /// The full book: deep enough for every impact size.
 const BOOK_DEPTH: usize = 1_000;
+
+/// Each change names the `nonce` of the one before it as `begin_nonce`.
+const BOOK_RULE: BookRule = BookRule::new(Continuity::UpdateId).depth(BOOK_DEPTH);
 
 fn subscribe(channel: &str) -> String {
     serde_json::json!({ "type": "subscribe", "channel": channel }).to_string()
@@ -94,10 +96,10 @@ struct Level<'a> {
 
 #[derive(Deserialize)]
 struct Ticker<'a> {
-    #[serde(borrow)]
-    a: Level<'a>,
-    #[serde(borrow)]
-    b: Level<'a>,
+    #[serde(borrow, default)]
+    a: Option<Level<'a>>,
+    #[serde(borrow, default)]
+    b: Option<Level<'a>>,
     /// Unix microseconds.
     #[serde(default)]
     last_updated_at: Option<u64>,
@@ -196,27 +198,28 @@ pub fn decode(
     let missing = || DecodeError::MissingField("data");
     match topic {
         "ticker" => {
-            let ticker: Ticker<'_> = parse(envelope.ticker.ok_or_else(missing)?)?;
-            out.push(book_top(
-                entry,
-                (decimal("b", ticker.b.price)?, decimal("a", ticker.a.price)?),
-                (decimal("b", ticker.b.size)?, decimal("a", ticker.a.size)?),
-                micros(ticker.last_updated_at),
-                local_recv_ns,
-            )?);
+            let ticker: Ticker<'_> = parse(envelope.ticker.ok_or_else(missing)?)
+                .map_err(|e| DecodeError::lost(&entry.instrument, e))?;
+            let top = || {
+                let (Some(b), Some(a)) = (&ticker.b, &ticker.a) else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    (decimal("b", b.price)?, decimal("a", a.price)?),
+                    (decimal("b", b.size)?, decimal("a", a.size)?),
+                )))
+            };
+            let time = micros(ticker.last_updated_at);
+            out.push(book_top(entry, top, time, local_recv_ns)?);
             Ok(())
         }
         "order_book" => {
-            let book: Book<'_> = parse(envelope.order_book.ok_or_else(missing)?)?;
-            depth(
-                id,
-                entry,
-                stage == "subscribed",
-                &book,
-                books,
-                local_recv_ns,
-                out,
-            )
+            let raw = envelope.order_book.ok_or_else(missing)?;
+            let parsed =
+                parse::<Book<'_>>(raw).and_then(|book| book_message(&book, stage == "subscribed"));
+            books
+                .keeper
+                .apply(BOOK_RULE, entry, parsed, local_recv_ns, out)
         }
         "trade" if stage == "subscribed" => Err(DecodeError::Control),
         "trade" => {
@@ -256,7 +259,7 @@ pub fn decode(
                 .open_interest
                 .map(|usd| decimal("open_interest", usd))
                 .transpose()?;
-            let state = books.funding(id);
+            let state = books.funding(&entry.instrument);
             // The stats repeat each second: funding goes out only when it changed.
             if state.update(Some(rate), open_interest) || state.settled != settled {
                 state.settled = settled;
@@ -279,43 +282,32 @@ pub fn decode(
     }
 }
 
-/// Applies the whole book or a change of it, and emits it.
-fn depth(
-    id: &str,
-    entry: &InstrumentEntry,
-    snapshot: bool,
-    change: &Book<'_>,
-    books: &mut Books,
-    local_recv_ns: u64,
-    out: &mut Vec<Observation>,
-) -> Result<(), DecodeError> {
-    let book = books.book(id);
-    if snapshot {
-        book.clear();
-    } else if change.begin_nonce != book.last_id {
-        return Err(DecodeError::Resync(format!(
-            "{id}: change follows {:?} but the book is at {:?}",
-            change.begin_nonce, book.last_id
-        )));
-    }
-    book.last_id = change.nonce;
-    for (side, levels) in [(Side::Bid, &change.bids), (Side::Ask, &change.asks)] {
-        for level in levels {
-            book.set(
-                side,
-                decimal("price", level.price)?,
-                decimal("size", level.size)?,
-            );
-        }
-    }
-    book.truncate(BOOK_DEPTH);
-    books.emit(
-        id,
-        entry.instrument.clone(),
-        micros(change.last_updated_at),
-        local_recv_ns,
-        out,
-    )
+/// The whole book or a change of it. A change without its nonces cannot
+/// prove that it follows the last one.
+fn book_message(change: &Book<'_>, snapshot: bool) -> Result<BookMsg<'static>, DecodeError> {
+    let nonce = change.nonce.ok_or(DecodeError::MissingField("nonce"))?;
+    let begin = if snapshot {
+        change.begin_nonce
+    } else {
+        Some(
+            change
+                .begin_nonce
+                .ok_or(DecodeError::MissingField("begin_nonce"))?,
+        )
+    };
+    let level = |level: &Level<'_>| {
+        Ok(Change::new(
+            decimal("price", level.price)?,
+            decimal("size", level.size)?,
+        ))
+    };
+    Ok(BookMsg {
+        snapshot,
+        prev_id: begin,
+        next_id: Some(nonce),
+        time: micros(change.last_updated_at),
+        ..BookMsg::changes(&change.bids, &change.asks, level)?
+    })
 }
 
 #[cfg(test)]
@@ -325,59 +317,29 @@ fn depth(
 )]
 mod tests {
     use super::*;
-    use crate::InstrumentSpec;
+    use crate::testing::{Feed, Replayed, fixed, instrument, of};
     use oracle_types::{MarketKind, Venue};
 
-    const RECV: u64 = 1_793_214_910_000_000_000;
     /// Recorded from Lighter on 2026-10-28: ETH's (`0`) quotes, and BTC's (`1`)
     /// whole book (cut to 30 levels a side) with its changes, trades and stats,
     /// and the refusal of an unknown market.
     const SESSION: &str = include_str!("../../tests/fixtures/lighter.jsonl");
 
-    fn fixed(text: &str) -> Fixed {
-        text.parse().expect("valid")
-    }
-
-    fn map() -> InstrumentMap {
-        let specs: Vec<InstrumentSpec> = [("0", false), ("1", true)]
-            .into_iter()
-            .map(|(id, depth)| {
-                let spec =
-                    InstrumentSpec::new(id, MarketKind::LinearPerp, "CRYPTO.X/USDT.PERP_MARK")
-                        .expect("valid");
-                if depth { spec.with_depth() } else { spec }
-            })
-            .collect();
-        InstrumentMap::new(Venue::Lighter, MarketKind::LinearPerp, &specs).expect("valid")
-    }
-
-    fn replay() -> (Vec<Observation>, Vec<String>) {
-        let map = map();
-        let mut books = Books::default();
-        let (mut all, mut errors) = (Vec::new(), Vec::new());
-        for line in SESSION.lines() {
-            let mut out = Vec::new();
-            match decode(line.as_bytes(), &map, &mut books, RECV, &mut out) {
-                Ok(()) => all.extend(out),
-                Err(error) if error.is_benign() => {}
-                Err(error) => errors.push(error.to_string()),
-            }
-        }
-        (all, errors)
-    }
-
-    fn of<'a>(all: &'a [Observation], id: &str, kind: ObsKind) -> Vec<&'a Observation> {
-        all.iter()
-            .filter(|o| &*o.instrument.symbol == id && o.kind == kind)
-            .collect()
-    }
-
     #[test]
     fn a_session_gives_quotes_a_book_trades_and_hourly_funding() {
-        let (all, errors) = replay();
-        // Only the unknown market is an error.
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("Invalid Channel"), "{errors:?}");
+        let markets = [
+            instrument("0", MarketKind::LinearPerp),
+            instrument("1", MarketKind::LinearPerp).with_depth(),
+        ];
+        let mut feed = Feed::venue(decode, Venue::Lighter, MarketKind::LinearPerp, &markets);
+        let Replayed {
+            observations: all,
+            errors,
+        } = feed.replay_all(SESSION.lines());
+        let [refused] = errors.as_slice() else {
+            panic!("only the unknown market is an error: {errors:?}");
+        };
+        assert!(refused.to_string().contains("Invalid Channel"), "{refused}");
 
         // The ticker at subscribe and its three updates.
         let tops = of(&all, "0", ObsKind::BookTop);
@@ -387,10 +349,7 @@ mod tests {
                 .all(|o| o.bid < o.ask && o.exchange_time_ns.is_some())
         );
         // The whole book and its six changes follow one another.
-        let depth = of(&all, "1", ObsKind::Depth);
-        assert_eq!(depth.len(), 7);
-        let book = depth[6].book.as_deref().expect("levels");
-        assert!(book.bids[0].price < book.asks[0].price);
+        assert_eq!(of(&all, "1", ObsKind::Depth).len(), 7);
         // The three trades at subscribe are old; the two updates hold 1 and 4.
         assert_eq!(of(&all, "1", ObsKind::Trade).len(), 5);
 
@@ -407,18 +366,20 @@ mod tests {
         assert!(usd > fixed("1000000"));
     }
 
+    /// A venue that leaves out `nonce` and `begin_nonce` everywhere would pass
+    /// a check of one missing id against another, so a book without them resyncs.
     #[test]
-    fn a_change_that_skips_one_ends_the_connection() {
-        let map = map();
-        let mut books = Books::default();
-        let mut out = Vec::new();
-        let whole = r#"{"type":"subscribed/order_book","channel":"order_book:1","order_book":{"asks":[{"price":"2","size":"1"}],"bids":[{"price":"1","size":"1"}],"nonce":10,"begin_nonce":0}}"#;
-        let skip = r#"{"type":"update/order_book","channel":"order_book:1","order_book":{"asks":[],"bids":[{"price":"1","size":"0"}],"nonce":12,"begin_nonce":11}}"#;
-        assert!(decode(whole.as_bytes(), &map, &mut books, RECV, &mut out).is_ok());
-        assert!(matches!(
-            decode(skip.as_bytes(), &map, &mut books, RECV, &mut out),
-            Err(DecodeError::Resync(_))
-        ));
+    fn a_book_without_its_nonces_resyncs() {
+        let markets = [instrument("1", MarketKind::LinearPerp).with_depth()];
+        let mut feed = Feed::venue(decode, Venue::Lighter, MarketKind::LinearPerp, &markets);
+        let snapshot = SESSION
+            .lines()
+            .find(|line| line.contains(r#""type":"subscribed/order_book""#))
+            .expect("a book snapshot");
+        let without = snapshot
+            .replace(r#""nonce":"#, r#""a_nonce":"#)
+            .replace(r#""begin_nonce":"#, r#""a_begin_nonce":"#);
+        assert!(matches!(feed.refused(without), DecodeError::Resync(_)));
     }
 
     #[test]

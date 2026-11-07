@@ -99,7 +99,7 @@ fn recording() -> Vec<Record> {
 }
 
 fn signer() -> Signer {
-    Signer::from_secret_bytes([0x5E; 32]).expect("valid key")
+    Signer::from_secret(&[0x5E; 32].into()).expect("valid key")
 }
 
 #[tokio::test]

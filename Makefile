@@ -19,7 +19,7 @@ WASM := target/wasm32-unknown-unknown/release/oracle_registry_canister.wasm
 DID := crates/oracle-registry-canister/oracle-registry-canister.did
 RELEASE_DIR := target/release-artifacts
 
-.PHONY: help build canister extract_did bake_candid_metadata node test lint e2e latency smoke \
+.PHONY: help build wasm canister extract_did bake_candid_metadata node test lint e2e latency smoke \
 	release publish network network-stop deploy governance check-identity
 
 help: ## List the targets
@@ -28,8 +28,10 @@ help: ## List the targets
 
 build: canister node ## The canister wasm and the node binary
 
-canister: ## The registry canister wasm, with its .did extracted and baked in
+wasm: ## The registry canister wasm alone, as the PocketIC tests install it
 	cargo build --target wasm32-unknown-unknown --release --locked -p $(PACKAGE)
+
+canister: wasm ## The registry canister wasm, with its .did extracted and baked in
 	$(MAKE) --no-print-directory extract_did bake_candid_metadata
 
 extract_did: ## Regenerate the .did from the built wasm
@@ -42,10 +44,17 @@ bake_candid_metadata: ## Embed the .did in the wasm as candid:service
 node: ## The oracle-node binary for this machine
 	cargo build --release --locked -p oracle-node --bin oracle-node
 
+# The PocketIC tests install the wasm that ORACLE_CANISTER_WASM names, so a build
+# error stops make before the tests. Without the variable, the tests build the wasm.
 # The workspace build turns on `pure-rust` everywhere, so oracle-wire alone
 # runs its vectors on `libsecp`, the backend the node ships with.
-test: ## Every test, PocketIC included, and the wire vectors on both backends
-	cargo test --workspace --locked
+# ORACLE_PREVIOUS_WASM names the wasm of the previous release, for the upgrade and
+# rollback test: the oracle_registry wasm of that GitHub release, checked against
+# its SHA256SUMS. Nothing downloads it. Without it the test skips, and under CI it fails.
+test: wasm ## Every test, PocketIC included, and the wire vectors on both backends
+	ORACLE_CANISTER_WASM=$(CURDIR)/$(WASM) \
+		$(if $(ORACLE_PREVIOUS_WASM),ORACLE_PREVIOUS_WASM=$(abspath $(ORACLE_PREVIOUS_WASM))) \
+		cargo test --workspace --locked
 	cargo test -p oracle-wire --locked
 
 lint: ## Formatting, then clippy for the workspace and the canister's wasm32 build
@@ -54,11 +63,11 @@ lint: ## Formatting, then clippy for the workspace and the canister's wasm32 bui
 	cargo clippy -p oracle-wire --all-targets --locked -- -D warnings
 	cargo clippy --target wasm32-unknown-unknown -p $(PACKAGE) --locked -- -D warnings
 
-e2e: ## The whole system on PocketIC: canister, node binary, SDK client
-	cargo test -p oracle-node --locked --test e2e
+e2e: wasm ## The whole system on PocketIC: canister, node binary, SDK client
+	ORACLE_CANISTER_WASM=$(CURDIR)/$(WASM) cargo test -p oracle-node --locked --test e2e
 
-latency: ## Live latency from the venues to the SDK on this machine; LATENCY_SECS (default 60), LATENCY_FEED
-	cargo test --release -p oracle-node --locked --test latency -- --ignored --nocapture
+latency: wasm ## Live latency from the venues to the SDK on this machine; LATENCY_SECS (default 60), LATENCY_FEED
+	ORACLE_CANISTER_WASM=$(CURDIR)/$(WASM) cargo test --release -p oracle-node --locked --test latency -- --ignored --nocapture
 
 smoke: ## The icp-cli path on a local network: deploy, and the calls init and rotate print
 	scripts/smoke.sh

@@ -15,7 +15,9 @@ use std::time::Duration;
 use oracle_client::{
     ConnectionState, NodeFeedState, OracleClient, Status, testing as client_testing,
 };
-use oracle_server::testing::{client_key, sample_update, signing_key, test_transport};
+use oracle_server::testing::{
+    client_key, sample_update, signing_key, test_client_list, test_transport,
+};
 use oracle_server::{Limits, ServerState, router};
 use oracle_types::{FeedId, Flags, NANOS_PER_SEC, PriceUpdate, Symbol};
 use oracle_wire::{Registry, Signer, VerifiedRegistry, feed_id};
@@ -193,7 +195,7 @@ async fn a_frame_from_an_unregistered_key_is_refused() {
         .build()
         .expect("valid configuration");
 
-    let impostor = Signer::from_secret_bytes([0xDD; 32]).expect("valid key");
+    let impostor = Signer::from_secret(&[0xDD; 32].into()).expect("valid key");
     let frame = impostor
         .sign_update(&update(1, 1, Flags::NONE))
         .encode_frame();
@@ -330,6 +332,14 @@ async fn the_open_routes_serve_the_catalogue_and_health() {
         body.contains(&signing_key().address().to_string()),
         "health must identify the node: {body}"
     );
+    let health: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(
+        health
+            .get("client_list")
+            .and_then(serde_json::Value::as_u64),
+        Some(test_client_list().version),
+        "{body}"
+    );
 }
 
 /// The registry a node serves is a convenience, not authority. Verifying it
@@ -339,7 +349,7 @@ async fn a_node_served_registry_still_requires_the_pinned_governance_key() {
     let node = start_node().await;
     let served: Registry = node.registry.as_registry().clone();
 
-    let impostor = Signer::from_secret_bytes([0x99; 32]).expect("valid key");
+    let impostor = Signer::from_secret(&[0x99; 32].into()).expect("valid key");
     assert!(
         served.verify(impostor.address(), 0).is_err(),
         "a registry must not verify against the wrong governance key"

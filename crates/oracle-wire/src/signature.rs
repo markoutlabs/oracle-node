@@ -208,7 +208,7 @@ mod tests {
     use crate::Signer;
 
     fn valid_signature() -> Signature {
-        let signer = Signer::from_secret_bytes([3_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[3_u8; 32].into()).expect("valid key");
         signer.sign_digest(&[9_u8; 32])
     }
 
@@ -216,7 +216,7 @@ mod tests {
     fn signing_produces_canonical_signatures() {
         // libsecp256k1 always emits low-s; this asserts we never relax that.
         for seed in 1_u8..32 {
-            let signer = Signer::from_secret_bytes([seed; 32]).expect("valid key");
+            let signer = Signer::from_secret(&[seed; 32].into()).expect("valid key");
             let sig = signer.sign_digest(&[seed; 32]);
             assert!(sig.s() <= HALF_CURVE_ORDER, "seed {seed} produced high-s");
             assert!(matches!(sig.recovery_byte(), 27 | 28));
@@ -285,7 +285,7 @@ mod tests {
     /// in-process signer would have produced.
     #[test]
     fn adapts_a_high_s_compact_signature_from_a_known_signer() {
-        let signer = Signer::from_secret_bytes([9_u8; 32]).expect("valid key");
+        let signer = Signer::from_secret(&[9_u8; 32].into()).expect("valid key");
         let digest = [0x5A_u8; 32];
         let canonical = signer.sign_digest(&digest);
         let (low, _) = canonical.parts();
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(from_low, canonical);
         assert_eq!(from_high, canonical);
 
-        let other = Signer::from_secret_bytes([10_u8; 32]).expect("valid key");
+        let other = Signer::from_secret(&[10_u8; 32].into()).expect("valid key");
         assert_eq!(
             Signature::from_compact_for(&digest, &low, other.address()),
             Err(WireError::RecoveryFailed)
