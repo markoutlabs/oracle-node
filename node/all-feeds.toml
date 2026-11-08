@@ -654,3 +654,144 @@ sources = [
 # but no decoder in this build emits one. A feed configured for it would halt
 # permanently rather than fail loudly, so it is left out until an adapter fills
 # it in.
+
+# The runner's coins and its next candidates (2026-11-08): Binance's USDC book and
+# MEXC's USDC book of each, so the board shows their USDC routes, and both USDT
+# books where no feed held MEXC's yet. Both venues list all of them; all trade far
+# above 0.001, so 8 decimals hold their price.
+
+[[feeds]]
+symbol = "CRYPTO.ICP/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ICPUSDC" },
+  { venue = "mexc", market = "spot", symbol = "ICPUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ZRO/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ZROUSDC" },
+  { venue = "mexc", market = "spot", symbol = "ZROUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.TRX/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "TRXUSDC" },
+  { venue = "mexc", market = "spot", symbol = "TRXUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ADA/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ADAUSDC" },
+  { venue = "mexc", market = "spot", symbol = "ADAUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ENA/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ENAUSDC" },
+  { venue = "mexc", market = "spot", symbol = "ENAUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.DOT/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "DOTUSDC" },
+  { venue = "mexc", market = "spot", symbol = "DOTUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.INJ/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "INJUSDC" },
+  { venue = "mexc", market = "spot", symbol = "INJUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.FIL/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "FILUSDC" },
+  { venue = "mexc", market = "spot", symbol = "FILUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.TIA/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "TIAUSDC" },
+  { venue = "mexc", market = "spot", symbol = "TIAUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.VIRTUAL/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "VIRTUALUSDC" },
+  { venue = "mexc", market = "spot", symbol = "VIRTUALUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.PENDLE/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "PENDLEUSDC" },
+  { venue = "mexc", market = "spot", symbol = "PENDLEUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.TAO/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "TAOUSDC" },
+  { venue = "mexc", market = "spot", symbol = "TAOUSDC" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ICP/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ICPUSDT" },
+  { venue = "mexc", market = "spot", symbol = "ICPUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.ZRO/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "ZROUSDT" },
+  { venue = "mexc", market = "spot", symbol = "ZROUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.TIA/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "TIAUSDT" },
+  { venue = "mexc", market = "spot", symbol = "TIAUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.VIRTUAL/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "VIRTUALUSDT" },
+  { venue = "mexc", market = "spot", symbol = "VIRTUALUSDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.PENDLE/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "PENDLEUSDT" },
+  { venue = "mexc", market = "spot", symbol = "PENDLEUSDT" },
+]
