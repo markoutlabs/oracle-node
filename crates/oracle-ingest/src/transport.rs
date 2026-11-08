@@ -10,8 +10,9 @@ use std::sync::LazyLock;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes, Message, Utf8Bytes};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 /// A transport-level failure. Always recoverable by reconnecting.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -177,6 +178,9 @@ pub(crate) fn install_tls_provider() {
     LazyLock::force(&TLS_PROVIDER);
 }
 
+/// The read buffer of each venue socket.
+const READ_BUFFER: usize = 16 * 1024;
+
 /// Connects over TLS using `rustls` with the webpki root store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WebSocketConnector;
@@ -186,7 +190,10 @@ impl Connector for WebSocketConnector {
 
     async fn connect(&self, url: &str) -> Result<Self::Conn, TransportError> {
         install_tls_provider();
-        let (inner, _response) = connect_async(url)
+        // Venue messages are a few KiB. The 128 KiB default is zeroed on every read and
+        // cost 5% of a node's CPU in the profile of 2026-11-08.
+        let config = WebSocketConfig::default().read_buffer_size(READ_BUFFER);
+        let (inner, _response) = connect_async_with_config(url, Some(config), false)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
         Ok(WebSocket { inner })
