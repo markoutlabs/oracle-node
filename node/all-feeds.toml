@@ -795,3 +795,22 @@ sources = [
   { venue = "binance", market = "spot", symbol = "PENDLEUSDT" },
   { venue = "mexc", market = "spot", symbol = "PENDLEUSDT" },
 ]
+
+# XAUT on Binance and MEXC (2026-11-09): MEXC lists it as GOLD(XAUT), and the board
+# read no MEXC book of it. MEXC took this symbol on a live subscribe, next to others.
+
+[[feeds]]
+symbol = "CRYPTO.XAUT/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "XAUTUSDT" },
+  { venue = "mexc", market = "spot", symbol = "GOLD(XAUT)USDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.XAUT/USDC"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "XAUTUSDC" },
+  { venue = "mexc", market = "spot", symbol = "GOLD(XAUT)USDC" },
+]
