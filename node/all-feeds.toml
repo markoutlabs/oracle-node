@@ -814,3 +814,26 @@ sources = [
   { venue = "binance", market = "spot", symbol = "XAUTUSDC" },
   { venue = "mexc", market = "spot", symbol = "GOLD(XAUT)USDC" },
 ]
+
+# QNT on every venue that lists it (2026-11-10), so the board reads each QNT book. MEXC,
+# Bitget and Coinbase's USDT book were missing; OKX, Bitfinex and Hyperliquid list none.
+
+[[feeds]]
+symbol = "CRYPTO.QNT/USDT"
+min_sources = 2
+sources = [
+  { venue = "binance", market = "spot", symbol = "QNTUSDT" },
+  { venue = "bybit", market = "spot", symbol = "QNTUSDT" },
+  { venue = "kucoin", market = "spot", symbol = "QNT-USDT" },
+  { venue = "gate", market = "spot", symbol = "QNT_USDT" },
+  { venue = "mexc", market = "spot", symbol = "QNTUSDT" },
+  { venue = "bitget", market = "spot", symbol = "QNTUSDT" },
+  { venue = "coinbase", market = "spot", symbol = "QNT-USDT" },
+]
+
+[[feeds]]
+symbol = "CRYPTO.QNT/USDC"
+min_sources = 1  # No other venue has a QNT USDC book; Binance's QNTUSDC is in BREAK.
+sources = [
+  { venue = "mexc", market = "spot", symbol = "QNTUSDC" },
+]
