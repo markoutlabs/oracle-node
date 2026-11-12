@@ -1,4 +1,4 @@
-# Every feed kind this build can actually serve, across all fifteen venues.
+# Every feed kind this build can actually serve, across all sixteen venues.
 #
 #   cargo run -p oracle-node --example gen_local_registry -- --nodes 1 \
 #     > node/registry.json
@@ -13,6 +13,11 @@
 #
 # Ingest subscriptions are DERIVED from the sources below — there is no separate
 # instrument list to keep in sync.
+#
+# Toobit's books follow Binance's, so each Toobit source is `quote_only`: the node
+# reads and signs the book, and the price does not count Binance twice. It has the
+# USDT and USDC feeds whose pair Toobit trades (checked 2026-11-12). ETH and SOL
+# have no USDT feed, so their Toobit USDT books are in the dollar feeds.
 
 # Heartbeats and stale venues are checked on this timer; price moves publish when
 # they arrive. --tail is noisy; grep it (`| grep published`).
@@ -104,6 +109,7 @@ sources = [
   { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
   { venue = "bitget", market = "spot", symbol = "ETHUSDT", converted = true },
   { venue = "gate", market = "spot", symbol = "ETH_USDT", converted = true },
+  { venue = "toobit", market = "spot", symbol = "ETHUSDT", converted = true, quote_only = true },
 ]
 
 [[feeds]]
@@ -123,6 +129,7 @@ sources = [
   { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
   { venue = "bitget", market = "spot", symbol = "SOLUSDT", converted = true },
   { venue = "gate", market = "spot", symbol = "SOL_USDT", converted = true },
+  { venue = "toobit", market = "spot", symbol = "SOLUSDT", converted = true, quote_only = true },
 ]
 
 # ----------------------------------------------------------- spot, USDT
@@ -143,6 +150,7 @@ sources = [
   { venue = "mexc", market = "spot", symbol = "BTCUSDT" },
   { venue = "bitget", market = "spot", symbol = "BTCUSDT" },
   { venue = "gate", market = "spot", symbol = "BTC_USDT" },
+  { venue = "toobit", market = "spot", symbol = "BTCUSDT", quote_only = true },
 ]
 
 # ------------------------------------------------- spot, stablecoin pairs
@@ -164,6 +172,7 @@ sources = [
   { venue = "bitfinex", market = "spot", symbol = "tUDCUST" },
   { venue = "bitget", market = "spot", symbol = "USDCUSDT" },
   { venue = "gate", market = "spot", symbol = "USDC_USDT" },
+  { venue = "toobit", market = "spot", symbol = "USDCUSDT", quote_only = true },
 ]
 
 # Kraken and Bitstamp have the native-USD books: Coinbase keeps no USDC book. The Bitfinex
@@ -207,6 +216,7 @@ sources = [
   { venue = "hyperliquid", market = "spot", symbol = "@142" },  # UBTC/USDC
   { venue = "bitget", market = "spot", symbol = "BTCUSDC" },
   { venue = "gate", market = "spot", symbol = "BTC_USDC" },
+  { venue = "toobit", market = "spot", symbol = "BTCUSDC", quote_only = true },
 ]
 
 [[feeds]]
@@ -223,6 +233,7 @@ sources = [
   { venue = "hyperliquid", market = "spot", symbol = "@151" },  # UETH/USDC
   { venue = "bitget", market = "spot", symbol = "ETHUSDC" },
   { venue = "gate", market = "spot", symbol = "ETH_USDC" },
+  { venue = "toobit", market = "spot", symbol = "ETHUSDC", quote_only = true },
 ]
 
 [[feeds]]
@@ -238,6 +249,7 @@ sources = [
   { venue = "hyperliquid", market = "spot", symbol = "@156" },  # USOL/USDC
   { venue = "bitget", market = "spot", symbol = "SOLUSDC" },
   { venue = "gate", market = "spot", symbol = "SOL_USDC" },
+  { venue = "toobit", market = "spot", symbol = "SOLUSDC", quote_only = true },
 ]
 
 [[feeds]]
@@ -395,6 +407,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "NIGHTUSDT" },
   { venue = "mexc", market = "spot", symbol = "NIGHTUSDT" },
+  { venue = "toobit", market = "spot", symbol = "NIGHTUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -403,6 +416,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "WLDUSDT" },
   { venue = "mexc", market = "spot", symbol = "WLDUSDT" },
+  { venue = "toobit", market = "spot", symbol = "WLDUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -411,6 +425,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "RENDERUSDT" },
   { venue = "mexc", market = "spot", symbol = "RENDERUSDT" },
+  { venue = "toobit", market = "spot", symbol = "RENDERUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -419,6 +434,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "HBARUSDT" },
   { venue = "mexc", market = "spot", symbol = "HBARUSDT" },
+  { venue = "toobit", market = "spot", symbol = "HBARUSDT", quote_only = true },
 ]
 
 # ------------------------------------------------------ spot, BTC and ETH
@@ -682,6 +698,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "TRXUSDC" },
   { venue = "mexc", market = "spot", symbol = "TRXUSDC" },
+  { venue = "toobit", market = "spot", symbol = "TRXUSDC", quote_only = true },
 ]
 
 [[feeds]]
@@ -762,6 +779,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "ICPUSDT" },
   { venue = "mexc", market = "spot", symbol = "ICPUSDT" },
+  { venue = "toobit", market = "spot", symbol = "ICPUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -770,6 +788,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "ZROUSDT" },
   { venue = "mexc", market = "spot", symbol = "ZROUSDT" },
+  { venue = "toobit", market = "spot", symbol = "ZROUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -786,6 +805,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "VIRTUALUSDT" },
   { venue = "mexc", market = "spot", symbol = "VIRTUALUSDT" },
+  { venue = "toobit", market = "spot", symbol = "VIRTUALUSDT", quote_only = true },
 ]
 
 [[feeds]]
@@ -794,6 +814,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "PENDLEUSDT" },
   { venue = "mexc", market = "spot", symbol = "PENDLEUSDT" },
+  { venue = "toobit", market = "spot", symbol = "PENDLEUSDT", quote_only = true },
 ]
 
 # XAUT on Binance and MEXC (2026-11-09): MEXC lists it as GOLD(XAUT), and the board
@@ -805,6 +826,7 @@ min_sources = 2
 sources = [
   { venue = "binance", market = "spot", symbol = "XAUTUSDT" },
   { venue = "mexc", market = "spot", symbol = "GOLD(XAUT)USDT" },
+  { venue = "toobit", market = "spot", symbol = "XAUTUSDT", quote_only = true },
 ]
 
 [[feeds]]
