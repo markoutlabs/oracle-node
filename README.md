@@ -33,10 +33,14 @@ exchanges ──▶ node 1 ──┐
 
 1. **Ingest.** Each node keeps WebSocket connections to fifteen venues: Binance,
    Bybit, OKX, Coinbase, Kraken, Deribit, Hyperliquid, Bitfinex, MEXC, KuCoin,
-   Bitstamp, Bitget, Gate, Lighter and dYdX.
+   Bitstamp, Bitget, Gate, Lighter and dYdX. It reads a sixteenth, Toobit, over
+   REST each second. The reads of all Toobit books use half of Toobit's rate
+   limit at most, and stop for 30 s when Toobit refuses one for the rate.
 2. **Aggregate.** For each feed, the node removes stale and outlier sources, and
    takes a weighted median of the rest. Deeper and tighter order books weigh
-   more.
+   more. A quote-only source, such as each Toobit book, stays out of the price:
+   Toobit's books follow Binance's. The node still signs its books and its venue
+   report entry.
 3. **Sign.** The node signs each price with its key. It publishes when the price
    moves by 1 basis point or more, and at least once a second.
 4. **Resolve.** The consumer checks each signature against the registry, and

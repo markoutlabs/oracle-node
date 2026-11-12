@@ -28,8 +28,7 @@ const CONTRACTS_EVERY: Duration = Duration::from_secs(60);
 /// The futures socket URL for a set of contracts.
 #[must_use]
 pub fn futures_url<'a>(contracts: impl Iterator<Item = &'a str>) -> String {
-    let contracts: Vec<&str> = contracts.collect();
-    format!("{FUTURES_URL}?contracts={}", contracts.join(","))
+    rest_frames::with_contracts(FUTURES_URL, contracts)
 }
 
 /// Wraps a connector: it opens MEXC's futures socket and adds the REST records

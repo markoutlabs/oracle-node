@@ -364,6 +364,48 @@ fn losing_the_peg_leaves_the_native_sources_and_degrades() {
     }
 }
 
+/// A peg that only the quote-only sources need neither degrades nor halts the
+/// feed. Those sources quote 10 % higher here: any of them in the price would show.
+#[test]
+fn a_peg_that_only_quote_only_sources_need_does_not_touch_the_feed() {
+    let mut btc = btc_feed_needing("50", 2);
+    for source in btc.sources.iter_mut().filter(|source| source.convert_quote) {
+        source.quote_only = true;
+    }
+    let mut aggregator = Aggregator::new(vec![btc, peg_feed()]).expect("valid config");
+    let updates = tick(&mut aggregator, START, "1", "0.00005", "64000", "70400");
+    let at_par = find(&updates, &btc_symbol()).expect("publishes");
+    assert_eq!((price_of(&at_par), at_par.num_sources), (fixed("64000"), 2));
+    assert!(
+        at_par.flags.is_none(),
+        "nothing converted, nothing degraded"
+    );
+
+    // Three seconds on, the peg's sources are stale; only BTC quotes arrive.
+    let later = START + 3 * SECOND;
+    for venue in USD_VENUES {
+        aggregator.observe(&book(venue, "BTC-USD", fixed("64000"), "0.00005", later));
+    }
+    for venue in STABLE_VENUES {
+        aggregator.observe(&book(venue, "BTCUSDT", fixed("70400"), "0.00005", later));
+    }
+    let updates = aggregator.poll_all(later).0;
+    let btc = find(&updates, &btc_symbol()).expect("btc publishes");
+    assert!(btc.flags.is_none(), "{:?}", btc.flags);
+    assert_eq!(price_of(&btc), fixed("64000"));
+
+    let reports = aggregator.poll_venues(later, |feed| feed == feed_id(&btc_symbol()));
+    let report = reports.first().expect("a report");
+    for entry in &report.entries {
+        let expected = if STABLE_VENUES.contains(&entry.venue) {
+            SourceStatus::QuoteOnly
+        } else {
+            SourceStatus::Used
+        };
+        assert_eq!(entry.status, expected, "{:?}", entry.venue);
+    }
+}
+
 /// The peg must be evaluated before its dependents, in the same tick.
 #[test]
 fn a_dependent_feed_converts_against_the_current_tick_not_the_previous_one() {

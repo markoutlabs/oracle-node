@@ -218,6 +218,11 @@ impl Source {
         self.with("converted", true)
     }
 
+    /// Read and reported, and kept out of the price.
+    pub(crate) fn quote_only(self) -> Self {
+        self.with("quote_only", true)
+    }
+
     fn with(mut self, key: &'static str, value: impl Into<toml::Value>) -> Self {
         self.fields.push((key, value.into()));
         self

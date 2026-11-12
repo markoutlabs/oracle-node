@@ -41,8 +41,7 @@ static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 /// The futures token URL for a set of contracts.
 #[must_use]
 pub fn futures_url<'a>(contracts: impl Iterator<Item = &'a str>) -> String {
-    let contracts: Vec<&str> = contracts.collect();
-    format!("{FUTURES_TOKEN}?contracts={}", contracts.join(","))
+    rest_frames::with_contracts(FUTURES_TOKEN, contracts)
 }
 
 /// Wraps a connector: it turns a KuCoin token URL into a socket, and adds the
@@ -143,7 +142,7 @@ async fn socket_url(client: &reqwest::Client, token_url: &str) -> Result<String,
     let failed = |error: String| TransportError::Connect(format!("kucoin token: {error}"));
     let data = rest_frames::read(client.post(token_url), data_of)
         .await
-        .map_err(failed)?;
+        .map_err(|error| failed(error.to_string()))?;
     let token: Token = serde_json::from_str(data.get()).map_err(|e| failed(e.to_string()))?;
     let server = token
         .instance_servers

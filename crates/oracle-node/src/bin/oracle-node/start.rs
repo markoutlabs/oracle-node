@@ -368,8 +368,9 @@ async fn listed_registry(
 }
 
 /// The venue adapters at start. With `--record`, the recorder sits under them,
-/// so a recording holds Binance's REST snapshots and funding intervals, and the
-/// KuCoin and MEXC tokens and contract records: a replay never calls REST.
+/// so a recording holds Binance's REST snapshots and funding intervals, the
+/// KuCoin and MEXC tokens and contract records, and Toobit's books: a replay
+/// never calls REST.
 fn first_adapters(
     binance: oracle_ingest::binance::BinanceConfig,
     venues: Vec<(

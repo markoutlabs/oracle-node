@@ -13,9 +13,9 @@ import struct
 import subprocess
 import sys
 
-VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit", "hyperliquid", "bitfinex", "mexc", "kucoin", "bitstamp", "bitget", "gate", "lighter", "dydx"]
+VENUES = ["binance", "bybit", "okx", "coinbase", "kraken", "deribit", "hyperliquid", "bitfinex", "mexc", "kucoin", "bitstamp", "bitget", "gate", "lighter", "dydx", "toobit"]
 MARKETS = ["spot", "linear_perp", "inverse_perp"]
-STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted", "peg_unavailable"]
+STATUSES = ["used", "outlier", "stale", "crossed", "no_data", "invalid", "feed_halted", "peg_unavailable", "quote_only"]
 FRAME_TYPES = {"price": 1, "venues": 2, "book": 3, "funding": 4, "batch": 5}
 BASES = ["interval", "eight_hours"]
 UNITS = ["base", "contracts", "quote"]
@@ -209,7 +209,8 @@ def feed_set(s: dict) -> bytes:
             else:
                 out += b"\x01" + struct.pack(">H", len(kinds)) + b"".join(text(k) for k in kinds)
             out += opt_text(source.get("weight"))
-            out += bytes([1 if source.get("converted") else 0])
+            # Source flags: bit 0 converted, bit 1 quote_only.
+            out += bytes([(1 if source.get("converted") else 0) | (2 if source.get("quote_only") else 0)])
             out += opt_text(source.get("contract_size"))
     return out
 
@@ -308,9 +309,10 @@ def main() -> int:
     for vector in golden["price_batches"]:
         errors += check("batch", vector, price_batch(vector["updates"]), separator)
         count += 1
-    vector = golden["feed_set"]
-    errors += check_signed("feed set", vector, feed_set(vector["feed_set"]), separator)
-    count += 1
+    for name in ["feed_set", "feed_set_quote_only"]:
+        vector = golden[name]
+        errors += check_signed(name, vector, feed_set(vector["feed_set"]), separator)
+        count += 1
     vector = golden["client_list"]
     errors += check_signed("client list", vector, client_list(vector["client_list"]), separator)
     count += 1

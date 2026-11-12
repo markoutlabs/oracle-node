@@ -1,6 +1,7 @@
 //! REST records delivered as frames among a socket's frames, for the venues
 //! whose socket leaves out what only REST gives, such as a perpetual's funding
-//! interval (KuCoin, MEXC).
+//! interval (KuCoin, MEXC). A venue with no socket, such as Toobit, gets a
+//! connection of records alone.
 //!
 //! A record is a frame `{"type":"rest","subject":"…","topic":"/rest:<contract>",
 //! "data":{…}}`, or the same with `error` in place of `data` when the read
@@ -10,6 +11,8 @@
 use std::time::Duration;
 
 use futures_util::stream::{self, BoxStream, SelectAll, StreamExt as _};
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::value::RawValue;
 
 use crate::transport::{Frame, Transport, TransportError, install_tls_provider};
@@ -45,28 +48,66 @@ pub(crate) fn client() -> Result<reqwest::Client, TransportError> {
         .map_err(|e| TransportError::Connect(e.to_string()))
 }
 
+/// Why a REST read failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadError {
+    /// The reply has an error status. A venue that refuses the rate can say
+    /// when to try again.
+    #[error("HTTP {status} from {url}")]
+    Status {
+        status: StatusCode,
+        /// `Retry-After`, when it gives whole seconds.
+        retry_after: Option<Duration>,
+        url: String,
+    },
+    /// No reply, or a reply that is too large or that the venue's `data_of` refused.
+    #[error("{0}")]
+    Failed(String),
+}
+
 /// Sends a request, and gives the `data` of a successful reply.
 pub(crate) async fn read(
     request: reqwest::RequestBuilder,
     data_of: DataOf,
-) -> Result<Box<RawValue>, String> {
-    let response = request
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| e.to_string())?;
+) -> Result<Box<RawValue>, ReadError> {
+    let failed = |error: reqwest::Error| ReadError::Failed(error.to_string());
+    let response = request.send().await.map_err(failed)?;
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        return Err(ReadError::Status {
+            status,
+            retry_after: retry_after(response.headers()),
+            url: response.url().to_string(),
+        });
+    }
     let too_large = |length: usize| length > MAX_BODY;
+    let too_large_error = || ReadError::Failed("the reply is too large".to_owned());
     if response
         .content_length()
         .is_some_and(|length| usize::try_from(length).map_or(true, too_large))
     {
-        return Err("the reply is too large".to_owned());
+        return Err(too_large_error());
     }
-    let body = response.bytes().await.map_err(|e| e.to_string())?;
+    let body = response.bytes().await.map_err(failed)?;
     if too_large(body.len()) {
-        return Err("the reply is too large".to_owned());
+        return Err(too_large_error());
     }
-    data_of(&body)
+    data_of(&body).map_err(ReadError::Failed)
+}
+
+/// The `Retry-After` of a reply in seconds. The date form gives none, and the
+/// caller keeps its own wait.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?;
+    let seconds = value.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// `base` with the contracts that [`contracts_of`] reads back.
+#[must_use]
+pub(crate) fn with_contracts<'a>(base: &str, contracts: impl Iterator<Item = &'a str>) -> String {
+    let contracts: Vec<&str> = contracts.collect();
+    format!("{base}?contracts={}", contracts.join(","))
 }
 
 /// The contracts of a URL's `contracts=` query. A name that is not letters,
@@ -115,6 +156,7 @@ pub(crate) fn records_as(
             // A failed read is a frame too: the decoder counts it, and the
             // session warns at most once a minute.
             let fetched = read(client.get(url), data_of).await;
+            let fetched = fetched.map_err(|error| error.to_string());
             Some((frame_of(subject, &contract, fetched), n + 1))
         }
     })
@@ -127,6 +169,15 @@ pub(crate) fn frame(
     contract: &str,
     fetched: Result<Box<RawValue>, String>,
 ) -> Frame {
+    Frame::Rest(record(subject, contract, fetched))
+}
+
+/// The text of a REST record: `data`, or `error` when the read failed.
+pub(crate) fn record(
+    subject: &str,
+    contract: &str,
+    fetched: Result<Box<RawValue>, String>,
+) -> String {
     let topic = format!("/rest:{contract}");
     let text = match fetched {
         Ok(data) => {
@@ -136,12 +187,13 @@ pub(crate) fn frame(
             serde_json::json!({ "type": "rest", "subject": subject, "topic": topic, "error": error })
         }
     };
-    Frame::Rest(text.to_string())
+    text.to_string()
 }
 
 /// A connection whose REST records arrive among its frames.
 pub struct RestTransport<T> {
-    inner: T,
+    /// The socket; none on a venue that only REST serves.
+    inner: Option<T>,
     pending: SelectAll<BoxStream<'static, Frame>>,
 }
 
@@ -149,7 +201,7 @@ impl<T> RestTransport<T> {
     /// A connection without records.
     pub(crate) fn plain(inner: T) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             pending: SelectAll::new(),
         }
     }
@@ -158,30 +210,54 @@ impl<T> RestTransport<T> {
     pub(crate) fn with(inner: T, records: BoxStream<'static, Frame>) -> Self {
         let mut pending = SelectAll::new();
         pending.push(records);
-        Self { inner, pending }
+        Self {
+            inner: Some(inner),
+            pending,
+        }
+    }
+
+    /// A connection of `records` alone, with no socket. It ends when they all do.
+    pub(crate) fn alone(records: impl IntoIterator<Item = BoxStream<'static, Frame>>) -> Self {
+        Self {
+            inner: None,
+            pending: records.into_iter().collect(),
+        }
     }
 }
 
 impl<T: Transport> Transport for RestTransport<T> {
     async fn recv(&mut self) -> Result<Option<Frame>, TransportError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(self.pending.next().await);
+        };
         if self.pending.is_empty() {
-            return self.inner.recv().await;
+            return inner.recv().await;
         }
         // Both arms are cancel-safe: the socket's `recv` is, and a pending read
         // stays in the set until it completes. The session times out a silent
         // socket, because a REST record does not count as its frame.
         tokio::select! {
             Some(frame) = self.pending.next() => Ok(Some(frame)),
-            result = self.inner.recv() => result,
+            result = inner.recv() => result,
         }
     }
 
     async fn send_text(&mut self, text: String) -> Result<(), TransportError> {
-        self.inner.send_text(text).await
+        match self.inner.as_mut() {
+            Some(inner) => inner.send_text(text).await,
+            None => Err(TransportError::Send(
+                "the connection has no socket".to_owned(),
+            )),
+        }
     }
 
     async fn send_ping(&mut self) -> Result<(), TransportError> {
-        self.inner.send_ping().await
+        match self.inner.as_mut() {
+            Some(inner) => inner.send_ping().await,
+            // A probe has no peer here. Only the records show that the
+            // connection lives, and the idle timeout ends it when they stop.
+            None => Ok(()),
+        }
     }
 }
 
@@ -196,6 +272,40 @@ mod tests {
             ["XBTUSDTM", "BTC_USDT"]
         );
         assert!(contracts_of("other=1").is_empty());
+    }
+
+    #[test]
+    fn retry_after_counts_only_whole_seconds() {
+        let after = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, value.parse().expect("a header value"));
+            retry_after(&headers)
+        };
+        assert_eq!(after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(after(" 5 "), Some(Duration::from_secs(5)));
+        assert_eq!(after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_url_carries_its_contracts() {
+        let url = with_contracts(
+            "https://x.example/depth",
+            ["ICPUSDT", "ETHUSDT"].into_iter(),
+        );
+        assert_eq!(url, "https://x.example/depth?contracts=ICPUSDT,ETHUSDT");
+        let (_, query) = url.split_once('?').expect("a query");
+        assert_eq!(contracts_of(query), ["ICPUSDT", "ETHUSDT"]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_of_records_alone_has_no_socket() {
+        let records = stream::iter([Frame::Rest("a".to_owned())]).boxed();
+        let mut conn = RestTransport::<crate::testing::ScriptedConn>::alone([records]);
+        assert_eq!(conn.recv().await, Ok(Some(Frame::Rest("a".to_owned()))));
+        assert_eq!(conn.recv().await, Ok(None), "it ends with its records");
+        assert_eq!(conn.send_ping().await, Ok(()));
+        assert!(conn.send_text("x".to_owned()).await.is_err());
     }
 
     #[test]

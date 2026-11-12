@@ -108,6 +108,11 @@ fn source(feed: &str, has_peg: bool, source: &SourceSettings) -> Result<SourceSe
     if source.converted && !has_peg {
         return Err(format!("{at}: a converted source needs the feed's peg"));
     }
+    if source.quote_only && source.weight.is_some() {
+        return Err(format!(
+            "{at}: a quote-only source has no weight: it is not in the price"
+        ));
+    }
     Ok(SourceSettings {
         venue: venue.as_str().to_owned(),
         market: market.as_str().to_owned(),
@@ -115,6 +120,7 @@ fn source(feed: &str, has_peg: bool, source: &SourceSettings) -> Result<SourceSe
         kinds,
         weight: optional(&at, "weight", source.weight.as_ref(), true)?,
         converted: source.converted,
+        quote_only: source.quote_only,
         contract_size: optional(&at, "contract_size", source.contract_size.as_ref(), true)?,
     })
 }
@@ -159,12 +165,17 @@ fn feed(settings: &FeedSettings) -> Result<FeedSettings, String> {
         }
         sources.push(checked);
     }
+    let pricing = sources.iter().filter(|checked| !checked.quote_only).count();
+    if pricing == 0 {
+        return Err(format!(
+            "{symbol}: a feed needs a source that prices it, and every source is quote-only"
+        ));
+    }
     if let Some(min) = settings.min_sources
-        && (min == 0 || usize::try_from(min).map_or(true, |min| min > sources.len()))
+        && (min == 0 || usize::try_from(min).map_or(true, |min| min > pricing))
     {
         return Err(format!(
-            "{symbol}: min_sources {min} must be 1 to the {} sources",
-            sources.len()
+            "{symbol}: min_sources {min} must be 1 to the {pricing} sources that price it"
         ));
     }
     for (field, value) in [
@@ -385,6 +396,39 @@ mod tests {
         too_few.min_sources = Some(2);
         refused(vec![too_few]);
         assert!(content(vec![]).canonical().is_err());
+    }
+
+    #[test]
+    fn a_quote_only_source_keeps_its_flag_and_counts_for_no_quorum() {
+        let quote_only = |venue, symbol| SourceSettings {
+            quote_only: true,
+            ..spot(venue, symbol)
+        };
+        let mut eth = feed_of(
+            "CRYPTO.ETH/USDT",
+            vec![spot("binance", "ETHUSDT"), quote_only("toobit", "ETHUSDT")],
+        );
+        eth.min_sources = Some(1);
+        let checked = content(vec![eth.clone()]).canonical().expect("passes");
+        let sources = &checked.feeds.first().expect("a feed").sources;
+        assert_eq!(
+            sources.iter().map(|s| s.quote_only).collect::<Vec<_>>(),
+            [false, true]
+        );
+
+        eth.min_sources = Some(2);
+        assert!(refused(vec![eth]).contains("1 to the 1 sources that price it"));
+        let only = feed_of("CRYPTO.ETH/USDT", vec![quote_only("toobit", "ETHUSDT")]);
+        assert!(refused(vec![only]).contains("every source is quote-only"));
+        let weighted = SourceSettings {
+            weight: Some("2".to_owned()),
+            ..quote_only("toobit", "ETHUSDT")
+        };
+        let error = refused(vec![feed_of(
+            "CRYPTO.ETH/USDT",
+            vec![spot("binance", "ETHUSDT"), weighted],
+        )]);
+        assert!(error.contains("no weight"), "{error}");
     }
 
     #[test]

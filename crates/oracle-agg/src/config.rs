@@ -34,6 +34,12 @@ pub struct SourceConfig {
     /// conversion is a lie that costs money the day the peg breaks — and it is a
     /// silent lie, because on any ordinary day the two are indistinguishable.
     pub convert_quote: bool,
+
+    /// This source is in the venue report, but never in the price.
+    ///
+    /// For a venue whose books follow another venue's, such as Toobit's: as a
+    /// price source it would count that venue twice.
+    pub quote_only: bool,
 }
 
 impl SourceConfig {
@@ -45,6 +51,7 @@ impl SourceConfig {
             kinds,
             weight: Fixed::ONE,
             convert_quote: false,
+            quote_only: false,
         }
     }
 
@@ -59,6 +66,13 @@ impl SourceConfig {
     #[must_use]
     pub const fn converted(mut self) -> Self {
         self.convert_quote = true;
+        self
+    }
+
+    /// Keeps this source out of the price; its venue report entry stays.
+    #[must_use]
+    pub const fn quote_only(mut self) -> Self {
+        self.quote_only = true;
         self
     }
 }
@@ -89,7 +103,7 @@ pub struct FeedConfig {
     pub feed_id: FeedId,
     /// Publication exponent.
     pub expo: i32,
-    /// Contributing venues.
+    /// Every source, in venue report order. [`Self::pricing_sources`] enter the price.
     pub sources: Vec<SourceConfig>,
 
     /// Peg conversion for sources marked [`SourceConfig::convert_quote`].
@@ -257,10 +271,15 @@ impl FeedConfig {
         }
     }
 
-    /// Returns `true` if any source needs peg conversion.
+    /// Returns the sources that enter the price: all but the quote-only ones.
+    pub fn pricing_sources(&self) -> impl Iterator<Item = &SourceConfig> + '_ {
+        self.sources.iter().filter(|source| !source.quote_only)
+    }
+
+    /// Returns `true` if any pricing source needs peg conversion.
     #[must_use]
     pub fn needs_conversion(&self) -> bool {
-        self.quote_conversion.is_some() && self.sources.iter().any(|source| source.convert_quote)
+        self.quote_conversion.is_some() && self.pricing_sources().any(|source| source.convert_quote)
     }
 
     /// Sets the peg conversion.
@@ -298,7 +317,7 @@ impl FeedConfig {
                 ),
             });
         }
-        let available = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
+        let available = u32::try_from(self.pricing_sources().count()).unwrap_or(u32::MAX);
         if self.min_sources > available {
             return Err(ConfigError::UnreachableQuorum {
                 symbol: self.symbol.to_string(),
@@ -379,9 +398,9 @@ impl FeedConfig {
         Ok(())
     }
 
-    /// Returns the venues that contribute to this feed.
+    /// Returns the venues that contribute to this feed's price.
     pub fn venues(&self) -> impl Iterator<Item = Venue> + '_ {
-        self.sources.iter().map(|source| source.instrument.venue)
+        self.pricing_sources().map(|source| source.instrument.venue)
     }
 }
 
@@ -397,13 +416,13 @@ pub enum ConfigError {
     },
 
     /// A feed required more sources than it has.
-    #[error("feed `{symbol}` requires {required} sources but only {available} are configured")]
+    #[error("feed `{symbol}` requires {required} sources but only {available} price it")]
     UnreachableQuorum {
         /// The feed.
         symbol: String,
         /// Sources demanded.
         required: u32,
-        /// Sources available.
+        /// Sources that price the feed: the quote-only ones do not count.
         available: u32,
     },
 
@@ -518,6 +537,29 @@ mod tests {
                 available: 2,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn a_quote_only_source_counts_for_no_quorum() {
+        let mut config = config();
+        if let Some(coinbase) = config.sources.get_mut(1) {
+            coinbase.quote_only = true;
+        }
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnreachableQuorum {
+                required: 2,
+                available: 1,
+                ..
+            })
+        ));
+        config.min_sources = 1;
+        assert_eq!(config.validate(), Ok(()));
+        config.sources.iter_mut().for_each(|s| s.quote_only = true);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnreachableQuorum { available: 0, .. })
         ));
     }
 

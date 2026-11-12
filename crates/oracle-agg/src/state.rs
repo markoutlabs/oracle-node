@@ -681,6 +681,9 @@ impl FeedRuntime {
     }
 
     /// One quote or reason per configured source, in configuration order.
+    ///
+    /// A live quote-only source gives [`SourceStatus::QuoteOnly`] as its reason,
+    /// so it never enters the price. A dead one keeps the reason it is dead.
     fn derive_all(&self, now_ns: u64) -> Vec<Result<SourceQuote, SourceStatus>> {
         self.config
             .sources
@@ -688,14 +691,18 @@ impl FeedRuntime {
             .enumerate()
             .map(|(index, source)| {
                 let slots = self.sources.get(index).ok_or(SourceStatus::NoData)?;
-                quote::derive(
+                let quote = quote::derive(
                     index,
                     source,
                     &self.config,
                     &slots.latest,
                     &slots.alive,
                     now_ns,
-                )
+                )?;
+                if source.quote_only {
+                    return Err(SourceStatus::QuoteOnly);
+                }
+                Ok(quote)
             })
             .collect()
     }
@@ -1389,6 +1396,52 @@ mod tests {
         let _ = aggregator.poll_all(later);
         let report = aggregator.poll_venues(later, |_| true).remove(0);
         assert_eq!(entry(&report, Venue::Binance).status, SourceStatus::Stale);
+    }
+
+    /// A quote-only source shows its book, and counts for no quorum, bitmap or
+    /// weight; when it goes quiet, it shows stale.
+    #[test]
+    fn a_quote_only_source_is_reported_but_never_priced() {
+        let mut config = config(&THREE);
+        if let Some(okx) = config.sources.get_mut(2) {
+            okx.quote_only = true;
+        }
+        let mut aggregator = Aggregator::new(vec![config]).expect("valid config");
+        let three = [
+            (Venue::Binance, "100", "100.02"),
+            (Venue::Bybit, "100", "100.02"),
+            (Venue::Okx, "100", "100.02"),
+        ];
+        feed(&mut aggregator, SECOND, &three);
+        let update = aggregator
+            .poll(feed_id(), SECOND)
+            .expect("no error")
+            .expect("publishes");
+        assert_eq!(update.num_sources, 2);
+        assert!(!update.sources.contains(Venue::Okx));
+        let report = aggregator.poll_venues(SECOND, |_| true).remove(0);
+        let okx = entry(&report, Venue::Okx);
+        assert_eq!(
+            (okx.status, okx.weight_bps, okx.bid),
+            (SourceStatus::QuoteOnly, 0, Some(10_000_000_000))
+        );
+        assert_eq!(entry(&report, Venue::Binance).weight_bps, 5_000);
+
+        // Bybit goes quiet: one pricing source is below the quorum of two.
+        let later = SECOND + 3 * SECOND;
+        feed(&mut aggregator, later, &[three[0], three[2]]);
+        let halted = aggregator
+            .poll(feed_id(), later)
+            .expect("no error")
+            .expect("halt publishes");
+        assert!(halted.flags.is_halted());
+        let report = aggregator.poll_venues(later, |_| true).remove(0);
+        assert_eq!(entry(&report, Venue::Okx).status, SourceStatus::QuoteOnly);
+
+        let silent = later + 3 * SECOND;
+        let _ = aggregator.poll_all(silent);
+        let report = aggregator.poll_venues(silent, |_| true).remove(0);
+        assert_eq!(entry(&report, Venue::Okx).status, SourceStatus::Stale);
     }
 
     /// The same quiet books stay in the price while their connections report

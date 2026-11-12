@@ -2944,7 +2944,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "oracle-agg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oracle-types",
  "oracle-wire",
@@ -2954,7 +2954,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "backon",
@@ -2983,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-ingest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "anyhow",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-quorum"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "oracle-agg",
  "oracle-types",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-registry-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "candid",
  "serde",
@@ -3077,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-registry-canister"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "candid",
  "hex",
@@ -3101,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-replay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "oracle-agg",
@@ -3119,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3145,7 +3145,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm-siv",
  "getrandom 0.4.3",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "proptest",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "oracle-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",

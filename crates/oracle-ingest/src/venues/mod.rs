@@ -8,6 +8,9 @@
 //! What actually differs per venue is small: how to name a subscription, what
 //! keepalive to send, and how to decode a payload. Everything else — connect,
 //! reconnect, backoff, staleness, invalidation — is [`crate::Session`].
+//!
+//! Toobit has no socket: [`toobit_connect`] reads its books over REST, and the
+//! same session runs on those reads.
 
 pub mod adapter;
 pub mod bitfinex;
@@ -30,6 +33,8 @@ pub mod mexc;
 pub mod mexc_connect;
 pub mod okx;
 pub mod rest_frames;
+pub mod toobit;
+pub mod toobit_connect;
 
 pub use adapter::{DecodeFn, VenueAdapter, VenueHandler, VenueSpec};
 
@@ -64,7 +69,7 @@ pub(crate) fn moving_kinds(venue: Venue, entry: &InstrumentEntry) -> Vec<ObsKind
     };
     let marks: &[ObsKind] = match venue {
         Venue::Okx | Venue::Dydx => &[ObsKind::MarkPrice],
-        Venue::Coinbase | Venue::Bitstamp => &[],
+        Venue::Coinbase | Venue::Bitstamp | Venue::Toobit => &[],
         _ => &[ObsKind::MarkPrice, ObsKind::IndexPrice],
     };
     if perp {
@@ -268,6 +273,8 @@ mod tests {
         );
         assert_eq!(kinds_of(Venue::Dydx, perp, true), [Depth, MarkPrice]);
         assert_eq!(kinds_of(Venue::Coinbase, MarketKind::Spot, true), [Depth]);
+        assert_eq!(kinds_of(Venue::Toobit, MarketKind::Spot, true), [Depth]);
+        assert_eq!(kinds_of(Venue::Toobit, MarketKind::Spot, false), [BookTop]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use oracle_ingest::clock::MonotonicClock;
 use oracle_ingest::transport::WebSocketConnector;
 use oracle_ingest::venues::kucoin_connect::KucoinConnector;
 use oracle_ingest::venues::mexc_connect::MexcConnector;
+use oracle_ingest::venues::toobit_connect::ToobitConnector;
 use oracle_ingest::{IngestEvent, VenueHealth};
 use oracle_types::Venue;
 use tokio::sync::mpsc;
@@ -29,7 +30,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const VENUE_PAUSE: Duration = Duration::from_secs(5);
 
 /// The connectors under the venue adapters.
-pub type Connectors = MexcConnector<KucoinConnector<SnapshotConnector<WebSocketConnector>>>;
+pub type Connectors =
+    ToobitConnector<MexcConnector<KucoinConnector<SnapshotConnector<WebSocketConnector>>>>;
 
 /// Builds the connectors for the Binance instruments of `binance`.
 ///
@@ -40,7 +42,8 @@ pub fn connectors(binance: &BinanceConfig) -> anyhow::Result<Connectors> {
     let snapshots = SnapshotConnector::new(WebSocketConnector, binance.snapshot_routes())?
         .with_funding_info(binance.funding_info_routes())
         .with_open_interest(binance.open_interest_routes());
-    Ok(MexcConnector::new(KucoinConnector::new(snapshots)?)?)
+    let kucoin = KucoinConnector::new(snapshots)?;
+    Ok(ToobitConnector::new(MexcConnector::new(kucoin)?)?)
 }
 
 struct Running {

@@ -311,6 +311,9 @@ struct LoadedSourceSettings {
     weight: Option<String>,
     #[serde(default)]
     converted: bool,
+    // Came after the feed sets that the mainnet canister holds.
+    #[serde(default)]
+    quote_only: bool,
     #[serde(default)]
     contract_size: Option<String>,
 }
@@ -324,6 +327,7 @@ impl From<LoadedSourceSettings> for SourceSettings {
             kinds: loaded.kinds,
             weight: loaded.weight,
             converted: loaded.converted,
+            quote_only: loaded.quote_only,
             contract_size: loaded.contract_size,
         }
     }
@@ -467,13 +471,22 @@ mod tests {
                 max_age_ms: Some(9_000),
                 impact_notional: Some("100000".to_owned()),
                 sanity_band: Some(["0.5".to_owned(), "2".to_owned()]),
-                sources: vec![SourceSettings {
-                    kinds: Some(vec!["book_top".to_owned()]),
-                    weight: Some("2".to_owned()),
-                    converted: true,
-                    contract_size: Some("0.1".to_owned()),
-                    ..feed.sources.first().cloned().expect("one source")
-                }],
+                sources: vec![
+                    SourceSettings {
+                        kinds: Some(vec!["book_top".to_owned()]),
+                        weight: Some("2".to_owned()),
+                        converted: true,
+                        contract_size: Some("0.1".to_owned()),
+                        ..feed.sources.first().cloned().expect("one source")
+                    },
+                    SourceSettings {
+                        venue: "toobit".to_owned(),
+                        market: "spot".to_owned(),
+                        symbol: "ETHBTC".to_owned(),
+                        quote_only: true,
+                        ..SourceSettings::default()
+                    },
+                ],
                 ..feed.clone()
             };
         }
@@ -498,10 +511,10 @@ mod tests {
     fn the_state_round_trips_through_stable_memory() {
         let state = full_state();
         assert!(
-            state
-                .feed_content
-                .as_ref()
-                .is_some_and(|content| content.feeds.iter().any(|f| f.sanity_band.is_some())),
+            state.feed_content.as_ref().is_some_and(|content| content
+                .feeds
+                .iter()
+                .any(|f| f.sources.iter().any(|s| s.quote_only))),
             "the fixture sets the newest field"
         );
         assert_eq!(round_trip(&state), state);
@@ -587,13 +600,15 @@ mod tests {
     #[test]
     fn the_wasm_before_this_layout_reads_it_for_a_rollback() {
         let mut state = full_state();
-        // The mainnet wasm does not know the sanity band; a set without one stays readable.
+        // The mainnet wasm knows neither the sanity band nor quote_only; a set
+        // without them stays readable.
         for feed in state
             .feed_content
             .iter_mut()
             .flat_map(|content| content.feeds.iter_mut())
         {
             feed.sanity_band = None;
+            feed.sources.iter_mut().for_each(|s| s.quote_only = false);
         }
         let saved = Stable::save(&state, StoredPrices::default()).expect("saves");
         let bytes = candid::encode_args(saved.into_arguments()).expect("encodes");
@@ -647,6 +662,26 @@ mod tests {
         let before: serde_json::Value = serde_json::from_slice(&stable.state_json).expect("JSON");
         let after: serde_json::Value = serde_json::from_slice(&again.state_json).expect("JSON");
         assert_eq!(after, before);
+    }
+
+    /// The fixture's feed set was signed before `quote_only`: every source still
+    /// prices, and the signature still verifies over the flags byte.
+    #[test]
+    fn a_feed_set_stored_before_quote_only_loads_and_verifies() {
+        let state = Stable::decode(LAYOUT_1)
+            .expect("decodes")
+            .state()
+            .expect("loads");
+        let sources: Vec<&SourceSettings> = state
+            .feed_set
+            .published
+            .iter()
+            .flat_map(|set| &set.feeds)
+            .flat_map(|feed| &feed.sources)
+            .collect();
+        assert!(sources.iter().any(|s| s.converted), "a flag was set");
+        assert!(sources.iter().all(|s| !s.quote_only));
+        assert!(state.documents_that_do_not_verify().is_empty());
     }
 
     /// A canister from before the prices saved one value, which reads back as no prices.

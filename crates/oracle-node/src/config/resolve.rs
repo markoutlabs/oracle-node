@@ -10,7 +10,7 @@ use oracle_ingest::InstrumentSpec;
 use oracle_ingest::binance::BinanceConfig;
 use oracle_ingest::venues::{
     DecodeFn, VenueSpec, bitfinex, bitget, bitstamp, bybit, coinbase, deribit, dydx, gate,
-    hyperliquid, kraken, kraken_futures, kucoin, lighter, mexc, okx,
+    hyperliquid, kraken, kraken_futures, kucoin, lighter, mexc, okx, toobit,
 };
 use oracle_types::{Fixed, InstrumentId, MarketKind, ObsKind, Symbol, Venue};
 use oracle_wire::{check_endpoint, feed_id};
@@ -147,6 +147,9 @@ pub fn resolve_feeds(
             let mut config = SourceConfig::new(instrument, kinds);
             if source.converted {
                 config = config.converted();
+            }
+            if source.quote_only {
+                config = config.quote_only();
             }
             if let Some(weight) = &source.weight {
                 let weight: Fixed = weight.parse().map_err(|e| {
@@ -411,6 +414,7 @@ const fn markets_per_connection(venue: Venue, market: MarketKind) -> usize {
         (Venue::Kucoin, _) => kucoin::MARKETS_PER_CONNECTION,
         (Venue::Mexc, MarketKind::Spot) => mexc::SPOT_MARKETS_PER_CONNECTION,
         (Venue::Mexc, _) => mexc::FUTURES_MARKETS_PER_CONNECTION,
+        (Venue::Toobit, _) => toobit::MARKETS_PER_CONNECTION,
         _ => usize::MAX,
     }
 }
@@ -604,6 +608,15 @@ fn venue_connection(
             Some((bitget::KEEPALIVE_EVERY, bitget::KEEPALIVE.to_owned())),
             bitget::decode,
         ),
+        Venue::Toobit if market.is_perp() => {
+            return Err(ConfigError::Invalid(
+                "toobit serves spot only in this build; use market = \"spot\"".to_owned(),
+            ));
+        }
+        // No socket, so nothing to subscribe or keep alive. Each book's good read
+        // comes about each second, so the idle timeout ends only a connection
+        // whose reads all fail.
+        Venue::Toobit => (toobit::url(symbols()), Vec::new(), None, toobit::decode),
         Venue::Binance => {
             return Err(ConfigError::Invalid(
                 "binance is configured through its own adapter".to_owned(),

@@ -90,6 +90,12 @@ pub struct SourceSettings {
     /// silent one, because on an ordinary day the two agree to a basis point.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub converted: bool,
+    /// The node reads and reports this source, but keeps it out of the price.
+    ///
+    /// Set on a venue whose books follow another venue's, such as Toobit's,
+    /// so that the price does not count that venue twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quote_only: bool,
     /// Base units per contract, as a decimal string, for a venue that sizes in
     /// contracts: OKX swaps (`ctVal` on OKX's instruments endpoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,7 +216,9 @@ fn put_source(out: &mut Vec<u8>, source: &SourceSettings) -> Result<(), WireErro
         }
     }
     put_opt_str(out, "weight", source.weight.as_deref())?;
-    out.put_u8(u8::from(source.converted));
+    // Bit 0 `converted`, bit 1 `quote_only`. The byte held `converted` alone
+    // before, so a set without a quote-only source signs to the same bytes.
+    out.put_u8(u8::from(source.converted) | (u8::from(source.quote_only) << 1));
     put_opt_str(out, "contract_size", source.contract_size.as_deref())
 }
 
@@ -470,6 +478,7 @@ mod tests {
         let json = serde_json::to_string(&signed).expect("serialises");
         // An absent setting stays out of the document.
         assert!(!json.contains("converted"), "{json}");
+        assert!(!json.contains("quote_only"), "{json}");
         let parsed: FeedSet = serde_json::from_str(&json).expect("parses");
         let verified = parsed.verify(governance().address(), 0).expect("verifies");
         assert_eq!(verified.version(), 1);
@@ -520,6 +529,11 @@ mod tests {
                 s.feeds
                     .iter_mut()
                     .for_each(|f| f.sources.iter_mut().for_each(|x| x.converted = true))
+            },
+            |s| {
+                s.feeds
+                    .iter_mut()
+                    .for_each(|f| f.sources.iter_mut().for_each(|x| x.quote_only = true))
             },
             |s| {
                 s.feeds

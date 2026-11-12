@@ -315,7 +315,9 @@ fn open_interest(
 /// One REST reply, as JSON, with the shared limits: a body limit, a timeout
 /// and no redirect.
 async fn fetch(client: &reqwest::Client, url: &str) -> Result<Box<RawValue>, String> {
-    rest_frames::read(client.get(url), rest_frames::whole_body).await
+    rest_frames::read(client.get(url), rest_frames::whole_body)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// A reply as a frame of `stream`: `data`, or `error` when the fetch failed.

@@ -73,6 +73,7 @@ struct GoldenFile {
     funding_updates: Vec<FundingUpdateVector>,
     price_batches: Vec<PriceBatchVector>,
     feed_set: FeedSetVector,
+    feed_set_quote_only: FeedSetVector,
     client_list: ClientListVector,
     client_auth: ClientAuthVector,
     auth_ok: AuthOkVector,
@@ -351,6 +352,7 @@ fn entry(venue: Venue, market: MarketKind, status: SourceStatus) -> VenueEntry {
         Venue::Gate => "BTC_USDT",
         Venue::Lighter => "1",
         Venue::Dydx => "BTC-USD",
+        Venue::Toobit => "BTCUSDT",
         // A venue added later; these vectors never use it.
         _ => "OTHER",
     };
@@ -384,8 +386,19 @@ fn sample_venue_reports() -> Vec<(&'static str, VenueReport)> {
         Venue::Kraken,
         Venue::Deribit,
     ];
+    // The eight statuses they were minted with; `SourceStatus::ALL` grows.
+    const MINTED_STATUSES: [SourceStatus; 8] = [
+        SourceStatus::Used,
+        SourceStatus::Outlier,
+        SourceStatus::Stale,
+        SourceStatus::Crossed,
+        SourceStatus::NoData,
+        SourceStatus::Invalid,
+        SourceStatus::FeedHalted,
+        SourceStatus::PegUnavailable,
+    ];
     let usdt: Symbol = "CRYPTO.BTC/USDT".parse().expect("valid symbol");
-    let every_status = SourceStatus::ALL
+    let every_status = MINTED_STATUSES
         .into_iter()
         .zip(MINTED.into_iter().cycle())
         .map(|(status, venue)| VenueEntry {
@@ -455,6 +468,33 @@ fn sample_venue_reports() -> Vec<(&'static str, VenueReport)> {
                 seq: 1,
                 expo: -8,
                 entries: Vec::new(),
+            },
+        ),
+        (
+            "toobit_quote_only",
+            VenueReport {
+                feed_id: feed_id(&usdt),
+                publish_time_ns: BASE_TIME_NS,
+                seq: 1_754_582_400_001,
+                expo: -8,
+                entries: vec![
+                    VenueEntry {
+                        weight_bps: 10_000,
+                        bid: Some(6_431_250_000_000),
+                        ask: Some(6_431_251_000_000),
+                        local_recv_ns: BASE_TIME_NS - 2_000_000,
+                        ..entry(Venue::Binance, MarketKind::Spot, SourceStatus::Used)
+                    },
+                    VenueEntry {
+                        bid: Some(6_431_240_000_000),
+                        ask: Some(6_431_262_000_000),
+                        bid_qty: Some(12_000_000),
+                        ask_qty: Some(31_500_000),
+                        exchange_time_ns: Some(BASE_TIME_NS - 400_000_000),
+                        local_recv_ns: BASE_TIME_NS - 350_000_000,
+                        ..entry(Venue::Toobit, MarketKind::Spot, SourceStatus::QuoteOnly)
+                    },
+                ],
             },
         ),
     ]
@@ -666,6 +706,50 @@ fn sample_feed_set(governance: &Signer) -> FeedSet {
     .expect("signs")
 }
 
+/// Quote-only sources, one of them converted, so that each bit of the source
+/// flags byte is set somewhere; and no push pace.
+fn sample_quote_only_feed_set(governance: &Signer) -> FeedSet {
+    let quote_only = |source: SourceSettings| SourceSettings {
+        quote_only: true,
+        ..source
+    };
+    let btc = FeedSettings {
+        symbol: "CRYPTO.BTC/USD".to_owned(),
+        peg: Some("CRYPTO.USDT/USD".to_owned()),
+        min_sources: Some(2),
+        sources: vec![
+            spot("coinbase", "BTC-USD", false),
+            spot("binance", "BTCUSDT", true),
+            quote_only(spot("toobit", "BTCUSDT", true)),
+        ],
+        ..FeedSettings::default()
+    };
+    let usdt = FeedSettings {
+        symbol: "CRYPTO.USDT/USD".to_owned(),
+        min_sources: Some(1),
+        sources: vec![spot("kraken", "USDT/USD", false)],
+        ..FeedSettings::default()
+    };
+    let eth = FeedSettings {
+        symbol: "CRYPTO.ETH/USDT".to_owned(),
+        min_sources: Some(1),
+        sources: vec![
+            spot("binance", "ETHUSDT", false),
+            quote_only(spot("toobit", "ETHUSDT", false)),
+        ],
+        ..FeedSettings::default()
+    };
+    FeedSet::sign(
+        governance,
+        2,
+        BASE_TIME_NS / NANOS_PER_SEC,
+        "0.3.0".to_owned(),
+        None,
+        vec![btc, usdt, eth],
+    )
+    .expect("signs")
+}
+
 /// Three clients out of address order, so the vector shows that the encoding sorts them.
 fn sample_client_list(governance: &Signer) -> ClientList {
     let clients = [0x52_u8, 0x51, 0x53]
@@ -797,8 +881,16 @@ fn build() -> GoldenFile {
     )
     .expect("signs");
     let registry_bytes = registry.to_signing_bytes().expect("encodes");
-    let feed_set = sample_feed_set(&governance);
-    let feed_set_bytes = feed_set.to_signing_bytes().expect("encodes");
+    let feed_set_vector = |feed_set: FeedSet| {
+        let bytes = feed_set.to_signing_bytes().expect("encodes");
+        FeedSetVector {
+            governance_secret_key: hex0x(&governance_secret),
+            governance_address: governance.address().to_string(),
+            signing_bytes: hex0x(&bytes),
+            digest: hex0x(&domain::digest(&bytes)),
+            feed_set,
+        }
+    };
     let client_list = sample_client_list(&governance);
     let client_list_bytes = client_list.to_signing_bytes().expect("encodes");
     let (client_auth, auth_ok) = sample_handshake();
@@ -908,13 +1000,8 @@ fn build() -> GoldenFile {
         book_updates,
         funding_updates,
         price_batches,
-        feed_set: FeedSetVector {
-            governance_secret_key: hex0x(&governance_secret),
-            governance_address: governance.address().to_string(),
-            signing_bytes: hex0x(&feed_set_bytes),
-            digest: hex0x(&domain::digest(&feed_set_bytes)),
-            feed_set,
-        },
+        feed_set: feed_set_vector(sample_feed_set(&governance)),
+        feed_set_quote_only: feed_set_vector(sample_quote_only_feed_set(&governance)),
         client_list: ClientListVector {
             governance_secret_key: hex0x(&governance_secret),
             governance_address: governance.address().to_string(),
@@ -1035,6 +1122,10 @@ fn golden_vectors_are_unchanged() {
         "feed set encoding changed"
     );
     assert_eq!(
+        generated.feed_set_quote_only, expected.feed_set_quote_only,
+        "quote-only feed set encoding changed"
+    );
+    assert_eq!(
         generated.client_list, expected.client_list,
         "client list encoding changed"
     );
@@ -1098,14 +1189,17 @@ fn the_stored_client_list_and_handshake_signatures_verify() {
     );
 }
 
-/// The stored feed set must verify against its own governance address.
+/// The stored feed sets must verify against their own governance address.
 #[test]
-fn the_stored_feed_set_verifies() {
-    let stored = load().feed_set;
-    let governance: oracle_wire::Address = stored.governance_address.parse().expect("an address");
-    let verified = stored.feed_set.verify(governance, 0).expect("verifies");
-    assert_eq!(verified.feeds().len(), 3);
-    assert_eq!(verified.governance(), governance);
+fn the_stored_feed_sets_verify() {
+    let file = load();
+    for stored in [file.feed_set, file.feed_set_quote_only] {
+        let governance: oracle_wire::Address =
+            stored.governance_address.parse().expect("an address");
+        let verified = stored.feed_set.verify(governance, 0).expect("verifies");
+        assert_eq!(verified.feeds().len(), 3);
+        assert_eq!(verified.governance(), governance);
+    }
 }
 
 /// The stored vectors must still verify end to end, not merely match byte for byte.

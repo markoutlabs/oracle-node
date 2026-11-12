@@ -350,6 +350,24 @@ const BITSTAMP: Book = Book {
     without_asks: |first, _| without(first, r#""asks":"#),
 };
 
+const TOOBIT: Book = Book {
+    feed: || {
+        let spot = instrument("ICPUSDT", MarketKind::Spot);
+        venue_feed(super::toobit::decode, Venue::Toobit, MarketKind::Spot, spot)
+    },
+    // Recorded from Toobit's REST on 2026-11-12: three reads each of ICPUSDT and
+    // ETHUSDT, as the connector frames them.
+    recorded: include_str!("../../tests/fixtures/toobit.jsonl"),
+    symbol: "ICPUSDT",
+    proof: Proof::WholeBook,
+    messages: 3,
+    refusals: 0,
+    best: ("2.527", "2.528"),
+    dropped: None,
+    corrupt: (1, "1671.33"),
+    without_asks: |first, _| without(first, r#""a":"#),
+};
+
 const HYPERLIQUID: Book = Book {
     feed: || {
         let perp = instrument("BTC", MarketKind::LinearPerp);
@@ -983,6 +1001,11 @@ conformance! {
         an_emptied_side_drops_the_old_quote,
     }
     hyperliquid: super::HYPERLIQUID => {
+        a_clean_replay_ends_at_the_recorded_quote,
+        a_corrupt_decimal_never_prices_a_half_applied_book,
+        an_emptied_side_drops_the_old_quote,
+    }
+    toobit: super::TOOBIT => {
         a_clean_replay_ends_at_the_recorded_quote,
         a_corrupt_decimal_never_prices_a_half_applied_book,
         an_emptied_side_drops_the_old_quote,

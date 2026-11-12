@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use oracle_ingest::binance::BinanceConfig;
-use oracle_ingest::venues::{VenueSpec, bitget, bitstamp, coinbase, dydx, gate, kucoin, lighter};
+use oracle_ingest::venues::{
+    VenueSpec, bitget, bitstamp, coinbase, dydx, gate, kucoin, lighter, toobit,
+};
 use oracle_types::{MarketKind, ObsKind, PRICE_HEARTBEAT, SLOW_HEARTBEAT, Venue};
 
 use super::*;
@@ -251,6 +253,72 @@ fn a_usd_feed_can_mix_native_and_converted_sources() {
 
     // And the aggregator accepts the pair, peg included.
     assert!(oracle_agg::Aggregator::new(resolved.feeds).is_ok());
+}
+
+/// A quote-only source subscribes like any other, but counts for no quorum.
+#[test]
+fn a_quote_only_source_is_subscribed_and_counts_for_no_quorum() {
+    let btc = || {
+        feed(BTC)
+            .source(spot("binance", "BTCUSDT"))
+            .source(spot("okx", "BTC-USDT").quote_only())
+    };
+    let resolved = config().feed(btc()).resolve().expect("resolves");
+    let okx = connections_of(&resolved, Venue::Okx);
+    assert!(
+        okx.iter()
+            .flat_map(|connection| &connection.instruments)
+            .any(|spec| spec.venue_symbol == "BTC-USDT")
+    );
+    let sources = &resolved.feeds.first().expect("one feed").sources;
+    assert_eq!(
+        sources.iter().map(|s| s.quote_only).collect::<Vec<_>>(),
+        [false, true]
+    );
+    let error = config()
+        .feed(btc().set("min_sources", 2))
+        .resolve()
+        .err()
+        .expect("must refuse");
+    assert!(
+        matches!(&error, ConfigError::Invalid(m) if m.contains("only 1 price it")),
+        "got {error:?}"
+    );
+}
+
+/// Toobit's books share one connection, so its connector paces the reads of the
+/// whole address; it has no socket, and no perpetuals.
+#[test]
+fn toobit_reads_every_book_on_one_connection_and_refuses_perps() {
+    let books = (0..30).map(|i| spot("toobit", &format!("C{i}USDT")).quote_only());
+    let resolved = config()
+        .feed(btc().sources(books))
+        .resolve()
+        .expect("resolves");
+    let [connection] = connections_of(&resolved, Venue::Toobit) else {
+        panic!("one Toobit connection");
+    };
+    assert_eq!(connection.instruments.len(), 30);
+    let (base, books) = connection.spec.url.split_once('?').expect("the books");
+    assert_eq!(base, toobit::URL);
+    assert_eq!(books.split(',').count(), 30);
+    assert!(connection.spec.subscribe.is_empty());
+    assert!(connection.spec.keepalive.is_none());
+    let sources = &resolved.feeds.first().expect("one feed").sources;
+    assert!(
+        sources
+            .iter()
+            .filter(|source| source.instrument.venue == Venue::Toobit)
+            .all(|source| source.quote_only)
+    );
+
+    let error = one_source("toobit", "linear_perp", "BTCUSDT")
+        .err()
+        .expect("must refuse");
+    assert!(
+        matches!(&error, ConfigError::Invalid(m) if m.contains("spot only")),
+        "got {error:?}"
+    );
 }
 
 #[test]
