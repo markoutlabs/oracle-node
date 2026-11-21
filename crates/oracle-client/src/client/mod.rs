@@ -27,6 +27,8 @@ use crate::verify::{
 };
 
 use connection::{IDLE_TIMEOUT, NodeConnection};
+#[cfg(feature = "local-unsigned")]
+pub use ingest::LocalFrame;
 use ingest::RecoveredFrame;
 use selection::Choice;
 

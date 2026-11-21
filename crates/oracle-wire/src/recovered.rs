@@ -18,6 +18,17 @@ impl<T> Recovered<T> {
         Self { value, signer }
     }
 
+    /// A value that a node in this process made and did not sign: `author` stands in for the
+    /// recovered signer.
+    ///
+    /// Only an app that runs its node and the SDK in one process turns on `local-unsigned`.
+    /// The registry check still decides whether `author` is trusted.
+    #[cfg(feature = "local-unsigned")]
+    #[must_use]
+    pub const fn local(value: T, author: Address) -> Self {
+        Self::new(value, author)
+    }
+
     /// Returns the address that signed. Authorship, not trust.
     #[must_use]
     pub const fn signer(&self) -> Address {

@@ -720,3 +720,127 @@ fn one_lying_node_cannot_move_the_resolved_price() {
     assert_eq!(resolved.status, Status::Degraded);
     assert!(resolved.conf.expect("a band") > oracle_types::Fixed::from_int(1).expect("ok"));
 }
+
+/// A local value goes through every rule of the signed frame of the same value and author.
+#[cfg(feature = "local-unsigned")]
+mod local {
+    use super::*;
+    use crate::LocalFrame;
+    use crate::testing::venues_at;
+    use oracle_wire::{Recovered, VerifyError};
+
+    /// Two clients over one registry of three nodes: one for signed frames, one for local values.
+    fn pair(nodes: &[TestNode]) -> (OracleClient, OracleClient) {
+        let registry = registry_with(&nodes.iter().collect::<Vec<_>>());
+        let client = || {
+            OracleClient::builder(registry.clone())
+                .build()
+                .expect("three nodes")
+        };
+        (client(), client())
+    }
+
+    /// One value of each kind, as the frame that `node` signs and as its local value.
+    fn each_kind(node: &TestNode, at: u64, seq: u64) -> [(Vec<u8>, LocalFrame); 4] {
+        let author = node.signing_address();
+        let (price, venues) = (update_at(at, seq), venues_at(at, seq));
+        let (book, funding) = (book_at(at, seq, true, 100), funding_at(at, seq, 100));
+        [
+            (
+                node.sign(&price),
+                LocalFrame::Price(Recovered::local(price, author)),
+            ),
+            (
+                node.sign_venues(&venues),
+                LocalFrame::Venues(Recovered::local(venues, author)),
+            ),
+            (
+                node.sign_book(&book),
+                LocalFrame::Book(Recovered::local(book, author)),
+            ),
+            (
+                node.sign_funding(&funding),
+                LocalFrame::Funding(Recovered::local(funding, author)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn each_kind_gives_the_event_of_its_signed_frame_and_no_tap_copy() {
+        let nodes = nodes();
+        let (mut signed, mut local) = pair(&nodes);
+        let (mut signed_tap, mut local_tap) = (signed.frames(64), local.frames(64));
+        for node in &nodes {
+            for (frame, value) in each_kind(node, NOW, 1) {
+                let event = signed.ingest_event(&frame, NOW);
+                assert!(event.is_ok(), "{event:?}");
+                assert_eq!(local.ingest_local(value, NOW), event);
+            }
+        }
+        assert_eq!(local.stats(), signed.stats());
+        assert_eq!(local.stats().accepted, 3);
+        assert_eq!(local.nodes(NOW), signed.nodes(NOW));
+        let book = InstrumentId::new(Venue::Binance, MarketKind::Spot, "BTCUSDT");
+        assert_eq!(
+            local.book(&book, NOW).cloned(),
+            signed.book(&book, NOW).cloned()
+        );
+        let perpetual = InstrumentId::new(Venue::Bybit, MarketKind::LinearPerp, "BTCUSDT");
+        assert_eq!(
+            local.funding(&perpetual, NOW).cloned(),
+            signed.funding(&perpetual, NOW).cloned()
+        );
+        assert!(signed_tap.try_recv().is_ok(), "a signed frame has bytes");
+        assert!(local_tap.try_recv().is_err(), "a local value has none");
+    }
+
+    #[test]
+    fn a_local_value_of_an_author_outside_the_registry_is_refused() {
+        let (mut signed, mut local) = pair(&nodes());
+        let outsider = TestNode::new(200);
+        for (frame, value) in each_kind(&outsider, NOW, 1) {
+            let refused = signed.ingest_event(&frame, NOW);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RejectReason::Untrusted(VerifyError::UnknownSigner { signer }))
+                        if *signer == outsider.signing_address()
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(local.ingest_local(value, NOW), refused);
+        }
+        assert_eq!(local.stats(), signed.stats());
+        assert_eq!(local.stats().untrusted, 4);
+    }
+
+    #[test]
+    fn a_stale_or_replayed_local_value_is_refused_as_its_signed_frame() {
+        let nodes = nodes();
+        let (mut signed, mut local) = pair(&nodes);
+        let node = nodes.first().expect("a node");
+        let stale = NOW - 600 * NANOS_PER_SEC;
+        for (frame, value) in each_kind(node, stale, 1) {
+            let refused = signed.ingest_event(&frame, NOW);
+            assert!(
+                matches!(refused, Err(RejectReason::TooOld { .. })),
+                "{refused:?}"
+            );
+            assert_eq!(local.ingest_local(value, NOW), refused);
+        }
+        for (frame, value) in each_kind(node, NOW, 2) {
+            let first = signed.ingest_event(&frame, NOW);
+            assert!(first.is_ok(), "{first:?}");
+            assert_eq!(local.ingest_local(value.clone(), NOW), first);
+            let replayed = signed.ingest_event(&frame, NOW);
+            assert!(
+                matches!(replayed, Err(RejectReason::Replayed { .. })),
+                "{replayed:?}"
+            );
+            assert_eq!(local.ingest_local(value, NOW), replayed);
+        }
+        assert_eq!(local.stats(), signed.stats());
+        assert_eq!(local.stats().replayed, 4);
+        assert_eq!(local.nodes(NOW), signed.nodes(NOW));
+    }
+}

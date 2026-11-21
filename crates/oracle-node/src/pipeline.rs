@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use oracle_agg::{AggError, Aggregator, ConfigError, FeedConfig, FeedStats, Trigger};
 use oracle_ingest::IngestEvent;
+#[cfg(feature = "local-unsigned")]
+use oracle_types::{BookUpdate, FundingUpdate, VenueReport};
 use oracle_types::{FeedId, InstrumentId, PriceUpdate};
 use oracle_wire::{
     SignedBookUpdate, SignedFundingUpdate, SignedUpdate, SignedVenueReport, Signer, WireError,
@@ -243,8 +245,20 @@ impl Pipeline {
 
     fn sign(
         &mut self,
-        (updates, errors): (Vec<PriceUpdate>, Vec<AggError>),
+        polled: (Vec<PriceUpdate>, Vec<AggError>),
     ) -> (Vec<SignedUpdate>, Vec<AggError>) {
+        let (updates, errors) = self.count(polled);
+        let signed = updates
+            .iter()
+            .map(|update| self.signer.sign_update(update))
+            .collect();
+        (signed, errors)
+    }
+
+    fn count(
+        &mut self,
+        (updates, errors): (Vec<PriceUpdate>, Vec<AggError>),
+    ) -> (Vec<PriceUpdate>, Vec<AggError>) {
         self.stats.encode_errors = self
             .stats
             .encode_errors
@@ -253,13 +267,73 @@ impl Pipeline {
             .stats
             .published
             .saturating_add(updates.len().try_into().unwrap_or(u64::MAX));
-
-        let signed = updates
-            .iter()
-            .map(|update| self.signer.sign_update(update))
-            .collect();
-        (signed, errors)
+        (updates, errors)
     }
+}
+
+/// The steps of [`Pipeline`] without the signature, for an embedded node whose SDK runs in the
+/// same process. Each one returns the values that its signed step signs, in the same order.
+#[cfg(feature = "local-unsigned")]
+impl Pipeline {
+    pub(crate) fn tick_unsigned(&mut self, now_ns: u64) -> (Vec<PriceUpdate>, Vec<AggError>) {
+        let polled = self.aggregator.poll_all(now_ns);
+        self.count(polled)
+    }
+
+    pub(crate) fn flush_unsigned(&mut self, now_ns: u64) -> (Vec<PriceUpdate>, Vec<AggError>) {
+        let polled = self.aggregator.poll_changed(now_ns);
+        self.count(polled)
+    }
+
+    pub(crate) fn venue_reports_unsigned(
+        &mut self,
+        now_ns: u64,
+        wanted: impl Fn(FeedId) -> bool,
+    ) -> (Vec<VenueReport>, Vec<WireError>) {
+        encodable(
+            self.aggregator.poll_venues(now_ns, wanted),
+            oracle_wire::encode_venue_report,
+        )
+    }
+
+    pub(crate) fn book_updates_unsigned(
+        &mut self,
+        now_ns: u64,
+        wanted: impl Fn(&InstrumentId) -> bool,
+    ) -> (Vec<BookUpdate>, Vec<WireError>) {
+        encodable(
+            self.books.poll(now_ns, wanted),
+            oracle_wire::encode_book_update,
+        )
+    }
+
+    pub(crate) fn funding_updates_unsigned(
+        &mut self,
+        now_ns: u64,
+    ) -> (Vec<FundingUpdate>, Vec<WireError>) {
+        encodable(
+            self.funding.poll(now_ns),
+            oracle_wire::encode_funding_update,
+        )
+    }
+}
+
+/// Keeps the values that the wire format can carry. The signed steps encode before they sign,
+/// so without this check the unsigned mode would pass a value that the signed mode drops.
+#[cfg(feature = "local-unsigned")]
+fn encodable<T>(
+    values: Vec<T>,
+    encode: impl Fn(&T) -> Result<Vec<u8>, WireError>,
+) -> (Vec<T>, Vec<WireError>) {
+    let mut kept = Vec::with_capacity(values.len());
+    let mut errors = Vec::new();
+    for value in values {
+        match encode(&value) {
+            Ok(_) => kept.push(value),
+            Err(error) => errors.push(error),
+        }
+    }
+    (kept, errors)
 }
 
 #[cfg(test)]

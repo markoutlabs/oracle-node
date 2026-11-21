@@ -78,63 +78,118 @@ pub struct PipelineLoop<O> {
 }
 
 impl<O: Outlet> PipelineLoop<O> {
-    fn apply(&mut self, event: &IngestEvent) {
-        self.outlet.observed(event);
-        self.pipeline.observe(event);
+    /// Runs until `shutdown`, or until every sender of the ingest queue is gone.
+    pub async fn run(self) {
+        let Self {
+            pipeline,
+            ingest,
+            tick,
+            clock,
+            outlet,
+            shutdown,
+        } = self;
+        drive(pipeline, ingest, tick, clock, Signing(outlet), shutdown).await;
+    }
+}
+
+/// What [`drive`] hands each evaluation to. The node binary and the signed embedded node use
+/// [`Signing`]; the unsigned embedded node has its own sink, so both modes share one loop.
+pub(crate) trait Sink: Send {
+    type Extra: Send;
+
+    fn extra(&mut self) -> impl Future<Output = Self::Extra> + Send;
+
+    fn on_extra(&mut self, extra: Self::Extra, pipeline: &mut Pipeline);
+
+    fn observed(&mut self, event: &IngestEvent);
+
+    /// Evaluates the feeds and takes what is due. `timed` is true after new input.
+    fn evaluate(&mut self, pipeline: &mut Pipeline, clock: &MonotonicClock, timed: bool);
+
+    fn stepped(&mut self);
+}
+
+/// Signs each evaluation and gives it to an [`Outlet`].
+pub(crate) struct Signing<O>(pub(crate) O);
+
+impl<O: Outlet> Sink for Signing<O> {
+    type Extra = O::Extra;
+
+    fn extra(&mut self) -> impl Future<Output = Self::Extra> + Send {
+        self.0.extra()
     }
 
-    /// Runs until `shutdown`, or until every sender of the ingest queue is gone.
-    pub async fn run(mut self) {
-        let clock = self.clock.clone();
-        let mut ticker = tokio::time::interval(self.tick);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            let retry = self
-                .pipeline
-                .next_retry_ns()
-                .map(|at| Duration::from_nanos(at.saturating_sub(clock.now_ns())));
-            tokio::select! {
-                biased;
-                () = self.shutdown.cancelled() => break,
-                // The timers first: an ingest queue that is never empty would
-                // otherwise starve the heartbeats and the outlet's own input.
-                _ = ticker.tick() => {
-                    let polled = self.pipeline.tick(clock.now_ns());
-                    self.outlet.publish(&self.pipeline, polled, None);
-                    self.outlet.publish_venues(&mut self.pipeline, clock.now_ns());
-                }
-                extra = self.outlet.extra() => {
-                    self.outlet.on_extra(extra, &mut self.pipeline);
-                }
-                event = self.ingest.recv() => {
-                    let Some(event) = event else { break };
-                    self.apply(&event);
-                    for _ in 1..BATCH_MAX {
-                        let Ok(event) = self.ingest.try_recv() else { break };
-                        self.apply(&event);
-                    }
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.outlet.publish(&self.pipeline, polled, Some(&clock));
-                    self.outlet.publish_venues(&mut self.pipeline, clock.now_ns());
-                }
-                () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
-                    let polled = self.pipeline.flush(clock.now_ns());
-                    self.outlet.publish(&self.pipeline, polled, Some(&clock));
-                    self.outlet.publish_venues(&mut self.pipeline, clock.now_ns());
-                }
-            }
-            self.outlet.stepped();
-        }
-        let stats = self.pipeline.stats();
-        info!(
-            observations = stats.observations,
-            published = stats.published,
-            connects = stats.connects,
-            disconnects = stats.disconnects,
-            unencodable = stats.encode_errors,
-            "pipeline stopped"
-        );
+    fn on_extra(&mut self, extra: Self::Extra, pipeline: &mut Pipeline) {
+        self.0.on_extra(extra, pipeline);
     }
+
+    fn observed(&mut self, event: &IngestEvent) {
+        self.0.observed(event);
+    }
+
+    fn evaluate(&mut self, pipeline: &mut Pipeline, clock: &MonotonicClock, timed: bool) {
+        let polled = if timed {
+            pipeline.flush(clock.now_ns())
+        } else {
+            pipeline.tick(clock.now_ns())
+        };
+        self.0.publish(pipeline, polled, timed.then_some(clock));
+        self.0.publish_venues(pipeline, clock.now_ns());
+    }
+
+    fn stepped(&mut self) {
+        self.0.stepped();
+    }
+}
+
+/// The loop of [`PipelineLoop::run`], for any [`Sink`].
+pub(crate) async fn drive<S: Sink>(
+    mut pipeline: Pipeline,
+    mut ingest: mpsc::Receiver<IngestEvent>,
+    tick: Duration,
+    clock: MonotonicClock,
+    mut sink: S,
+    shutdown: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let retry = pipeline
+            .next_retry_ns()
+            .map(|at| Duration::from_nanos(at.saturating_sub(clock.now_ns())));
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            // The timers first: an ingest queue that is never empty would
+            // otherwise starve the heartbeats and the outlet's own input.
+            _ = ticker.tick() => sink.evaluate(&mut pipeline, &clock, false),
+            extra = sink.extra() => sink.on_extra(extra, &mut pipeline),
+            event = ingest.recv() => {
+                let Some(event) = event else { break };
+                sink.observed(&event);
+                pipeline.observe(&event);
+                for _ in 1..BATCH_MAX {
+                    let Ok(event) = ingest.try_recv() else { break };
+                    sink.observed(&event);
+                    pipeline.observe(&event);
+                }
+                sink.evaluate(&mut pipeline, &clock, true);
+            }
+            () = tokio::time::sleep(retry.unwrap_or_default()), if retry.is_some() => {
+                sink.evaluate(&mut pipeline, &clock, true);
+            }
+        }
+        sink.stepped();
+    }
+    let stats = pipeline.stats();
+    info!(
+        observations = stats.observations,
+        published = stats.published,
+        connects = stats.connects,
+        disconnects = stats.disconnects,
+        unencodable = stats.encode_errors,
+        "pipeline stopped"
+    );
 }
 
 /// Keeps the node clock on wall time until `shutdown`. A consumer compares

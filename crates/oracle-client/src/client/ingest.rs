@@ -49,6 +49,33 @@ fn recover_price(frame: &[u8]) -> Result<Recovered<PriceUpdate>, VerifyError> {
     UnverifiedFrame::parse(frame)?.recover()
 }
 
+/// One value of a node in this process, with no signature, for [`OracleClient::ingest_local`].
+/// Each value carries its author, from [`Recovered::local`].
+#[cfg(feature = "local-unsigned")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalFrame {
+    /// A price update.
+    Price(Recovered<PriceUpdate>),
+    /// A venue report.
+    Venues(Recovered<VenueReport>),
+    /// A book snapshot or delta.
+    Book(Recovered<BookUpdate>),
+    /// A funding update.
+    Funding(Recovered<FundingUpdate>),
+}
+
+#[cfg(feature = "local-unsigned")]
+impl From<LocalFrame> for RecoveredFrame {
+    fn from(frame: LocalFrame) -> Self {
+        match frame {
+            LocalFrame::Price(update) => Self::Price(update),
+            LocalFrame::Venues(report) => Self::Venues(report),
+            LocalFrame::Book(update) => Self::Book(update),
+            LocalFrame::Funding(update) => Self::Funding(update),
+        }
+    }
+}
+
 impl OracleClient {
     /// Feeds one frame in directly, bypassing the network and the registry source.
     ///
@@ -74,6 +101,27 @@ impl OracleClient {
     pub fn ingest_event(&mut self, frame: &[u8], now_ns: u64) -> Result<Event, RejectReason> {
         let outcome = self.try_ingest(RecoveredFrame::of(frame), now_ns, now_ns);
         self.record(Cow::Borrowed(frame), now_ns, outcome)
+    }
+
+    /// Feeds one value of a node in this process, like [`OracleClient::ingest_event`] for the
+    /// same value signed by its author.
+    ///
+    /// The frame parse and the signature recovery do not run; every other rule does. The
+    /// value has no wire bytes, so [`OracleClient::frames`] gets no copy of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RejectReason`] that [`OracleClient::ingest_event`] returns for the signed
+    /// value, for example for an author that the registry does not list.
+    #[cfg(feature = "local-unsigned")]
+    pub fn ingest_local(&mut self, frame: LocalFrame, now_ns: u64) -> Result<Event, RejectReason> {
+        match self.try_ingest(Ok(frame.into()), now_ns, now_ns) {
+            Ok((event, _)) => Ok(event),
+            Err(reason) => {
+                self.refused(&reason);
+                Err(reason)
+            }
+        }
     }
 
     /// Feeds one frame in, refreshing the registry once if the signer is unknown.
@@ -232,14 +280,21 @@ impl OracleClient {
             }
             Err(reason) => reason,
         };
-        self.stats.record(&reason);
-        if let Some(node) = rejected_node(&reason) {
-            self.tallies.entry(node).or_default().frames.record(&reason);
-            if let Some(verdict) = Verdict::of(&reason) {
-                self.copy(frame, node, received_ns, verdict);
-            }
+        if let Some(node) = self.refused(&reason)
+            && let Some(verdict) = Verdict::of(&reason)
+        {
+            self.copy(frame, node, received_ns, verdict);
         }
         Err(reason)
+    }
+
+    /// Counts a rejection in the stats and in the tally of the listed node that it names, which
+    /// it returns.
+    fn refused(&mut self, reason: &RejectReason) -> Option<Address> {
+        self.stats.record(reason);
+        let node = rejected_node(reason)?;
+        self.tallies.entry(node).or_default().frames.record(reason);
+        Some(node)
     }
 
     /// Adds what a feed view cannot know: the symbol, and the client-level

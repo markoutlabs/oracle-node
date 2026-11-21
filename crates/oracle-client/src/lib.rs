@@ -93,6 +93,8 @@ pub use oracle_types::{Fixed, InstrumentId, Symbol};
 pub use oracle_wire::{Address, Registry, Signer};
 
 pub use book::Book;
+#[cfg(feature = "local-unsigned")]
+pub use client::LocalFrame;
 pub use client::{
     ClientError, ClientStats, Event, OracleClient, OracleClientBuilder, Subscription,
     now_unix_nanos,

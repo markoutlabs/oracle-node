@@ -14,6 +14,9 @@ default = ["pure-rust"]
 pure-rust = ["oracle-wire/pure-rust", "oracle-quorum/pure-rust"]
 # The C `libsecp256k1` backend, the fastest.
 libsecp = ["oracle-wire/libsecp", "oracle-quorum/libsecp"]
+# `OracleClient::ingest_local`: the values of a node in this process, with no signature. Only an
+# app that runs its node in its own process turns it on; a client of the network never does.
+local-unsigned = ["oracle-wire/local-unsigned"]
 
 [dependencies]
 oracle-agg.workspace = true

@@ -40,6 +40,9 @@ serve = [
 ]
 # Reads `signing.key_env`, for local playgrounds only: the environment keeps the key.
 dev-key-env = []
+# `LocalNode::start_unsigned`: an embedded node that gives its values to the SDK in the same
+# process with no signature. No build of the network node turns it on.
+local-unsigned = ["oracle-client/local-unsigned", "oracle-wire/local-unsigned"]
 
 [[bin]]
 name = "oracle-node"

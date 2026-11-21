@@ -18,6 +18,9 @@ libsecp = ["dep:secp256k1"]
 # are on, and wasm32 always uses it. `make test` runs the golden vectors under
 # each backend to prove that they agree.
 pure-rust = ["dep:k256"]
+# `Recovered::local`: a value with no signature, for a node and an SDK in one process. No
+# default turns it on, so the network node, the canister and the proxy never have it.
+local-unsigned = []
 
 [dependencies]
 oracle-types.workspace = true

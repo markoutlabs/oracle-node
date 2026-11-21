@@ -121,3 +121,104 @@ async fn book_frames_for_a_feed_that_the_node_does_not_run_stop_the_start() {
         started.err()
     );
 }
+
+/// The node signs nothing, and the SDK takes its values as it takes signed frames.
+#[cfg(feature = "local-unsigned")]
+#[tokio::test]
+async fn an_unsigned_local_node_gives_values_that_the_sdk_accepts_with_no_signature() {
+    use oracle_client::LocalFrame;
+
+    let signer = Arc::new(Signer::from_secret(&[0x51; 32].into()).expect("a key"));
+    let governance = Signer::from_secret(&[0x52; 32].into()).expect("a key");
+    let connector = ScriptedConnector::repeating(
+        Script::new()
+            .pong_on_ping()
+            .then_repeat(Script::new().text(QUOTE).delay(Duration::from_millis(50))),
+    );
+    let config = EmbedConfig {
+        feeds: vec![btc()],
+        endpoints: Vec::new(),
+        tick_interval_ms: DEFAULT_TICK_MS,
+        signer: Arc::clone(&signer),
+        clock: MonotonicClock::new(),
+        venue_reports: true,
+        books: BookFrames::None,
+        funding: false,
+    };
+    let mut node =
+        LocalNode::start_unsigned_with_connector(config, connector, CancellationToken::new())
+            .expect("starts");
+    assert!(
+        node.take_frames().is_none(),
+        "an unsigned node signs no frame"
+    );
+    let mut frames = node.take_local_frames().expect("the first call");
+    assert!(node.take_local_frames().is_none());
+
+    let registry = local_registry(signer.address(), &governance, 1, 0).expect("signs");
+    let mut client = OracleClient::builder(registry)
+        .quorum(1)
+        .i_understand_this_provides_no_protection_against_a_bad_node()
+        .build()
+        .expect("one node, acknowledged");
+    client
+        .subscribe_local(Subscription {
+            prices: &[FEED],
+            venues: &[FEED],
+            ..Subscription::default()
+        })
+        .expect("a valid symbol");
+
+    let (mut price, mut venues) = (None, false);
+    while price.is_none() || !venues {
+        let frame = tokio::time::timeout(WAIT, frames.recv())
+            .await
+            .expect("a value in time")
+            .expect("the node runs");
+        let author = match &frame {
+            LocalFrame::Price(value) => value.signer(),
+            LocalFrame::Venues(value) => value.signer(),
+            other => panic!("only prices and venue reports are asked for: {other:?}"),
+        };
+        assert_eq!(author, signer.address());
+        match client.ingest_local(frame, now_unix_nanos()) {
+            Ok(Event::Price(resolved)) => price = Some(resolved),
+            Ok(Event::Venues(_)) => venues = true,
+            other => panic!("a price or a venue report: {other:?}"),
+        }
+    }
+    let price = price.expect("a price");
+    assert_eq!((price.status, price.nodes), (Status::Ok, 1), "{price:?}");
+    let quote = price.price.expect("a price");
+    let (bid, ask): (Fixed, Fixed) = (
+        "60000.00".parse().expect("a bid"),
+        "60000.10".parse().expect("an ask"),
+    );
+    assert!(bid < quote && quote < ask, "{quote:?} is outside the quote");
+    assert_eq!(client.stats().untrusted, 0);
+    assert_eq!(node.dropped_frames(), 0);
+    tokio::spawn(node.stop()).await.expect("stops");
+}
+
+/// A node that signs keeps its frames, and has no unsigned values.
+#[cfg(feature = "local-unsigned")]
+#[tokio::test]
+async fn a_signed_local_node_has_no_unsigned_values() {
+    let signer = Arc::new(Signer::from_secret(&[0x51; 32].into()).expect("a key"));
+    let config = EmbedConfig {
+        feeds: vec![btc()],
+        endpoints: Vec::new(),
+        tick_interval_ms: DEFAULT_TICK_MS,
+        signer,
+        clock: MonotonicClock::new(),
+        venue_reports: false,
+        books: BookFrames::None,
+        funding: false,
+    };
+    let connector = ScriptedConnector::repeating(Script::new().pong_on_ping());
+    let mut node = LocalNode::start_with_connector(config, connector, CancellationToken::new())
+        .expect("starts");
+    assert!(node.take_local_frames().is_none());
+    assert!(node.take_frames().is_some());
+    node.stop().await;
+}
