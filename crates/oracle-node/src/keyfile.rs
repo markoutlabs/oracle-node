@@ -39,6 +39,14 @@ pub enum KeyFileError {
         /// Why.
         reason: String,
     },
+    /// Every user of the host can read or write the key or passphrase file.
+    #[error("{path} is open to every user (mode {mode:o}); run chmod 600 on it")]
+    Exposed {
+        /// Which file.
+        path: PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
     /// The file is encrypted and nothing supplied a passphrase.
     #[error(
         "{path} is encrypted and no passphrase was given: set signing.passphrase_file, \
@@ -267,10 +275,28 @@ impl PassphraseSource {
 }
 
 fn read(path: &Path) -> Result<String, KeyFileError> {
-    std::fs::read_to_string(path).map_err(|e| KeyFileError::Read {
+    let failed = |e: std::io::Error| KeyFileError::Read {
         path: path.to_path_buf(),
         reason: e.to_string(),
-    })
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(failed)?
+            .permissions()
+            .mode()
+            & 0o777;
+        // The group bits stay allowed: systemd's credential files show an ACL
+        // mask there. A file that every user can read gives the key away.
+        if mode & 0o007 != 0 {
+            return Err(KeyFileError::Exposed {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    std::fs::read_to_string(path).map_err(failed)
 }
 
 #[cfg(test)]
@@ -287,6 +313,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creates");
         dir
+    }
+
+    fn write_private(path: &Path, contents: &str) {
+        write_with_mode(path, contents, 0o600);
+    }
+
+    fn write_with_mode(path: &Path, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::remove_file(path);
+        std::fs::write(path, contents).expect("writes");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("sets");
+    }
+
+    /// A restore or a copy with wide modes gave the key and its passphrase to
+    /// every user of the host, with no warning.
+    #[test]
+    fn a_key_or_passphrase_file_open_to_every_user_is_refused() {
+        let dir = scratch("modes");
+        let signer = Signer::from_secret(&[6_u8; 32].into()).expect("valid key");
+        let key = dir.join("signing.key");
+        let pass = dir.join("passphrase");
+        for mode in [0o644, 0o604, 0o602] {
+            write_with_mode(&key, &signer.to_secret_hex(), mode);
+            assert!(
+                matches!(load_signer(&key, None), Err(KeyFileError::Exposed { mode: m, .. }) if m == mode),
+                "{mode:o}"
+            );
+            write_with_mode(&pass, "hunter2\n", mode);
+            assert!(matches!(
+                PassphraseSource::File(pass.clone()).read("test", false),
+                Err(KeyFileError::Exposed { .. })
+            ));
+        }
+        for mode in [0o600, 0o400, 0o640] {
+            write_with_mode(&key, &signer.to_secret_hex(), mode);
+            assert!(load_signer(&key, None).is_ok(), "{mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -345,7 +409,7 @@ mod tests {
         let signer = Signer::from_secret(&[6_u8; 32].into()).expect("valid key");
 
         let plain = dir.join("plain.key");
-        std::fs::write(&plain, format!("{}\n", &*signer.to_secret_hex())).expect("writes");
+        write_private(&plain, &format!("{}\n", &*signer.to_secret_hex()));
         assert_eq!(
             load_signer(&plain, None).expect("loads").address(),
             signer.address()
@@ -353,7 +417,7 @@ mod tests {
 
         let encrypted = dir.join("encrypted.key");
         let armored = encrypt(&signer.to_secret_hex(), &passphrase("pw")).expect("encrypts");
-        std::fs::write(&encrypted, armored).expect("writes");
+        write_private(&encrypted, &armored);
         assert!(file_is_encrypted(&encrypted).expect("reads"));
         assert!(matches!(
             load_signer(&encrypted, None),
@@ -372,13 +436,13 @@ mod tests {
     fn a_passphrase_file_is_trimmed_and_must_not_be_empty() {
         let dir = scratch("pass");
         let file = dir.join("passphrase");
-        std::fs::write(&file, "hunter2\n").expect("writes");
+        write_private(&file, "hunter2\n");
         let read = PassphraseSource::File(file.clone())
             .read("test", false)
             .expect("reads");
         assert_eq!(read.expose_secret(), "hunter2");
 
-        std::fs::write(&file, "\n").expect("writes");
+        write_private(&file, "\n");
         assert!(matches!(
             PassphraseSource::File(file).read("test", false),
             Err(KeyFileError::Empty)

@@ -158,7 +158,7 @@ impl PushPlanner {
         {
             return Vec::new();
         }
-        latest
+        let mut due: Vec<PriceUpdate> = latest
             .into_iter()
             .filter(|update| self.feeds.contains(&update.feed_id))
             .filter(|update| since(update.publish_time_ns) <= MAX_FRAME_AGE)
@@ -171,9 +171,15 @@ impl PushPlanner {
                             || since(last.at_ns) >= self.pace.heartbeat)
                 }
             })
-            .take(MAX_UPDATES_PER_PUSH)
             .copied()
-            .collect()
+            .collect();
+        if due.len() > MAX_UPDATES_PER_PUSH {
+            // The feeds that waited longest go first, so a feed past the batch
+            // limit is not left out at every push. A never pushed feed waited longest.
+            due.sort_by_key(|update| self.pushed.get(&update.feed_id).map(|last| last.at_ns));
+            due.truncate(MAX_UPDATES_PER_PUSH);
+        }
+        due
     }
 
     fn moved(&self, from: i64, to: i64) -> bool {
@@ -302,5 +308,50 @@ mod tests {
             })
             .collect();
         assert_eq!(planner.due(&latest, T0).len(), MAX_UPDATES_PER_PUSH);
+    }
+
+    /// With more feeds than one batch holds, the first 32 took every place at
+    /// every heartbeat and the rest never reached the canister.
+    #[test]
+    fn every_feed_lands_when_more_are_due_than_one_batch_holds() {
+        let mut planner = PushPlanner::new(PushPace {
+            heartbeat: Duration::from_secs(60),
+            deviation_bps: 2,
+            min_interval: Duration::from_secs(60),
+        });
+        let ids: Vec<FeedId> = (0..40).map(|n| FeedId::from_bytes([n; 32])).collect();
+        planner.set_feeds(ids.iter().copied());
+        let mut landed_at: HashMap<FeedId, Vec<u64>> = HashMap::new();
+        for round in 0..6_u64 {
+            let now = T0 + round * 60 * SEC;
+            let latest: Vec<PriceUpdate> = ids
+                .iter()
+                .map(|id| PriceUpdate {
+                    feed_id: *id,
+                    ..at(now, round + 1, 1)
+                })
+                .collect();
+            let due = planner.due(&latest, now);
+            assert!(due.len() <= MAX_UPDATES_PER_PUSH);
+            planner.attempted(now);
+            for update in &due {
+                planner.landed(update, now);
+                landed_at.entry(update.feed_id).or_default().push(round);
+            }
+        }
+        for id in &ids {
+            let rounds = landed_at.get(id).map_or(&[][..], Vec::as_slice);
+            assert!(
+                rounds.first().is_some_and(|first| *first <= 1),
+                "{id:?}: {rounds:?}"
+            );
+            assert!(
+                rounds
+                    .iter()
+                    .zip(rounds.iter().skip(1))
+                    .all(|(before, after)| after - before <= 2),
+                "{id:?} waited more than two pushes: {rounds:?}"
+            );
+        }
     }
 }

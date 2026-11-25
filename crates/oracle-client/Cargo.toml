@@ -46,7 +46,7 @@ tracing.workspace = true
 axum.workspace = true
 clap.workspace = true
 oracle-wire.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "test-util", "io-util"] }
 
 [lints]
 workspace = true

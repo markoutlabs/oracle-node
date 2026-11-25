@@ -124,6 +124,10 @@ pub fn derive(
                 status = worse(status, SourceStatus::Crossed);
                 continue;
             }
+            if !is_sane_book(observation) {
+                status = worse(status, SourceStatus::Invalid);
+                continue;
+            }
             let Some(price) = observation.microprice().or_else(|| observation.mid()) else {
                 status = worse(status, SourceStatus::Invalid);
                 continue;
@@ -136,9 +140,9 @@ pub fn derive(
             (observation.price, None, false)
         };
 
-        if !price.is_positive() && kind.has_book() {
-            // A non-positive book price is nonsense. Non-book kinds may legitimately
-            // be zero or negative — funding rates cross zero constantly.
+        if !price.is_positive() && !is_signed(*kind) {
+            // A trade, mark or index at zero is a blank field, not a price. Funding
+            // rates cross zero constantly, so only they may be zero or negative.
             status = worse(status, SourceStatus::Invalid);
             continue;
         }
@@ -160,6 +164,21 @@ pub fn derive(
         });
     }
     Err(status)
+}
+
+/// The kinds whose value can be zero or negative.
+const fn is_signed(kind: ObsKind) -> bool {
+    matches!(kind, ObsKind::Funding | ObsKind::OpenInterest)
+}
+
+/// Each best price is above zero and no size is negative. A bid at zero or a
+/// negative size gives a positive microprice that no one quoted.
+fn is_sane_book(observation: &Observation) -> bool {
+    let not_negative = |qty: Fixed| qty.is_positive() || qty.is_zero();
+    observation.bid.is_none_or(Fixed::is_positive)
+        && observation.ask.is_none_or(Fixed::is_positive)
+        && observation.bid_qty.is_none_or(not_negative)
+        && observation.ask_qty.is_none_or(not_negative)
 }
 
 /// The more specific of two reasons a source has no quote.
@@ -189,7 +208,7 @@ fn usable<'a>(
         .get(kind.index())?
         .as_ref()
         .filter(|observation| !limits.is_stale(observation, alive, now_ns))
-        .filter(|observation| !observation.is_crossed())
+        .filter(|observation| !observation.is_crossed() && is_sane_book(observation))
 }
 
 /// The impact mid for `notional` from the latest depth snapshot, moved by how
@@ -728,5 +747,65 @@ mod tests {
         put(&mut slots, observation);
         let quote = derive(0, &funding_source, &config(), &slots, &NO_ALIVE, NOW).expect("usable");
         assert_eq!(quote.price, fixed("-0.000125"));
+    }
+
+    /// A blank trade, mark or index field parses as zero. It must not price.
+    #[test]
+    fn a_trade_mark_or_index_at_zero_or_below_is_invalid() {
+        for kind in [ObsKind::Trade, ObsKind::MarkPrice, ObsKind::IndexPrice] {
+            for price in ["0", "-1"] {
+                let source = SourceConfig::new(instrument(), vec![kind]);
+                let mut slots = slots();
+                put(
+                    &mut slots,
+                    Observation {
+                        kind,
+                        ..trade(price, 0)
+                    },
+                );
+                assert_eq!(
+                    derive(0, &source, &config(), &slots, &NO_ALIVE, NOW),
+                    Err(SourceStatus::Invalid),
+                    "{kind:?} at {price}"
+                );
+            }
+        }
+    }
+
+    /// A bid at zero with an ask at 100 has a microprice of 83: a price nobody
+    /// quoted. A negative size can move the microprice outside the book.
+    #[test]
+    fn a_book_with_a_side_at_zero_or_a_negative_size_is_invalid() {
+        for (bid, ask, bid_qty, ask_qty) in [
+            ("0", "100", "5", "1"),
+            ("-1", "100", "5", "1"),
+            ("100", "102", "1", "-0.999"),
+            ("100", "102", "-0.999", "1"),
+        ] {
+            let mut slots = slots();
+            put(&mut slots, book(bid, ask, bid_qty, ask_qty, 0));
+            assert_eq!(
+                derive(0, &source(), &config(), &slots, &NO_ALIVE, NOW),
+                Err(SourceStatus::Invalid),
+                "{bid}/{ask} sizes {bid_qty}/{ask_qty}"
+            );
+        }
+        // The fallback to a fresh trade still works.
+        let mut slots = slots();
+        put(&mut slots, book("0", "100", "5", "1", 0));
+        put(&mut slots, trade("99.5", 0));
+        let quote = derive(0, &source(), &config(), &slots, &NO_ALIVE, NOW).expect("the trade");
+        assert_eq!(quote.price, fixed("99.5"));
+    }
+
+    /// A newer top with a bid at zero would move the depth price by half the ask.
+    #[test]
+    fn a_top_with_a_side_at_zero_never_moves_the_depth_price() {
+        let mut slots = slots();
+        put(&mut slots, depth(&[("100", "10")], &[("101", "10")], 80));
+        put(&mut slots, book("0", "101.4", "1", "1", 5));
+        let quote =
+            derive(0, &source(), &with_impact("50"), &slots, &NO_ALIVE, NOW).expect("the depth");
+        assert_eq!(quote.price, fixed("100.5"));
     }
 }

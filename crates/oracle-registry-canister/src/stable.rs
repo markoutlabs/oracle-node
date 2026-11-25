@@ -84,6 +84,14 @@ impl Stable {
     pub fn decode(bytes: &[u8]) -> Result<Self, candid::Error> {
         let mut decoder = candid::de::IDLDeserialize::new(bytes)?;
         let (state_json, prices, version): Arguments = ArgumentDecoder::decode(&mut decoder)?;
+        // Every layout from 2 on saves its prices. Candid reads a stored record
+        // that no longer fits as `null`, so a `None` here would drop the priced
+        // feeds in silence; failing keeps the old wasm.
+        if version.is_some_and(|version| version >= 2) && prices.is_none() {
+            return Err(candid::Error::msg(
+                "a layout from version 2 on holds no prices: the stored prices do not fit this wasm",
+            ));
+        }
         Ok(Self {
             version: version.unwrap_or(1),
             state_json: state_json.into_vec(),
@@ -751,5 +759,31 @@ mod tests {
             prices: None,
         };
         assert!(stable.state().is_err());
+    }
+
+    /// A later wasm that changed `StoredPrices` read the stored record as `null`,
+    /// and the canister priced nothing after the upgrade, with no error.
+    #[test]
+    fn a_layout_with_prices_that_do_not_fit_fails_to_load() {
+        #[derive(candid::CandidType)]
+        struct Changed {
+            feeds: u64,
+        }
+        let json = serde_json::to_vec(&SavedState::of(&listed(&[1]))).expect("serialises");
+        let changed = candid::encode_args((
+            ByteBuf::from(json.clone()),
+            Some(Changed { feeds: 5 }),
+            Some(2_u32),
+        ))
+        .expect("encodes");
+        assert!(
+            Stable::decode(&changed).is_err(),
+            "a record that does not fit"
+        );
+        let missing = candid::encode_args((ByteBuf::from(json), None::<StoredPrices>, Some(2_u32)))
+            .expect("encodes");
+        assert!(Stable::decode(&missing).is_err(), "no prices at layout 2");
+        // The layouts from before the prices still load.
+        assert!(Stable::decode(LAYOUT_1).is_ok());
     }
 }

@@ -28,6 +28,10 @@ pub use oracle_registry_api::{
 
 use crate::admission::{Admission, Refusal, SIGNED_START};
 
+/// The concern of a `get_price` record whose price or band does not fit an
+/// `i64` or a `u64` at the feed's exponent.
+pub const UNREPRESENTABLE: &str = "unrepresentable";
+
 fn verdict_of(reason: &RejectReason) -> Verdict {
     match reason {
         RejectReason::Untrusted(VerifyError::UnknownSigner { .. }) => Verdict::UnknownSigner,
@@ -86,28 +90,39 @@ impl FeedPrice {
         let resolved = &self.resolved;
         let expo = self.symbol.expo();
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let price = resolved.price.and_then(|price| price.to_scaled(expo).ok());
+        // Rounded up: a band rounded down claims more precision than the nodes have.
+        let conf = resolved
+            .conf
+            .and_then(|conf| conf.to_scaled_unsigned_up(expo).ok());
+        // A usable status needs both numbers: a caller that unwraps would trap,
+        // and one that reads a missing band as zero would trust a wide price.
+        let unrepresentable =
+            resolved.status != Status::Halted && (price.is_none() || conf.is_none());
+        let mut concerns: Vec<String> = resolved
+            .concerns
+            .iter()
+            .map(|concern| concern.as_str().to_owned())
+            .collect();
+        if unrepresentable {
+            concerns.push(UNREPRESENTABLE.to_owned());
+        }
         PriceRecord {
             feed_id: ByteBuf::from(resolved.feed_id.as_bytes().to_vec()),
             symbol: self.symbol.to_string(),
             status: match resolved.status {
+                _ if unrepresentable => PriceStatus::Halted,
                 Status::Ok => PriceStatus::Ok,
                 Status::Degraded => PriceStatus::Degraded,
                 Status::Halted => PriceStatus::Halted,
             },
-            price: resolved.price.and_then(|price| price.to_scaled(expo).ok()),
-            conf: resolved
-                .conf
-                // Rounded up: a band rounded down claims more precision than the nodes have.
-                .and_then(|conf| conf.to_scaled_unsigned_up(expo).ok()),
+            price,
+            conf,
             expo,
             publish_time_ns: resolved.publish_time_ns,
             nodes: count(resolved.nodes),
             halted_nodes: count(resolved.halted_nodes),
-            concerns: resolved
-                .concerns
-                .iter()
-                .map(|concern| concern.as_str().to_owned())
-                .collect(),
+            concerns,
             spread_bps: resolved.spread_bps.map(|spread| spread.to_string()),
             resolved_at_ns: self.resolved_at_ns,
         }
@@ -999,6 +1014,45 @@ mod tests {
             Duration::from_secs(25),
             "an upgrade keeps it"
         );
+    }
+
+    /// `get_price` answered `Ok` with no price when a node's value did not fit
+    /// the feed's exponent, so a caller that unwrapped it trapped.
+    #[test]
+    fn a_price_or_band_that_does_not_fit_the_record_is_halted() {
+        let huge = 200_000_000_000_000_i64;
+        for (price, conf) in [(huge, 1_u64), (64_000, 1_000_000_000_000)] {
+            let node = TestNode::new(1);
+            let mut prices = listed(&[&node]);
+            let update = PriceUpdate {
+                expo: 0,
+                price,
+                conf,
+                ..node.next(id(BTC), usd(64_000))
+            };
+            prices
+                .push(&[node.sign_batch(&[update])], NOW)
+                .expect("passes the push rules");
+            let [btc] = prices.resolve_all(NOW).try_into().expect("one feed");
+            assert_ne!(
+                btc.resolved.status,
+                Status::Halted,
+                "the quorum prices {price} ± {conf}"
+            );
+            let record = btc.record();
+            assert_eq!(record.status, PriceStatus::Halted, "{price} ± {conf}");
+            assert!(record.concerns.iter().any(|c| c == UNREPRESENTABLE));
+        }
+        // A value that fits keeps its status and no new concern.
+        let node = TestNode::new(1);
+        let mut prices = listed(&[&node]);
+        prices
+            .push(&[node.sign_batch(&[node.next(id(BTC), usd(64_000))])], NOW)
+            .expect("passes");
+        let [btc] = prices.resolve_all(NOW).try_into().expect("one feed");
+        let record = btc.record();
+        assert_eq!(record.status, PriceStatus::Ok);
+        assert!(record.concerns.is_empty());
     }
 
     /// A band rounded down to zero would claim an exact price.

@@ -71,7 +71,7 @@ pub(crate) async fn read(
     data_of: DataOf,
 ) -> Result<Box<RawValue>, ReadError> {
     let failed = |error: reqwest::Error| ReadError::Failed(error.to_string());
-    let response = request.send().await.map_err(failed)?;
+    let mut response = request.send().await.map_err(failed)?;
     let status = response.status();
     if status.is_client_error() || status.is_server_error() {
         return Err(ReadError::Status {
@@ -88,9 +88,13 @@ pub(crate) async fn read(
     {
         return Err(too_large_error());
     }
-    let body = response.bytes().await.map_err(failed)?;
-    if too_large(body.len()) {
-        return Err(too_large_error());
+    // A chunked reply has no length, so the cap counts each chunk as it comes.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(failed)? {
+        if too_large(body.len().saturating_add(chunk.len())) {
+            return Err(too_large_error());
+        }
+        body.extend_from_slice(&chunk);
     }
     data_of(&body).map_err(ReadError::Failed)
 }
@@ -264,6 +268,48 @@ impl<T: Transport> Transport for RestTransport<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves one reply of `chunks` chunks of `size` bytes each, with no length.
+    async fn chunked_server(chunks: usize, size: usize) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let url = format!("http://{}/", listener.local_addr().expect("bound"));
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accepts");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = socket.write_all(head.as_bytes()).await;
+            let chunk = format!("{size:x}\r\n{}\r\n", " ".repeat(size));
+            for _ in 0..chunks {
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"1\r\n1\r\n0\r\n\r\n").await;
+        });
+        url
+    }
+
+    /// A reply with no length was read whole before the cap, so a broken host
+    /// could fill memory until the timeout.
+    #[tokio::test]
+    async fn a_reply_with_no_length_stops_at_the_cap() {
+        let client = client().expect("a client");
+        let url = chunked_server(64, MAX_BODY / 16).await;
+        let result = read(client.get(&url), whole_body).await;
+        assert!(
+            matches!(&result, Err(ReadError::Failed(why)) if why.contains("too large")),
+            "{result:?}"
+        );
+        let url = chunked_server(2, 1_024).await;
+        let small = read(client.get(&url), whole_body)
+            .await
+            .expect("a small reply");
+        assert_eq!(small.get().trim(), "1");
+    }
 
     #[test]
     fn contracts_keep_only_plain_names() {

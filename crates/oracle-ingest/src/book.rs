@@ -16,6 +16,11 @@ use crate::venues::{mid, observation};
 /// Levels per side carried in each depth observation.
 pub const DEPTH_LEVELS: usize = 50;
 
+/// The most levels that one side of a book keeps. A venue that sends the full
+/// book, or a broken one that adds levels far from the top, cannot grow it
+/// without bound; every checksum and depth rule covers far fewer.
+pub const MAX_LEVELS: usize = 5_000;
+
 /// Which side of the book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -110,6 +115,7 @@ impl LocalBook {
         if message.next_id.is_some() {
             self.last_id = message.next_id;
         }
+        self.truncate(MAX_LEVELS);
     }
 
     /// Keeps only the best `depth` levels on each side. Venues that publish a
@@ -561,6 +567,14 @@ impl BookKeeper {
         let (Some(bid), Some(ask)) = (best(Side::Bid), best(Side::Ask)) else {
             return Err(DecodeError::halted(&entry.instrument));
         };
+        // A level at a price of zero is a blank field; as the best bid it makes
+        // a mid at half the ask.
+        if !bid.price.is_positive() {
+            return Err(DecodeError::Resync(format!(
+                "{key}: the best bid is at {}",
+                bid.price
+            )));
+        }
         let seq = kept.book.last_id;
         let (kind, book) = if entry.depth && rule.shown > 1 {
             (ObsKind::Depth, Some(kept.depth(rule.shown)))
@@ -995,5 +1009,56 @@ mod tests {
             keeper.next_message(10),
             Err(DecodeError::Resync(_))
         ));
+    }
+
+    /// A full-book venue, or a broken one, cannot grow a side without bound.
+    #[test]
+    fn a_side_keeps_at_most_the_best_max_levels() {
+        let far = MAX_LEVELS + 1_000;
+        let prices: Vec<String> = (1..=far).map(|n| n.to_string()).collect();
+        let bids: Vec<Change<'_>> = prices.iter().map(|p| change(p, "1")).collect();
+        let asks: Vec<Change<'_>> = prices
+            .iter()
+            .map(|p| {
+                change(
+                    &format!("{}", p.parse::<usize>().expect("a number") + far),
+                    "1",
+                )
+            })
+            .collect();
+        let mut book = LocalBook::default();
+        book.apply(&BookMsg {
+            snapshot: true,
+            bids,
+            asks,
+            ..BookMsg::default()
+        });
+        assert_eq!(book.top(Side::Bid, usize::MAX).len(), MAX_LEVELS);
+        assert_eq!(book.top(Side::Ask, usize::MAX).len(), MAX_LEVELS);
+        assert_eq!(book.top(Side::Bid, 1)[0].price, fixed(&far.to_string()));
+        assert_eq!(
+            book.top(Side::Ask, 1)[0].price,
+            fixed(&(far + 1).to_string())
+        );
+    }
+
+    /// A bid at zero with an ask at 100 would price at 50.
+    #[test]
+    fn a_best_bid_at_zero_or_below_resyncs() {
+        for bid in ["0", "-1"] {
+            let message = BookMsg {
+                snapshot: true,
+                next_id: Some(1),
+                bids: vec![change(bid, "5")],
+                asks: vec![change("100", "1")],
+                ..BookMsg::default()
+            };
+            let outcomes = keep(CHAINED, &depth(), [Ok(message)]);
+            assert!(
+                matches!(outcomes[0], Err(DecodeError::Resync(_))),
+                "{bid}: {:?}",
+                outcomes[0]
+            );
+        }
     }
 }

@@ -185,7 +185,7 @@ impl HttpDocumentSource {
     /// certify recently, and [`FetchError::Malformed`] for a body that does
     /// not parse.
     pub async fn fetch<T: serde::de::DeserializeOwned>(&self) -> Result<T, FetchError> {
-        let response = self
+        let mut response = self
             .client
             .get(self.url.clone())
             .send()
@@ -203,20 +203,40 @@ impl HttpDocumentSource {
                     .map(|value| (name.as_str().to_owned(), value.to_owned()))
             })
             .collect();
-        let body = response
-            .bytes()
+        // The certificate is checked only after the whole body, so the body is
+        // capped as it arrives: a hostile gateway could stream until the timeout.
+        let too_large = || {
+            FetchError::Transport(format!(
+                "{} is larger than {MAX_DOCUMENT_BYTES} bytes",
+                self.url
+            ))
+        };
+        if response.content_length().is_some_and(|length| {
+            usize::try_from(length).map_or(true, |length| length > MAX_DOCUMENT_BYTES)
+        }) {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| FetchError::Transport(error.to_string()))?;
-        let certified = self.certification.verify(
-            self.url.path(),
-            status,
-            headers,
-            body.to_vec(),
-            now_unix_nanos(),
-        )?;
+            .map_err(|error| FetchError::Transport(error.to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_DOCUMENT_BYTES {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let certified =
+            self.certification
+                .verify(self.url.path(), status, headers, body, now_unix_nanos())?;
         serde_json::from_slice(&certified).map_err(|error| FetchError::Malformed(error.to_string()))
     }
 }
+
+/// The largest certified document the SDK reads. A canister's query reply is
+/// at most about 3 MiB.
+pub const MAX_DOCUMENT_BYTES: usize = 8 << 20;
 
 /// The URL of a mainnet canister's document, such as `registry.json`.
 #[must_use]

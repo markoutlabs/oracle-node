@@ -61,8 +61,11 @@ const CHECKSUM_LEVELS: usize = 25;
 
 const EIGHT_HOURS_NS: u64 = 8 * 3_600 * NANOS_PER_SEC;
 
-/// The changes carry no ids; the checksum messages prove the book.
-const BOOK_RULE: BookRule = BookRule::new(Continuity::Checksum).checksum(checksum);
+/// The changes carry no ids; the checksum messages prove the book. A depth
+/// observation shows only the levels that the checksum covers (SPEC §5.1).
+const BOOK_RULE: BookRule = BookRule::new(Continuity::Checksum)
+    .checksum(checksum)
+    .shown(CHECKSUM_LEVELS);
 
 /// The channels the decoder reads, by the name the venue gives them.
 const CHANNELS: [&str; 3] = ["book", "trades", "status"];
@@ -467,6 +470,23 @@ mod tests {
         assert_eq!(beyond_band(fixed("0.01"), band, cap), fixed("0.0025"));
         assert_eq!(beyond_band(fixed("-0.01"), band, cap), fixed("-0.0025"));
         assert_eq!(beyond_band(fixed("0.0003"), None, None), fixed("0.0003"));
+    }
+
+    /// Levels below the 25 that a checksum covers are not proved, so a depth
+    /// observation must not show them.
+    #[test]
+    fn a_depth_observation_shows_only_the_levels_a_checksum_covers() {
+        let level = |price: usize, amount: &str| format!("[{price},1,{amount}]");
+        let bids = (1..=30).map(|n| level(1_000 - n, "1"));
+        let asks = (1..=30).map(|n| level(1_000 + n, "-1"));
+        let snapshot = format!("[5,[{}]]", bids.chain(asks).collect::<Vec<_>>().join(","));
+        let all = spot(true).replay([BOOK_5, snapshot.as_str()]);
+        let book = all.last().and_then(|o| o.book.as_deref()).expect("a book");
+        assert_eq!(
+            (book.bids.len(), book.asks.len()),
+            (CHECKSUM_LEVELS, CHECKSUM_LEVELS)
+        );
+        assert_eq!(book.bids[0].price, fixed("999"));
     }
 
     #[test]

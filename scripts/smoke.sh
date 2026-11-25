@@ -69,7 +69,7 @@ icp canister call oracle_registry set_feeds "$PRICED" --identity "$IDENTITY" \
 echo "feed set v1 at PUSH=${PUSH:-60,2,60}, and $PRICED priced"
 
 say "init prints add_node"
-echo "smoke" > "$DIR/passphrase"
+echo "smoke" > "$DIR/passphrase" && chmod 600 "$DIR/passphrase"
 $NODE init --out "$DIR/node" --canister "$CANISTER" \
   --gateway "$GATEWAY" --root-key "$ROOT_KEY" --governance "$GOV" \
   --passphrase-file "$DIR/passphrase" > "$DIR/init.out"

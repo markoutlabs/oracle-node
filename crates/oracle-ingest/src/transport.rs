@@ -181,6 +181,21 @@ pub(crate) fn install_tls_provider() {
 /// The read buffer of each venue socket.
 const READ_BUFFER: usize = 16 * 1024;
 
+/// The largest message or frame a venue socket takes. The largest venue
+/// message, a full-book snapshot, is a few MiB; the library's 64 MiB default
+/// let a broken venue make each socket buffer 64 MiB.
+pub const MAX_MESSAGE: usize = 16 << 20;
+
+/// The socket settings of every venue connection.
+fn socket_config() -> WebSocketConfig {
+    // Venue messages are a few KiB. The 128 KiB default is zeroed on every read and
+    // cost 5% of a node's CPU in the profile of 2026-11-08.
+    WebSocketConfig::default()
+        .read_buffer_size(READ_BUFFER)
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE))
+}
+
 /// Connects over TLS using `rustls` with the webpki root store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WebSocketConnector;
@@ -190,10 +205,7 @@ impl Connector for WebSocketConnector {
 
     async fn connect(&self, url: &str) -> Result<Self::Conn, TransportError> {
         install_tls_provider();
-        // Venue messages are a few KiB. The 128 KiB default is zeroed on every read and
-        // cost 5% of a node's CPU in the profile of 2026-11-08.
-        let config = WebSocketConfig::default().read_buffer_size(READ_BUFFER);
-        let (inner, _response) = connect_async_with_config(url, Some(config), false)
+        let (inner, _response) = connect_async_with_config(url, Some(socket_config()), false)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
         Ok(WebSocket { inner })
@@ -220,5 +232,37 @@ mod tests {
         );
         assert_eq!(Frame::Ping.payload(), None);
         assert_eq!(Frame::Pong.payload(), None);
+    }
+
+    /// A venue that sends an over-size message loses the connection, and the
+    /// session reconnects; a large normal message still arrives.
+    #[tokio::test]
+    async fn an_over_size_message_ends_the_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds");
+        let url = format!("ws://{}/", listener.local_addr().expect("bound"));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accepts");
+            let mut socket = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("upgrades");
+            for size in [1 << 20, MAX_MESSAGE + 1] {
+                let text = "x".repeat(size);
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            // Keep the socket open, so only the size can end the read.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let mut conn = WebSocketConnector.connect(&url).await.expect("connects");
+        let first = conn.recv().await.expect("a frame").expect("open");
+        assert_eq!(first.payload().map(<[u8]>::len), Some(1 << 20));
+        assert!(
+            matches!(conn.recv().await, Err(TransportError::Io(_))),
+            "an over-size message must fail the read"
+        );
+        server.abort();
     }
 }

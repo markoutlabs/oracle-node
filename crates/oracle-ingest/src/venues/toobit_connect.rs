@@ -43,6 +43,9 @@ const NODE_SHARE: u32 = 2;
 const FASTEST: Duration = Duration::from_secs(1);
 /// The budget is per address, so a refused read stops the reads of every book.
 const PAUSE: Duration = Duration::from_secs(30);
+/// The longest `Retry-After` that counts. A Binance ban lasts up to 3 days, and a
+/// larger value would overflow the clock and end the adapter.
+const MAX_PAUSE: Duration = Duration::from_secs(3 * 24 * 3_600);
 /// The other books' reads confirm a book until its own read fails, so a read gets
 /// no more time than the 2 s confirmed age (SPEC §5.2).
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -184,7 +187,7 @@ fn pause_after(error: &ReadError) -> Option<Duration> {
         *status,
         StatusCode::TOO_MANY_REQUESTS | StatusCode::IM_A_TEAPOT | StatusCode::FORBIDDEN
     );
-    refused.then(|| retry_after.map_or(PAUSE, |after| after.max(PAUSE)))
+    refused.then(|| retry_after.map_or(PAUSE, |after| after.clamp(PAUSE, MAX_PAUSE)))
 }
 
 /// The end of the pause that every read of the address waits out.
@@ -198,7 +201,8 @@ impl Pause {
 
     /// Stops the reads for `wait` from now, unless a longer pause holds.
     fn hold(&self, wait: Duration) {
-        let until = Instant::now() + wait;
+        let now = Instant::now();
+        let until = now.checked_add(wait).unwrap_or(now + MAX_PAUSE);
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         *held = Some(held.map_or(until, |held| held.max(until)));
     }
@@ -287,6 +291,12 @@ mod tests {
             Some(Duration::from_secs(120))
         );
         assert_eq!(pause(StatusCode::FORBIDDEN, None), Some(PAUSE));
+        // A huge wait panicked in `Instant + Duration` and ended the adapter.
+        assert_eq!(
+            pause(StatusCode::TOO_MANY_REQUESTS, Some(u64::MAX)),
+            Some(MAX_PAUSE)
+        );
+        Pause::default().hold(Duration::MAX);
         assert_eq!(pause(StatusCode::BAD_REQUEST, None), None);
         assert_eq!(pause(StatusCode::BAD_GATEWAY, None), None);
         assert_eq!(pause_after(&ReadError::Failed("timeout".to_owned())), None);

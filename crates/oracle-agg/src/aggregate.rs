@@ -339,6 +339,21 @@ pub fn aggregate(
         };
     };
 
+    // With no last price the band has no reference, and the median of two
+    // venues a band apart is a level that neither quoted. They do not agree, so
+    // the reference must not follow it.
+    if reasons.contains(Reasons::OUTLIER_PRESSURE)
+        && last_price.is_none()
+        && config.sanity_band_enabled()
+        && !quotes_within_band(&quotes, config)
+    {
+        return Outcome::Halted {
+            reasons: reasons | Reasons::SANITY_BAND,
+            live,
+            out_of_band: None,
+        };
+    }
+
     // The sanity band catches the failure nothing else can: every venue agreeing,
     // and all of them wrong. A bad instrument mapping, a redenomination, a stock
     // split. Halting is right here — there is no price to widen around.
@@ -564,6 +579,16 @@ fn within_band(price: Fixed, reference: Fixed, config: &FeedConfig) -> bool {
     price >= low && price <= high
 }
 
+/// Returns `true` if the lowest and the highest quote each sit inside the band
+/// around the other.
+fn quotes_within_band(quotes: &[SourceQuote], config: &FeedConfig) -> bool {
+    let prices = quotes.iter().map(|quote| quote.price);
+    let (Some(low), Some(high)) = (prices.clone().min(), prices.max()) else {
+        return true;
+    };
+    within_band(low, high, config) && within_band(high, low, config)
+}
+
 /// Returns `true` if `price` differs from `reference` by at least `threshold_bps`.
 fn moved_by(price: Fixed, reference: Fixed, threshold_bps: Fixed) -> bool {
     price
@@ -679,6 +704,36 @@ mod tests {
         let quotes = vec![quote(Venue::Binance, "100"), quote(Venue::Okx, "100.05")];
         let result = priced(aggregate(&config, quotes, None, None, None));
         assert!(result.flags.is_none());
+    }
+
+    /// At a start, a venue with a wrong decimal gave the midpoint 55 of 100
+    /// and 10, published as degraded. Two venues a band apart now halt.
+    #[test]
+    fn two_sources_a_band_apart_with_no_last_price_halt() {
+        let config = config(&[Venue::Binance, Venue::Okx]);
+        for (first, second) in [("100", "10"), ("100", "1000"), ("100", "49")] {
+            let quotes = vec![quote(Venue::Binance, first), quote(Venue::Okx, second)];
+            match aggregate(&config, quotes.clone(), None, None, None) {
+                Outcome::Halted {
+                    reasons,
+                    out_of_band,
+                    ..
+                } => {
+                    assert!(reasons.contains(Reasons::SANITY_BAND), "{reasons:?}");
+                    assert_eq!(out_of_band, None, "the reference must not follow it");
+                }
+                Outcome::Priced(priced) => panic!("{first} and {second} gave {}", priced.price),
+            }
+            // With a last price, the quote nearer it stands, as before.
+            let kept = priced(aggregate(&config, quotes, None, Some(fixed("100")), None));
+            assert_eq!(kept.price, fixed("100"));
+        }
+        // A gap inside the band still prices, degraded and wide.
+        let quotes = vec![quote(Venue::Binance, "100"), quote(Venue::Okx, "60")];
+        let wide = priced(aggregate(&config, quotes, None, None, None));
+        assert_eq!(wide.price, fixed("80"));
+        assert!(wide.flags.is_degraded());
+        assert!(wide.conf >= fixed("20"), "{}", wide.conf);
     }
 
     /// A source with most of the weight made the weighted MAD zero, and the

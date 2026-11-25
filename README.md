@@ -132,13 +132,16 @@ Put options after `sh -s --`:
 | File | Contents |
 |---|---|
 | `signing.key` | The node's secret seed, encrypted with `age`. It is the only copy. Keep it on this machine. |
-| `passphrase` | The passphrase of the key. Mode `0600`. |
+| `passphrase` | The passphrase of the key. Mode `0600`. The node refuses a key or passphrase file that every user of the host can read. |
 | `config.toml` | The node's config, with every feed of the network. |
 | `node-entry.json` | The registry entry for governance: the node's address and endpoint. It holds no secret. |
 
 The endpoint is the URL that clients dial, such as `ws://203.0.113.7:8791/v2/ws`.
 The node listens on the port of the URL. Behind a TLS proxy, use a `wss://` URL
-without a port. The node then listens on port 8791.
+without a port. The node then listens on port 8791. A TLS proxy on the same
+host brings every client from the loopback address, and the per-address limits
+do not apply to it; only the totals do. Put a per-address rate limit in the TLS
+proxy.
 
 For a script, give the endpoint as a flag:
 
@@ -313,7 +316,9 @@ let usable = btc.filter(|price| price.status != PriceStatus::Halted);
 
 The price is `price × 10^expo`. Use it only when the status is `Ok` or
 `Degraded`. A feed whose nodes stop pushing goes `Halted` after the canister's
-price window, 180 s by default (`get_price_window`).
+price window, 180 s by default (`get_price_window`). So a price with status
+`Ok` can be about 190 s old: the window, and the 10 s that a node's clock may be
+ahead. At the production pace of one push a minute, it is a 60 s sample.
 `get_prices` returns every priced feed with its id, for the same fee. The other
 methods refuse calls from canisters, because the canister pays for each call;
 query them from an agent, such as `get_feeds` for the priced feeds and their ids.
@@ -347,6 +352,10 @@ signature and the quorum, and serves the result as JSON over a WebSocket.
 | Client access | A client signs a challenge with its key. The node checks that the registry lists the client. |
 | Data in transit | The node encrypts its stream for the listed clients. |
 | Wrong prices | The median of the nodes, with a quorum of three or more. |
+
+**Today the network runs one node**, with a quorum of 1 of 1. A price with
+`nodes: 1` is that one node's word, and the median of the nodes does not
+protect it. The canister puts no bound on a change of the price.
 
 ## Repository layout
 
@@ -454,6 +463,13 @@ and so does each push from a node. A node signs each push as one batch, so the
 canister checks one signature for it: about 22M cycles a push, or 0.94T cycles a
 month for each node at the production pace (SPEC §3.7). Keep the canister
 funded. Below 0.5T cycles it refuses pushes, so that governance can still sign.
+
+Any canister can call any method. A refused call still costs the registry about
+5M cycles, the base fee, and costs its caller about 12M (SPEC §3.7). So another
+canister can spend the balance. Hold a balance far above the reserve, and watch it. A frozen canister
+answers no call: each on-chain price goes `Halted`, each node refuses new client
+sessions after 3 h without a certified client list, and it closes each session
+after 24 h.
 
 On an installed canister, `make deploy` upgrades it and keeps every node,
 client and price. A fresh install prices no feed. The canister prices feeds only

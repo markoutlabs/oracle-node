@@ -93,6 +93,7 @@ impl Fixture {
             &serde_json::to_string(&clients).expect("json"),
         );
         write("signing.key", &key(NODE_SEED).to_secret_hex());
+        common::private(&dir.join("signing.key"));
         write(
             "config.toml",
             &format!(

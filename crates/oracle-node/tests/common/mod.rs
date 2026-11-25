@@ -81,7 +81,14 @@ pub fn scratch(name: &str) -> Scratch {
 pub fn passphrase_file(dir: &Path) -> String {
     let path = dir.with_extension("passphrase");
     std::fs::write(&path, format!("{PASSPHRASE}\n")).expect("writes");
+    private(&path);
     path.to_str().expect("utf-8").to_owned()
+}
+
+/// The node refuses a key or passphrase file that every user can read.
+pub fn private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("sets the mode");
 }
 
 pub fn passphrase() -> SecretString {
