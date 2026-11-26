@@ -68,6 +68,29 @@ fn the_generated_asset_feeds_resolve_with_the_playground() {
     assert!(resolved.feeds.len() > 100, "{} feeds", resolved.feeds.len());
 }
 
+/// The OKX channels of an X-Perp reach no network feed: the network's files name no X-Perp,
+/// so each OKX instrument of the network subscribes exactly as before.
+#[test]
+fn no_network_okx_instrument_is_an_x_perp() {
+    let resolved = playground(&["all-feeds.toml", "assets.toml"])
+        .resolve()
+        .expect("resolves");
+    let instruments: Vec<&str> = connections_of(&resolved, Venue::Okx)
+        .iter()
+        .flat_map(|connection| &connection.instruments)
+        .map(|spec| spec.venue_symbol.as_str())
+        .collect();
+    assert!(instruments.len() > 100, "{} instruments", instruments.len());
+    for id in instruments {
+        assert!(!oracle_ingest::venues::okx::is_x_perp(id), "{id}");
+        assert_eq!(
+            oracle_ingest::venues::okx::pays_funding(id),
+            oracle_ingest::venues::okx::is_swap(id),
+            "{id}"
+        );
+    }
+}
+
 #[test]
 fn a_complete_config_resolves() {
     let resolved = config()

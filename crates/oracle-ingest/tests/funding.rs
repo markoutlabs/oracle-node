@@ -210,3 +210,122 @@ fn deribit_sends_an_eight_hour_rate_and_usd_open_interest() {
         }
     );
 }
+
+/// A recorded line of a JSON Lines fixture, by the text that it holds.
+fn line_of(text: &str, holds: &str) -> String {
+    text.lines()
+        .find(|line| line.contains(holds))
+        .unwrap_or_else(|| panic!("a line with {holds}"))
+        .to_owned()
+}
+
+/// The fixtures are live messages of 2026-11-26. The USDC perpetual `ZECUSDC` pays every 4 hours
+/// and the USDT one `ZECUSDT` every 8 hours, so one list gives the two markets two intervals.
+#[test]
+fn a_binance_usdc_perpetual_is_its_own_market_with_its_own_interval() {
+    let mut feed = binance(&["ZECUSDT", "ZECUSDC"]);
+    let _ = feed.decoded(fixture("binance-usdc-funding-info.json"));
+    let recorded = fixture("binance-usdc-perp.jsonl");
+
+    let book = feed.decoded(line_of(&recorded, "@bookTicker"));
+    let [top] = book.as_slice() else {
+        panic!("one book top: {book:?}");
+    };
+    assert_eq!(top.kind, ObsKind::BookTop);
+    assert_eq!(&*top.instrument.symbol, "ZECUSDC");
+    assert_eq!(top.instrument.market, MarketKind::LinearPerp);
+    assert_eq!(
+        (top.bid, top.ask),
+        (Some(fixed("756.22")), Some(fixed("756.32")))
+    );
+
+    let trade = feed.decoded(line_of(&recorded, "@aggTrade"));
+    let [trade] = trade.as_slice() else {
+        panic!("one trade: {trade:?}");
+    };
+    assert_eq!((trade.kind, trade.price), (ObsKind::Trade, fixed("756.69")));
+
+    let mark = line_of(&recorded, "@markPrice");
+    let usdc = feed.decoded(&mark);
+    assert!(usdc.iter().all(|o| &*o.instrument.symbol == "ZECUSDC"));
+    let (rate, info) = funding(&usdc);
+    assert_eq!(rate, fixed("0.00005"));
+    assert_eq!(
+        info,
+        FundingInfo {
+            interval_ns: Some(4 * HOUR_NS),
+            next_funding_time_ns: ms(1_795_680_000_000),
+            ..FundingInfo::new(FundingBasis::Interval)
+        }
+    );
+    // The same message of the USDT market keeps that market's own interval.
+    let usdt = feed.decoded(
+        mark.replace("ZECUSDC", "ZECUSDT")
+            .replace("zecusdc", "zecusdt"),
+    );
+    assert!(usdt.iter().all(|o| &*o.instrument.symbol == "ZECUSDT"));
+    assert_eq!(funding(&usdt).1.interval_ns, Some(8 * HOUR_NS));
+}
+
+/// An OKX X-Perp (`instType` `FUTURES`, `ruleType` `xperp`) sends the messages of a swap. The
+/// fixture holds live messages of 2026-11-26; its contract is 0.01 ZEC (`ctVal`).
+#[test]
+fn an_okx_x_perp_subscribes_and_decodes_as_a_swap() {
+    const X_PERP: &str = "ZEC-USD_UM_XPERP-310530";
+    assert!(okx::pays_funding(X_PERP) && !okx::is_swap(X_PERP));
+    let frames = okx::subscribe_frames([(X_PERP, false)].into_iter(), 100);
+    for channel in [
+        "bbo-tbt",
+        "trades",
+        "mark-price",
+        "funding-rate",
+        "open-interest",
+    ] {
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.contains(&format!(r#""channel":"{channel}""#))),
+            "{channel}"
+        );
+    }
+
+    let spec =
+        oracle_ingest::testing::contracts_of(instrument(X_PERP, MarketKind::LinearPerp), "0.01");
+    let mut feed = Feed::venue(okx::decode, Venue::Okx, MarketKind::LinearPerp, &[spec]);
+    let recorded = fixture("okx-x-perp.jsonl");
+    let one = |feed: &mut Feed, holds: &str| {
+        let out = feed.decoded(line_of(&recorded, holds));
+        let [observation] = out.as_slice() else {
+            panic!("one observation of {holds}: {out:?}");
+        };
+        observation.clone()
+    };
+    let top = one(&mut feed, "bbo-tbt");
+    assert_eq!(top.kind, ObsKind::BookTop);
+    assert_eq!(top.ask, Some(fixed("755.6")));
+    assert_eq!(top.ask_qty, Some(fixed("0.26")), "26 contracts of 0.01 ZEC");
+    assert_eq!(one(&mut feed, "trades").price, fixed("755.73"));
+    let mark = one(&mut feed, "mark-price");
+    assert_eq!(
+        (mark.kind, mark.price),
+        (ObsKind::MarkPrice, fixed("755.52"))
+    );
+    assert!(
+        feed.refused(line_of(&recorded, "open-interest"))
+            .is_benign(),
+        "the open interest waits for the first rate"
+    );
+    let (rate, info) = funding(&feed.decoded(line_of(&recorded, "funding-rate")));
+    assert_eq!(rate, fixed("0.0001"));
+    assert_eq!(
+        info,
+        FundingInfo {
+            predicted: None,
+            interval_ns: Some(8 * HOUR_NS),
+            next_funding_time_ns: ms(1_795_680_000_000),
+            settled: Some((fixed("0.0001"), 1_795_651_200_000 * 1_000_000)),
+            open_interest: Some((fixed("5765.92"), OpenInterestUnit::Base)),
+            ..FundingInfo::new(FundingBasis::Interval)
+        }
+    );
+}

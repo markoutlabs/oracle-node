@@ -60,6 +60,18 @@ pub fn is_swap(inst_id: &str) -> bool {
     inst_id.ends_with("-SWAP")
 }
 
+/// Returns `true` for an X-Perp id such as `ZEC-USD_UM_XPERP-310530` (`FUTURES`, `ruleType` `xperp`).
+#[must_use]
+pub fn is_x_perp(inst_id: &str) -> bool {
+    inst_id.contains("_XPERP-")
+}
+
+/// Returns `true` for a swap or an X-Perp, which send the same funding messages (2026-11-26).
+#[must_use]
+pub fn pays_funding(inst_id: &str) -> bool {
+    is_swap(inst_id) || is_x_perp(inst_id)
+}
+
 /// Builds subscribe frames for a set of OKX instrument ids, each with whether
 /// it wants the book. A swap's book is in contracts, so it needs the
 /// instrument's contract size; the node config refuses one without it.
@@ -70,7 +82,7 @@ pub fn subscribe_frames<'a>(
 ) -> Vec<String> {
     let mut args: Vec<serde_json::Value> = Vec::new();
     for (inst_id, depth) in instruments {
-        let channels: &[&str] = if is_swap(inst_id) {
+        let channels: &[&str] = if pays_funding(inst_id) {
             &SWAP_CHANNELS
         } else {
             &SPOT_CHANNELS
@@ -641,6 +653,17 @@ mod tests {
     fn swaps_are_distinguished_by_their_instrument_id() {
         assert!(is_swap("BTC-USDT-SWAP"));
         assert!(!is_swap("BTC-USDT"));
+    }
+
+    /// An X-Perp and a swap pay funding; a spot pair and a dated future without the rule do not.
+    #[test]
+    fn x_perps_pay_funding_as_swaps_do() {
+        assert!(is_x_perp("BTC-USD_UM_XPERP-310404"));
+        assert!(pays_funding("BTC-USD_UM_XPERP-310404"));
+        assert!(pays_funding("BTC-USDT-SWAP"));
+        for other in ["BTC-USDT", "BTC-USDC", "BTC-USD-261225", "BTC-USDT-261225"] {
+            assert!(!is_x_perp(other) && !pays_funding(other), "{other}");
+        }
     }
 
     #[test]
